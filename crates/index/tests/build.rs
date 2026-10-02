@@ -61,6 +61,17 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
         assert_eq!(got[t], want, "{spec} hpc={hpc}: transcript {}", tx.name);
         assert_eq!(idx.tx_name(t as u32), tx.name);
     }
+    // Stored parsed sequences decode back exactly.
+    for (t, tx) in txs.iter().enumerate() {
+        let parsed = seeder.parsed(&tx.seq).map_or(tx.seq.clone(), |h| h.seq);
+        let codes: Vec<u8> = parsed
+            .iter()
+            .map(|&b| lcp_core::encode::CODE[b as usize])
+            .map(|c| if c > 3 { 0 } else { c })
+            .collect();
+        let n = idx.tx_plen()[t];
+        assert_eq!(idx.tx_codes(t as u32, 0, n), codes);
+    }
     // Colors agree with occurrences.
     for u in 0..idx.n_unitigs() as u32 {
         let (ts, _) = idx.occurrences(u);

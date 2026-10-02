@@ -45,8 +45,23 @@ pub struct IndexData {
     pub tx_family: Vec<u32>,
     pub tx_len: Vec<u32>,
     pub tx_plen: Vec<u32>,
+    /// Parsed transcript sequences, 2-bit packed (32 bases per word, base i at bits
+    /// 2(i mod 32)); each transcript starts on a word boundary: (word offsets, words).
+    pub tx_seq: (Vec<u64>, Vec<u64>),
     pub tx_names: Vec<String>,
     pub gene_names: Vec<String>,
+}
+
+/// 2-bit pack an ASCII sequence (non-ACGT as A), 32 bases per word, base i at bits
+/// 2(i mod 32).
+pub(crate) fn pack2(seq: &[u8]) -> Vec<u64> {
+    let mut words = vec![0u64; seq.len().div_ceil(32)];
+    for (i, &b) in seq.iter().enumerate() {
+        let c = lcp_core::encode::CODE[b as usize];
+        let c = if c > 3 { 0 } else { c as u64 };
+        words[i / 32] |= c << (2 * (i % 32));
+    }
+    words
 }
 
 fn pool(strings: &[String]) -> (Vec<u64>, Vec<u8>) {
@@ -83,6 +98,8 @@ impl IndexData {
         w.add("tx_family", &self.tx_family);
         w.add("tx_len", &self.tx_len);
         w.add("tx_plen", &self.tx_plen);
+        w.add("tx_seq_off", &self.tx_seq.0);
+        w.add("tx_seq", &self.tx_seq.1);
         let (o, b) = pool(&self.tx_names);
         w.add("tx_name_off", &o);
         w.add("tx_names", &b);
@@ -154,6 +171,8 @@ impl Index {
             "tx_family",
             "tx_len",
             "tx_plen",
+            "tx_seq_off",
+            "tx_seq",
             "tx_name_off",
             "tx_names",
             "gene_name_off",
@@ -191,6 +210,8 @@ impl Index {
     section!(tx_family, u32);
     section!(tx_len, u32);
     section!(tx_plen, u32);
+    section!(tx_seq_off, u64);
+    section!(tx_seq, u64);
 
     pub fn n_nodes(&self) -> usize {
         self.labels().len()
@@ -212,6 +233,14 @@ impl Index {
         let lo = l.partition_point(|&x| x < label);
         let hi = lo + l[lo..].partition_point(|&x| x == label);
         lo as u32..hi as u32
+    }
+
+    /// 2-bit codes (A=0, C=1, G=2, T=3) of the parsed transcript `t` over `[lo, hi)`.
+    pub fn tx_codes(&self, t: u32, lo: u32, hi: u32) -> Vec<u8> {
+        let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
+        (lo..hi)
+            .map(|i| ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8)
+            .collect()
     }
 
     /// Nodes of unitig `u`, in order.

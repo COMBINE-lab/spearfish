@@ -37,6 +37,15 @@ pub struct Args {
     /// Chaining: predecessor window (anchors).
     #[arg(long, default_value_t = 50)]
     window: usize,
+    /// Disable the base-level tie-break among near-best transcripts.
+    #[arg(long)]
+    no_tiebreak: bool,
+    /// Tie-break: score charged per extra edit.
+    #[arg(long, default_value_t = 6.0)]
+    kappa: f32,
+    /// Tie-break: absolute score margin defining the tie set.
+    #[arg(long, default_value_t = 30.0)]
+    tie_margin: f32,
     /// Report transcripts within this fraction of the best score.
     #[arg(long, default_value_t = 0.3)]
     delta_rep: f32,
@@ -119,9 +128,15 @@ pub fn run(args: Args) -> Result<()> {
         h: args.window,
         ..Default::default()
     };
+    let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
+        kappa: args.kappa,
+        margin_abs: args.tie_margin,
+        ..Default::default()
+    });
     let params = MapParams {
         delta_rep: args.delta_rep,
         chain: chain.clone(),
+        tiebreak,
         ..Default::default()
     };
     let mapper = Arc::new(Mapper::new(idx, OracleChainer { p: chain }, params)?);
