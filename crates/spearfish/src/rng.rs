@@ -25,6 +25,11 @@ impl SplitMix64 {
         ((self.next_u64() as u128 * n as u128) >> 64) as u64
     }
 
+    /// Uniform in `[0, 1)`.
+    pub fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
     /// A random base other than `b` (case-insensitive), as uppercase ASCII.
     pub fn other_base(&mut self, b: u8) -> u8 {
         let alts: Vec<u8> = b"ACGT"

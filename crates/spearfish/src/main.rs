@@ -5,6 +5,8 @@ mod hist;
 mod lcp_stats;
 mod locality_cmd;
 mod rng;
+mod sim;
+mod survival_cmd;
 
 use clap::{Parser, Subcommand};
 
@@ -21,11 +23,14 @@ enum Command {
     LcpStats(lcp_stats::Args),
     /// Measure LCP context radii by random single edits.
     Locality(locality_cmd::Args),
+    /// Seed survival under simulated sequencing errors, per seed scheme (M2).
+    Survival(survival_cmd::Args),
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::LcpStats(args) => lcp_stats::run(args),
         Command::Locality(args) => locality_cmd::run(args),
+        Command::Survival(args) => survival_cmd::run(args),
     }
 }

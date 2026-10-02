@@ -76,3 +76,38 @@ fn locality_on_toy() {
         assert!(changed > 0.0 && changed < 20.0, "{r:?}");
     }
 }
+
+#[test]
+fn survival_on_toy() {
+    let out = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .arg("survival")
+        .arg(toy())
+        .args([
+            "-s",
+            "lcp:K=3",
+            "-s",
+            "minimizer:k=15,w=10",
+            "--rates",
+            "0,0.05",
+            "--profiles",
+            "ont",
+        ])
+        .args(["--hpc", "off,on", "-t", "2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+    // 2 rates x 2 HPC settings x (3 LCP levels + 1 minimizer set).
+    assert_eq!(rows.len(), 1 + 2 * 2 * 4);
+    let col = |name: &str| rows[0].iter().position(|c| *c == name).unwrap();
+    for r in &rows[1..] {
+        let s: f64 = r[col("survival")].parse().unwrap();
+        if r[col("rate")] == "0" {
+            // No errors: every seed survives.
+            assert_eq!(s, 1.0, "{r:?}");
+        } else {
+            assert!(s < 1.0, "{r:?}");
+        }
+    }
+}

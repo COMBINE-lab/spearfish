@@ -847,6 +847,8 @@ dependencies = [
  "lcp-core",
  "paraseq",
  "rustc-hash",
+ "seeds",
+ "xxhash-rust",
 ]
 
 [[package]]

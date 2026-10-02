@@ -12,3 +12,5 @@ clap.workspace = true
 lcp-core.workspace = true
 paraseq.workspace = true
 rustc-hash.workspace = true
+seeds.workspace = true
+xxhash-rust.workspace = true
