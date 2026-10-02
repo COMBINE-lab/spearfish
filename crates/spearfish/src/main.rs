@@ -4,6 +4,7 @@
 mod annot;
 mod halo_cmd;
 mod hist;
+mod index_cmd;
 mod lcp_stats;
 mod locality_cmd;
 mod rng;
@@ -22,6 +23,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Build the index from a transcript FASTA.
+    Index(index_cmd::Args),
+    /// Report on a built index.
+    IndexStats(index_cmd::StatsArgs),
     /// Per-level LCP core statistics for a FASTA/FASTQ file.
     LcpStats(lcp_stats::Args),
     /// Measure LCP context radii by random single edits.
@@ -34,6 +39,8 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
+        Command::Index(args) => index_cmd::run(args),
+        Command::IndexStats(args) => index_cmd::stats(args),
         Command::LcpStats(args) => lcp_stats::run(args),
         Command::Locality(args) => locality_cmd::run(args),
         Command::Survival(args) => survival_cmd::run(args),

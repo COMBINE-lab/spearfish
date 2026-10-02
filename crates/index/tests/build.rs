@@ -1,0 +1,186 @@
+//! Index construction tests: the round trip (every transcript's seeds are reconstructed
+//! exactly from the serialized index) on the toy fixture and on random transcriptomes.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use index::{BuildParams, Collapse, Index, TxInput, build};
+use proptest::prelude::*;
+use seeds::BaseSeeder;
+
+fn toy() -> Vec<TxInput> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .split('>')
+        .skip(1)
+        .map(|rec| {
+            let mut lines = rec.lines();
+            let h: Vec<&str> = lines.next().unwrap().split('|').collect();
+            TxInput {
+                name: h[0].into(),
+                gene: h[1].into(),
+                seq: lines.flat_map(|l| l.trim().bytes()).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Build, serialize, reload, and check every transcript's seeds against fresh seeding.
+fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -> Index {
+    let p = BuildParams {
+        spec: spec.into(),
+        hpc,
+        f_max: 20,
+        allow_collisions: false,
+        collapse,
+    };
+    let (data, rep) = build(txs, &p).unwrap();
+    assert_eq!(rep.inconsistent_lengths, 0, "{spec}");
+    let idx = Index::from_bytes(&data.to_bytes()).unwrap();
+    assert_eq!(idx.meta("spec"), Some(spec));
+    let seeder = BaseSeeder::new(spec, hpc).unwrap();
+    let got = idx.transcript_seeds();
+    for (t, tx) in txs.iter().enumerate() {
+        // A label's node for transcript t: the one whose unitig t traverses.
+        let node = |label: u64| {
+            idx.lookup(label)
+                .find(|&n| {
+                    idx.occurrences(idx.node_unitig()[n as usize])
+                        .0
+                        .contains(&(t as u32))
+                })
+                .unwrap()
+        };
+        let mut want: Vec<(u32, u32)> = seeder
+            .seed(&tx.seq)
+            .iter()
+            .map(|s| (node(s.label), s.start))
+            .collect();
+        want.sort_unstable_by_key(|&(n, p)| (p, n));
+        assert_eq!(got[t], want, "{spec} hpc={hpc}: transcript {}", tx.name);
+        assert_eq!(idx.tx_name(t as u32), tx.name);
+    }
+    // Colors agree with occurrences.
+    for u in 0..idx.n_unitigs() as u32 {
+        let (ts, _) = idx.occurrences(u);
+        let set: Vec<u32> = ts
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(idx.color(idx.unitig_color()[u as usize]), &set[..]);
+    }
+    idx
+}
+
+#[test]
+fn toy_roundtrip_and_structure() {
+    let txs = toy();
+    for spec in [
+        "lcp:K=3",
+        "lcp:K=4",
+        "minimizer:k=19,w=23",
+        "closed-syncmer:k=15,s=5",
+    ] {
+        for hpc in [false, true] {
+            for collapse in [Collapse::Global, Collapse::Gene] {
+                let idx = check_roundtrip(&txs, spec, hpc, collapse);
+                let fam = idx.tx_family();
+                assert_eq!(fam[0], fam[1], "{spec}: GENEA isoforms");
+                assert_eq!(fam[2], fam[3], "{spec}: GENEB isoforms");
+                // Paralogs GENEC/GENECP share unitigs only when nodes are global.
+                let global = collapse == Collapse::Global;
+                assert_eq!(fam[4] == fam[5], global, "{spec} {collapse:?}: paralogs");
+                let distinct: HashSet<u32> = fam.iter().copied().collect();
+                assert_eq!(distinct.len(), if global { 3 } else { 4 }, "{spec} {collapse:?}");
+                // GENEA: a unitig shared by both isoforms, and one specific to the isoform
+                // with the cassette exon.
+                let colors: HashSet<Vec<u32>> = (0..idx.n_unitigs() as u32)
+                    .map(|u| idx.color(idx.unitig_color()[u as usize]).to_vec())
+                    .collect();
+                assert!(
+                    colors.contains(&vec![0, 1]) && colors.contains(&vec![0]),
+                    "{spec}"
+                );
+                let mixed = colors.iter().any(|c| c.contains(&4) && c.contains(&5));
+                assert_eq!(mixed, global, "{spec} {collapse:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn file_roundtrip() {
+    let txs = toy();
+    let (data, _) = build(
+        &txs,
+        &BuildParams {
+            spec: "lcp:K=3".into(),
+            hpc: true,
+            f_max: 20,
+            allow_collisions: false,
+            collapse: Collapse::Gene,
+        },
+    )
+    .unwrap();
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("toy.sfi");
+    data.write(&path).unwrap();
+    let idx = Index::open(&path).unwrap();
+    assert_eq!(idx.labels(), &data.labels[..]);
+    assert_eq!(idx.occ_pos(), &data.occ_pos[..]);
+    assert_eq!(idx.gene_name(idx.tx_gene()[4]), "TOYG0000003");
+}
+
+/// Random transcriptomes: genes of random exons; isoforms pick exon subsets; some exons
+/// carry tandem repeats or are copied into other genes, exercising branching, repeated
+/// nodes and shared unitigs.
+fn transcriptome() -> impl Strategy<Value = Vec<TxInput>> {
+    let exon = prop::collection::vec(prop::sample::select(b"ACGT".to_vec()), 30..300);
+    let gene = (
+        prop::collection::vec(exon, 2..6),
+        prop::collection::vec(prop::collection::vec(any::<bool>(), 6), 1..5),
+    );
+    prop::collection::vec(gene, 1..5).prop_map(|genes| {
+        let mut txs = Vec::new();
+        let shared: Vec<u8> = genes[0].0[0].clone();
+        for (g, (mut exons, isoforms)) in genes.into_iter().enumerate() {
+            // A tandem repeat inside the last exon, and a copy of gene 0's first exon.
+            let last = exons.len() - 1;
+            let unit: Vec<u8> = exons[last].iter().take(12).copied().collect();
+            exons[last].extend(unit.iter().cycle().take(unit.len() * 4));
+            if g > 0 {
+                exons.push(shared.clone());
+            }
+            for (i, pick) in isoforms.iter().enumerate() {
+                let seq: Vec<u8> = exons
+                    .iter()
+                    .zip(pick.iter().chain(std::iter::repeat(&true)))
+                    .filter(|(_, k)| **k)
+                    .flat_map(|(e, _)| e.clone())
+                    .collect();
+                if !seq.is_empty() {
+                    txs.push(TxInput {
+                        name: format!("g{g}t{i}"),
+                        gene: format!("g{g}"),
+                        seq,
+                    });
+                }
+            }
+        }
+        txs
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    #[test]
+    fn random_roundtrip(txs in transcriptome(), hpc in any::<bool>()) {
+        for spec in ["lcp:K=3", "minimizer:k=15,w=10"] {
+            check_roundtrip(&txs, spec, hpc, Collapse::Global);
+            check_roundtrip(&txs, spec, hpc, Collapse::Gene);
+        }
+    }
+}

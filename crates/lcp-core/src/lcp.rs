@@ -4,7 +4,7 @@
 //! Core *boundaries* reproduce lcptools (BilkentCompGen/lcptools, `lps.c`) exactly; this is
 //! checked by the differential test against `lcp-oracle-sys`. Labels differ by design:
 //! lcptools labels are lossy summaries, ours are 64-bit hashes of the full content
-//! (level 1: the bases; level k: the child labels).
+//! (level 1: the bases; level k: the child labels and their relative offsets).
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -13,7 +13,7 @@ use crate::encode::acgt_segments;
 use crate::{Core, Hierarchy, Level, Parser, ParserMeta};
 
 /// Bumped whenever a change alters any parse or label.
-pub const LCP_PARSER_VERSION: u32 = 1;
+pub const LCP_PARSER_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct LcpConfig {
@@ -103,8 +103,11 @@ impl LcpParser {
             for &(lo, hi) in &spans {
                 let children = &prev.cores[lo..hi];
                 label_buf.clear();
+                // Child labels and offsets: the same children can overlap by different amounts
+                // in different contexts, so labels alone would not determine the content.
                 for c in children {
                     label_buf.extend_from_slice(&c.label.to_le_bytes());
+                    label_buf.extend_from_slice(&(c.start - children[0].start).to_le_bytes());
                 }
                 level.cores.push(Core {
                     label: xxh3_64_with_seed(&label_buf, seed),
@@ -314,5 +317,37 @@ mod tests {
             .map(|c| c.label)
             .collect();
         assert_eq!(left, right);
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    /// Equal labels at a level imply equal content (spans of equal length and equal bases).
+    #[test]
+    fn labels_determine_content() {
+        let p = LcpParser::default();
+        let mut x = 99u64;
+        let mut seen: std::collections::HashMap<(usize, u64), Vec<u8>> = std::collections::HashMap::new();
+        for _ in 0..200 {
+            // Low-entropy sequence: many repeated substrings with varying contexts.
+            let seq: Vec<u8> = (0..3000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"AACGT"[(x % 5) as usize]
+                })
+                .collect();
+            let h = p.parse(&seq, 5);
+            for (k, l) in h.levels.iter().enumerate() {
+                for c in &l.cores {
+                    let content = seq[c.start as usize..c.end as usize].to_vec();
+                    let e = seen.entry((k, c.label)).or_insert_with(|| content.clone());
+                    assert_eq!(*e, content, "level {} label {:x}", k + 1, c.label);
+                }
+            }
+        }
     }
 }

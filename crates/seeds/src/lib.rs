@@ -6,12 +6,14 @@
 //! non-ACGT characters. Labels are 64-bit content hashes. Schemes are built from spec strings
 //! such as `minimizer:k=15,w=10` (see [`from_spec`]).
 
+mod base;
 mod kmer;
 mod linked;
 mod spec;
 
 use lcp_core::{Hierarchy, LcpParser, Parser};
 
+pub use base::{BaseSeeder, Seed};
 pub use kmer::{Minimizer, Randstrobe, Syncmer, SyncmerKind};
 pub use linked::LinkedCores;
 pub use spec::{SpecError, from_spec};

@@ -159,3 +159,34 @@ fn halo_on_toy() {
     );
     assert!(read("halo").lines().count() > 1);
 }
+
+#[test]
+fn index_and_stats_on_toy() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let idx = dir.join("toy_cli.sfi");
+    let out = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .arg("index")
+        .arg(toy())
+        .args(["-s", "lcp:K=3", "-t", "2", "-o"])
+        .arg(&idx)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .arg("index-stats")
+        .arg(&idx)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let get = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}\t")))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get("spec"), "lcp:K=3");
+    assert_eq!(get("hpc"), "true");
+    assert_eq!(get("collapse"), "gene");
+    assert_eq!(get("transcripts"), "6");
+}

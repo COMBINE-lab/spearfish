@@ -23,6 +23,8 @@ anyhow = "1.0"
 paraseq = "0.6.1"
 rustc-hash = "2.1"
 rayon = "1.12"
+memmap2 = "0.9"
+bytemuck = "1.25"
 
 [profile.release]
 debug = 1

@@ -9,7 +9,7 @@ pub mod hpc;
 mod lcp;
 pub mod locality;
 
-pub use lcp::{LcpConfig, LcpParser};
+pub use lcp::{LCP_PARSER_VERSION, LcpConfig, LcpParser};
 
 /// One core of a parse: a labelled interval of the input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

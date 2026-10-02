@@ -13,5 +13,6 @@ lcp-core.workspace = true
 paraseq.workspace = true
 rustc-hash.workspace = true
 rayon.workspace = true
+index.workspace = true
 seeds.workspace = true
 xxhash-rust.workspace = true
