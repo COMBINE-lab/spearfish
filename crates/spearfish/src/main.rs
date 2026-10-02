@@ -3,6 +3,8 @@
 
 mod hist;
 mod lcp_stats;
+mod locality_cmd;
+mod rng;
 
 use clap::{Parser, Subcommand};
 
@@ -17,10 +19,13 @@ struct Cli {
 enum Command {
     /// Per-level LCP core statistics for a FASTA/FASTQ file.
     LcpStats(lcp_stats::Args),
+    /// Measure LCP context radii by random single edits.
+    Locality(locality_cmd::Args),
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::LcpStats(args) => lcp_stats::run(args),
+        Command::Locality(args) => locality_cmd::run(args),
     }
 }

@@ -55,3 +55,24 @@ fn hpc_lengths_are_raw() {
     let b: f64 = hpc[1][c].parse().unwrap();
     assert!(b > a, "plain {a}, hpc {b}");
 }
+
+#[test]
+fn locality_on_toy() {
+    let out = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .arg("locality")
+        .arg(toy())
+        .args(["-K", "3", "-t", "2", "--edits", "5"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 1 + 3 * 3, "header plus 3 edit types x 3 levels");
+    let col = |name: &str| rows[0].iter().position(|c| *c == name).unwrap();
+    for r in &rows[1..] {
+        // 6 toy transcripts x 5 edits.
+        assert_eq!(r[col("edits")], "30");
+        let changed: f64 = r[col("changed_mean")].parse().unwrap();
+        assert!(changed > 0.0 && changed < 20.0, "{r:?}");
+    }
+}
