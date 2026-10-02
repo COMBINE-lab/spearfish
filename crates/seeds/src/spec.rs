@@ -6,13 +6,14 @@
 //! - `open-syncmer:k=15,s=9,t=3[,keep=0.5]`
 //! - `randstrobe:k=15,s=9[,t=3][,keep=1],wmin=1,wmax=4` (open syncmers if `t` is given,
 //!   closed otherwise)
+//! - `linked-lcp:b=3,wmin=1,wmax=4[,order=2][,keep=1][,pool=all|sampled]`
 
 use std::collections::HashMap;
 use std::fmt;
 
 use lcp_core::LcpParser;
 
-use crate::{LcpSeeds, Minimizer, Randstrobe, SeedScheme, Syncmer, SyncmerKind};
+use crate::{LcpSeeds, LinkedCores, Minimizer, Randstrobe, SeedScheme, Syncmer, SyncmerKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecError(pub String);
@@ -107,6 +108,31 @@ pub fn from_spec(spec: &str) -> Result<Box<dyn SeedScheme>, SpecError> {
                 w_max,
             })
         }
+        "linked-lcp" => {
+            let (w_min, w_max): (usize, usize) = (p.req("wmin")?, p.req("wmax")?);
+            if w_min == 0 || w_max < w_min {
+                return Err(SpecError(format!("{spec}: need 1 <= wmin <= wmax")));
+            }
+            let order = p.get("order")?.unwrap_or(2);
+            let keep = p.get("keep")?.unwrap_or(1.0);
+            if order < 2 || !(keep > 0.0 && keep <= 1.0) {
+                return Err(SpecError(format!("{spec}: need order >= 2 and keep in (0, 1]")));
+            }
+            let sampled = match p.get::<String>("pool")?.as_deref() {
+                None | Some("all") => false,
+                Some("sampled") => true,
+                Some(x) => return Err(SpecError(format!("{spec}: pool must be all or sampled, got {x}"))),
+            };
+            Box::new(LinkedCores {
+                parser: LcpParser::default(),
+                base: p.req("b")?,
+                w_min,
+                w_max,
+                order,
+                keep,
+                sampled,
+            })
+        }
         _ => return Err(SpecError(format!("{spec}: unknown scheme {name}"))),
     })
 }
@@ -125,6 +151,9 @@ mod tests {
             "open-syncmer:t=3,k=15,s=9",
             "randstrobe:t=3,k=15,s=9,wmin=1,wmax=4",
             "randstrobe:k=15,s=5,wmin=2,wmax=6",
+            "linked-lcp:b=3,wmin=1,wmax=4,order=2",
+            "linked-lcp:b=3,wmin=2,wmax=6,order=3,keep=0.4",
+            "linked-lcp:b=3,wmin=1,wmax=3,order=2,keep=0.43,pool=sampled",
         ] {
             let scheme = from_spec(s).unwrap();
             assert_eq!(from_spec(&scheme.name()).unwrap().name(), scheme.name(), "{s}");

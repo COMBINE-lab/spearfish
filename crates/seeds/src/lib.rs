@@ -7,11 +7,13 @@
 //! such as `minimizer:k=15,w=10` (see [`from_spec`]).
 
 mod kmer;
+mod linked;
 mod spec;
 
 use lcp_core::{Hierarchy, LcpParser, Parser};
 
 pub use kmer::{Minimizer, Randstrobe, Syncmer, SyncmerKind};
+pub use linked::LinkedCores;
 pub use spec::{SpecError, from_spec};
 
 pub trait SeedScheme: Send + Sync {
