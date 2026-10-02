@@ -34,8 +34,12 @@ pub struct TieBreak {
     pub cap: u32,
     /// Align only where tied transcripts differ (false: whole read per candidate).
     pub segmented: bool,
-    /// Edit differences up to this many are treated as ties.
-    pub tol: u32,
+    /// Segmented mode: score segments with affine gaps (None: unit-cost edit distance with
+    /// `kappa` per edit). Scores are charged `lambda` per point below the best.
+    pub affine: Option<align::Affine>,
+    pub lambda: f32,
+    /// Affine band (cells off the diagonals spanning the segment lengths).
+    pub band: usize,
 }
 
 impl Default for TieBreak {
@@ -48,7 +52,9 @@ impl Default for TieBreak {
             max_cands: 256,
             cap: 16,
             segmented: true,
-            tol: 0,
+            affine: Some(align::Affine::default()),
+            lambda: 1.0,
+            band: 16,
         }
     }
 }
@@ -153,15 +159,19 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
             .collect();
+        // Costs (edits, or negated affine scores) and the score charged per unit.
         let seg = if tb.segmented {
             self.segmented(tb, &codes, &hits[..n])
         } else {
             None
         };
-        let dist = seg.unwrap_or_else(|| self.whole_read(tb, &codes, &hits[..n]));
-        let dmin = *dist.iter().min().unwrap();
-        for (h, &d) in hits[..n].iter_mut().zip(&dist) {
-            h.score = best - tb.kappa * d.saturating_sub(dmin + tb.tol) as f32;
+        let (cost, unit) = seg.unwrap_or_else(|| {
+            let d = self.whole_read(tb, &codes, &hits[..n]);
+            (d.into_iter().map(i64::from).collect(), tb.kappa)
+        });
+        let cmin = *cost.iter().min().unwrap();
+        for (h, &c) in hits[..n].iter_mut().zip(&cost) {
+            h.score = best - unit * (c - cmin) as f32;
         }
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
         n as u32
@@ -211,7 +221,7 @@ impl<C: Chainer> Mapper<C> {
     /// sequences differ (identical segments cost every candidate the same); the read ends are
     /// aligned against windows anchored at the outermost shared anchors. `None` if the
     /// candidates share no anchor.
-    fn segmented(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Option<Vec<u32>> {
+    fn segmented(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Option<(Vec<i64>, f32)> {
         // Query starts present in every chain, with each candidate's transcript start.
         let mut shared: Vec<u32> = hits[0].chain.iter().map(|a| a.0).collect();
         for h in &hits[1..] {
@@ -237,7 +247,7 @@ impl<C: Chainer> Mapper<C> {
             })
             .collect();
         let plen = codes.len() as u32;
-        let mut dist = vec![0u32; hits.len()];
+        let mut cost = vec![0i64; hits.len()];
         let mut add = |texts: Vec<Vec<u8>>, read: &[u8], mode: align::Mode, rev: bool| {
             if texts.windows(2).all(|w| w[0] == w[1]) {
                 return; // same cost for every candidate
@@ -250,8 +260,26 @@ impl<C: Chainer> Mapper<C> {
             } else {
                 (read.to_vec(), texts)
             };
-            for (d, x) in dist.iter_mut().zip(Self::banded(&read, &texts, mode, tb.cap)) {
-                *d += x;
+            match &tb.affine {
+                Some(sc) => {
+                    // Tied isoforms often share a segment's sequence: score each text once.
+                    let mut order: Vec<usize> = (0..texts.len()).collect();
+                    order.sort_unstable_by(|&a, &b| texts[a].cmp(&texts[b]));
+                    let mut last: Option<(usize, i64)> = None;
+                    for i in order {
+                        let x = match last {
+                            Some((j, x)) if texts[j] == texts[i] => x,
+                            _ => i64::from(align::affine(&read, &texts[i], mode, sc, tb.band)),
+                        };
+                        last = Some((i, x));
+                        cost[i] -= x;
+                    }
+                }
+                None => {
+                    for (c, x) in cost.iter_mut().zip(Self::banded(&read, &texts, mode, tb.cap)) {
+                        *c += i64::from(x);
+                    }
+                }
             }
         };
         // Interior segments [shared_k, shared_k+1).
@@ -295,7 +323,8 @@ impl<C: Chainer> Mapper<C> {
             })
             .collect();
         add(texts, &codes[ql as usize..], align::Mode::Prefix, false);
-        Some(dist)
+        let unit = if tb.affine.is_some() { tb.lambda } else { tb.kappa };
+        Some((cost, unit))
     }
 
     fn map_strand(&self, raw: &[u8]) -> Strand {
@@ -379,7 +408,7 @@ impl<C: Chainer> Mapper<C> {
                     std::mem::swap(&mut st, &mut other);
                     reverse = !reverse;
                 }
-                let target = st.hits[0].score - tb.kappa * da.abs_diff(db).saturating_sub(tb.tol) as f32;
+                let target = st.hits[0].score - tb.kappa * da.abs_diff(db) as f32;
                 let shift = target - other.hits[0].score;
                 for h in &mut other.hits {
                     h.score += shift;

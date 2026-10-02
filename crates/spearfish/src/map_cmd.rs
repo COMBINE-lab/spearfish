@@ -66,9 +66,12 @@ pub struct Args {
     /// Tie-break: absolute score margin defining the tie set.
     #[arg(long, default_value_t = 30.0)]
     tie_margin: f32,
-    /// Tie-break: edit differences up to this many count as ties.
-    #[arg(long, default_value_t = 0)]
-    tie_tol: u32,
+    /// Tie-break: score segments by unit-cost edit distance instead of affine gaps.
+    #[arg(long)]
+    unit_tiebreak: bool,
+    /// Tie-break: score charged per affine-score point below the best.
+    #[arg(long, default_value_t = 1.0)]
+    lambda: f32,
     /// Tie-break: align at most this many near-best transcripts.
     #[arg(long, default_value_t = 256)]
     tie_cands: usize,
@@ -176,7 +179,8 @@ pub fn run(args: Args) -> Result<()> {
     let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
         kappa: args.kappa,
         margin_abs: args.tie_margin,
-        tol: args.tie_tol,
+        affine: (!args.unit_tiebreak).then(map::align::Affine::default),
+        lambda: args.lambda,
         max_cands: args.tie_cands,
         segmented: !args.whole_read_tiebreak,
         ..Default::default()

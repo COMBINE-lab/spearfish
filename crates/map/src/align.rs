@@ -128,6 +128,101 @@ pub fn infix_distance(pattern: &[u8], text: &[u8]) -> u32 {
     distance(pattern, text, Mode::Infix, u32::MAX).unwrap()
 }
 
+/// Affine-gap scoring (maximized): `+mat` per match, `-mis` per mismatch, `-(open + ext·l)`
+/// per gap of length `l`. Defaults are minimap2's map-ont single-affine part.
+#[derive(Clone, Copy, Debug)]
+pub struct Affine {
+    pub mat: i32,
+    pub mis: i32,
+    pub open: i32,
+    pub ext: i32,
+}
+
+impl Default for Affine {
+    fn default() -> Self {
+        Affine {
+            mat: 2,
+            mis: 4,
+            open: 4,
+            ext: 2,
+        }
+    }
+}
+
+const NEG: i32 = i32::MIN / 4;
+
+/// Best affine score aligning all of `pattern` against `text` (Gotoh). `Global`: all of the
+/// text too; `Prefix`: a prefix of the text (text end free); `Infix`: any substring. Cells
+/// more than `band` off the diagonals spanning the two lengths are not computed, so the
+/// result is a lower bound (pass `usize::MAX` for the exact score).
+pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
+    let (m, n) = (pattern.len(), text.len());
+    let go = sc.open + sc.ext;
+    // Row i (pattern) covers text columns [i - band - (m - n)⁺, i + band + (n - m)⁺]; Infix
+    // is unbanded.
+    let full = mode == Mode::Infix || band == usize::MAX;
+    let (below, above) = (
+        band.saturating_add(m.saturating_sub(n)),
+        band.saturating_add(n.saturating_sub(m)),
+    );
+    let range = |i: usize| {
+        if full {
+            (0, n)
+        } else {
+            (i.saturating_sub(below), i.saturating_add(above).min(n))
+        }
+    };
+    // h: best score ending at (i, j); f: ending in a gap that consumes pattern (vertical).
+    // Rows alternate between two buffers; cells outside a row's band stay NEG.
+    let (mut h, mut f) = (vec![NEG; n + 1], vec![NEG; n + 1]);
+    let (mut nh, mut nf) = (vec![NEG; n + 1], vec![NEG; n + 1]);
+    let (lo0, hi0) = range(0);
+    for (j, x) in h.iter_mut().enumerate().take(hi0 + 1).skip(lo0) {
+        *x = if j == 0 || mode == Mode::Infix {
+            0
+        } else {
+            -(sc.open + sc.ext * j as i32)
+        };
+    }
+    let mut prev = (lo0, hi0); // band of the row in h
+    let mut stale = (1, 0); // band of the row left in nh (empty)
+    for i in 1..=m {
+        let (lo, hi) = range(i);
+        nh[stale.0..=stale.1.min(n)].fill(NEG);
+        nf[stale.0..=stale.1.min(n)].fill(NEG);
+        let c = pattern[i - 1] & 3;
+        let mut start = lo;
+        if lo == 0 {
+            // Column 0: only a vertical gap reaches it.
+            let fj = (h[0] - go).max(f[0] - sc.ext);
+            nh[0] = fj;
+            nf[0] = fj;
+            start = 1;
+        }
+        // Horizontal gap (consumes text) ending at (i, j). Cells left of the band are NEG in
+        // both rows, so the band edges need no special case.
+        let mut e = NEG;
+        if start <= hi {
+            for j in start..=hi {
+                let fj = (h[j] - go).max(f[j] - sc.ext);
+                e = (nh[j - 1] - go).max(e - sc.ext);
+                let s = if c == text[j - 1] & 3 { sc.mat } else { -sc.mis };
+                let hj = (h[j - 1] + s).max(e).max(fj);
+                nh[j] = hj.max(NEG);
+                nf[j] = fj.max(NEG);
+            }
+        }
+        std::mem::swap(&mut h, &mut nh);
+        std::mem::swap(&mut f, &mut nf);
+        stale = prev;
+        prev = (lo, hi);
+    }
+    match mode {
+        Mode::Global => h[n],
+        Mode::Prefix | Mode::Infix => h[prev.0..=prev.1].iter().copied().max().unwrap_or(NEG),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,8 +285,75 @@ mod tests {
         assert_eq!(distance(&[], &[0, 1], Mode::Global, 5), Some(2));
     }
 
+    fn naive_affine(p: &[u8], t: &[u8], mode: Mode, sc: &Affine) -> i32 {
+        let (m, n) = (p.len(), t.len());
+        let go = sc.open + sc.ext;
+        let mut h = vec![vec![NEG; n + 1]; m + 1];
+        let mut e = vec![vec![NEG; n + 1]; m + 1];
+        let mut f = vec![vec![NEG; n + 1]; m + 1];
+        h[0][0] = 0;
+        for j in 1..=n {
+            h[0][j] = if mode == Mode::Infix {
+                0
+            } else {
+                -(sc.open + sc.ext * j as i32)
+            };
+            e[0][j] = h[0][j];
+        }
+        for i in 1..=m {
+            h[i][0] = -(sc.open + sc.ext * i as i32);
+            f[i][0] = h[i][0];
+            for j in 1..=n {
+                e[i][j] = (h[i][j - 1] - go).max(e[i][j - 1] - sc.ext);
+                f[i][j] = (h[i - 1][j] - go).max(f[i - 1][j] - sc.ext);
+                let s = if p[i - 1] == t[j - 1] { sc.mat } else { -sc.mis };
+                h[i][j] = (h[i - 1][j - 1] + s).max(e[i][j]).max(f[i][j]);
+            }
+        }
+        match mode {
+            Mode::Global => h[m][n],
+            _ => *h[m].iter().max().unwrap(),
+        }
+    }
+
+    #[test]
+    fn affine_examples() {
+        let sc = Affine::default();
+        let p = [0, 1, 2, 3, 0, 1, 2, 3];
+        assert_eq!(affine(&p, &p, Mode::Global, &sc, usize::MAX), 16);
+        // One 2-base deletion from the text: 6 matches, one gap of 2.
+        let t = [0, 1, 2, 3, 0, 1, 2, 3, 2, 2];
+        assert_eq!(affine(&p, &t, Mode::Global, &sc, usize::MAX), 16 - 8);
+        assert_eq!(affine(&p, &t, Mode::Prefix, &sc, usize::MAX), 16);
+        assert_eq!(affine(&[], &[0, 1], Mode::Global, &sc, usize::MAX), -8);
+        assert_eq!(affine(&[0, 1], &[], Mode::Global, &sc, usize::MAX), -8);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
+
+        #[test]
+        fn affine_vs_naive(
+            t in prop::collection::vec(0u8..4, 0..200),
+            edits in prop::collection::vec((0usize..200, 0u8..4, 0u8..3), 0..20),
+            a in 0usize..30, len in 0usize..180,
+        ) {
+            let end = (a + len).min(t.len());
+            let mut p: Vec<u8> = t[a.min(end)..end].to_vec();
+            for (pos, base, kind) in edits {
+                if p.is_empty() { break; }
+                let i = pos % p.len();
+                match kind { 0 => p[i] = base, 1 => p.insert(i, base), _ => { p.remove(i); } }
+            }
+            let sc = Affine::default();
+            for mode in [Mode::Global, Mode::Prefix, Mode::Infix] {
+                let want = naive_affine(&p, &t, mode, &sc);
+                prop_assert_eq!(affine(&p, &t, mode, &sc, usize::MAX), want, "mode {:?}", mode);
+                // A band never improves the score, and a band covering everything is exact.
+                prop_assert!(affine(&p, &t, mode, &sc, 8) <= want);
+                prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
+            }
+        }
 
         #[test]
         fn random_vs_naive(
