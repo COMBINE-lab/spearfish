@@ -354,6 +354,17 @@ impl<C: Chainer> Mapper<C> {
     }
 
     pub fn map(&self, raw: &[u8]) -> ReadResult {
+        // Direct RNA reads spell T as U; seeds hash bases, so normalize first.
+        let dna: Vec<u8>;
+        let raw = if raw.iter().any(|&b| b == b'U' || b == b'u') {
+            dna = raw
+                .iter()
+                .map(|&b| if b == b'U' || b == b'u' { b'T' } else { b })
+                .collect();
+            &dna[..]
+        } else {
+            raw
+        };
         let fwd = self.map_strand(raw);
         let rc = self.map_strand(&revcomp(raw));
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);

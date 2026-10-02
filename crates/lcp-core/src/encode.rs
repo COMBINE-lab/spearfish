@@ -16,6 +16,9 @@ const fn build_table() -> [u8; 256] {
     t[b'g' as usize] = 2;
     t[b'T' as usize] = 3;
     t[b't' as usize] = 3;
+    // RNA reads (direct RNA basecalls use U).
+    t[b'U' as usize] = 3;
+    t[b'u' as usize] = 3;
     t
 }
 

@@ -140,13 +140,25 @@ pub struct Affine {
 
 impl Default for Affine {
     fn default() -> Self {
-        Affine {
-            mat: 2,
-            mis: 4,
-            open: 4,
-            ext: 2,
-        }
+        Self::ONT
     }
+}
+
+impl Affine {
+    /// minimap2 map-ont (single-affine part of -A2 -B4 -O4,24 -E2,1).
+    pub const ONT: Affine = Affine {
+        mat: 2,
+        mis: 4,
+        open: 4,
+        ext: 2,
+    };
+    /// minimap2 map-hifi (single-affine part of -A1 -B4 -O6,26 -E2,1).
+    pub const HIFI: Affine = Affine {
+        mat: 1,
+        mis: 4,
+        open: 6,
+        ext: 2,
+    };
 }
 
 const NEG: i32 = i32::MIN / 4;

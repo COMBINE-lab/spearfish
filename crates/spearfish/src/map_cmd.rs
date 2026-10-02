@@ -73,6 +73,10 @@ pub struct Args {
     /// Tie-break: absolute score margin defining the tie set.
     #[arg(long, default_value_t = 30.0)]
     tie_margin: f32,
+    /// Read technology: `ont` or `hifi` (sets the tie-break's affine scores to minimap2's
+    /// map-ont or map-hifi values).
+    #[arg(long, default_value = "ont")]
+    preset: String,
     /// Tie-break: score segments by unit-cost edit distance instead of affine gaps.
     #[arg(long)]
     unit_tiebreak: bool,
@@ -183,10 +187,15 @@ pub fn run(args: Args) -> Result<()> {
         h: args.window,
         ..Default::default()
     };
+    let affine = match args.preset.as_str() {
+        "ont" => map::align::Affine::ONT,
+        "hifi" => map::align::Affine::HIFI,
+        x => anyhow::bail!("unknown preset {x:?} (ont, hifi)"),
+    };
     let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
         kappa: args.kappa,
         margin_abs: args.tie_margin,
-        affine: (!args.unit_tiebreak).then(map::align::Affine::default),
+        affine: (!args.unit_tiebreak).then_some(affine),
         lambda: args.lambda,
         max_cands: args.tie_cands,
         segmented: !args.whole_read_tiebreak,
