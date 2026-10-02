@@ -5,6 +5,7 @@
 
 mod bits;
 pub mod encode;
+pub mod hpc;
 mod lcp;
 pub mod locality;
 

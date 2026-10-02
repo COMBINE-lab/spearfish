@@ -1,10 +1,26 @@
-//! `spearfish`: index, map, quant, stats and survival subcommands land here as their
-//! milestones complete (see PLAN.md).
+//! `spearfish`: fast long-read RNA-seq mapping with locally consistent parsing.
+//! Subcommands arrive as their milestones complete (see PLAN.md).
 
-fn main() {
-    eprintln!(
-        "spearfish {}: no subcommands yet; see PLAN.md",
-        env!("CARGO_PKG_VERSION")
-    );
-    std::process::exit(2);
+mod hist;
+mod lcp_stats;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "spearfish", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Per-level LCP core statistics for a FASTA/FASTQ file.
+    LcpStats(lcp_stats::Args),
+}
+
+fn main() -> anyhow::Result<()> {
+    match Cli::parse().command {
+        Command::LcpStats(args) => lcp_stats::run(args),
+    }
 }
