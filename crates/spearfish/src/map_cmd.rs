@@ -43,6 +43,9 @@ pub struct Args {
     /// Tie-break: score charged per extra edit.
     #[arg(long, default_value_t = 6.0)]
     kappa: f32,
+    /// Tie-break: align whole reads instead of only where tied transcripts differ.
+    #[arg(long)]
+    whole_read_tiebreak: bool,
     /// Tie-break: absolute score margin defining the tie set.
     #[arg(long, default_value_t = 30.0)]
     tie_margin: f32,
@@ -131,6 +134,7 @@ pub fn run(args: Args) -> Result<()> {
     let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
         kappa: args.kappa,
         margin_abs: args.tie_margin,
+        segmented: !args.whole_read_tiebreak,
         ..Default::default()
     });
     let params = MapParams {

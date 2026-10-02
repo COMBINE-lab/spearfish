@@ -56,6 +56,8 @@ pub struct TxHit {
     pub anchored: u32,
     /// Largest |Δq - ρΔt| over the chain's transitions.
     pub max_discrepancy: f32,
+    /// The chain's anchors in query order: (query start, transcript start, length).
+    pub chain: Vec<(u32, u32, u32)>,
 }
 
 pub trait Chainer {
@@ -162,9 +164,11 @@ impl Chainer for OracleChainer {
             }
             let (mut k, mut n, mut maxd) = (end, 0u32, 0.0f32);
             let mut spans: Vec<(u32, u32)> = Vec::new();
+            let mut chain: Vec<(u32, u32, u32)> = Vec::new();
             loop {
                 let a = &cand.anchors[el[k].a as usize];
                 spans.push((a.qs, a.qe));
+                chain.push((a.qs, el[k].ts, len[el[k].a as usize]));
                 n += 1;
                 maxd = maxd.max(disc[k]);
                 if back[k] == u32::MAX {
@@ -175,6 +179,7 @@ impl Chainer for OracleChainer {
             let first = el[k];
             let last = el[end];
             spans.reverse();
+            chain.reverse();
             let mut anchored = 0;
             let mut covered_to = 0;
             for &(s, e) in &spans {
@@ -194,6 +199,7 @@ impl Chainer for OracleChainer {
                 anchors: n,
                 anchored,
                 max_discrepancy: maxd,
+                chain,
             });
         }
         hits
