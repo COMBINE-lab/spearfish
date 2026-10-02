@@ -4,3 +4,4 @@
 *.tsv.gz
 __pycache__/
 .snakemake/
+/pkgs
