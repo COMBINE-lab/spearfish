@@ -190,3 +190,69 @@ fn index_and_stats_on_toy() {
     assert_eq!(get("collapse"), "gene");
     assert_eq!(get("transcripts"), "6");
 }
+
+#[test]
+fn simulate_and_map_on_toy() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let (idx, reads, out_tsv) = (
+        dir.join("toy_map.sfi"),
+        dir.join("toy_reads.fa"),
+        dir.join("toy_map.tsv"),
+    );
+    let run = |args: &[&std::ffi::OsStr]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    run(&[
+        "index".as_ref(),
+        toy().as_os_str(),
+        "-o".as_ref(),
+        idx.as_os_str(),
+    ]);
+    run(&[
+        "simulate".as_ref(),
+        toy().as_os_str(),
+        "-n".as_ref(),
+        "200".as_ref(),
+        "--rate".as_ref(),
+        "0.03".as_ref(),
+        "-o".as_ref(),
+        reads.as_os_str(),
+    ]);
+    run(&[
+        "map".as_ref(),
+        idx.as_os_str(),
+        reads.as_os_str(),
+        "-t".as_ref(),
+        "2".as_ref(),
+        "-o".as_ref(),
+        out_tsv.as_os_str(),
+    ]);
+    // Every read maps, its source transcript is among its top-scoring hits (truncated reads
+    // can tie between isoforms), and output is in input order.
+    let text = std::fs::read_to_string(&out_tsv).unwrap();
+    let mut reads: Vec<(String, Vec<(f64, String)>)> = Vec::new();
+    for l in text.lines().skip(1) {
+        let f: Vec<&str> = l.split('\t').collect();
+        if reads.last().is_none_or(|r| r.0 != f[0]) {
+            reads.push((f[0].to_string(), Vec::new()));
+        }
+        reads
+            .last_mut()
+            .unwrap()
+            .1
+            .push((f[5].parse().unwrap(), f[4].to_string()));
+    }
+    assert_eq!(reads.len(), 200);
+    let mut correct = 0;
+    for (i, (name, hits)) in reads.iter().enumerate() {
+        let parts: Vec<&str> = name.split('|').collect();
+        assert_eq!(parts[0], format!("r{i}"), "output out of input order");
+        let best = hits.iter().map(|h| h.0).fold(f64::MIN, f64::max);
+        correct += hits.iter().any(|h| h.0 == best && h.1 == parts[1]) as usize;
+    }
+    assert!(correct >= 195, "{correct}/200 top hits correct");
+}

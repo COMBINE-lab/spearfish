@@ -7,9 +7,11 @@ mod hist;
 mod index_cmd;
 mod lcp_stats;
 mod locality_cmd;
+mod map_cmd;
 mod rng;
 mod seeding;
 mod sim;
+mod simulate_cmd;
 mod survival_cmd;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +29,10 @@ enum Command {
     Index(index_cmd::Args),
     /// Report on a built index.
     IndexStats(index_cmd::StatsArgs),
+    /// Map long reads to the indexed transcriptome.
+    Map(map_cmd::Args),
+    /// Simulate long reads with known origin.
+    Simulate(simulate_cmd::Args),
     /// Per-level LCP core statistics for a FASTA/FASTQ file.
     LcpStats(lcp_stats::Args),
     /// Measure LCP context radii by random single edits.
@@ -41,6 +47,8 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Index(args) => index_cmd::run(args),
         Command::IndexStats(args) => index_cmd::stats(args),
+        Command::Map(args) => map_cmd::run(args),
+        Command::Simulate(args) => simulate_cmd::run(args),
         Command::LcpStats(args) => lcp_stats::run(args),
         Command::Locality(args) => locality_cmd::run(args),
         Command::Survival(args) => survival_cmd::run(args),
