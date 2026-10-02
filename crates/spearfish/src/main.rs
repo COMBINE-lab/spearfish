@@ -17,6 +17,9 @@ mod survival_cmd;
 
 use clap::{Parser, Subcommand};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "spearfish", version, about)]
 struct Cli {

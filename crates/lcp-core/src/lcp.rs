@@ -4,7 +4,10 @@
 //! Core *boundaries* reproduce lcptools (BilkentCompGen/lcptools, `lps.c`) exactly; this is
 //! checked by the differential test against `lcp-oracle-sys`. Labels differ by design:
 //! lcptools labels are lossy summaries, ours are 64-bit hashes of the full content
-//! (level 1: the bases; level k: the child labels and their relative offsets).
+//! (level 1: the bases; level k: the child labels and their relative offsets). Short level-1
+//! cores (< 32 bases) are labelled by an invertible mix of their packed 2-bit codes, so they
+//! never collide with each other; level-k labels fold child labels and offsets with a
+//! multiply-rotate mix and a final avalanche.
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -13,7 +16,61 @@ use crate::encode::acgt_segments;
 use crate::{Core, Hierarchy, Level, Parser, ParserMeta};
 
 /// Bumped whenever a change alters any parse or label.
-pub const LCP_PARSER_VERSION: u32 = 2;
+pub const LCP_PARSER_VERSION: u32 = 3;
+
+/// murmur3 fmix64: an invertible avalanche.
+#[inline(always)]
+fn fmix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
+}
+
+/// A level-1 core with 2-bit codes `c`: its label, and its DCT bit string (2 bits per base,
+/// last base lowest) appended to `bits` as one item.
+#[inline(always)]
+fn level1(c: &[u8], seed: u64, bits: &mut BitArena) -> u64 {
+    if c.len() < 32 {
+        let mut x = 0u64;
+        for &b in c {
+            x = (x << 2) | b as u64;
+        }
+        bits.push_bits(x, 2 * c.len() as u32);
+        bits.finish_item();
+        // A leading 1 marks the length: injective, and fmix64 is a bijection.
+        fmix64((x | (1u64 << (2 * c.len()))) ^ seed)
+    } else {
+        for &b in c.iter().rev() {
+            bits.push_bits(b as u64, 2);
+        }
+        bits.finish_item();
+        xxh3_64_with_seed(c, seed)
+    }
+}
+
+/// Label of a level-k core from its children's (label, offset from the first child).
+#[inline(always)]
+fn label_k(children: impl Iterator<Item = (u64, u32)>, seed: u64) -> u64 {
+    let mut h = seed;
+    for (l, off) in children {
+        h = (h ^ l).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)
+            ^ (off as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    }
+    fmix64(h)
+}
+
+/// Reusable buffers for `LcpParser::top_cores`.
+#[derive(Default)]
+pub struct ParseScratch {
+    codes: Vec<u8>,
+    spans: Vec<(usize, usize)>,
+    vals: Vec<u64>,
+    bits: [BitArena; 2],
+    /// Two levels (ping-pong): labels, starts, ends.
+    lv: [(Vec<u64>, Vec<u32>, Vec<u32>); 2],
+}
 
 #[derive(Clone, Debug)]
 pub struct LcpConfig {
@@ -66,22 +123,17 @@ impl LcpParser {
         };
         for &(lo, hi) in &spans {
             level.cores.push(Core {
-                label: xxh3_64_with_seed(&s[lo..hi], seed1),
+                label: level1(&s[lo..hi], seed1, &mut bits),
                 start: lo as u32,
                 end: hi as u32,
                 child_lo: lo as u32,
                 child_hi: hi as u32,
             });
             level.ctx_start.push(lo as u32);
-            for &c in s[lo..hi].iter().rev() {
-                bits.push_bits(c as u64, 2);
-            }
-            bits.finish_item();
         }
         levels.push(level);
 
         let d = self.cfg.dct_iters as usize;
-        let mut label_buf: Vec<u8> = Vec::new();
         for k in 2..=max_level {
             let prev = levels.last().unwrap();
             let n = prev.cores.len();
@@ -102,15 +154,14 @@ impl LcpParser {
             };
             for &(lo, hi) in &spans {
                 let children = &prev.cores[lo..hi];
-                label_buf.clear();
                 // Child labels and offsets: the same children can overlap by different amounts
                 // in different contexts, so labels alone would not determine the content.
-                for c in children {
-                    label_buf.extend_from_slice(&c.label.to_le_bytes());
-                    label_buf.extend_from_slice(&(c.start - children[0].start).to_le_bytes());
-                }
+                let label = label_k(
+                    children.iter().map(|c| (c.label, c.start - children[0].start)),
+                    seed,
+                );
                 level.cores.push(Core {
-                    label: xxh3_64_with_seed(&label_buf, seed),
+                    label,
                     start: children[0].start,
                     end: children.iter().map(|c| c.end).max().unwrap(),
                     child_lo: lo as u32,
@@ -127,6 +178,101 @@ impl LcpParser {
             bits = next_bits;
         }
         levels
+    }
+}
+
+impl LcpParser {
+    /// The level-`k` cores of `seq` as (label, start, end), appended to `out` in start order;
+    /// identical to `parse(seq, k).level(k)` but without building the hierarchy, reusing the
+    /// buffers in `sc`.
+    pub fn top_cores(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
+        if k == 0 {
+            return;
+        }
+        let d = self.cfg.dct_iters as usize;
+        let mut i = 0;
+        while i < seq.len() {
+            // Next maximal ACGT segment.
+            while i < seq.len() && crate::encode::CODE[seq[i] as usize] == crate::encode::INVALID {
+                i += 1;
+            }
+            let off = i;
+            sc.codes.clear();
+            while i < seq.len() {
+                let c = crate::encode::CODE[seq[i] as usize];
+                if c == crate::encode::INVALID {
+                    break;
+                }
+                sc.codes.push(c);
+                i += 1;
+            }
+            if sc.codes.is_empty() {
+                continue;
+            }
+            // Level 1.
+            sc.spans.clear();
+            parse_rules(&sc.codes, |lo, hi| sc.spans.push((lo, hi)));
+            let seed1 = self.level_seed(1);
+            let cur = &mut sc.lv[0];
+            cur.0.clear();
+            cur.1.clear();
+            cur.2.clear();
+            sc.bits[0].clear();
+            for &(lo, hi) in &sc.spans {
+                cur.0.push(level1(&sc.codes[lo..hi], seed1, &mut sc.bits[0]));
+                cur.1.push(lo as u32);
+                cur.2.push(hi as u32);
+            }
+            let mut ci = 0; // index of the current level's buffers
+            for level in 2..=k {
+                let n = sc.lv[ci].0.len();
+                let ni = 1 - ci;
+                if n < d + 1 {
+                    sc.lv[ni].0.clear();
+                    sc.lv[ni].1.clear();
+                    sc.lv[ni].2.clear();
+                    ci = ni;
+                    break;
+                }
+                dct_into(&sc.bits[ci], d, &mut sc.vals);
+                sc.spans.clear();
+                parse_rules(&sc.vals[d..], |lo, hi| sc.spans.push((lo + d, hi + d)));
+                let seed = self.level_seed(level);
+                let (a, b) = sc.lv.split_at_mut(1);
+                let (prev, next) = if ci == 0 {
+                    (&a[0], &mut b[0])
+                } else {
+                    (&b[0], &mut a[0])
+                };
+                next.0.clear();
+                next.1.clear();
+                next.2.clear();
+                let (ba, bb) = sc.bits.split_at_mut(1);
+                let nbits = if ci == 0 { &mut bb[0] } else { &mut ba[0] };
+                nbits.clear();
+                for &(lo, hi) in &sc.spans {
+                    let s0 = prev.1[lo];
+                    next.0
+                        .push(label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed));
+                    next.1.push(s0);
+                    next.2.push(prev.2[lo..hi].iter().copied().max().unwrap());
+                    for &v in sc.vals[lo..hi].iter().rev() {
+                        nbits.push_bits(v, value_width(v));
+                    }
+                    nbits.finish_item();
+                }
+                ci = ni;
+            }
+            let top = &sc.lv[ci];
+            let o = off as u32;
+            out.extend(
+                top.0
+                    .iter()
+                    .zip(&top.1)
+                    .zip(&top.2)
+                    .map(|((&l, &s), &e)| (l, s + o, e + o)),
+            );
+        }
     }
 }
 
@@ -171,8 +317,15 @@ impl Parser for LcpParser {
 /// DCT values after `d` iterations. Entries `[d..]` are valid; the first `d` cores have no
 /// left neighbour at some iteration and are dropped, as in lcptools.
 fn dct(bits: &BitArena, d: usize) -> Vec<u64> {
+    let mut vals = Vec::new();
+    dct_into(bits, d, &mut vals);
+    vals
+}
+
+fn dct_into(bits: &BitArena, d: usize, vals: &mut Vec<u64>) {
     let n = bits.len();
-    let mut vals = vec![0u64; n];
+    vals.clear();
+    vals.resize(n, 0);
     for (i, v) in vals.iter_mut().enumerate().skip(1) {
         *v = dct_value(bits.get(i - 1), bits.get(i));
     }
@@ -183,7 +336,6 @@ fn dct(bits: &BitArena, d: usize) -> Vec<u64> {
             vals[i] = dct_value_words(l, value_width(l), r, value_width(r));
         }
     }
-    vals
 }
 
 /// The LCP core rules, shared by all levels (lcptools `parse1`/`parse3`). Calls
@@ -317,6 +469,34 @@ mod tests {
             .map(|c| c.label)
             .collect();
         assert_eq!(left, right);
+    }
+}
+
+#[cfg(test)]
+mod top_cores_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        /// The allocation-free path equals the hierarchy's top level exactly.
+        #[test]
+        fn top_cores_equal_parse(
+            seq in prop::collection::vec(prop::sample::select(b"AACGTTTGN".to_vec()), 0..3000),
+            k in 1u8..=5,
+        ) {
+            let p = LcpParser::default();
+            let want: Vec<(u64, u32, u32)> = p.parse(&seq, k).level(k).iter().map(|c| (c.label, c.start, c.end)).collect();
+            let mut sc = ParseScratch::default();
+            let mut got = Vec::new();
+            p.top_cores(&seq, k, &mut sc, &mut got);
+            prop_assert_eq!(&got, &want);
+            // Reusing the scratch gives the same result.
+            let mut again = Vec::new();
+            p.top_cores(&seq, k, &mut sc, &mut again);
+            prop_assert_eq!(again, want);
+        }
     }
 }
 

@@ -205,7 +205,7 @@ impl<C: Chainer> Mapper<C> {
         // Query starts present in every chain, with each candidate's transcript start.
         let mut shared: Vec<u32> = hits[0].chain.iter().map(|a| a.0).collect();
         for h in &hits[1..] {
-            let qs: std::collections::HashSet<u32> = h.chain.iter().map(|a| a.0).collect();
+            let qs: rustc_hash::FxHashSet<u32> = h.chain.iter().map(|a| a.0).collect();
             shared.retain(|q| qs.contains(q));
         }
         if shared.is_empty() {

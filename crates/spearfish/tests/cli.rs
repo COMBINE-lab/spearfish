@@ -232,7 +232,8 @@ fn simulate_and_map_on_toy() {
         out_tsv.as_os_str(),
     ]);
     // Every read maps, its source transcript is among its top-scoring hits (truncated reads
-    // can tie between isoforms), and output is in input order.
+    // can tie between isoforms), and each read's lines are contiguous (reads may appear in
+    // any order).
     let text = std::fs::read_to_string(&out_tsv).unwrap();
     let mut reads: Vec<(String, Vec<(f64, String)>)> = Vec::new();
     for l in text.lines().skip(1) {
@@ -246,11 +247,16 @@ fn simulate_and_map_on_toy() {
             .1
             .push((f[5].parse().unwrap(), f[4].to_string()));
     }
-    assert_eq!(reads.len(), 200);
+    assert_eq!(
+        reads.len(),
+        200,
+        "each read must appear as exactly one contiguous block"
+    );
+    let names: std::collections::HashSet<&str> = reads.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(names.len(), 200);
     let mut correct = 0;
-    for (i, (name, hits)) in reads.iter().enumerate() {
+    for (name, hits) in &reads {
         let parts: Vec<&str> = name.split('|').collect();
-        assert_eq!(parts[0], format!("r{i}"), "output out of input order");
         let best = hits.iter().map(|h| h.0).fold(f64::MIN, f64::max);
         correct += hits.iter().any(|h| h.0 == best && h.1 == parts[1]) as usize;
     }

@@ -12,7 +12,7 @@ pub mod store;
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 pub use build::{BuildParams, BuildReport, Collapse, TxInput, build};
 use store::{Store, Writer};
@@ -80,6 +80,7 @@ impl IndexData {
         let meta: String = self.meta.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
         w.add("meta", meta.as_bytes());
         w.add("labels", &self.labels);
+        w.add("label_dir", &label_dir(&self.labels));
         w.add("node_unitig", &self.node_unitig);
         w.add("node_offset", &self.node_offset);
         w.add("node_len", &self.node_len);
@@ -119,18 +120,120 @@ impl IndexData {
     }
 }
 
+/// Bits of the label directory for `n` nodes: about one node per bucket.
+pub fn label_dir_bits(n: usize) -> u32 {
+    (usize::BITS - n.max(2).leading_zeros() - 1).clamp(1, 30)
+}
+
+/// For each of the 2^bits buckets of the label's top bits, the first node whose label falls
+/// in it (plus a final entry, the node count). Labels are uniform hashes, so a lookup reads
+/// one directory entry and scans about one label.
+pub fn label_dir(labels: &[u64]) -> Vec<u32> {
+    let bits = label_dir_bits(labels.len());
+    let mut dir = vec![0u32; (1usize << bits) + 1];
+    let mut i = 0usize;
+    for (b, d) in dir.iter_mut().enumerate() {
+        while i < labels.len() && ((labels[i] >> (64 - bits)) as usize) < b {
+            i += 1;
+        }
+        *d = i as u32;
+    }
+    dir
+}
+
+/// A section borrowed from the index's own backing memory (mmap or heap buffer), which never
+/// moves or changes while the `Index` lives.
+struct Raw<T> {
+    ptr: *const T,
+    len: usize,
+}
+
+impl<T> Clone for Raw<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Raw<T> {}
+
+// SAFETY: the pointed-to data is immutable and owned by the Index holding the Raw.
+unsafe impl<T: Sync> Send for Raw<T> {}
+unsafe impl<T: Sync> Sync for Raw<T> {}
+
+impl<T> Raw<T> {
+    fn of(s: &[T]) -> Self {
+        Raw {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+
+    /// SAFETY: the caller ties the returned lifetime to the owner of the backing memory.
+    #[inline(always)]
+    unsafe fn slice<'a>(self) -> &'a [T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+macro_rules! sections {
+    ($($name:ident : $t:ty),* $(,)?) => {
+        struct Sections {
+            $($name: Raw<$t>,)*
+        }
+
+        impl Sections {
+            fn load(store: &Store) -> Result<Self> {
+                Ok(Sections { $($name: Raw::of(store.get::<$t>(stringify!($name))?),)* })
+            }
+        }
+
+        impl Index {
+            $(
+                #[inline(always)]
+                pub fn $name(&self) -> &[$t] {
+                    // SAFETY: borrowed from self.store, which outlives the returned slice.
+                    unsafe { self.s.$name.slice() }
+                }
+            )*
+        }
+    };
+}
+
+sections!(
+    labels: u64,
+    label_dir: u32,
+    node_unitig: u32,
+    node_offset: u32,
+    node_len: u32,
+    node_flags: u8,
+    unitig_off: u64,
+    unitig_nodes: u32,
+    unitig_span: u32,
+    unitig_color: u32,
+    unitig_family: u32,
+    occ_off: u64,
+    occ_tx: u32,
+    occ_pos: u32,
+    color_off: u64,
+    color_tx: u32,
+    tx_gene: u32,
+    tx_family: u32,
+    tx_len: u32,
+    tx_plen: u32,
+    tx_seq_off: u64,
+    tx_seq: u64,
+    tx_name_off: u64,
+    tx_names: u8,
+    gene_name_off: u64,
+    gene_names: u8,
+);
+
 /// A loaded (memory-mapped) index.
 pub struct Index {
     store: Store,
+    s: Sections,
     meta: Vec<(String, String)>,
-}
-
-macro_rules! section {
-    ($name:ident, $t:ty) => {
-        pub fn $name(&self) -> &[$t] {
-            self.store.get::<$t>(stringify!($name)).unwrap()
-        }
-    };
+    dir_shift: u32,
 }
 
 impl Index {
@@ -149,69 +252,23 @@ impl Index {
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let idx = Index { store, meta };
-        // Touch every section once so a malformed index fails here, not mid-mapping.
-        for name in [
-            "labels",
-            "node_unitig",
-            "node_offset",
-            "node_len",
-            "node_flags",
-            "unitig_off",
-            "unitig_nodes",
-            "unitig_span",
-            "unitig_color",
-            "unitig_family",
-            "occ_off",
-            "occ_tx",
-            "occ_pos",
-            "color_off",
-            "color_tx",
-            "tx_gene",
-            "tx_family",
-            "tx_len",
-            "tx_plen",
-            "tx_seq_off",
-            "tx_seq",
-            "tx_name_off",
-            "tx_names",
-            "gene_name_off",
-            "gene_names",
-        ] {
-            idx.store
-                .sizes()
-                .iter()
-                .find(|(n, _)| n == name)
-                .with_context(|| format!("index lacks {name}"))?;
-        }
-        Ok(idx)
+        let s = Sections::load(&store)?;
+        let bits = label_dir_bits(s.labels.len);
+        anyhow::ensure!(
+            s.label_dir.len == (1usize << bits) + 1,
+            "label directory has the wrong size"
+        );
+        Ok(Index {
+            store,
+            s,
+            meta,
+            dir_shift: 64 - bits,
+        })
     }
 
     pub fn meta(&self, key: &str) -> Option<&str> {
         self.meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
-
-    section!(labels, u64);
-    section!(node_unitig, u32);
-    section!(node_offset, u32);
-    section!(node_len, u32);
-    section!(node_flags, u8);
-    section!(unitig_off, u64);
-    section!(unitig_nodes, u32);
-    section!(unitig_span, u32);
-    section!(unitig_color, u32);
-    section!(unitig_family, u32);
-    section!(occ_off, u64);
-    section!(occ_tx, u32);
-    section!(occ_pos, u32);
-    section!(color_off, u64);
-    section!(color_tx, u32);
-    section!(tx_gene, u32);
-    section!(tx_family, u32);
-    section!(tx_len, u32);
-    section!(tx_plen, u32);
-    section!(tx_seq_off, u64);
-    section!(tx_seq, u64);
 
     pub fn n_nodes(&self) -> usize {
         self.labels().len()
@@ -229,18 +286,29 @@ impl Index {
     /// most one; with per-gene collapsing one per gene containing the label.
     #[inline]
     pub fn lookup(&self, label: u64) -> std::ops::Range<u32> {
-        let l = self.labels();
-        let lo = l.partition_point(|&x| x < label);
-        let hi = lo + l[lo..].partition_point(|&x| x == label);
-        lo as u32..hi as u32
+        let b = (label >> self.dir_shift) as usize;
+        let dir = self.label_dir();
+        let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
+        let l = &self.labels()[lo..hi];
+        let start = l.partition_point(|&x| x < label);
+        let end = start + l[start..].partition_point(|&x| x == label);
+        (lo + start) as u32..(lo + end) as u32
     }
 
     /// 2-bit codes (A=0, C=1, G=2, T=3) of the parsed transcript `t` over `[lo, hi)`.
     pub fn tx_codes(&self, t: u32, lo: u32, hi: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.tx_codes_into(t, lo, hi, &mut v, false);
+        v
+    }
+
+    /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes or (if
+    /// `ascii`) as ACGT.
+    pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>, ascii: bool) {
         let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
-        (lo..hi)
-            .map(|i| ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8)
-            .collect()
+        let map: [u8; 4] = if ascii { *b"ACGT" } else { [0, 1, 2, 3] };
+        out.reserve((hi - lo) as usize);
+        out.extend((lo..hi).map(|i| map[((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as usize]));
     }
 
     /// Nodes of unitig `u`, in order.
@@ -262,18 +330,16 @@ impl Index {
         &self.color_tx()[off[c as usize] as usize..off[c as usize + 1] as usize]
     }
 
-    fn pooled(&self, off: &str, bytes: &str, i: usize) -> &str {
-        let o = self.store.get::<u64>(off).unwrap();
-        let b = self.store.get::<u8>(bytes).unwrap();
-        std::str::from_utf8(&b[o[i] as usize..o[i + 1] as usize]).unwrap()
+    fn pooled<'a>(off: &[u64], bytes: &'a [u8], i: usize) -> &'a str {
+        std::str::from_utf8(&bytes[off[i] as usize..off[i + 1] as usize]).unwrap()
     }
 
     pub fn tx_name(&self, t: u32) -> &str {
-        self.pooled("tx_name_off", "tx_names", t as usize)
+        Self::pooled(self.tx_name_off(), self.tx_names(), t as usize)
     }
 
     pub fn gene_name(&self, g: u32) -> &str {
-        self.pooled("gene_name_off", "gene_names", g as usize)
+        Self::pooled(self.gene_name_off(), self.gene_names(), g as usize)
     }
 
     /// Section sizes in bytes, by name.
@@ -299,5 +365,51 @@ impl Index {
             v.sort_unstable_by_key(|&(n, p)| (p, n));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Directory lookup equals a plain binary search, for present labels (with duplicates, as
+    /// per-gene nodes give), absent labels, and the extremes.
+    #[test]
+    fn label_dir_lookup_matches_binary_search() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for n in [1usize, 2, 3, 100, 5000] {
+            let mut labels: Vec<u64> = (0..n).map(|_| next()).collect();
+            // Duplicates and extremes.
+            let dup: Vec<u64> = labels.iter().step_by(7).copied().collect();
+            labels.extend(dup);
+            labels.extend([0, u64::MAX, u64::MAX]);
+            labels.sort_unstable();
+            let dir = label_dir(&labels);
+            let shift = 64 - label_dir_bits(labels.len());
+            let lookup = |label: u64| {
+                let b = (label >> shift) as usize;
+                let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
+                let l = &labels[lo..hi];
+                let s = l.partition_point(|&v| v < label);
+                lo + s..lo + s + l[s..].partition_point(|&v| v == label)
+            };
+            let reference = |label: u64| {
+                let s = labels.partition_point(|&v| v < label);
+                s..s + labels[s..].partition_point(|&v| v == label)
+            };
+            for &q in labels.iter().chain(&[1, 12345, u64::MAX - 1]) {
+                assert_eq!(lookup(q), reference(q), "n {n} label {q:x}");
+            }
+            for _ in 0..1000 {
+                let q = next();
+                assert_eq!(lookup(q), reference(q));
+            }
+        }
     }
 }

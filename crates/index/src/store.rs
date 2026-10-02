@@ -13,7 +13,7 @@ use bytemuck::Pod;
 use memmap2::Mmap;
 
 const MAGIC: &[u8; 8] = b"SPFISH01";
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 const NAME_LEN: usize = 24;
 const ALIGN: usize = 64;
 

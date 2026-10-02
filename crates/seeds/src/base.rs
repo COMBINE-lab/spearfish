@@ -49,19 +49,19 @@ impl BaseSeeder {
 
     /// Seeds of an already parsed (compressed, if HPC is on) sequence.
     pub fn seed_parsed(&self, seq: &[u8]) -> Vec<Seed> {
-        let hier = self.scheme.seeds(seq);
-        let top = hier.levels.last().map_or(&[][..], |l| &l.cores[..]);
-        let mut v: Vec<Seed> = top
-            .iter()
-            .map(|c| Seed {
-                label: c.label,
-                start: c.start,
-                end: c.end,
-            })
-            .collect();
-        v.sort_unstable_by_key(|s| (s.start, s.end, s.label));
-        v.dedup();
+        let mut v = Vec::new();
+        self.seed_parsed_into(seq, &mut v, &mut Vec::new());
         v
+    }
+
+    /// `seed_parsed` into `out` (cleared first), with `tmp` as reusable scratch.
+    pub fn seed_parsed_into(&self, seq: &[u8], out: &mut Vec<Seed>, tmp: &mut Vec<(u64, u32, u32)>) {
+        tmp.clear();
+        self.scheme.top_into(seq, tmp);
+        out.clear();
+        out.extend(tmp.iter().map(|&(label, start, end)| Seed { label, start, end }));
+        out.sort_unstable_by_key(|s| (s.start, s.end, s.label));
+        out.dedup();
     }
 }
 

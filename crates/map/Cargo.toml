@@ -10,6 +10,9 @@ anyhow.workspace = true
 index.workspace = true
 lcp-core.workspace = true
 seeds.workspace = true
+rustc-hash.workspace = true
+multiversion.workspace = true
+
 
 [dev-dependencies]
 proptest.workspace = true

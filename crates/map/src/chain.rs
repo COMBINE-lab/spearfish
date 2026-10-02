@@ -101,7 +101,11 @@ pub(crate) fn transition(p: &ChainParams, x: Pt, y: Pt) -> Option<(f32, f32)> {
         return None;
     }
     let d = (dq as f32 - p.rho * dt as f32).abs();
-    let gamma = p.alpha * d + p.beta * (1.0 + dq.max(dt).max(0) as f32).log2();
+    let gamma = if p.beta == 0.0 {
+        p.alpha * d
+    } else {
+        p.alpha * d + p.beta * (1.0 + dq.max(dt).max(0) as f32).log2()
+    };
     let qlen = (y.qe - y.qs) as f32;
     let overlap = (x.qe.saturating_sub(y.qs)).min(y.qe - y.qs) as f32;
     Some((y.w * (1.0 - overlap / qlen) - gamma, d))
@@ -157,124 +161,245 @@ pub(crate) fn best_chain(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>
     Some((f[end], chain, maxd))
 }
 
-impl OracleChainer {
-    /// Transition score from anchor `x` to anchor `y` (placed at their target starts), if valid.
-    #[inline]
-    fn transition(&self, cand: &Candidate, len: &[u32], x: Placed, y: Placed) -> Option<(f32, f32)> {
-        let pt = |z: Placed| {
-            let a = &cand.anchors[z.a as usize];
-            Pt {
-                qs: a.qs,
-                qe: a.qe,
-                ts: z.ts,
-                len: len[z.a as usize],
-                w: a.weight,
-            }
-        };
-        transition(&self.p, pt(x), pt(y))
+/// Per-thread buffers for the oracle DP (reused across reads).
+#[derive(Default)]
+struct DpScratch {
+    /// Transcript -> bucket, and per-bucket placements in anchor order.
+    bucket_of: rustc_hash::FxHashMap<u32, u32>,
+    tx: Vec<u32>,
+    buckets: Vec<Vec<Placed>>,
+    // Structure-of-arrays for one transcript's placements.
+    a: Vec<u32>,
+    qs: Vec<i32>,
+    qe: Vec<i32>,
+    ts: Vec<i32>,
+    te: Vec<i32>,
+    w: Vec<f32>,
+    f: Vec<f32>,
+    back: Vec<u32>,
+    disc: Vec<f32>,
+    // Candidate scores and discrepancies of one anchor's predecessors.
+    cs: Vec<f32>,
+    cd: Vec<f32>,
+}
+
+thread_local! {
+    static DP: std::cell::RefCell<DpScratch> = std::cell::RefCell::new(DpScratch::default());
+}
+
+/// Scores of extending each predecessor `m` in `lo..k` with `y` (`-inf` if invalid) and the
+/// gap discrepancies, branch-free so it vectorizes; the arithmetic is exactly `transition`'s
+/// (with β = 0), so results are bit-identical.
+#[multiversion::multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
+    "x86_64+avx2+fma",
+    "x86_64+avx",
+    "aarch64+neon"
+))]
+#[allow(clippy::too_many_arguments)]
+fn pred_scores(
+    alpha: f32,
+    rho: f32,
+    o_max: i32,
+    g_max: i32,
+    xa: &[u32],
+    xqs: &[i32],
+    xqe: &[i32],
+    xts: &[i32],
+    xte: &[i32],
+    xf: &[f32],
+    (ya, yqs, yqe, yts, yw): (u32, i32, i32, i32, f32),
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    let qlen = (yqe - yqs) as f32;
+    for m in 0..cs.len() {
+        let dq = yqs - xqe[m];
+        let dt = yts - xte[m];
+        let valid = xa[m] < ya
+            && yqs > xqs[m]
+            && yts > xts[m]
+            && dq >= -o_max
+            && dq <= g_max
+            && dt >= -o_max
+            && dt <= g_max;
+        let d = (dq as f32 - rho * dt as f32).abs();
+        let gamma = alpha * d;
+        let overlap = (xqe[m] - yqs).max(0).min(yqe - yqs) as f32;
+        let delta = yw * (1.0 - overlap / qlen) - gamma;
+        cs[m] = if valid { xf[m] + delta } else { f32::NEG_INFINITY };
+        cd[m] = d;
     }
 }
 
 impl Chainer for OracleChainer {
     fn chain(&self, idx: &Index, cand: &Candidate) -> Vec<TxHit> {
+        DP.with(|dp| self.chain_with(idx, cand, &mut dp.borrow_mut()))
+    }
+}
+
+impl OracleChainer {
+    fn chain_with(&self, idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> Vec<TxHit> {
         let unitig = idx.node_unitig();
         let offset = idx.node_offset();
         let node_len = idx.node_len();
-        let len: Vec<u32> = cand.anchors.iter().map(|a| node_len[a.node as usize]).collect();
-        // (transcript, anchor, tpos) for every placement.
-        let mut placed: Vec<(u32, Placed)> = Vec::new();
+        let len = |i: usize| node_len[cand.anchors[i].node as usize];
+        // Bucket placements by transcript; visiting anchors in order keeps each bucket sorted
+        // by (anchor, target position).
+        sc.bucket_of.clear();
+        sc.tx.clear();
+        let mut used = 0;
         for (i, a) in cand.anchors.iter().enumerate() {
             let (ts, ps) = idx.occurrences(unitig[a.node as usize]);
             let off = offset[a.node as usize];
             for (&t, &p) in ts.iter().zip(ps) {
-                placed.push((
-                    t,
-                    Placed {
-                        a: i as u32,
-                        ts: p + off,
-                    },
-                ));
+                let b = *sc.bucket_of.entry(t).or_insert_with(|| {
+                    if used == sc.buckets.len() {
+                        sc.buckets.push(Vec::new());
+                    }
+                    sc.buckets[used].clear();
+                    sc.tx.push(t);
+                    used += 1;
+                    used as u32 - 1
+                });
+                sc.buckets[b as usize].push(Placed {
+                    a: i as u32,
+                    ts: p + off,
+                });
             }
         }
-        placed.sort_unstable_by_key(|&(t, x)| (t, x.a, x.ts));
 
-        let mut hits = Vec::new();
-        let (mut f, mut back, mut disc): (Vec<f32>, Vec<u32>, Vec<f32>) =
-            (Vec::new(), Vec::new(), Vec::new());
-        for group in placed.chunk_by(|x, y| x.0 == y.0) {
-            let t = group[0].0;
-            let el: Vec<Placed> = group.iter().map(|x| x.1).collect();
-            f.clear();
-            back.clear();
-            disc.clear();
+        let p = &self.p;
+        let mut hits = Vec::with_capacity(used);
+        for bi in 0..used {
+            let t = sc.tx[bi];
+            let el = std::mem::take(&mut sc.buckets[bi]);
+            let n = el.len();
+            sc.a.clear();
+            sc.qs.clear();
+            sc.qe.clear();
+            sc.ts.clear();
+            sc.te.clear();
+            sc.w.clear();
+            for x in &el {
+                let an = &cand.anchors[x.a as usize];
+                sc.a.push(x.a);
+                sc.qs.push(an.qs as i32);
+                sc.qe.push(an.qe as i32);
+                sc.ts.push(x.ts as i32);
+                sc.te.push((x.ts + len(x.a as usize)) as i32);
+                sc.w.push(an.weight);
+            }
+            sc.f.clear();
+            sc.f.resize(n, 0.0);
+            sc.back.clear();
+            sc.back.resize(n, u32::MAX);
+            sc.disc.clear();
+            sc.disc.resize(n, 0.0);
             let mut lo = 0;
-            for k in 0..el.len() {
-                let y = el[k];
-                while (el[lo].a as usize) + self.p.h < y.a as usize {
+            for k in 0..n {
+                let ya = sc.a[k];
+                while (sc.a[lo] as usize) + p.h < ya as usize {
                     lo += 1;
                 }
-                let (mut best, mut arg, mut bd) = (cand.anchors[y.a as usize].weight, u32::MAX, 0.0f32);
-                for m in lo..k {
-                    if el[m].a >= y.a {
-                        break;
-                    }
-                    if let Some((delta, d)) = self.transition(cand, &len, el[m], y) {
-                        let s = f[m] + delta;
-                        if s > best {
-                            (best, arg, bd) = (s, m as u32, d);
+                let y = (ya, sc.qs[k], sc.qe[k], sc.ts[k], sc.w[k]);
+                let (mut best, mut arg, mut bd) = (y.4, u32::MAX, 0.0f32);
+                if k > lo {
+                    if p.beta == 0.0 {
+                        sc.cs.resize(k - lo, 0.0);
+                        sc.cd.resize(k - lo, 0.0);
+                        pred_scores(
+                            p.alpha,
+                            p.rho,
+                            p.o_max as i32,
+                            p.g_max as i32,
+                            &sc.a[lo..k],
+                            &sc.qs[lo..k],
+                            &sc.qe[lo..k],
+                            &sc.ts[lo..k],
+                            &sc.te[lo..k],
+                            &sc.f[lo..k],
+                            y,
+                            &mut sc.cs[..k - lo],
+                            &mut sc.cd[..k - lo],
+                        );
+                        let mx = sc.cs[..k - lo].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        if mx > best {
+                            let j = sc.cs[..k - lo].iter().position(|&v| v == mx).unwrap();
+                            (best, arg, bd) = (mx, (lo + j) as u32, sc.cd[j]);
+                        }
+                    } else {
+                        let pt = |m: usize| Pt {
+                            qs: sc.qs[m] as u32,
+                            qe: sc.qe[m] as u32,
+                            ts: sc.ts[m] as u32,
+                            len: (sc.te[m] - sc.ts[m]) as u32,
+                            w: sc.w[m],
+                        };
+                        for m in lo..k {
+                            if sc.a[m] >= ya {
+                                break;
+                            }
+                            if let Some((delta, d)) = transition(p, pt(m), pt(k)) {
+                                let s = sc.f[m] + delta;
+                                if s > best {
+                                    (best, arg, bd) = (s, m as u32, d);
+                                }
+                            }
                         }
                     }
                 }
-                f.push(best);
-                back.push(arg);
-                disc.push(bd);
+                sc.f[k] = best;
+                sc.back[k] = arg;
+                sc.disc[k] = bd;
             }
             // Best chain end (ties: earliest element), then trace back.
             let (mut end, mut score) = (0, f32::NEG_INFINITY);
-            for (k, &s) in f.iter().enumerate() {
+            for (k, &s) in sc.f.iter().enumerate() {
                 if s > score {
                     (end, score) = (k, s);
                 }
             }
-            let (mut k, mut n, mut maxd) = (end, 0u32, 0.0f32);
-            let mut spans: Vec<(u32, u32)> = Vec::new();
+            let (mut k, mut n_anchors, mut maxd) = (end, 0u32, 0.0f32);
             let mut chain: Vec<(u32, u32, u32)> = Vec::new();
+            let mut spans: Vec<(u32, u32)> = Vec::new();
             loop {
-                let a = &cand.anchors[el[k].a as usize];
-                spans.push((a.qs, a.qe));
-                chain.push((a.qs, el[k].ts, len[el[k].a as usize]));
-                n += 1;
-                maxd = maxd.max(disc[k]);
-                if back[k] == u32::MAX {
+                chain.push((sc.qs[k] as u32, sc.ts[k] as u32, (sc.te[k] - sc.ts[k]) as u32));
+                spans.push((sc.qs[k] as u32, sc.qe[k] as u32));
+                n_anchors += 1;
+                maxd = maxd.max(sc.disc[k]);
+                if sc.back[k] == u32::MAX {
                     break;
                 }
-                k = back[k] as usize;
+                k = sc.back[k] as usize;
             }
-            let first = el[k];
-            let last = el[end];
-            spans.reverse();
             chain.reverse();
             let mut anchored = 0;
             let mut covered_to = 0;
-            for &(s, e) in &spans {
-                let from = s.max(covered_to);
-                if e > from {
-                    anchored += e - from;
+            for &(qs, _, _) in &chain {
+                let qe = sc.qe[el
+                    .iter()
+                    .position(|x| cand.anchors[x.a as usize].qs == qs)
+                    .unwrap()] as u32;
+                let from = qs.max(covered_to);
+                if qe > from {
+                    anchored += qe - from;
                 }
-                covered_to = covered_to.max(e);
+                covered_to = covered_to.max(qe);
             }
             hits.push(TxHit {
                 tx: t,
                 score,
-                qstart: cand.anchors[first.a as usize].qs,
-                qend: cand.anchors[last.a as usize].qe,
-                tstart: first.ts,
-                tend: last.ts + len[last.a as usize],
-                anchors: n,
+                qstart: sc.qs[k] as u32,
+                qend: sc.qe[end] as u32,
+                tstart: sc.ts[k] as u32,
+                tend: sc.te[end] as u32,
+                anchors: n_anchors,
                 anchored,
                 max_discrepancy: maxd,
                 chain,
             });
+            sc.buckets[bi] = el;
         }
         hits
     }

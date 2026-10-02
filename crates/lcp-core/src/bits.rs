@@ -46,6 +46,15 @@ impl BitArena {
         }
     }
 
+    /// Empty the arena, keeping its allocations.
+    pub(crate) fn clear(&mut self) {
+        self.words.clear();
+        self.off.clear();
+        self.off.push(0);
+        self.len.clear();
+        self.cur_len = 0;
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len.len()
     }
