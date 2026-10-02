@@ -10,6 +10,9 @@ pub(crate) struct BitArena {
     off: Vec<usize>,
     len: Vec<u32>,
     cur_len: u32,
+    /// Bits of the current item not yet flushed to `words` (the low `acc_bits` bits).
+    acc: u64,
+    acc_bits: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +46,8 @@ impl BitArena {
             off,
             len: Vec::with_capacity(items),
             cur_len: 0,
+            acc: 0,
+            acc_bits: 0,
         }
     }
 
@@ -53,6 +58,8 @@ impl BitArena {
         self.off.push(0);
         self.len.clear();
         self.cur_len = 0;
+        self.acc = 0;
+        self.acc_bits = 0;
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -63,16 +70,21 @@ impl BitArena {
     #[inline]
     pub(crate) fn push_bits(&mut self, v: u64, width: u32) {
         debug_assert!(width <= 64 && (width == 64 || v >> width == 0));
-        let base = *self.off.last().unwrap();
-        let idx = (self.cur_len / 64) as usize;
-        let shift = self.cur_len % 64;
-        let need = ((self.cur_len + width).div_ceil(64)) as usize;
-        if self.words.len() < base + need {
-            self.words.resize(base + need, 0);
+        if width == 0 {
+            return;
         }
-        self.words[base + idx] |= v << shift;
-        if shift > 0 && shift + width > 64 {
-            self.words[base + idx + 1] |= v >> (64 - shift);
+        let free = 64 - self.acc_bits;
+        if width < free {
+            self.acc |= v << self.acc_bits;
+            self.acc_bits += width;
+        } else {
+            // Fill the accumulator, flush it, keep the rest.
+            self.words.push(self.acc | (v << self.acc_bits));
+            self.acc = if free < 64 { v >> free } else { 0 };
+            self.acc_bits = width - free;
+            if self.acc_bits == 0 {
+                self.acc = 0;
+            }
         }
         self.cur_len += width;
     }
@@ -80,10 +92,12 @@ impl BitArena {
     /// Close the current item.
     #[inline]
     pub(crate) fn finish_item(&mut self) {
-        let base = *self.off.last().unwrap();
-        let need = (self.cur_len.div_ceil(64)) as usize;
-        self.words.resize(base + need, 0);
-        self.off.push(base + need);
+        if self.acc_bits > 0 {
+            self.words.push(self.acc);
+        }
+        self.acc = 0;
+        self.acc_bits = 0;
+        self.off.push(self.words.len());
         self.len.push(self.cur_len);
         self.cur_len = 0;
     }

@@ -60,7 +60,10 @@ impl BaseSeeder {
         self.scheme.top_into(seq, tmp);
         out.clear();
         out.extend(tmp.iter().map(|&(label, start, end)| Seed { label, start, end }));
-        out.sort_unstable_by_key(|s| (s.start, s.end, s.label));
+        // Parsers emit seeds in start order; sort only if needed.
+        if !out.is_sorted_by_key(|s| (s.start, s.end, s.label)) {
+            out.sort_unstable_by_key(|s| (s.start, s.end, s.label));
+        }
         out.dedup();
     }
 }
