@@ -4,6 +4,7 @@
 pub mod align;
 pub mod anchor;
 pub mod chain;
+pub mod refine;
 pub mod rescue;
 
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use seeds::BaseSeeder;
 
 pub use anchor::{Anchor, AnchorParams, Candidate};
 pub use chain::{ChainParams, Chainer, OracleChainer, TxHit};
+pub use refine::RefineChainer;
 pub use rescue::{RescueParams, Rescuer};
 
 /// Targeted base-level tie-break among near-best transcripts.

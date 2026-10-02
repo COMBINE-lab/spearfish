@@ -62,6 +62,40 @@ pub struct TxHit {
     pub reverse: bool,
 }
 
+/// A transcript's hit from its chain, given as (qs, qe, ts, len) per anchor in query order.
+pub(crate) fn hit_from_path(
+    tx: u32,
+    score: f32,
+    max_discrepancy: f32,
+    path: impl Iterator<Item = (u32, u32, u32, u32)>,
+) -> TxHit {
+    let (mut chain, mut anchored, mut covered_to) = (Vec::new(), 0, 0);
+    let mut qend = 0;
+    for (qs, qe, ts, len) in path {
+        chain.push((qs, ts, len));
+        let from = qs.max(covered_to);
+        if qe > from {
+            anchored += qe - from;
+        }
+        covered_to = covered_to.max(qe);
+        qend = qe;
+    }
+    let (first, last) = (chain[0], chain[chain.len() - 1]);
+    TxHit {
+        tx,
+        score,
+        qstart: first.0,
+        qend,
+        tstart: first.1,
+        tend: last.1 + last.2,
+        anchors: chain.len() as u32,
+        anchored,
+        max_discrepancy,
+        chain,
+        reverse: false,
+    }
+}
+
 pub trait Chainer {
     /// Best chain per transcript of the candidate, in any order.
     fn chain(&self, idx: &Index, cand: &Candidate) -> Vec<TxHit>;
@@ -362,46 +396,30 @@ impl OracleChainer {
                     (end, score) = (k, s);
                 }
             }
-            let (mut k, mut n_anchors, mut maxd) = (end, 0u32, 0.0f32);
-            let mut chain: Vec<(u32, u32, u32)> = Vec::new();
-            let mut spans: Vec<(u32, u32)> = Vec::new();
+            let (mut k, mut maxd) = (end, 0.0f32);
+            let mut path: Vec<usize> = Vec::new();
             loop {
-                chain.push((sc.qs[k] as u32, sc.ts[k] as u32, (sc.te[k] - sc.ts[k]) as u32));
-                spans.push((sc.qs[k] as u32, sc.qe[k] as u32));
-                n_anchors += 1;
+                path.push(k);
                 maxd = maxd.max(sc.disc[k]);
                 if sc.back[k] == u32::MAX {
                     break;
                 }
                 k = sc.back[k] as usize;
             }
-            chain.reverse();
-            let mut anchored = 0;
-            let mut covered_to = 0;
-            for &(qs, _, _) in &chain {
-                let qe = sc.qe[el
-                    .iter()
-                    .position(|x| cand.anchors[x.a as usize].qs == qs)
-                    .unwrap()] as u32;
-                let from = qs.max(covered_to);
-                if qe > from {
-                    anchored += qe - from;
-                }
-                covered_to = covered_to.max(qe);
-            }
-            hits.push(TxHit {
-                tx: t,
+            path.reverse();
+            hits.push(hit_from_path(
+                t,
                 score,
-                qstart: sc.qs[k] as u32,
-                qend: sc.qe[end] as u32,
-                tstart: sc.ts[k] as u32,
-                tend: sc.te[end] as u32,
-                anchors: n_anchors,
-                anchored,
-                max_discrepancy: maxd,
-                chain,
-                reverse: false,
-            });
+                maxd,
+                path.iter().map(|&k| {
+                    (
+                        sc.qs[k] as u32,
+                        sc.qe[k] as u32,
+                        sc.ts[k] as u32,
+                        (sc.te[k] - sc.ts[k]) as u32,
+                    )
+                }),
+            ));
             sc.buckets[bi] = el;
         }
         hits
