@@ -15,7 +15,7 @@ use lcp_core::encode::revcomp;
 use seeds::BaseSeeder;
 
 pub use anchor::{Anchor, AnchorParams, Candidate};
-pub use chain::{ChainParams, Chainer, OracleChainer, TxHit};
+pub use chain::{AnyChainer, ChainParams, Chainer, OracleChainer, TxHit};
 pub use refine::RefineChainer;
 pub use rescue::{RescueParams, Rescuer};
 

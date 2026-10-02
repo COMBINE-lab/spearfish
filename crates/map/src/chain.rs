@@ -1,8 +1,12 @@
 //! Colinear chaining in transcript coordinates (design doc, "Chaining").
 //!
-//! `OracleChainer` runs one DP per candidate transcript. It defines the scores the
-//! multi-transcript refinement chainer (M6) must reproduce exactly with an unbounded beam
-//! (Theorem 2), so the window, validity rule, gain and cost here are the specification:
+//! `OracleChainer` runs one DP per candidate transcript. Transcripts are visited in order of
+//! their placement lists (shifted to the first placement), and each DP resumes where its list
+//! diverges from the previous transcript's: identical prefixes give identical DP values, so
+//! this is exact and shares the work of isoforms that agree over a read's anchors. It defines
+//! the scores the multi-transcript refinement chainer (M6, `RefineChainer`) must reproduce
+//! exactly with an unbounded beam (Theorem 2), so the window, validity rule, gain and cost here
+//! are the specification:
 //!
 //! - Anchors of a candidate are indexed in their family order (sorted by query start);
 //!   anchor `i'` may extend a chain ending at anchor `i` only if `i' - h <= i < i'`.
@@ -197,6 +201,9 @@ pub(crate) fn best_chain(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>
     Some((f[end], chain, maxd))
 }
 
+/// Bias added to relative target positions so they stay positive.
+const REL_BIAS: i64 = 1 << 29;
+
 /// Per-thread buffers for the oracle DP (reused across reads).
 #[derive(Default)]
 struct DpScratch {
@@ -214,6 +221,8 @@ struct DpScratch {
     f: Vec<f32>,
     back: Vec<u32>,
     disc: Vec<f32>,
+    /// Transcripts (bucket indices) in placement-list order.
+    order: Vec<u32>,
     // Candidate scores and discrepancies of one anchor's predecessors.
     cs: Vec<f32>,
     cd: Vec<f32>,
@@ -306,34 +315,69 @@ impl OracleChainer {
         }
 
         let p = &self.p;
+        // Visit transcripts sorted by their placement lists shifted to the first placement:
+        // transcripts with a common prefix (relative to their first placement) have identical
+        // DP values over it, so each DP resumes where the previous transcript's list diverges.
+        sc.order.clear();
+        sc.order.extend(0..used as u32);
+        {
+            let b = &sc.buckets;
+            sc.order.sort_unstable_by(|&x, &y| {
+                let (u, v) = (&b[x as usize], &b[y as usize]);
+                let (u0, v0) = (u[0].ts as i64, v[0].ts as i64);
+                for (pu, pv) in u.iter().zip(v) {
+                    let c =
+                        pu.a.cmp(&pv.a)
+                            .then((pu.ts as i64 - u0).cmp(&(pv.ts as i64 - v0)));
+                    if c.is_ne() {
+                        return c;
+                    }
+                }
+                u.len().cmp(&v.len())
+            });
+        }
         let mut hits = Vec::with_capacity(used);
-        for bi in 0..used {
+        let mut prev: Option<usize> = None;
+        for oi in 0..used {
+            let bi = sc.order[oi] as usize;
             let t = sc.tx[bi];
             let el = std::mem::take(&mut sc.buckets[bi]);
             let n = el.len();
-            sc.a.clear();
-            sc.qs.clear();
-            sc.qe.clear();
-            sc.ts.clear();
-            sc.te.clear();
-            sc.w.clear();
-            for x in &el {
+            // Target positions are stored relative to the first placement (plus a bias that
+            // keeps them positive); transitions only use their differences.
+            let base = el[0].ts as i64 - REL_BIAS;
+            let lcp = prev.map_or(0, |pb| {
+                let pe = &sc.buckets[pb];
+                let pbase = pe[0].ts as i64 - REL_BIAS;
+                el.iter()
+                    .zip(pe)
+                    .take_while(|(x, y)| x.a == y.a && x.ts as i64 - base == y.ts as i64 - pbase)
+                    .count()
+            });
+            sc.a.truncate(lcp);
+            sc.qs.truncate(lcp);
+            sc.qe.truncate(lcp);
+            sc.ts.truncate(lcp);
+            sc.te.truncate(lcp);
+            sc.w.truncate(lcp);
+            for x in &el[lcp..] {
                 let an = &cand.anchors[x.a as usize];
+                let rel = (x.ts as i64 - base) as i32;
                 sc.a.push(x.a);
                 sc.qs.push(an.qs as i32);
                 sc.qe.push(an.qe as i32);
-                sc.ts.push(x.ts as i32);
-                sc.te.push((x.ts + len(x.a as usize)) as i32);
+                sc.ts.push(rel);
+                sc.te.push(rel + len(x.a as usize) as i32);
                 sc.w.push(an.weight);
             }
-            sc.f.clear();
+            sc.f.truncate(lcp);
             sc.f.resize(n, 0.0);
-            sc.back.clear();
+            sc.back.truncate(lcp);
             sc.back.resize(n, u32::MAX);
-            sc.disc.clear();
+            sc.disc.truncate(lcp);
             sc.disc.resize(n, 0.0);
             let mut lo = 0;
-            for k in 0..n {
+            for k in lcp..n {
                 let ya = sc.a[k];
                 while (sc.a[lo] as usize) + p.h < ya as usize {
                     lo += 1;
@@ -415,13 +459,29 @@ impl OracleChainer {
                     (
                         sc.qs[k] as u32,
                         sc.qe[k] as u32,
-                        sc.ts[k] as u32,
+                        (sc.ts[k] as i64 + base) as u32,
                         (sc.te[k] - sc.ts[k]) as u32,
                     )
                 }),
             ));
+            prev = Some(bi);
             sc.buckets[bi] = el;
         }
         hits
+    }
+}
+
+/// A chainer chosen at run time.
+pub enum AnyChainer {
+    Oracle(OracleChainer),
+    Refine(crate::RefineChainer),
+}
+
+impl Chainer for AnyChainer {
+    fn chain(&self, idx: &Index, cand: &Candidate) -> Vec<TxHit> {
+        match self {
+            AnyChainer::Oracle(c) => c.chain(idx, cand),
+            AnyChainer::Refine(c) => c.chain(idx, cand),
+        }
     }
 }

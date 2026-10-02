@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use index::Index;
-use map::{MapParams, Mapper, OracleChainer};
+use map::{AnyChainer, MapParams, Mapper, OracleChainer, RefineChainer};
 use paraseq::prelude::*;
 use paraseq::{ReaderBuilder, Record};
 
@@ -42,6 +42,13 @@ pub struct Args {
     /// Chaining: predecessor window (anchors).
     #[arg(long, default_value_t = 50)]
     window: usize,
+    /// Chainer: `oracle` (per-transcript DP with shared prefixes) or `refine` (multi-transcript
+    /// state DP with lazy color refinement). Both give identical scores with no beam.
+    #[arg(long, default_value = "oracle")]
+    chainer: String,
+    /// Refine chainer: keep at most this many states per anchor (default: unbounded, exact).
+    #[arg(long)]
+    beam: Option<usize>,
     /// Disable the hierarchical rescue of low-coverage reads.
     #[arg(long)]
     no_rescue: bool,
@@ -100,7 +107,7 @@ type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 
 #[derive(Clone)]
 struct Processor {
-    mapper: Arc<Mapper<OracleChainer>>,
+    mapper: Arc<Mapper<AnyChainer>>,
     buf: Vec<u8>,
     out: Out,
     stats: Arc<Mutex<(u64, u64, u64)>>,
@@ -207,7 +214,15 @@ pub fn run(args: Args) -> Result<()> {
         tiebreak,
         ..Default::default()
     };
-    let mapper = Arc::new(Mapper::new(idx, OracleChainer { p: chain }, params)?);
+    let chainer = match args.chainer.as_str() {
+        "oracle" => AnyChainer::Oracle(OracleChainer { p: chain }),
+        "refine" => AnyChainer::Refine(RefineChainer {
+            p: chain,
+            beam: args.beam,
+        }),
+        c => anyhow::bail!("unknown chainer {c:?} (oracle, refine)"),
+    };
+    let mapper = Arc::new(Mapper::new(idx, chainer, params)?);
     let load = t0.elapsed().as_secs_f64();
     let sink: Box<dyn Write + Send> = match &args.output {
         Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
