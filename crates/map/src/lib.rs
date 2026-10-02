@@ -4,6 +4,7 @@
 pub mod align;
 pub mod anchor;
 pub mod chain;
+pub mod rescue;
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use seeds::BaseSeeder;
 
 pub use anchor::{Anchor, AnchorParams, Candidate};
 pub use chain::{ChainParams, Chainer, OracleChainer, TxHit};
+pub use rescue::{RescueParams, Rescuer};
 
 /// Targeted base-level tie-break among near-best transcripts.
 #[derive(Clone, Debug)]
@@ -54,6 +56,8 @@ pub struct MapParams {
     pub chain: ChainParams,
     /// Re-rank near-ties by edit distance to the read (None: chain scores only).
     pub tiebreak: Option<TieBreak>,
+    /// Re-seed low-coverage reads at a lower LCP level within candidate genes (None: off).
+    pub rescue: Option<RescueParams>,
     /// Report transcripts scoring within this fraction of the best.
     pub delta_rep: f32,
     /// Flag reads whose best chain spans less than this fraction of the read (cf. oarfish's
@@ -67,6 +71,7 @@ impl Default for MapParams {
             anchor: AnchorParams::default(),
             chain: ChainParams::default(),
             tiebreak: Some(TieBreak::default()),
+            rescue: Some(RescueParams::default()),
             delta_rep: 0.3,
             pi_cov: 0.5,
         }
@@ -88,6 +93,8 @@ pub struct ReadResult {
     pub low_coverage: bool,
     /// Transcripts re-ranked by the tie-break (0 if it didn't run).
     pub tiebreak_size: u32,
+    /// The hits come from the hierarchical rescue.
+    pub rescued: bool,
 }
 
 pub struct Mapper<C: Chainer> {
@@ -95,6 +102,16 @@ pub struct Mapper<C: Chainer> {
     pub seeder: BaseSeeder,
     pub chainer: C,
     pub p: MapParams,
+    rescuer: Option<Rescuer>,
+}
+
+/// One orientation of a read: hits (sorted), the parsed sequence and its base seeds.
+struct Strand {
+    hits: Vec<TxHit>,
+    seq: Vec<u8>,
+    seeds: Vec<seeds::Seed>,
+    anchors: u32,
+    candidates: u32,
 }
 
 impl<C: Chainer> Mapper<C> {
@@ -103,11 +120,13 @@ impl<C: Chainer> Mapper<C> {
         let spec = idx.meta("spec").context("index lacks its seed spec")?;
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";
         let seeder = BaseSeeder::new(spec, hpc)?;
+        let rescuer = p.rescue.clone().map(|r| Rescuer::new(&idx, r)).transpose()?;
         Ok(Mapper {
             idx,
             seeder,
             chainer,
             p,
+            rescuer,
         })
     }
 
@@ -269,10 +288,9 @@ impl<C: Chainer> Mapper<C> {
         Some(dist)
     }
 
-    fn map_strand(&self, raw: &[u8]) -> (Vec<TxHit>, u32, u32, u32) {
-        let h = self.seeder.parsed(raw);
-        let seq: &[u8] = h.as_ref().map_or(raw, |h| &h.seq);
-        let seeds = self.seeder.seed_parsed(seq);
+    fn map_strand(&self, raw: &[u8]) -> Strand {
+        let seq = self.seeder.parsed(raw).map_or_else(|| raw.to_vec(), |h| h.seq);
+        let seeds = self.seeder.seed_parsed(&seq);
         let anchors = anchor::anchors(&self.idx, &seeds, &self.p.anchor);
         let n_anchors = anchors.len() as u32;
         let cands = anchor::candidates(&self.idx, anchors, &self.p.anchor);
@@ -280,24 +298,58 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .flat_map(|c| self.chainer.chain(&self.idx, c))
             .collect();
-        hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
-        (hits, n_anchors, cands.len() as u32, seq.len() as u32)
+        sort_hits(&mut hits);
+        Strand {
+            hits,
+            seq,
+            seeds,
+            anchors: n_anchors,
+            candidates: cands.len() as u32,
+        }
+    }
+
+    fn span_frac(h: Option<&TxHit>, plen: usize) -> f32 {
+        h.map_or(0.0, |h| (h.qend - h.qstart) as f32 / plen.max(1) as f32)
     }
 
     pub fn map(&self, raw: &[u8]) -> ReadResult {
         let fwd = self.map_strand(raw);
         let rc = self.map_strand(&revcomp(raw));
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);
-        let (reverse, (mut hits, anchors, candidates, plen)) = if best(&rc.0) > best(&fwd.0) {
-            (true, rc)
+        let (reverse, mut st, other) = if best(&rc.hits) > best(&fwd.hits) {
+            (true, rc, fwd)
         } else {
-            (false, fwd)
+            (false, fwd, rc)
         };
+        let (mut reverse, mut rescued) = (reverse, false);
+        // Hierarchical rescue when the base-level chain covers too little of the read.
+        if let Some(r) = &self.rescuer
+            && Self::span_frac(st.hits.first(), st.seq.len()) < self.p.pi_cov
+        {
+            let mut a = r.rescue(&self.idx, &st.seq, &st.seeds, &self.p.anchor, &self.p.chain);
+            let mut b = r.rescue(&self.idx, &other.seq, &other.seeds, &self.p.anchor, &self.p.chain);
+            sort_hits(&mut a);
+            sort_hits(&mut b);
+            let (rev, hits, seq) = if best(&b) > best(&a) {
+                (!reverse, b, &other.seq)
+            } else {
+                (reverse, a, &st.seq)
+            };
+            if Self::span_frac(hits.first(), seq.len()) > Self::span_frac(st.hits.first(), st.seq.len()) {
+                if rev != reverse {
+                    st = Strand { hits, ..other };
+                } else {
+                    st.hits = hits;
+                }
+                reverse = rev;
+                rescued = true;
+            }
+        }
+        let plen = st.seq.len() as u32;
+        let mut hits = st.hits;
         let mut tiebreak_size = 0;
         if let Some(tb) = &self.p.tiebreak {
-            let strand = if reverse { revcomp(raw) } else { raw.to_vec() };
-            let seq = self.seeder.parsed(&strand).map_or(strand, |h| h.seq);
-            tiebreak_size = self.tiebreak(tb, &seq, &mut hits);
+            tiebreak_size = self.tiebreak(tb, &st.seq, &mut hits);
         }
         let mut low_coverage = true;
         if let Some(top) = hits.first() {
@@ -310,10 +362,15 @@ impl<C: Chainer> Mapper<C> {
             plen,
             reverse,
             hits,
-            anchors,
-            candidates,
+            anchors: st.anchors,
+            candidates: st.candidates,
             low_coverage,
             tiebreak_size,
+            rescued,
         }
     }
+}
+
+fn sort_hits(hits: &mut [TxHit]) {
+    hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
 }

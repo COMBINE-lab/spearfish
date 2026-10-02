@@ -77,27 +77,101 @@ pub struct OracleChainer {
     pub p: ChainParams,
 }
 
+/// One placed anchor, as the transition rule sees it: query span `[qs, qe)`, transcript
+/// start `ts`, seed length `len` in the transcript, and weight `w`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Pt {
+    pub qs: u32,
+    pub qe: u32,
+    pub ts: u32,
+    pub len: u32,
+    pub w: f32,
+}
+
+/// The transition rule shared by every chainer: score delta of extending a chain ending at
+/// `x` with `y` and its gap discrepancy, or `None` if the transition is invalid.
+#[inline]
+pub(crate) fn transition(p: &ChainParams, x: Pt, y: Pt) -> Option<(f32, f32)> {
+    if y.qs <= x.qs || y.ts <= x.ts {
+        return None;
+    }
+    let dq = y.qs as i64 - x.qe as i64;
+    let dt = y.ts as i64 - (x.ts + x.len) as i64;
+    if dq < -p.o_max || dq > p.g_max || dt < -p.o_max || dt > p.g_max {
+        return None;
+    }
+    let d = (dq as f32 - p.rho * dt as f32).abs();
+    let gamma = p.alpha * d + p.beta * (1.0 + dq.max(dt).max(0) as f32).log2();
+    let qlen = (y.qe - y.qs) as f32;
+    let overlap = (x.qe.saturating_sub(y.qs)).min(y.qe - y.qs) as f32;
+    Some((y.w * (1.0 - overlap / qlen) - gamma, d))
+}
+
+/// Best local colinear chain over points sorted by (qs, ts), with predecessors among the
+/// previous `2h` points. Returns (score, chain indices in order, max discrepancy), or `None`
+/// for no points.
+pub(crate) fn best_chain(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>, f32)> {
+    if pts.is_empty() {
+        return None;
+    }
+    let (mut f, mut back, mut disc) = (
+        vec![0f32; pts.len()],
+        vec![usize::MAX; pts.len()],
+        vec![0f32; pts.len()],
+    );
+    let mut lo = 0;
+    for k in 0..pts.len() {
+        let y = pts[k];
+        while k - lo > 2 * p.h {
+            lo += 1;
+        }
+        let (mut best, mut arg, mut bd) = (y.w, usize::MAX, 0f32);
+        for m in lo..k {
+            if let Some((delta, d)) = transition(p, pts[m], y) {
+                let s = f[m] + delta;
+                if s > best {
+                    (best, arg, bd) = (s, m, d);
+                }
+            }
+        }
+        f[k] = best;
+        back[k] = arg;
+        disc[k] = bd;
+    }
+    let mut end = 0;
+    for k in 1..pts.len() {
+        if f[k] > f[end] {
+            end = k;
+        }
+    }
+    let (mut k, mut chain, mut maxd) = (end, Vec::new(), 0f32);
+    loop {
+        chain.push(k);
+        maxd = maxd.max(disc[k]);
+        if back[k] == usize::MAX {
+            break;
+        }
+        k = back[k];
+    }
+    chain.reverse();
+    Some((f[end], chain, maxd))
+}
+
 impl OracleChainer {
-    /// Transition score from anchor `x` (at target `tx_s`) to anchor `y` (at `ty_s`), if valid.
+    /// Transition score from anchor `x` to anchor `y` (placed at their target starts), if valid.
     #[inline]
     fn transition(&self, cand: &Candidate, len: &[u32], x: Placed, y: Placed) -> Option<(f32, f32)> {
-        let (ax, ay) = (&cand.anchors[x.a as usize], &cand.anchors[y.a as usize]);
-        if ay.qs <= ax.qs || y.ts <= x.ts {
-            return None;
-        }
-        let te = x.ts + len[x.a as usize];
-        let dq = ay.qs as i64 - ax.qe as i64;
-        let dt = y.ts as i64 - te as i64;
-        let p = &self.p;
-        if dq < -p.o_max || dq > p.g_max || dt < -p.o_max || dt > p.g_max {
-            return None;
-        }
-        let d = (dq as f32 - p.rho * dt as f32).abs();
-        let gamma = p.alpha * d + p.beta * (1.0 + dq.max(dt).max(0) as f32).log2();
-        let qlen = (ay.qe - ay.qs) as f32;
-        let overlap = (ax.qe.saturating_sub(ay.qs)).min(ay.qe - ay.qs) as f32;
-        let gain = ay.weight * (1.0 - overlap / qlen);
-        Some((gain - gamma, d))
+        let pt = |z: Placed| {
+            let a = &cand.anchors[z.a as usize];
+            Pt {
+                qs: a.qs,
+                qe: a.qe,
+                ts: z.ts,
+                len: len[z.a as usize],
+                w: a.weight,
+            }
+        };
+        transition(&self.p, pt(x), pt(y))
     }
 }
 

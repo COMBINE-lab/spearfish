@@ -37,6 +37,18 @@ pub struct Args {
     /// Chaining: predecessor window (anchors).
     #[arg(long, default_value_t = 50)]
     window: usize,
+    /// Disable the hierarchical rescue of low-coverage reads.
+    #[arg(long)]
+    no_rescue: bool,
+    /// Rescue seed scheme (applied to parsed read and candidate transcripts).
+    #[arg(long, default_value = "lcp:K=2")]
+    rescue_scheme: String,
+    /// Rescue: candidate genes per strand.
+    #[arg(long, default_value_t = 16)]
+    rescue_genes: usize,
+    /// Rescue: transcripts per gene (those with the most base anchors).
+    #[arg(long, default_value_t = 128)]
+    rescue_tx: usize,
     /// Disable the base-level tie-break among near-best transcripts.
     #[arg(long)]
     no_tiebreak: bool,
@@ -92,7 +104,12 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
             return Ok(());
         }
         self.local.1 += 1;
-        let flags = if r.low_coverage { "low_coverage" } else { "-" };
+        let flags = match (r.low_coverage, r.rescued) {
+            (true, true) => "rescued,low_coverage",
+            (true, false) => "low_coverage",
+            (false, true) => "rescued",
+            (false, false) => "-",
+        };
         for (rank, h) in r.hits.iter().enumerate() {
             let _ = writeln!(
                 self.buf,
@@ -153,8 +170,15 @@ pub fn run(args: Args) -> Result<()> {
         g_max: args.g_max,
         ..Default::default()
     };
+    let rescue = (!args.no_rescue).then(|| map::RescueParams {
+        spec: args.rescue_scheme.clone(),
+        max_genes: args.rescue_genes,
+        max_tx_per_gene: args.rescue_tx,
+        ..Default::default()
+    });
     let params = MapParams {
         anchor,
+        rescue,
         delta_rep: args.delta_rep,
         chain: chain.clone(),
         tiebreak,
