@@ -15,5 +15,6 @@ rustc-hash.workspace = true
 rayon.workspace = true
 index.workspace = true
 map.workspace = true
+quant.workspace = true
 seeds.workspace = true
 xxhash-rust.workspace = true

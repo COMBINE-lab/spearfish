@@ -8,6 +8,7 @@ mod index_cmd;
 mod lcp_stats;
 mod locality_cmd;
 mod map_cmd;
+mod quant_cmd;
 mod rng;
 mod seeding;
 mod sim;
@@ -31,6 +32,8 @@ enum Command {
     IndexStats(index_cmd::StatsArgs),
     /// Map long reads to the indexed transcriptome.
     Map(map_cmd::Args),
+    /// Quantify transcripts by EM from a mapping TSV.
+    Quant(quant_cmd::Args),
     /// Simulate long reads with known origin.
     Simulate(simulate_cmd::Args),
     /// Per-level LCP core statistics for a FASTA/FASTQ file.
@@ -48,6 +51,7 @@ fn main() -> anyhow::Result<()> {
         Command::Index(args) => index_cmd::run(args),
         Command::IndexStats(args) => index_cmd::stats(args),
         Command::Map(args) => map_cmd::run(args),
+        Command::Quant(args) => quant_cmd::run(args),
         Command::Simulate(args) => simulate_cmd::run(args),
         Command::LcpStats(args) => lcp_stats::run(args),
         Command::Locality(args) => locality_cmd::run(args),
