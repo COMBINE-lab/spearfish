@@ -27,6 +27,9 @@ pub struct Args {
     /// Divide likelihoods by transcript length.
     #[arg(long)]
     length_norm: bool,
+    /// Also use reads flagged `low_coverage` (best chain spans < half the read).
+    #[arg(long)]
+    keep_low_coverage: bool,
     /// Output TSV.
     #[arg(short, long)]
     output: PathBuf,
@@ -60,22 +63,31 @@ pub fn run(args: Args) -> Result<()> {
     let f =
         std::fs::File::open(&args.mapping).with_context(|| format!("opening {}", args.mapping.display()))?;
     let (mut cur, mut hits): (String, Vec<(u32, f64)>) = (String::new(), Vec::new());
-    let (mut unknown, mut unmapped) = (0u64, 0u64);
+    let (mut unknown, mut unmapped, mut skipped) = (0u64, 0u64, 0u64);
+    let mut cur_low = false;
     for line in BufReader::new(f).lines().skip(1) {
         let line = line?;
         let mut it = line.split('\t');
         let read = it.next().unwrap_or("");
         let tx = it.nth(3).unwrap_or("*");
         let score: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+        let low = line.ends_with("\tlow_coverage");
         if read != cur {
             if !hits.is_empty() {
                 b.add(&hits, &lens, &p);
+            } else if cur_low {
+                skipped += 1;
             }
             hits.clear();
             cur = read.to_string();
+            cur_low = false;
         }
         if tx == "*" {
             unmapped += 1;
+            continue;
+        }
+        if low && !args.keep_low_coverage {
+            cur_low = true;
             continue;
         }
         match id.get(tx) {
@@ -85,6 +97,8 @@ pub fn run(args: Args) -> Result<()> {
     }
     if !hits.is_empty() {
         b.add(&hits, &lens, &p);
+    } else if cur_low {
+        skipped += 1;
     }
     let reads = b.reads;
     let classes = b.finish();
@@ -95,7 +109,7 @@ pub fn run(args: Args) -> Result<()> {
         writeln!(out, "{n}\t{l}\t{c:.4}")?;
     }
     eprintln!(
-        "quant: {reads} reads ({unmapped} unmapped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
+        "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
         classes.len(),
         t0.elapsed().as_secs_f64()
     );

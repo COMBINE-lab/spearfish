@@ -49,6 +49,16 @@ pub struct Args {
     /// Tie-break: absolute score margin defining the tie set.
     #[arg(long, default_value_t = 30.0)]
     tie_margin: f32,
+    /// Candidate genes kept per read (best-scoring first).
+    #[arg(long, default_value_t = 8)]
+    f_keep: usize,
+    /// Ignore seed labels found in more than this many genes.
+    #[arg(long, default_value_t = 1000)]
+    h_max: usize,
+    /// Gene count at which a seed's weight reaches zero (specificity weighting; the
+    /// default effectively disables it).
+    #[arg(long, default_value_t = 1e9)]
+    g_max: f32,
     /// Report transcripts within this fraction of the best score.
     #[arg(long, default_value_t = 0.3)]
     delta_rep: f32,
@@ -137,7 +147,14 @@ pub fn run(args: Args) -> Result<()> {
         segmented: !args.whole_read_tiebreak,
         ..Default::default()
     });
+    let anchor = map::AnchorParams {
+        f_keep: args.f_keep,
+        h_max: args.h_max,
+        g_max: args.g_max,
+        ..Default::default()
+    };
     let params = MapParams {
+        anchor,
         delta_rep: args.delta_rep,
         chain: chain.clone(),
         tiebreak,

@@ -30,7 +30,30 @@ fn main() {
     let raw = if r.reverse { revcomp(&seq) } else { seq };
     let seeds = mapper.seeder.seed(&raw);
     let anchors = anchor::anchors(&idx, &seeds, &mapper.p.anchor);
+    let n_anchors = anchors.len();
     let cands = anchor::candidates(&idx, anchors, &mapper.p.anchor);
+    let ranges: Vec<usize> = seeds.iter().map(|s| idx.lookup(s.label).len()).collect();
+    let found = ranges.iter().filter(|&&r| r > 0).count();
+    let over = ranges.iter().filter(|&&r| r > mapper.p.anchor.h_max).count();
+    println!(
+        "reverse {} | seeds {} | found in index {} | in > h_max genes {} | anchors {} | candidates {}",
+        r.reverse,
+        seeds.len(),
+        found,
+        over,
+        n_anchors,
+        cands.len()
+    );
+    for c in cands.iter().take(10) {
+        let t0 = idx.occurrences(idx.node_unitig()[c.anchors[0].node as usize]).0[0];
+        println!(
+            "  cand family {} ({}) score {:.1} anchors {}",
+            c.family,
+            idx.gene_name(idx.tx_gene()[t0 as usize]),
+            c.score,
+            c.anchors.len()
+        );
+    }
     let tx_id = |name: &str| {
         (0..idx.n_transcripts() as u32)
             .find(|&t| idx.tx_name(t) == name)
@@ -38,6 +61,21 @@ fn main() {
     };
     for name in [&a[4], &a[5]] {
         let t = tx_id(name);
+        // Read seeds whose label has a node in this transcript (any position).
+        let mut hit = 0;
+        for s in &seeds {
+            if idx
+                .lookup(s.label)
+                .any(|n| idx.occurrences(idx.node_unitig()[n as usize]).0.contains(&t))
+            {
+                hit += 1;
+            }
+        }
+        println!(
+            "{name}: gene {} family {}, read seeds present in it: {hit}",
+            idx.gene_name(idx.tx_gene()[t as usize]),
+            idx.tx_family()[t as usize]
+        );
         println!("== {name} (parsed length {})", idx.tx_plen()[t as usize]);
         for c in &cands {
             for (i, an) in c.anchors.iter().enumerate() {

@@ -56,7 +56,8 @@ pub struct MapParams {
     pub tiebreak: Option<TieBreak>,
     /// Report transcripts scoring within this fraction of the best.
     pub delta_rep: f32,
-    /// Flag reads whose best chain anchors less than this fraction of the read.
+    /// Flag reads whose best chain spans less than this fraction of the read (cf. oarfish's
+    /// minimum aligned fraction, 0.5).
     pub pi_cov: f32,
 }
 
@@ -67,7 +68,7 @@ impl Default for MapParams {
             chain: ChainParams::default(),
             tiebreak: Some(TieBreak::default()),
             delta_rep: 0.3,
-            pi_cov: 0.6,
+            pi_cov: 0.5,
         }
     }
 }
@@ -83,7 +84,7 @@ pub struct ReadResult {
     pub hits: Vec<TxHit>,
     pub anchors: u32,
     pub candidates: u32,
-    /// The best chain anchors less than `pi_cov` of the read.
+    /// The best chain spans less than `pi_cov` of the (parsed) read.
     pub low_coverage: bool,
     /// Transcripts re-ranked by the tie-break (0 if it didn't run).
     pub tiebreak_size: u32,
@@ -301,7 +302,7 @@ impl<C: Chainer> Mapper<C> {
         let mut low_coverage = true;
         if let Some(top) = hits.first() {
             let floor = top.score - self.p.delta_rep * top.score.abs();
-            low_coverage = (top.anchored as f32) < self.p.pi_cov * plen as f32;
+            low_coverage = ((top.qend - top.qstart) as f32) < self.p.pi_cov * plen as f32;
             hits.retain(|h| h.score >= floor);
         }
         ReadResult {

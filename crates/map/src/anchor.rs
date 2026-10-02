@@ -31,9 +31,11 @@ pub struct AnchorParams {
 impl Default for AnchorParams {
     fn default() -> Self {
         AnchorParams {
-            h_max: 64,
+            h_max: 1000,
             s_max: 100,
-            g_max: 64.0,
+            // Effectively off: at genome scale, down-weighting multi-gene seeds hid the true
+            // locus of reads from multi-copy and repeat-rich genes (reports/genome-v0.md).
+            g_max: 1e9,
             alpha_fam: 0.5,
             f_keep: 8,
         }
