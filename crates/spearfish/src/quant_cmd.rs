@@ -30,6 +30,13 @@ pub struct Args {
     /// Also use reads flagged `low_coverage` (best chain spans < half the read).
     #[arg(long)]
     keep_low_coverage: bool,
+    /// EM: maximum iterations.
+    #[arg(long, default_value_t = 10_000)]
+    max_iter: usize,
+    /// EM: stop when the largest relative change (transcripts with >= 0.01 reads) is below
+    /// this.
+    #[arg(long, default_value_t = 1e-6)]
+    tol: f64,
     /// Output TSV.
     #[arg(short, long)]
     output: PathBuf,
@@ -57,7 +64,8 @@ pub fn run(args: Args) -> Result<()> {
         score_denom: args.score_denom,
         min_frac: args.min_frac,
         length_norm: args.length_norm,
-        ..Default::default()
+        max_iter: args.max_iter,
+        tol: args.tol,
     };
     let mut b = EqBuilder::default();
     let f =

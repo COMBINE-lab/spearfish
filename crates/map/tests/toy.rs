@@ -109,3 +109,58 @@ fn toy_reads_map_to_their_transcript() {
         }
     }
 }
+
+/// Antisense genes sharing sequence: a read from the shared region is reported on both
+/// orientations with equal scores; a read spanning the unshared part prefers its own.
+#[test]
+fn antisense_overlap_reports_both_orientations() {
+    let mut x = 0x2545f4914f6cdd1du64;
+    let seq: Vec<u8> = (0..3000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b"ACGT"[(x >> 62) as usize]
+        })
+        .collect();
+    let txs = vec![
+        TxInput {
+            name: "sense".into(),
+            gene: "A".into(),
+            seq: seq.clone(),
+        },
+        TxInput {
+            name: "anti".into(),
+            gene: "B".into(),
+            seq: revcomp(&seq[1000..2500]),
+        },
+    ];
+    let (data, _) = build(
+        &txs,
+        &BuildParams {
+            spec: "lcp:K=3".into(),
+            hpc: true,
+            f_max: 20,
+            allow_collisions: false,
+            collapse: Collapse::Gene,
+        },
+    )
+    .unwrap();
+    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let mapper = Mapper::new(
+        idx.clone(),
+        OracleChainer {
+            p: Default::default(),
+        },
+        MapParams::default(),
+    )
+    .unwrap();
+    let r = mapper.map(&mutate(&seq[1200..2300], 0.03, 11));
+    let get = |name: &str| r.hits.iter().find(|h| idx.tx_name(h.tx) == name);
+    let (s, a) = (get("sense").expect("sense"), get("anti").expect("anti"));
+    assert!(!s.reverse && a.reverse, "{:?}", r.hits);
+    assert_eq!(s.score, a.score, "{:?}", r.hits);
+    let r = mapper.map(&mutate(&seq[200..2300], 0.03, 12));
+    assert_eq!(idx.tx_name(r.hits[0].tx), "sense");
+    assert!(r.hits.iter().skip(1).all(|h| h.score < r.hits[0].score));
+}

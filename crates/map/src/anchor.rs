@@ -24,8 +24,11 @@ pub struct AnchorParams {
     pub g_max: f32,
     /// Keep genes scoring at least this fraction of the best.
     pub alpha_fam: f32,
-    /// Keep at most this many genes.
+    /// Keep this many genes, plus any scoring within `f_tie` (relative) of the last kept.
     pub f_keep: usize,
+    pub f_tie: f32,
+    /// Hard cap on kept genes (ties in large multi-copy families).
+    pub f_max: usize,
 }
 
 impl Default for AnchorParams {
@@ -38,6 +41,8 @@ impl Default for AnchorParams {
             g_max: 1e9,
             alpha_fam: 0.5,
             f_keep: 8,
+            f_tie: 0.01,
+            f_max: 64,
         }
     }
 }
@@ -108,7 +113,12 @@ pub fn candidates(idx: &Index, mut anchors: Vec<Anchor>, p: &AnchorParams) -> Ve
     out.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.family.cmp(&b.family)));
     if let Some(best) = out.first().map(|c| c.score) {
         out.retain(|c| c.score >= p.alpha_fam * best);
-        out.truncate(p.f_keep);
+        // Don't cut through a tie: multi-copy families give many genes the same score.
+        if let Some(last) = out.get(p.f_keep.max(1) - 1).map(|c| c.score) {
+            let floor = last - p.f_tie * last.abs();
+            let n = out.iter().take_while(|c| c.score >= floor).count();
+            out.truncate(n.min(p.f_max.max(p.f_keep)));
+        }
     }
     out
 }

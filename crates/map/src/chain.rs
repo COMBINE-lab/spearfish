@@ -58,6 +58,8 @@ pub struct TxHit {
     pub max_discrepancy: f32,
     /// The chain's anchors in query order: (query start, transcript start, length).
     pub chain: Vec<(u32, u32, u32)>,
+    /// The read's reverse complement was chained (set by the mapper).
+    pub reverse: bool,
 }
 
 pub trait Chainer {
@@ -398,6 +400,7 @@ impl OracleChainer {
                 anchored,
                 max_discrepancy: maxd,
                 chain,
+                reverse: false,
             });
             sc.buckets[bi] = el;
         }

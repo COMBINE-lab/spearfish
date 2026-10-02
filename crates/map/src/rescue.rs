@@ -90,6 +90,7 @@ impl Rescuer {
         let anchors = anchor::anchors(idx, base, ap);
         let all = AnchorParams {
             f_keep: self.p.max_genes,
+            f_max: self.p.max_genes,
             alpha_fam: 0.0,
             ..ap.clone()
         };
@@ -182,6 +183,7 @@ impl Rescuer {
                         .iter()
                         .map(|&k| (pts[k].qs, pts[k].ts, pts[k].len))
                         .collect(),
+                    reverse: false,
                 });
             }
         }

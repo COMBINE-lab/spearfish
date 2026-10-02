@@ -1,7 +1,8 @@
 //! `spearfish map`: map long reads to the indexed transcriptome.
 //!
 //! Output TSV, one line per reported (read, transcript), best first. A read's lines are
-//! contiguous; reads appear in completion order, not input order:
+//! contiguous; reads appear in completion order, not input order. The strand is per line: a
+//! read whose orientations nearly tie (antisense transcripts) is reported on both.
 //! read, read_len, strand, rank, transcript, score, qstart, qend, tstart, tend, anchors,
 //! anchored, max_disc, flags. Coordinates are parsed (HPC) coordinates for now. Unmapped
 //! reads get one line with transcript `*`.
@@ -65,9 +66,21 @@ pub struct Args {
     /// Tie-break: absolute score margin defining the tie set.
     #[arg(long, default_value_t = 30.0)]
     tie_margin: f32,
+    /// Tie-break: edit differences up to this many count as ties.
+    #[arg(long, default_value_t = 0)]
+    tie_tol: u32,
+    /// Tie-break: align at most this many near-best transcripts.
+    #[arg(long, default_value_t = 256)]
+    tie_cands: usize,
     /// Candidate genes kept per read (best-scoring first).
     #[arg(long, default_value_t = 8)]
     f_keep: usize,
+    /// Also keep genes within this relative score of the last kept one (ties)...
+    #[arg(long, default_value_t = 0.01)]
+    f_tie: f32,
+    /// ...up to this many genes in total.
+    #[arg(long, default_value_t = 64)]
+    f_max: usize,
     /// Ignore seed labels found in more than this many genes.
     #[arg(long, default_value_t = 1000)]
     h_max: usize,
@@ -96,7 +109,6 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         let seq = record.seq();
         let r = self.mapper.map(&seq);
         let name = record.id_str().split_whitespace().next().unwrap_or("");
-        let strand = if r.reverse { '-' } else { '+' };
         self.local.0 += 1;
         self.local.2 += seq.len() as u64;
         if r.hits.is_empty() {
@@ -115,6 +127,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
             (false, false) => "-",
         };
         for (rank, h) in r.hits.iter().enumerate() {
+            let strand = if h.reverse { '-' } else { '+' };
             let _ = writeln!(
                 self.buf,
                 "{name}\t{}\t{strand}\t{rank}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{flags}",
@@ -163,11 +176,15 @@ pub fn run(args: Args) -> Result<()> {
     let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
         kappa: args.kappa,
         margin_abs: args.tie_margin,
+        tol: args.tie_tol,
+        max_cands: args.tie_cands,
         segmented: !args.whole_read_tiebreak,
         ..Default::default()
     });
     let anchor = map::AnchorParams {
         f_keep: args.f_keep,
+        f_tie: args.f_tie,
+        f_max: args.f_max,
         h_max: args.h_max,
         g_max: args.g_max,
         ..Default::default()

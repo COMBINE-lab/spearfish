@@ -12,20 +12,29 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let idx = Arc::new(Index::open(a[1].as_ref()).unwrap());
     let max: usize = a.get(3).map_or(usize::MAX, |s| s.parse().unwrap());
-    let p = MapParams {
-        anchor: AnchorParams {
-            g_max: 1e6,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mapper = Mapper::new(idx.clone(), OracleChainer { p: p.chain.clone() }, p).unwrap();
+    let p = MapParams::default();
+    let mapper = Mapper::new(idx.clone(), OracleChainer { p: p.chain.clone() }, p.clone()).unwrap();
+    let variant = |q: MapParams| Mapper::new(idx.clone(), OracleChainer { p: q.chain.clone() }, q).unwrap();
+    let no_tb = variant(MapParams {
+        tiebreak: None,
+        ..p.clone()
+    });
+    let wide = variant(MapParams {
+        delta_rep: 1.0,
+        ..p.clone()
+    });
+    let wide_no_tb = variant(MapParams {
+        delta_rep: 1.0,
+        tiebreak: None,
+        ..p.clone()
+    });
     let tx_id: HashMap<&str, u32> = (0..idx.n_transcripts() as u32)
         .map(|t| (idx.tx_name(t), t))
         .collect();
     let text = std::fs::read_to_string(&a[2]).unwrap();
     let mut counts: HashMap<&str, usize> = HashMap::new();
     let mut n = 0;
+    let mut gaps: Vec<f32> = Vec::new();
     for rec in text.split('>').skip(1).take(max) {
         let mut lines = rec.lines();
         let name = lines.next().unwrap();
@@ -35,7 +44,7 @@ fn main() {
         let want_rev = f[2] == "-";
         n += 1;
         let r = mapper.map(&seq);
-        if r.hits.iter().any(|h| h.tx == truth) {
+        if r.hits.iter().any(|h| h.tx == truth && h.reverse == want_rev) {
             continue;
         }
         // Re-run the steps on the true strand.
@@ -66,7 +75,7 @@ fn main() {
         };
         let class = if r.hits.is_empty() {
             "unmapped"
-        } else if r.reverse != want_rev {
+        } else if !r.hits.iter().any(|h| h.reverse == want_rev) {
             if in_truth == 0 {
                 "wrong strand; no read seed occurs in the truth"
             } else {
@@ -82,7 +91,37 @@ fn main() {
             "right strand; truth gene kept, transcript lost in chaining/reporting"
         };
         *counts.entry(class).or_default() += 1;
-        if class == "wrong strand chosen" && counts[class] <= 15 {
+        if class.contains("transcript lost") {
+            let rank = |m: &Mapper<OracleChainer>| {
+                let r = m.map(&seq);
+                let pos = r.hits.iter().position(|h| h.tx == truth);
+                (pos, pos.map(|i| (r.hits[i].score, r.hits[0].score, r.hits.len())))
+            };
+            println!(
+                "LOST\t{name}\tno_tb {:?}\twide {:?}\twide_no_tb {:?}",
+                rank(&no_tb),
+                rank(&wide),
+                rank(&wide_no_tb)
+            );
+        }
+        if class.contains("cut by candidate") {
+            let rank = all.iter().position(|c| fam_of(c) == truth_gene).unwrap();
+            let pass = all
+                .iter()
+                .filter(|c| c.score >= mapper.p.anchor.alpha_fam * all[0].score)
+                .count();
+            println!(
+                "CUT\t{name}\trank {rank}\tscore {:.1}\tbest {:.1}\tratio {:.2}\tpass_alpha {pass}\tn {}",
+                all[rank].score,
+                all[0].score,
+                all[rank].score / all[0].score,
+                all.len()
+            );
+        }
+        if std::env::var_os("DIAG_LIST").is_some() {
+            println!("FAIL\t{name}\t{}\t{class}", seq.len());
+        }
+        if class == "wrong strand chosen" {
             // Best chain per orientation, from the public pipeline pieces.
             let best_on = |s: &[u8]| {
                 let seeds = mapper.seeder.seed(s);
@@ -112,17 +151,34 @@ fn main() {
                 )
             };
             let other = revcomp(&strand);
+            let (bt, bo) = (best_on(&strand), best_on(&other));
+            let gap = bo.1.as_ref().map_or(0.0, |h| h.0) - bt.1.as_ref().map_or(0.0, |h| h.0);
+            gaps.push(gap);
+            if counts[class] > 15 {
+                continue;
+            }
             println!(
                 "  {name} len {} | TRUE strand: {:?} | OTHER strand: {:?} | truth gene {}",
                 seq.len(),
-                best_on(&strand),
-                best_on(&other),
+                bt,
+                bo,
                 idx.gene_name(truth_gene)
             );
         }
     }
     let mut v: Vec<_> = counts.into_iter().collect();
     v.sort_by_key(|a| std::cmp::Reverse(a.1));
+    gaps.sort_by(f32::total_cmp);
+    let below = |x: f32| gaps.iter().filter(|&&g| g < x).count();
+    println!(
+        "wrong-strand score gaps (other - true): n {} | <5 {} | <15 {} | <30 {} | <60 {} | median {:?}",
+        gaps.len(),
+        below(5.0),
+        below(15.0),
+        below(30.0),
+        below(60.0),
+        gaps.get(gaps.len() / 2)
+    );
     println!("{n} reads");
     for (k, c) in v {
         println!("{c:7}  {:.3}%  {k}", 100.0 * c as f64 / n as f64);

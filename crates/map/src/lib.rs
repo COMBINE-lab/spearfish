@@ -34,6 +34,8 @@ pub struct TieBreak {
     pub cap: u32,
     /// Align only where tied transcripts differ (false: whole read per candidate).
     pub segmented: bool,
+    /// Edit differences up to this many are treated as ties.
+    pub tol: u32,
 }
 
 impl Default for TieBreak {
@@ -43,9 +45,10 @@ impl Default for TieBreak {
             margin_rel: 0.05,
             kappa: 6.0,
             pad: 50,
-            max_cands: 16,
+            max_cands: 256,
             cap: 16,
             segmented: true,
+            tol: 0,
         }
     }
 }
@@ -85,7 +88,8 @@ pub struct ReadResult {
     pub plen: u32,
     /// True if the reverse complement mapped best.
     pub reverse: bool,
-    /// Reported transcripts, best first.
+    /// Reported transcripts, best first. Near-tied orientations are both reported; each
+    /// hit records its own.
     pub hits: Vec<TxHit>,
     pub anchors: u32,
     pub candidates: u32,
@@ -157,7 +161,7 @@ impl<C: Chainer> Mapper<C> {
         let dist = seg.unwrap_or_else(|| self.whole_read(tb, &codes, &hits[..n]));
         let dmin = *dist.iter().min().unwrap();
         for (h, &d) in hits[..n].iter_mut().zip(&dist) {
-            h.score = best - tb.kappa * (d - dmin) as f32;
+            h.score = best - tb.kappa * d.saturating_sub(dmin + tb.tol) as f32;
         }
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
         n as u32
@@ -182,18 +186,24 @@ impl<C: Chainer> Mapper<C> {
     /// ends, padded), infix mode.
     fn whole_read(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Vec<u32> {
         let plen = codes.len() as u32;
-        let texts: Vec<Vec<u8>> = hits
-            .iter()
-            .map(|h| {
-                let tlen = self.idx.tx_plen()[h.tx as usize];
-                let (left, right) = (h.qstart, plen - h.qend);
-                let slack = |ext: u32| tb.pad + ext / 6;
-                let lo = h.tstart.saturating_sub(left + slack(left));
-                let hi = (h.tend + right + slack(right)).min(tlen);
-                self.idx.tx_codes(h.tx, lo, hi)
-            })
-            .collect();
+        let texts: Vec<Vec<u8>> = hits.iter().map(|h| self.hit_region(tb, plen, h)).collect();
         Self::banded(codes, &texts, align::Mode::Infix, tb.cap)
+    }
+
+    /// A hit's transcript region projected to the read ends (read length `plen`), padded.
+    fn hit_region(&self, tb: &TieBreak, plen: u32, h: &TxHit) -> Vec<u8> {
+        let tlen = self.idx.tx_plen()[h.tx as usize];
+        let (left, right) = (h.qstart, plen - h.qend);
+        let slack = |ext: u32| tb.pad + ext / 6;
+        let lo = h.tstart.saturating_sub(left + slack(left));
+        let hi = (h.tend + right + slack(right)).min(tlen);
+        self.idx.tx_codes(h.tx, lo, hi)
+    }
+
+    /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
+    fn whole_read_k(&self, tb: &TieBreak, codes: &[u8], h: &TxHit, k: u32) -> u32 {
+        let text = self.hit_region(tb, codes.len() as u32, h);
+        align::distance(codes, &text, align::Mode::Infix, k).unwrap_or(k.saturating_add(1))
     }
 
     /// Distances through anchors shared by every candidate: segments between consecutive
@@ -316,12 +326,12 @@ impl<C: Chainer> Mapper<C> {
         let fwd = self.map_strand(raw);
         let rc = self.map_strand(&revcomp(raw));
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);
-        let (reverse, mut st, other) = if best(&rc.hits) > best(&fwd.hits) {
+        let (mut reverse, mut st, mut other) = if best(&rc.hits) > best(&fwd.hits) {
             (true, rc, fwd)
         } else {
             (false, fwd, rc)
         };
-        let (mut reverse, mut rescued) = (reverse, false);
+        let mut rescued = false;
         // Hierarchical rescue when the base-level chain covers too little of the read.
         if let Some(r) = &self.rescuer
             && Self::span_frac(st.hits.first(), st.seq.len()) < self.p.pi_cov
@@ -330,26 +340,60 @@ impl<C: Chainer> Mapper<C> {
             let mut b = r.rescue(&self.idx, &other.seq, &other.seeds, &self.p.anchor, &self.p.chain);
             sort_hits(&mut a);
             sort_hits(&mut b);
-            let (rev, hits, seq) = if best(&b) > best(&a) {
-                (!reverse, b, &other.seq)
+            let (rev, hits, alt, seq) = if best(&b) > best(&a) {
+                (!reverse, b, a, &other.seq)
             } else {
-                (reverse, a, &st.seq)
+                (reverse, a, b, &st.seq)
             };
             if Self::span_frac(hits.first(), seq.len()) > Self::span_frac(st.hits.first(), st.seq.len()) {
                 if rev != reverse {
-                    st = Strand { hits, ..other };
-                } else {
-                    st.hits = hits;
+                    std::mem::swap(&mut st, &mut other);
                 }
+                st.hits = hits;
+                other.hits = alt;
                 reverse = rev;
                 rescued = true;
             }
         }
         let plen = st.seq.len() as u32;
-        let mut hits = st.hits;
         let mut tiebreak_size = 0;
+        let mut both = false;
         if let Some(tb) = &self.p.tiebreak {
-            tiebreak_size = self.tiebreak(tb, &st.seq, &mut hits);
+            let margin = |s: f32| tb.margin_abs.max(tb.margin_rel * s.abs());
+            both = matches!((st.hits.first(), other.hits.first()),
+                    (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
+            tiebreak_size = self.tiebreak(tb, &st.seq, &mut st.hits);
+            if both {
+                // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
+                // orientation, then place the other's scores relative to this one by the
+                // whole-read edit distances of the two best transcripts.
+                tiebreak_size += self.tiebreak(tb, &other.seq, &mut other.hits);
+                let codes = |s: &[u8]| -> Vec<u8> {
+                    s.iter()
+                        .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
+                        .collect()
+                };
+                let da = self.whole_read(tb, &codes(&st.seq), &st.hits[..1])[0];
+                let db = self.whole_read_k(tb, &codes(&other.seq), &other.hits[0], da.saturating_add(tb.cap));
+                if db < da {
+                    std::mem::swap(&mut st, &mut other);
+                    reverse = !reverse;
+                }
+                let target = st.hits[0].score - tb.kappa * da.abs_diff(db).saturating_sub(tb.tol) as f32;
+                let shift = target - other.hits[0].score;
+                for h in &mut other.hits {
+                    h.score += shift;
+                    h.reverse = !reverse;
+                }
+            }
+        }
+        for h in &mut st.hits {
+            h.reverse = reverse;
+        }
+        let mut hits = st.hits;
+        if both {
+            hits.append(&mut other.hits);
+            sort_hits(&mut hits);
         }
         let mut low_coverage = true;
         if let Some(top) = hits.first() {

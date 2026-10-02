@@ -76,7 +76,8 @@ impl EqBuilder {
                 )
             })
             .collect();
-        kept.sort_unstable_by_key(|h| h.0);
+        // A transcript hit on both read orientations keeps its larger weight.
+        kept.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
         kept.dedup_by_key(|h| h.0);
         let max = kept.iter().map(|h| h.1).fold(0.0, f64::max);
         let txs: Vec<u32> = kept.iter().map(|h| h.0).collect();
