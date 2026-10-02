@@ -1,6 +1,6 @@
 [package]
 name = "spearfish"
-description = "Fast long-read RNA-seq mapping to a transcriptome with locally consistent parsing"
+description = "Fast long-read RNA-seq mapping to a transcriptome with locally consistent parsing (library)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,12 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-mimalloc.workspace = true
-clap.workspace = true
-lcp-core.workspace = true
-paraseq.workspace = true
-rustc-hash.workspace = true
-rayon.workspace = true
 index.workspace = true
+lcp-core.workspace = true
 map.workspace = true
 quant.workspace = true
 seeds.workspace = true
-xxhash-rust.workspace = true
+paraseq.workspace = true
+
+[dev-dependencies]
+lcp-core.workspace = true

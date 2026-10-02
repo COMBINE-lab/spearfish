@@ -1,0 +1,26 @@
+[package]
+name = "spearfish-cli"
+description = "Command-line interface to spearfish (long-read RNA-seq mapping with locally consistent parsing)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "spearfish"
+path = "src/main.rs"
+
+[dependencies]
+spearfish.workspace = true
+anyhow.workspace = true
+mimalloc.workspace = true
+clap.workspace = true
+lcp-core.workspace = true
+paraseq.workspace = true
+rustc-hash.workspace = true
+rayon.workspace = true
+index.workspace = true
+map.workspace = true
+quant.workspace = true
+seeds.workspace = true
+xxhash-rust.workspace = true

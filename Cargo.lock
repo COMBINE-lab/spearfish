@@ -924,6 +924,19 @@ name = "spearfish"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "index",
+ "lcp-core",
+ "map",
+ "paraseq",
+ "quant",
+ "seeds",
+]
+
+[[package]]
+name = "spearfish-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "clap",
  "index",
  "lcp-core",
@@ -934,6 +947,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "seeds",
+ "spearfish",
  "xxhash-rust",
 ]
 

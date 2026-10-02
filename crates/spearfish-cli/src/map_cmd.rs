@@ -4,8 +4,9 @@
 //! contiguous; reads appear in completion order, not input order. The strand is per line: a
 //! read whose orientations nearly tie (antisense transcripts) is reported on both.
 //! read, read_len, strand, rank, transcript, score, qstart, qend, tstart, tend, anchors,
-//! anchored, max_disc, flags. Coordinates are parsed (HPC) coordinates for now. Unmapped
-//! reads get one line with transcript `*`.
+//! anchored, max_disc, flags. qstart/qend are raw read coordinates on the read's forward
+//! strand; tstart/tend are transcript coordinates scaled from homopolymer-compressed to raw
+//! length; anchored counts compressed bases. Unmapped reads get one line with transcript `*`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,10 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use index::Index;
-use map::{AnyChainer, MapParams, Mapper, OracleChainer, RefineChainer};
 use paraseq::prelude::*;
 use paraseq::{ReaderBuilder, Record};
+use spearfish::{ChainerKind, Index, MapOptions, Mapper, Preset};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -136,7 +136,7 @@ type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 
 #[derive(Clone)]
 struct Processor {
-    mapper: Arc<Mapper<AnyChainer>>,
+    mapper: Arc<Mapper>,
     buf: Vec<u8>,
     out: Out,
     stats: Arc<Mutex<(u64, u64, u64)>>,
@@ -171,12 +171,12 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
                 self.buf,
                 "{name}\t{}\t{strand}\t{rank}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{flags}",
                 r.len,
-                self.mapper.idx.tx_name(h.tx),
+                self.mapper.index().tx_name(h.tx),
                 h.score,
-                h.qstart,
-                h.qend,
-                h.tstart,
-                h.tend,
+                h.query_start,
+                h.query_end,
+                h.target_start,
+                h.target_end,
                 h.anchors,
                 h.anchored,
                 h.max_discrepancy
@@ -206,75 +206,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
 pub fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let idx = Arc::new(Index::open(&args.index)?);
-    let chain = map::ChainParams {
-        alpha: args.alpha,
-        beta: args.beta,
-        h: args.window,
-        ..Default::default()
-    };
-    let (affine, preset_strands, preset_within, preset_pad) = match args.preset.as_str() {
-        "ont" => (map::align::Affine::ONT, "both", None, (50, 6)),
-        "drna" => (map::align::Affine::ONT, "fwd", Some(4), (20, 10)),
-        "hifi" => (map::align::Affine::HIFI, "both", None, (50, 6)),
-        x => anyhow::bail!("unknown preset {x:?} (ont, drna, hifi)"),
-    };
-    let strands = match args.strands.as_deref().unwrap_or(preset_strands) {
-        "both" => map::Strands::Both,
-        "fwd" => map::Strands::Forward,
-        "rev" => map::Strands::Reverse,
-        x => anyhow::bail!("unknown strands {x:?} (both, fwd, rev)"),
-    };
-    let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
-        kappa: args.kappa,
-        margin_abs: args.tie_margin,
-        affine: (!args.unit_tiebreak).then_some(affine),
-        lambda: args.lambda,
-        clip_ends: !args.no_tie_clip,
-        end_bonus: args.end_bonus,
-        pad: args.tie_pad.unwrap_or(preset_pad.0),
-        pad_div: args.tie_pad_div.unwrap_or(preset_pad.1).max(1),
-        affine_within: args.affine_within.or(preset_within),
-        max_cands: args.tie_cands,
-        segmented: !args.whole_read_tiebreak,
-        ..Default::default()
-    });
-    let anchor = map::AnchorParams {
-        f_keep: args.f_keep,
-        f_tie: args.f_tie,
-        f_max: args.f_max,
-        h_max: args.h_max,
-        g_max: args.g_max,
-        ..Default::default()
-    };
-    let rescue = (!args.no_rescue).then(|| map::RescueParams {
-        spec: args.rescue_scheme.clone(),
-        max_genes: args.rescue_genes,
-        max_tx_per_gene: args.rescue_tx,
-        window: if args.rescue_full {
-            None
-        } else {
-            map::RescueParams::default().window
-        },
-        ..Default::default()
-    });
-    let params = MapParams {
-        anchor,
-        rescue,
-        delta_rep: args.delta_rep,
-        chain: chain.clone(),
-        tiebreak,
-        strands,
-        ..Default::default()
-    };
-    let chainer = match args.chainer.as_str() {
-        "oracle" => AnyChainer::Oracle(OracleChainer { p: chain }),
-        "refine" => AnyChainer::Refine(RefineChainer {
-            p: chain,
-            beam: args.beam,
-        }),
-        c => anyhow::bail!("unknown chainer {c:?} (oracle, refine)"),
-    };
-    let mapper = Arc::new(Mapper::new(idx, chainer, params)?);
+    let mapper = Arc::new(Mapper::new(idx, &options(&args)?)?);
     let load = t0.elapsed().as_secs_f64();
     let sink: Box<dyn Write + Send> = match &args.output {
         Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
@@ -314,4 +246,67 @@ pub fn run(args: Args) -> Result<()> {
         bases as f64 / 1e6 / secs
     );
     Ok(())
+}
+
+/// Mapping options: the preset's, then any explicit flags.
+fn options(args: &Args) -> Result<MapOptions> {
+    let preset: Preset = args.preset.parse()?;
+    let mut o = MapOptions::preset(preset);
+    let p = &mut o.params;
+    p.chain.alpha = args.alpha;
+    p.chain.beta = args.beta;
+    p.chain.h = args.window;
+    if let Some(s) = &args.strands {
+        p.strands = match s.as_str() {
+            "both" => map::Strands::Both,
+            "fwd" => map::Strands::Forward,
+            "rev" => map::Strands::Reverse,
+            x => anyhow::bail!("unknown strands {x:?} (both, fwd, rev)"),
+        };
+    }
+    if args.no_tiebreak {
+        p.tiebreak = None;
+    } else if let Some(tb) = p.tiebreak.as_mut() {
+        tb.kappa = args.kappa;
+        tb.margin_abs = args.tie_margin;
+        if args.unit_tiebreak {
+            tb.affine = None;
+        }
+        tb.lambda = args.lambda;
+        tb.clip_ends = !args.no_tie_clip;
+        tb.end_bonus = args.end_bonus;
+        if let Some(x) = args.tie_pad {
+            tb.pad = x;
+        }
+        if let Some(x) = args.tie_pad_div {
+            tb.pad_div = x.max(1);
+        }
+        if args.affine_within.is_some() {
+            tb.affine_within = args.affine_within;
+        }
+        tb.max_cands = args.tie_cands;
+        tb.segmented = !args.whole_read_tiebreak;
+    }
+    p.anchor.f_keep = args.f_keep;
+    p.anchor.f_tie = args.f_tie;
+    p.anchor.f_max = args.f_max;
+    p.anchor.h_max = args.h_max;
+    p.anchor.g_max = args.g_max;
+    if args.no_rescue {
+        p.rescue = None;
+    } else if let Some(r) = p.rescue.as_mut() {
+        r.spec = args.rescue_scheme.clone();
+        r.max_genes = args.rescue_genes;
+        r.max_tx_per_gene = args.rescue_tx;
+        if args.rescue_full {
+            r.window = None;
+        }
+    }
+    p.delta_rep = args.delta_rep;
+    o.chainer = match args.chainer.as_str() {
+        "oracle" => ChainerKind::Oracle,
+        "refine" => ChainerKind::Refine { beam: args.beam },
+        c => anyhow::bail!("unknown chainer {c:?} (oracle, refine)"),
+    };
+    Ok(o)
 }
