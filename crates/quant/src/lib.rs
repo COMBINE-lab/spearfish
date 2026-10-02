@@ -43,10 +43,14 @@ pub struct EqClass {
     pub count: f64,
 }
 
+/// Class key: transcripts and quantized weights.
+type ClassKey = (Vec<u32>, Vec<u32>);
+
 /// Builds equivalence classes from reads.
 #[derive(Default)]
 pub struct EqBuilder {
-    classes: HashMap<(Vec<u32>, Vec<u32>), (Vec<f64>, f64)>,
+    /// Key -> (weights, read count).
+    classes: HashMap<ClassKey, (Vec<f64>, f64)>,
     pub reads: u64,
 }
 
