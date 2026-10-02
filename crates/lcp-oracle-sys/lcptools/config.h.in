@@ -1,0 +1,24 @@
+/**
+ * @file config.h.in
+ * @brief Template for the generated `config.h`.
+ *
+ * Do not include this template directly and do not edit the generated header;
+ * change the values by re-running the build, e.g.
+ *
+ *     make install LABEL=64 POS=64 DCT=1
+ *
+ */
+
+#ifndef LCPTOOLS_CONFIG_H
+#define LCPTOOLS_CONFIG_H
+
+/* Width of `lcp_label` in bits. Either 32 or 64. */
+#define LCP_LABEL_BITS @LABEL@
+
+/* Width of `lcp_pos` in bits. Either 32 or 64. */
+#define LCP_POS_BITS @POS@
+
+/* Default number of DCT iterations used by lcp_dct/lps_deepen. */
+#define LCP_DCT_ITERATION_COUNT @DCT@
+
+#endif

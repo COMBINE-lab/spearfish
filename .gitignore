@@ -1,0 +1,6 @@
+/target
+/vendor
+/data
+*.tsv.gz
+__pycache__/
+.snakemake/

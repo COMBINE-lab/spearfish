@@ -1,0 +1,13 @@
+[package]
+name = "lcp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+lcp-oracle-sys.workspace = true
+proptest.workspace = true

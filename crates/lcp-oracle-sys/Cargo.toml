@@ -1,0 +1,13 @@
+[package]
+name = "lcp-oracle-sys"
+description = "Test-only FFI to the lcptools C implementation, used to check lcp-core's core boundaries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "lcptools"
+
+[dependencies]
+
+[build-dependencies]
+cc.workspace = true
