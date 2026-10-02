@@ -1,10 +1,13 @@
 //! `spearfish`: fast long-read RNA-seq mapping with locally consistent parsing.
 //! Subcommands arrive as their milestones complete (see PLAN.md).
 
+mod annot;
+mod halo_cmd;
 mod hist;
 mod lcp_stats;
 mod locality_cmd;
 mod rng;
+mod seeding;
 mod sim;
 mod survival_cmd;
 
@@ -25,6 +28,8 @@ enum Command {
     Locality(locality_cmd::Args),
     /// Seed survival under simulated sequencing errors, per seed scheme (M2).
     Survival(survival_cmd::Args),
+    /// Junction halos and isoform resolution per seed scheme (M4 analysis).
+    Halo(halo_cmd::Args),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -32,5 +37,6 @@ fn main() -> anyhow::Result<()> {
         Command::LcpStats(args) => lcp_stats::run(args),
         Command::Locality(args) => locality_cmd::run(args),
         Command::Survival(args) => survival_cmd::run(args),
+        Command::Halo(args) => halo_cmd::run(args),
     }
 }

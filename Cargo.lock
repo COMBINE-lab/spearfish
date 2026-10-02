@@ -847,6 +847,7 @@ dependencies = [
  "clap",
  "lcp-core",
  "paraseq",
+ "rayon",
  "rustc-hash",
  "seeds",
  "xxhash-rust",

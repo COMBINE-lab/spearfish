@@ -22,6 +22,7 @@ clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
 paraseq = "0.6.1"
 rustc-hash = "2.1"
+rayon = "1.12"
 
 [profile.release]
 debug = 1

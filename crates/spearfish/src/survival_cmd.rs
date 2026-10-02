@@ -14,13 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use lcp_core::hpc::Hpc;
 use paraseq::prelude::*;
 use paraseq::{ReaderBuilder, Record};
 use rustc_hash::FxHashMap;
-use seeds::{SeedScheme, from_spec};
 
 use crate::rng::SplitMix64;
+use crate::seeding::{SeedSet, UnitSeeds, has_near};
 use crate::sim::{ErrorProfile, profile, simulate};
 
 #[derive(clap::Args, Debug)]
@@ -66,13 +65,6 @@ pub struct Args {
     output: Option<PathBuf>,
 }
 
-/// One evaluated seed set: a scheme and one of its levels.
-#[derive(Clone, Debug)]
-struct Unit {
-    scheme: usize,
-    level: usize,
-}
-
 #[derive(Clone, Default)]
 struct Row {
     seqs: u64,
@@ -111,7 +103,7 @@ struct Stats {
 
 impl Stats {
     fn new(cfg: &Cfg) -> Self {
-        let nh = cfg.hpc.len() * cfg.units.len();
+        let nh = cfg.hpc.len() * cfg.set.units.len();
         Stats {
             rows: vec![Row::default(); cfg.profiles.len() * cfg.rates.len() * nh],
             edits: vec![(0, 0); cfg.profiles.len() * cfg.rates.len()],
@@ -140,8 +132,7 @@ impl Stats {
 }
 
 struct Cfg {
-    schemes: Vec<Box<dyn SeedScheme>>,
-    units: Vec<Unit>,
+    set: SeedSet,
     profiles: Vec<ErrorProfile>,
     rates: Vec<f64>,
     hpc: Vec<bool>,
@@ -153,36 +144,8 @@ struct Cfg {
 
 impl Cfg {
     fn row(&self, prof: usize, rate: usize, hpc: usize, unit: usize) -> usize {
-        ((prof * self.rates.len() + rate) * self.hpc.len() + hpc) * self.units.len() + unit
+        ((prof * self.rates.len() + rate) * self.hpc.len() + hpc) * self.set.units.len() + unit
     }
-}
-
-/// Seeds `(label, start, end)` in raw coordinates, per unit.
-type UnitSeeds = Vec<Vec<(u64, u32, u32)>>;
-
-fn seed_units(cfg: &Cfg, raw: &[u8], hpc: bool) -> UnitSeeds {
-    let h = hpc.then(|| Hpc::new(raw));
-    let seq: &[u8] = h.as_ref().map_or(raw, |h| &h.seq);
-    let hier: Vec<_> = cfg.schemes.iter().map(|s| s.seeds(seq)).collect();
-    cfg.units
-        .iter()
-        .map(|u| {
-            hier[u.scheme].levels[u.level]
-                .cores
-                .iter()
-                .map(|c| {
-                    let (s, e) = h.as_ref().map_or((c.start, c.end), |h| h.to_raw(c.start, c.end));
-                    (c.label, s, e)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Is there an entry `(label, p)` in `sorted` with `|p - pos| <= tol`?
-fn has_near(sorted: &[(u64, u32)], label: u64, pos: u32, tol: u32) -> bool {
-    let i = sorted.partition_point(|&(l, p)| (l, p) < (label, pos.saturating_sub(tol)));
-    sorted.get(i).is_some_and(|&(l, p)| l == label && p <= pos + tol)
 }
 
 #[derive(Clone)]
@@ -199,10 +162,10 @@ impl Processor {
         if raw.len() < cfg.min_len || rng.unit() >= cfg.sample {
             return;
         }
-        let orig: Vec<UnitSeeds> = cfg.hpc.iter().map(|&h| seed_units(&cfg, raw, h)).collect();
+        let orig: Vec<UnitSeeds> = cfg.hpc.iter().map(|&h| cfg.set.seeds(raw, h)).collect();
         for (hi, per_unit) in orig.iter().enumerate() {
             for (ui, seeds) in per_unit.iter().enumerate() {
-                let map = &mut self.local.labels[hi * cfg.units.len() + ui];
+                let map = &mut self.local.labels[hi * cfg.set.units.len() + ui];
                 for &(label, _, _) in seeds {
                     let e = map.entry(label).or_insert((gene, 0));
                     if e.0 != gene {
@@ -219,8 +182,8 @@ impl Processor {
                 e.0 += read.edits as u64;
                 e.1 += raw.len() as u64;
                 for (hi, &hpc) in cfg.hpc.iter().enumerate() {
-                    let rseeds = seed_units(&cfg, &read.seq, hpc);
-                    for ui in 0..cfg.units.len() {
+                    let rseeds = cfg.set.seeds(&read.seq, hpc);
+                    for ui in 0..cfg.set.units.len() {
                         let row = &mut self.local.rows[cfg.row(pi, ri, hi, ui)];
                         let o = &orig[hi][ui];
                         let r = &rseeds[ui];
@@ -277,27 +240,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let mut specs = args.schemes.clone();
-    if let Some(f) = &args.schemes_file {
-        let text = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
-        specs.extend(
-            text.lines()
-                .map(|l| l.split('#').next().unwrap().trim())
-                .filter(|l| !l.is_empty())
-                .map(String::from),
-        );
-    }
-    if specs.is_empty() {
-        bail!("no seed schemes given (use --scheme or --schemes-file)");
-    }
-    let schemes: Vec<Box<dyn SeedScheme>> = specs.iter().map(|s| from_spec(s)).collect::<Result<_, _>>()?;
-    let mut units = Vec::new();
-    for (i, s) in schemes.iter().enumerate() {
-        // A probe sequence reveals how many levels the scheme reports.
-        for level in 0..s.seeds(b"ACGTACGTAC").levels.len() {
-            units.push(Unit { scheme: i, level });
-        }
-    }
+    let set = SeedSet::load(&args.schemes, args.schemes_file.as_deref(), 1)?;
     let profiles = args
         .profiles
         .iter()
@@ -313,8 +256,7 @@ pub fn run(args: Args) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let cfg = Arc::new(Cfg {
-        schemes,
-        units,
+        set,
         profiles,
         rates: args.rates.clone(),
         hpc,
@@ -366,7 +308,7 @@ pub fn run(args: Args) -> Result<()> {
         for (ri, rate) in cfg.rates.iter().enumerate() {
             let (ed, eb) = stats.edits[pi * cfg.rates.len() + ri];
             for (hi, hpc) in cfg.hpc.iter().enumerate() {
-                for (ui, u) in cfg.units.iter().enumerate() {
+                for (ui, u) in cfg.set.units.iter().enumerate() {
                     let r = &stats.rows[cfg.row(pi, ri, hi, ui)];
                     let div = |a: u64, b: u64| a as f64 / b.max(1) as f64;
                     writeln!(
@@ -376,7 +318,7 @@ pub fn run(args: Args) -> Result<()> {
                         rate,
                         div(ed, eb),
                         if *hpc { "on" } else { "off" },
-                        cfg.schemes[u.scheme].name(),
+                        cfg.set.name(u),
                         u.level + 1,
                         r.seqs,
                         r.seeds,
@@ -386,7 +328,7 @@ pub fn run(args: Args) -> Result<()> {
                         div(r.covered, r.bases),
                         r.read_seeds,
                         div(r.read_matched, r.read_seeds),
-                        unique[hi * cfg.units.len() + ui]
+                        unique[hi * cfg.set.units.len() + ui]
                     )?;
                 }
             }
