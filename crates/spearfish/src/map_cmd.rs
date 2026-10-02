@@ -28,6 +28,18 @@ pub struct Args {
     /// Output TSV (default stdout).
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Chaining: cost per base of gap discrepancy |Δq - ρΔt|.
+    #[arg(long, default_value_t = 1.5)]
+    alpha: f32,
+    /// Chaining: cost per log2 of gap length.
+    #[arg(long, default_value_t = 0.0)]
+    beta: f32,
+    /// Chaining: predecessor window (anchors).
+    #[arg(long, default_value_t = 50)]
+    window: usize,
+    /// Report transcripts within this fraction of the best score.
+    #[arg(long, default_value_t = 0.3)]
+    delta_rep: f32,
 }
 
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -101,13 +113,18 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
 pub fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let idx = Arc::new(Index::open(&args.index)?);
-    let mapper = Arc::new(Mapper::new(
-        idx,
-        OracleChainer {
-            p: Default::default(),
-        },
-        MapParams::default(),
-    )?);
+    let chain = map::ChainParams {
+        alpha: args.alpha,
+        beta: args.beta,
+        h: args.window,
+        ..Default::default()
+    };
+    let params = MapParams {
+        delta_rep: args.delta_rep,
+        chain: chain.clone(),
+        ..Default::default()
+    };
+    let mapper = Arc::new(Mapper::new(idx, OracleChainer { p: chain }, params)?);
     let load = t0.elapsed().as_secs_f64();
     let sink: Box<dyn Write + Send> = match &args.output {
         Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
