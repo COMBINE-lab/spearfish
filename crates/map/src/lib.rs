@@ -48,6 +48,11 @@ pub struct TieBreak {
     /// Affine-score only segment texts within this many unit-cost edits of the best (None:
     /// all); farther texts are charged one mismatch per extra edit.
     pub affine_within: Option<u32>,
+    /// Read ends: clip what doesn't align (adapters, junk; as minimap2's extension) instead
+    /// of forcing every read base into the alignment.
+    pub clip_ends: bool,
+    /// With `clip_ends`: bonus for aligning through to the read's end.
+    pub end_bonus: i32,
 }
 
 impl Default for TieBreak {
@@ -65,6 +70,8 @@ impl Default for TieBreak {
             lambda: 1.0,
             band: 16,
             affine_within: None,
+            clip_ends: true,
+            end_bonus: 5,
         }
     }
 }
@@ -348,7 +355,11 @@ impl<C: Chainer> Mapper<C> {
                         if mode == align::Mode::Prefix {
                             stats::add(&stats::AFFINE_END_CELLS, cells);
                         }
-                        let x = i64::from(align::affine(&read, &texts[u], mode, sc, tb.band));
+                        let x = i64::from(if mode == align::Mode::Prefix && tb.clip_ends {
+                            align::affine_extend(&read, &texts[u], sc, tb.band, tb.end_bonus)
+                        } else {
+                            align::affine(&read, &texts[u], mode, sc, tb.band)
+                        });
                         score[k] = Some(x);
                         let du = unit.as_ref().map_or(0, |(d, _)| d[k]);
                         if best.is_none_or(|(bd, bx)| (du, -x) < (bd, -bx)) {

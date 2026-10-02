@@ -167,14 +167,30 @@ const NEG: i32 = i32::MIN / 4;
 /// text too; `Prefix`: a prefix of the text (text end free); `Infix`: any substring. Cells
 /// more than `band` off the diagonals spanning the two lengths are not computed, so the
 /// result is a lower bound (pass `usize::MAX` for the exact score).
+pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
+    affine_dp(pattern, text, mode, sc, band, false).0
+}
+
+/// Best affine score of an extension from the start of both sequences, with both far ends
+/// free: the maximum over all DP cells (as minimap2's extension, without z-drop). Read tails
+/// that don't align (adapters, junk) are clipped instead of forced through the alignment.
+pub fn affine_extend(pattern: &[u8], text: &[u8], sc: &Affine, band: usize, end_bonus: i32) -> i32 {
+    // Reaching the pattern's end earns `end_bonus` (minimap2's --end-bonus).
+    let (whole, clipped) = affine_dp(pattern, text, Mode::Prefix, sc, band, true);
+    clipped.max(whole.saturating_add(end_bonus))
+}
+
 #[multiversion::multiversion(targets(
     "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
     "x86_64+avx2+fma",
     "x86_64+avx",
     "aarch64+neon"
 ))]
-pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
+/// (score in `mode`, best cell anywhere if `clip` else 0).
+fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, clip: bool) -> (i32, i32) {
     let (m, n) = (pattern.len(), text.len());
+    // With `clip`, the best cell anywhere (0 aligns nothing).
+    let mut clip_best = 0i32;
     let go = sc.open + sc.ext;
     // Row i (pattern) covers text columns [i - band - (m - n)⁺, i + band + (n - m)⁺]; Infix
     // is unbanded.
@@ -255,15 +271,19 @@ pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize)
                 nh[start + k] = hp[k].max(gs[k] - sc.ext * k as i32);
             }
         }
+        if clip {
+            clip_best = clip_best.max(nh[lo..=hi].iter().copied().max().unwrap_or(NEG));
+        }
         std::mem::swap(&mut h, &mut nh);
         std::mem::swap(&mut f, &mut nf);
         stale = prev;
         prev = (lo, hi);
     }
-    match mode {
+    let score = match mode {
         Mode::Global => h[n],
         Mode::Prefix | Mode::Infix => h[prev.0..=prev.1].iter().copied().max().unwrap_or(NEG),
-    }
+    };
+    (score, clip_best)
 }
 
 #[cfg(test)]
@@ -359,6 +379,27 @@ mod tests {
         }
     }
 
+    fn naive_extend(p: &[u8], t: &[u8], sc: &Affine) -> i32 {
+        (0..=p.len())
+            .flat_map(|i| (0..=t.len()).map(move |j| (i, j)))
+            .map(|(i, j)| naive_affine(&p[..i], &t[..j], Mode::Global, sc))
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn affine_extend_examples() {
+        let sc = Affine::default();
+        // Read with a junk tail: the matching prefix scores, the tail is clipped.
+        let t = [0, 1, 2, 3, 0, 1, 2, 3];
+        let p = [0, 1, 2, 3, 0, 1, 3, 3, 3, 3, 3];
+        assert_eq!(
+            affine_extend(&p, &t, &sc, usize::MAX, 0),
+            naive_extend(&p, &t, &sc)
+        );
+        assert_eq!(affine_extend(&[], &t, &sc, usize::MAX, 0), 0);
+    }
+
     #[test]
     fn affine_examples() {
         let sc = Affine::default();
@@ -395,6 +436,9 @@ mod tests {
                 // A band never improves the score, and a band covering everything is exact.
                 prop_assert!(affine(&p, &t, mode, &sc, 8) <= want);
                 prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
+            }
+            if p.len() <= 40 && t.len() <= 60 {
+                prop_assert_eq!(affine_extend(&p, &t[..t.len().min(60)], &sc, usize::MAX, 0), naive_extend(&p, &t[..t.len().min(60)], &sc));
             }
         }
 

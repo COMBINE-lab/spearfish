@@ -98,6 +98,13 @@ pub struct Args {
     tie_pad: Option<u32>,
     #[arg(long)]
     tie_pad_div: Option<u32>,
+    /// Tie-break: force whole read ends through the alignment instead of clipping what
+    /// doesn't align (adapters, junk).
+    #[arg(long)]
+    no_tie_clip: bool,
+    /// Tie-break: bonus for aligning through to the read's end (minimap2's --end-bonus).
+    #[arg(long, default_value_t = 5)]
+    end_bonus: i32,
     /// Tie-break: score charged per affine-score point below the best.
     #[arg(long, default_value_t = 1.0)]
     lambda: f32,
@@ -222,6 +229,8 @@ pub fn run(args: Args) -> Result<()> {
         margin_abs: args.tie_margin,
         affine: (!args.unit_tiebreak).then_some(affine),
         lambda: args.lambda,
+        clip_ends: !args.no_tie_clip,
+        end_bonus: args.end_bonus,
         pad: args.tie_pad.unwrap_or(preset_pad.0),
         pad_div: args.tie_pad_div.unwrap_or(preset_pad.1).max(1),
         affine_within: args.affine_within.or(preset_within),
