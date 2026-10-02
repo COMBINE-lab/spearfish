@@ -188,6 +188,7 @@ impl Index {
 
     /// Build an index in memory from a (optionally compressed) transcript FASTA. GENCODE
     /// headers (`tx|gene|...`) give gene IDs; otherwise each transcript is its own gene.
+    #[cfg(feature = "fasta")]
     pub fn build_from_fasta(path: &Path, opts: &IndexOptions) -> Result<Self> {
         Ok(Self::build(read_transcripts(path)?, opts)?.0)
     }
@@ -212,7 +213,23 @@ impl Index {
     }
 }
 
+/// Name and gene from a FASTA ID: GENCODE-style `tx|gene|...`, else the ID (up to
+/// whitespace) for both.
+pub fn name_and_gene(id: &str) -> (String, String) {
+    let mut f = id.split('|');
+    let name = f
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let gene = f.next().map_or_else(|| name.clone(), String::from);
+    (name, gene)
+}
+
 /// Read transcripts from a FASTA as (name, gene, sequence).
+#[cfg(feature = "fasta")]
 pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     use paraseq::{ReaderBuilder, Record};
     let mut txs = Vec::new();

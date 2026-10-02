@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Third-party checkouts (e.g. oarfish built against the spearfish library) live under data/.
+exclude = ["data"]
 
 [workspace.package]
 edition = "2024"

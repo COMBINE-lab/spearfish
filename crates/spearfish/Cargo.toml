@@ -13,7 +13,12 @@ lcp-core.workspace = true
 map.workspace = true
 quant.workspace = true
 seeds.workspace = true
-paraseq.workspace = true
+paraseq = { workspace = true, optional = true }
+
+[features]
+default = ["fasta"]
+# FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
+fasta = ["dep:paraseq"]
 
 [dev-dependencies]
 lcp-core.workspace = true
