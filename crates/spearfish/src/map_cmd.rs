@@ -5,6 +5,7 @@
 //! anchored, max_disc, flags. Coordinates are parsed (HPC) coordinates for now. Unmapped
 //! reads get one line with transcript `*`.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,12 @@ pub struct Args {
     /// Output TSV (default stdout).
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Write records in completion order instead of input order.
+    #[arg(long)]
+    unordered: bool,
+    /// Reads per work batch (smaller batches balance load better when read costs vary).
+    #[arg(long, default_value_t = 32)]
+    batch_size: usize,
     /// Chaining: cost per base of gap discrepancy |Δq - ρΔt|.
     #[arg(long, default_value_t = 1.5)]
     alpha: f32,
@@ -76,7 +83,37 @@ pub struct Args {
     delta_rep: f32,
 }
 
-type Out = Arc<Mutex<Box<dyn Write + Send>>>;
+/// Output sink with a reorder buffer: batches finish in any order, are keyed by their first
+/// record index, and are written as soon as every earlier record has been written. Workers
+/// never wait for their turn; whoever holds the lock flushes what is ready.
+struct Sink {
+    w: Box<dyn Write + Send>,
+    ordered: bool,
+    /// Index of the next record to write (ordered mode).
+    next: u64,
+    /// Finished batches not yet writable: first record -> (records, bytes).
+    pending: BTreeMap<u64, (u64, Vec<u8>)>,
+}
+
+impl Sink {
+    fn push(&mut self, first: u64, n: u64, buf: Vec<u8>) -> std::io::Result<()> {
+        if !self.ordered {
+            return self.w.write_all(&buf);
+        }
+        self.pending.insert(first, (n, buf));
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() != self.next {
+                break;
+            }
+            let (n, buf) = entry.remove();
+            self.w.write_all(&buf)?;
+            self.next += n;
+        }
+        Ok(())
+    }
+}
+
+type Out = Arc<Mutex<Sink>>;
 
 #[derive(Clone)]
 struct Processor {
@@ -85,10 +122,14 @@ struct Processor {
     out: Out,
     stats: Arc<Mutex<(u64, u64, u64)>>,
     local: (u64, u64, u64),
+    /// First record index and record count of the current batch.
+    batch: Option<(u64, u64)>,
 }
 
 impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     fn process_record(&mut self, record: Rf) -> paraseq::Result<()> {
+        let b = self.batch.get_or_insert((record.index(), 0));
+        b.1 += 1;
         let seq = record.seq();
         let r = self.mapper.map(&seq);
         let name = record.id_str().split_whitespace().next().unwrap_or("");
@@ -130,8 +171,10 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
-        self.out.lock().unwrap().write_all(&self.buf)?;
-        self.buf.clear();
+        if let Some((first, n)) = self.batch.take() {
+            let buf = std::mem::take(&mut self.buf);
+            self.out.lock().unwrap().push(first, n, buf)?;
+        }
         Ok(())
     }
 
@@ -142,10 +185,6 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         s.2 += self.local.2;
         self.local = (0, 0, 0);
         Ok(())
-    }
-
-    fn requires_ordering(&self) -> bool {
-        true
     }
 }
 
@@ -190,8 +229,13 @@ pub fn run(args: Args) -> Result<()> {
         Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
     };
-    let out: Out = Arc::new(Mutex::new(sink));
-    out.lock().unwrap().write_all(
+    let out: Out = Arc::new(Mutex::new(Sink {
+        w: sink,
+        ordered: !args.unordered,
+        next: 0,
+        pending: BTreeMap::new(),
+    }));
+    out.lock().unwrap().w.write_all(
         b"read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n",
     )?;
     let stats = Arc::new(Mutex::new((0u64, 0u64, 0u64)));
@@ -201,12 +245,23 @@ pub fn run(args: Args) -> Result<()> {
         out: out.clone(),
         stats: stats.clone(),
         local: (0, 0, 0),
+        batch: None,
     };
     let input = Some(args.reads.clone()).filter(|p| p.as_os_str() != "-");
-    let reader = ReaderBuilder::optional_path(input).build()?;
+    let reader = ReaderBuilder::optional_path(input)
+        .batch_size(args.batch_size)
+        .build()?;
     let t1 = Instant::now();
     reader.process_parallel(&mut proc, args.threads)?;
-    out.lock().unwrap().flush()?;
+    {
+        let mut o = out.lock().unwrap();
+        anyhow::ensure!(
+            o.pending.is_empty(),
+            "internal error: {} batches left unwritten",
+            o.pending.len()
+        );
+        o.w.flush()?;
+    }
     let secs = t1.elapsed().as_secs_f64();
     let (n, mapped, bases) = *stats.lock().unwrap();
     eprintln!(
