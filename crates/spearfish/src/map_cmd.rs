@@ -58,6 +58,9 @@ pub struct Args {
     /// Rescue: candidate genes per strand.
     #[arg(long, default_value_t = 16)]
     rescue_genes: usize,
+    /// Rescue: re-seed whole transcripts instead of the window the read can occupy.
+    #[arg(long)]
+    rescue_full: bool,
     /// Rescue: transcripts per gene (those with the most base anchors).
     #[arg(long, default_value_t = 128)]
     rescue_tx: usize,
@@ -73,13 +76,28 @@ pub struct Args {
     /// Tie-break: absolute score margin defining the tie set.
     #[arg(long, default_value_t = 30.0)]
     tie_margin: f32,
-    /// Read technology: `ont` or `hifi` (sets the tie-break's affine scores to minimap2's
-    /// map-ont or map-hifi values).
+    /// Read type: `ont` (cDNA, both orientations), `drna` (ONT direct RNA: sense
+    /// orientation only), or `hifi` (PacBio HiFi). Sets the tie-break's affine scores
+    /// (minimap2 map-ont / map-hifi) and the orientations mapped.
     #[arg(long, default_value = "ont")]
     preset: String,
+    /// Orientations to map, overriding the preset: `both`, `fwd` (as given) or `rev`.
+    #[arg(long)]
+    strands: Option<String>,
     /// Tie-break: score segments by unit-cost edit distance instead of affine gaps.
     #[arg(long)]
     unit_tiebreak: bool,
+    /// Tie-break: affine-score only segment texts within this many edits of the best
+    /// (unit-cost prefilter); default from the preset (drna: 4, others: all).
+    #[arg(long)]
+    affine_within: Option<u32>,
+    /// Tie-break: transcript bases beyond the read's projected ends (plus 1/`tie_pad_div` of
+    /// the unanchored end).
+    /// Default from the preset (drna: 20 + 1/10, others: 50 + 1/6).
+    #[arg(long)]
+    tie_pad: Option<u32>,
+    #[arg(long)]
+    tie_pad_div: Option<u32>,
     /// Tie-break: score charged per affine-score point below the best.
     #[arg(long, default_value_t = 1.0)]
     lambda: f32,
@@ -187,16 +205,26 @@ pub fn run(args: Args) -> Result<()> {
         h: args.window,
         ..Default::default()
     };
-    let affine = match args.preset.as_str() {
-        "ont" => map::align::Affine::ONT,
-        "hifi" => map::align::Affine::HIFI,
-        x => anyhow::bail!("unknown preset {x:?} (ont, hifi)"),
+    let (affine, preset_strands, preset_within, preset_pad) = match args.preset.as_str() {
+        "ont" => (map::align::Affine::ONT, "both", None, (50, 6)),
+        "drna" => (map::align::Affine::ONT, "fwd", Some(4), (20, 10)),
+        "hifi" => (map::align::Affine::HIFI, "both", None, (50, 6)),
+        x => anyhow::bail!("unknown preset {x:?} (ont, drna, hifi)"),
+    };
+    let strands = match args.strands.as_deref().unwrap_or(preset_strands) {
+        "both" => map::Strands::Both,
+        "fwd" => map::Strands::Forward,
+        "rev" => map::Strands::Reverse,
+        x => anyhow::bail!("unknown strands {x:?} (both, fwd, rev)"),
     };
     let tiebreak = (!args.no_tiebreak).then(|| map::TieBreak {
         kappa: args.kappa,
         margin_abs: args.tie_margin,
         affine: (!args.unit_tiebreak).then_some(affine),
         lambda: args.lambda,
+        pad: args.tie_pad.unwrap_or(preset_pad.0),
+        pad_div: args.tie_pad_div.unwrap_or(preset_pad.1).max(1),
+        affine_within: args.affine_within.or(preset_within),
         max_cands: args.tie_cands,
         segmented: !args.whole_read_tiebreak,
         ..Default::default()
@@ -213,6 +241,11 @@ pub fn run(args: Args) -> Result<()> {
         spec: args.rescue_scheme.clone(),
         max_genes: args.rescue_genes,
         max_tx_per_gene: args.rescue_tx,
+        window: if args.rescue_full {
+            None
+        } else {
+            map::RescueParams::default().window
+        },
         ..Default::default()
     });
     let params = MapParams {
@@ -221,6 +254,7 @@ pub fn run(args: Args) -> Result<()> {
         delta_rep: args.delta_rep,
         chain: chain.clone(),
         tiebreak,
+        strands,
         ..Default::default()
     };
     let chainer = match args.chainer.as_str() {
@@ -257,6 +291,11 @@ pub fn run(args: Args) -> Result<()> {
     reader.process_parallel(&mut proc, args.threads)?;
     out.lock().unwrap().flush()?;
     let secs = t1.elapsed().as_secs_f64();
+    if map::stats::on() {
+        for (k, v) in map::stats::snapshot() {
+            eprintln!("stats\t{k}\t{v}");
+        }
+    }
     let (n, mapped, bases) = *stats.lock().unwrap();
     eprintln!(
         "map: {n} reads ({:.1}% mapped), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",

@@ -6,6 +6,7 @@ pub mod anchor;
 pub mod chain;
 pub mod refine;
 pub mod rescue;
+pub mod stats;
 
 use std::sync::Arc;
 
@@ -28,8 +29,10 @@ pub struct TieBreak {
     pub margin_rel: f32,
     /// Score charged per extra edit relative to the tie set's best alignment.
     pub kappa: f32,
-    /// Transcript bases added beyond the read's projected ends.
+    /// Transcript bases added beyond the read's projected ends: `pad` + 1/`pad_div` of the
+    /// unanchored read end.
     pub pad: u32,
+    pub pad_div: u32,
     /// Align at most this many transcripts per read.
     pub max_cands: usize,
     /// Band: distances beyond the best candidate's + cap are not computed exactly.
@@ -42,6 +45,9 @@ pub struct TieBreak {
     pub lambda: f32,
     /// Affine band (cells off the diagonals spanning the segment lengths).
     pub band: usize,
+    /// Affine-score only segment texts within this many unit-cost edits of the best (None:
+    /// all); farther texts are charged one mismatch per extra edit.
+    pub affine_within: Option<u32>,
 }
 
 impl Default for TieBreak {
@@ -51,12 +57,14 @@ impl Default for TieBreak {
             margin_rel: 0.05,
             kappa: 6.0,
             pad: 50,
+            pad_div: 6,
             max_cands: 256,
             cap: 16,
             segmented: true,
             affine: Some(align::Affine::default()),
             lambda: 1.0,
             band: 16,
+            affine_within: None,
         }
     }
 }
@@ -74,6 +82,18 @@ pub struct MapParams {
     /// Flag reads whose best chain spans less than this fraction of the read (cf. oarfish's
     /// minimum aligned fraction, 0.5).
     pub pi_cov: f32,
+    /// Read orientations to map (direct RNA reads are sense-strand).
+    pub strands: Strands,
+}
+
+/// Which orientations of a read to map against the transcripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strands {
+    Both,
+    /// The read as given (sense: direct RNA).
+    Forward,
+    /// Only its reverse complement.
+    Reverse,
 }
 
 impl Default for MapParams {
@@ -85,6 +105,7 @@ impl Default for MapParams {
             rescue: Some(RescueParams::default()),
             delta_rep: 0.3,
             pi_cov: 0.5,
+            strands: Strands::Both,
         }
     }
 }
@@ -157,6 +178,8 @@ impl<C: Chainer> Mapper<C> {
         if n < 2 {
             return 0;
         }
+        stats::add(&stats::TIEBREAK_CALLS, 1);
+        stats::add(&stats::TIEBREAK_TIED, n as u64);
         let codes: Vec<u8> = seq
             .iter()
             .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
@@ -168,6 +191,7 @@ impl<C: Chainer> Mapper<C> {
             None
         };
         let (cost, unit) = seg.unwrap_or_else(|| {
+            stats::add(&stats::TIEBREAK_WHOLE_READ, 1);
             let d = self.whole_read(tb, &codes, &hits[..n]);
             (d.into_iter().map(i64::from).collect(), tb.kappa)
         });
@@ -187,6 +211,11 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .map(|t| {
                 let k = best.saturating_add(cap);
+                stats::add(&stats::MYERS_CALLS, 1);
+                stats::add(
+                    &stats::MYERS_CELLS,
+                    (read.len() as u64).div_ceil(64) * t.len() as u64,
+                );
                 let d = align::distance(read, t, mode, k).unwrap_or(k.saturating_add(1));
                 best = best.min(d);
                 d
@@ -206,7 +235,7 @@ impl<C: Chainer> Mapper<C> {
     fn hit_region(&self, tb: &TieBreak, plen: u32, h: &TxHit) -> Vec<u8> {
         let tlen = self.idx.tx_plen()[h.tx as usize];
         let (left, right) = (h.qstart, plen - h.qend);
-        let slack = |ext: u32| tb.pad + ext / 6;
+        let slack = |ext: u32| tb.pad + ext / tb.pad_div;
         let lo = h.tstart.saturating_sub(left + slack(left));
         let hi = (h.tend + right + slack(right)).min(tlen);
         self.idx.tx_codes(h.tx, lo, hi)
@@ -215,6 +244,11 @@ impl<C: Chainer> Mapper<C> {
     /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
     fn whole_read_k(&self, tb: &TieBreak, codes: &[u8], h: &TxHit, k: u32) -> u32 {
         let text = self.hit_region(tb, codes.len() as u32, h);
+        stats::add(&stats::MYERS_CALLS, 1);
+        stats::add(
+            &stats::MYERS_CELLS,
+            (codes.len() as u64).div_ceil(64) * text.len() as u64,
+        );
         align::distance(codes, &text, align::Mode::Infix, k).unwrap_or(k.saturating_add(1))
     }
 
@@ -254,6 +288,7 @@ impl<C: Chainer> Mapper<C> {
             if texts.windows(2).all(|w| w[0] == w[1]) {
                 return; // same cost for every candidate
             }
+            stats::add(&stats::TIEBREAK_SEGMENTS, 1);
             let (read, texts): (Vec<u8>, Vec<Vec<u8>>) = if rev {
                 (
                     read.iter().rev().copied().collect(),
@@ -264,17 +299,71 @@ impl<C: Chainer> Mapper<C> {
             };
             match &tb.affine {
                 Some(sc) => {
-                    // Tied isoforms often share a segment's sequence: score each text once.
+                    // Tied isoforms often share a segment's sequence: score each distinct text
+                    // once. With `affine_within`, a capped unit-cost (Myers) pass comes first
+                    // and only texts within that many edits of the best get an affine score;
+                    // the rest are charged one mismatch (mat + mis) per extra edit.
                     let mut order: Vec<usize> = (0..texts.len()).collect();
                     order.sort_unstable_by(|&a, &b| texts[a].cmp(&texts[b]));
-                    let mut last: Option<(usize, i64)> = None;
-                    for i in order {
-                        let x = match last {
-                            Some((j, x)) if texts[j] == texts[i] => x,
-                            _ => i64::from(align::affine(&read, &texts[i], mode, sc, tb.band)),
-                        };
-                        last = Some((i, x));
-                        cost[i] -= x;
+                    let mut uniq: Vec<usize> = Vec::with_capacity(order.len());
+                    let mut rep = vec![0usize; texts.len()];
+                    for &i in &order {
+                        if uniq.last().is_none_or(|&u| texts[u] != texts[i]) {
+                            uniq.push(i);
+                        }
+                        rep[i] = uniq.len() - 1;
+                    }
+                    let unit = match tb.affine_within {
+                        Some(w) if uniq.len() > 1 => {
+                            let ut: Vec<Vec<u8>> = uniq.iter().map(|&u| texts[u].clone()).collect();
+                            Some((Self::banded(&read, &ut, mode, w), w))
+                        }
+                        _ => None,
+                    };
+                    let dmin = unit.as_ref().map_or(0, |(d, _)| *d.iter().min().unwrap());
+                    if stats::on() {
+                        // Text bases, and those outside the common prefix with the previous
+                        // distinct text in sorted order (what prefix sharing would compute).
+                        let mut prev: Option<&Vec<u8>> = None;
+                        for &u in &uniq {
+                            let t = &texts[u];
+                            let l = prev.map_or(0, |p| t.iter().zip(p).take_while(|(a, b)| a == b).count());
+                            stats::add(&stats::AFFINE_TEXT_BASES, t.len() as u64);
+                            stats::add(&stats::AFFINE_TEXT_NEW_BASES, (t.len() - l) as u64);
+                            prev = Some(t);
+                        }
+                    }
+                    let mut score = vec![None::<i64>; uniq.len()];
+                    let mut best: Option<(u32, i64)> = None; // (unit distance, affine score)
+                    for (k, &u) in uniq.iter().enumerate() {
+                        if let Some((d, w)) = &unit
+                            && d[k] > dmin + w
+                        {
+                            continue;
+                        }
+                        let (m, n) = (read.len() as u64, texts[u].len() as u64);
+                        stats::add(&stats::AFFINE_CALLS, 1);
+                        let cells = m * (2 * tb.band as u64 + m.abs_diff(n) + 1).min(n + 1);
+                        stats::add(&stats::AFFINE_CELLS, cells);
+                        if mode == align::Mode::Prefix {
+                            stats::add(&stats::AFFINE_END_CELLS, cells);
+                        }
+                        let x = i64::from(align::affine(&read, &texts[u], mode, sc, tb.band));
+                        score[k] = Some(x);
+                        let du = unit.as_ref().map_or(0, |(d, _)| d[k]);
+                        if best.is_none_or(|(bd, bx)| (du, -x) < (bd, -bx)) {
+                            best = Some((du, x));
+                        }
+                    }
+                    let per_edit = i64::from(sc.mat + sc.mis);
+                    for (i, c) in cost.iter_mut().enumerate() {
+                        let k = rep[i];
+                        let x = score[k].unwrap_or_else(|| {
+                            let (bd, bx) = best.unwrap();
+                            let d = unit.as_ref().unwrap().0[k];
+                            bx - per_edit * i64::from(d - bd)
+                        });
+                        *c -= x;
                     }
                 }
                 None => {
@@ -306,7 +395,7 @@ impl<C: Chainer> Mapper<C> {
                 .zip(&tpos)
                 .map(|(h, t)| {
                     self.idx
-                        .tx_codes(h.tx, t[0].saturating_sub(q0 + tb.pad + q0 / 6), t[0])
+                        .tx_codes(h.tx, t[0].saturating_sub(q0 + tb.pad + q0 / tb.pad_div), t[0])
                 })
                 .collect();
             add(texts, &codes[..q0 as usize], align::Mode::Prefix, true);
@@ -321,7 +410,7 @@ impl<C: Chainer> Mapper<C> {
                 let tlen = self.idx.tx_plen()[h.tx as usize];
                 let s = *t.last().unwrap();
                 self.idx
-                    .tx_codes(h.tx, s, (s + rest + tb.pad + rest / 6).min(tlen))
+                    .tx_codes(h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
             })
             .collect();
         add(texts, &codes[ql as usize..], align::Mode::Prefix, false);
@@ -354,6 +443,7 @@ impl<C: Chainer> Mapper<C> {
     }
 
     pub fn map(&self, raw: &[u8]) -> ReadResult {
+        stats::add(&stats::READS, 1);
         // Direct RNA reads spell T as U; seeds hash bases, so normalize first.
         let dna: Vec<u8>;
         let raw = if raw.iter().any(|&b| b == b'U' || b == b'u') {
@@ -365,8 +455,18 @@ impl<C: Chainer> Mapper<C> {
         } else {
             raw
         };
-        let fwd = self.map_strand(raw);
-        let rc = self.map_strand(&revcomp(raw));
+        let skip = |s: &Self, r: &[u8]| Strand {
+            hits: Vec::new(),
+            seq: s.seeder.parsed(r).map_or_else(|| r.to_vec(), |h| h.seq),
+            seeds: Vec::new(),
+            anchors: 0,
+            candidates: 0,
+        };
+        let (fwd, rc) = match self.p.strands {
+            Strands::Both => (self.map_strand(raw), self.map_strand(&revcomp(raw))),
+            Strands::Forward => (self.map_strand(raw), skip(self, &revcomp(raw))),
+            Strands::Reverse => (skip(self, raw), self.map_strand(&revcomp(raw))),
+        };
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);
         let (mut reverse, mut st, mut other) = if best(&rc.hits) > best(&fwd.hits) {
             (true, rc, fwd)
@@ -409,6 +509,7 @@ impl<C: Chainer> Mapper<C> {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
+                stats::add(&stats::BOTH_ORIENTATIONS, 1);
                 tiebreak_size += self.tiebreak(tb, &other.seq, &mut other.hits);
                 let codes = |s: &[u8]| -> Vec<u8> {
                     s.iter()

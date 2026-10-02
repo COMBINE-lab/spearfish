@@ -167,6 +167,12 @@ const NEG: i32 = i32::MIN / 4;
 /// text too; `Prefix`: a prefix of the text (text end free); `Infix`: any substring. Cells
 /// more than `band` off the diagonals spanning the two lengths are not computed, so the
 /// result is a lower bound (pass `usize::MAX` for the exact score).
+#[multiversion::multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
+    "x86_64+avx2+fma",
+    "x86_64+avx",
+    "aarch64+neon"
+))]
 pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
     let (m, n) = (pattern.len(), text.len());
     let go = sc.open + sc.ext;
@@ -188,6 +194,8 @@ pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize)
     // Rows alternate between two buffers; cells outside a row's band stay NEG.
     let (mut h, mut f) = (vec![NEG; n + 1], vec![NEG; n + 1]);
     let (mut nh, mut nf) = (vec![NEG; n + 1], vec![NEG; n + 1]);
+    let (mut hp, mut gs): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
+    debug_assert!(sc.open >= 0 && sc.ext >= 0);
     let (lo0, hi0) = range(0);
     for (j, x) in h.iter_mut().enumerate().take(hi0 + 1).skip(lo0) {
         *x = if j == 0 || mode == Mode::Infix {
@@ -204,24 +212,47 @@ pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize)
         nf[stale.0..=stale.1.min(n)].fill(NEG);
         let c = pattern[i - 1] & 3;
         let mut start = lo;
+        // Horizontal gap (consumes text) ending at (i, start - 1): from column 0 if it is in
+        // the band, else unreachable.
+        let mut e = NEG;
         if lo == 0 {
             // Column 0: only a vertical gap reaches it.
             let fj = (h[0] - go).max(f[0] - sc.ext);
             nh[0] = fj;
             nf[0] = fj;
+            e = fj - go;
             start = 1;
         }
-        // Horizontal gap (consumes text) ending at (i, j). Cells left of the band are NEG in
-        // both rows, so the band edges need no special case.
-        let mut e = NEG;
         if start <= hi {
-            for j in start..=hi {
-                let fj = (h[j] - go).max(f[j] - sc.ext);
-                e = (nh[j - 1] - go).max(e - sc.ext);
-                let s = if c == text[j - 1] & 3 { sc.mat } else { -sc.mis };
-                let hj = (h[j - 1] + s).max(e).max(fj);
-                nh[j] = hj.max(NEG);
-                nf[j] = fj.max(NEG);
+            // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H without horizontal
+            // gaps), from the previous row only. Cells left of the band are NEG in both rows.
+            let w = hi + 1 - start;
+            hp.clear();
+            hp.resize(w, NEG);
+            gs.clear();
+            gs.resize(w, NEG);
+            let (hprev, fprev, tx) = (&h[start - 1..=hi], &f[start..=hi], &text[start - 1..hi]);
+            for k in 0..w {
+                let fj = (hprev[k + 1] - go).max(fprev[k] - sc.ext).max(NEG);
+                let s = if c == tx[k] & 3 { sc.mat } else { -sc.mis };
+                let x = (hprev[k] + s).max(fj).max(NEG);
+                hp[k] = x;
+                gs[k] = x - go + sc.ext * (k as i32 + 1);
+                nf[start + k] = fj;
+            }
+            // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1] - ext): opening
+            // from H = max(H', E) adds nothing. With g[k] = E[k] + ext*k this is a running max,
+            // g[k+1] = max(g[k], H'[k] - go + ext*(k+1)): pass 2 makes `gs` exclusive prefix
+            // maxima (one op per cell on the critical path), pass 3 (vectorizes) takes
+            // H = max(H', E).
+            let mut g = e;
+            for x in gs.iter_mut() {
+                let next = g.max(*x);
+                *x = g;
+                g = next;
+            }
+            for k in 0..w {
+                nh[start + k] = hp[k].max(gs[k] - sc.ext * k as i32);
             }
         }
         std::mem::swap(&mut h, &mut nh);

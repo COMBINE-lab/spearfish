@@ -536,6 +536,7 @@ dependencies = [
  "proptest",
  "rustc-hash",
  "seeds",
+ "xxhash-rust",
 ]
 
 [[package]]

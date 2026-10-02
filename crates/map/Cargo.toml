@@ -12,6 +12,7 @@ lcp-core.workspace = true
 seeds.workspace = true
 rustc-hash.workspace = true
 multiversion.workspace = true
+xxhash-rust.workspace = true
 
 
 [dev-dependencies]
