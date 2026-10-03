@@ -130,7 +130,6 @@ impl RefineChainer {
         let p = &self.p;
         let unitig = idx.node_unitig();
         let offset = idx.node_offset();
-        let node_len = idx.node_len();
         let anchors = &cand.anchors;
         let n = anchors.len();
 
@@ -231,7 +230,7 @@ impl RefineChainer {
                     }
                 };
                 let x_off = offset[x.node as usize] as i64;
-                let x_len = node_len[x.node as usize] as i64;
+                let x_len = (x.qe - x.qs) as i64;
                 let overlap = (xqe - yqs).max(0).min(yqe - yqs) as f32;
                 let gain = y.weight * (1.0 - overlap / qlen);
                 for g in groups {
@@ -410,7 +409,6 @@ impl RefineChainer {
     fn extract(&self, idx: &Index, cand: &Candidate, sc: &Scratch, ntx: usize, nw: usize) -> Vec<TxHit> {
         let state_words = &sc.state_words;
         let offset = idx.node_offset();
-        let node_len = idx.node_len();
         // Per transcript: (f, state, rank).
         let mut best: Vec<(f32, u32, u32)> = vec![(f32::NEG_INFINITY, NONE, 0); ntx];
         for (s, st) in sc.states.iter().enumerate() {
@@ -449,12 +447,7 @@ impl RefineChainer {
                 let a = &cand.anchors[st.anchor as usize];
                 let u = &sc.units[sc.anchor_unit[st.anchor as usize] as usize];
                 let pos = sc.pos[u.pos_at as usize + r * ntx + j];
-                path.push((
-                    a.qs,
-                    a.qe,
-                    pos + offset[a.node as usize],
-                    node_len[a.node as usize],
-                ));
+                path.push((a.qs, a.qe, pos + offset[a.node as usize], a.qe - a.qs));
                 maxd = maxd.max(st.d);
                 if st.back == NONE {
                     break;

@@ -287,8 +287,9 @@ impl OracleChainer {
     fn chain_with(&self, idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> Vec<TxHit> {
         let unitig = idx.node_unitig();
         let offset = idx.node_offset();
-        let node_len = idx.node_len();
-        let len = |i: usize| node_len[cand.anchors[i].node as usize];
+        // An anchor's transcript span equals its query span (exact core matches; merged
+        // collinear runs).
+        let len = |i: usize| cand.anchors[i].qe - cand.anchors[i].qs;
         // Bucket placements by transcript; visiting anchors in order keeps each bucket sorted
         // by (anchor, target position).
         sc.bucket_of.clear();

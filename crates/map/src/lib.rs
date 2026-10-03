@@ -109,6 +109,9 @@ pub struct MapParams {
     pub pi_cov: f32,
     /// Read orientations to map (direct RNA reads are sense-strand).
     pub strands: Strands,
+    /// Merge collinear anchors within a unitig before chaining (see
+    /// [`anchor::merge_collinear`]).
+    pub merge_collinear: bool,
 }
 
 /// Which orientations of a read to map against the transcripts.
@@ -131,6 +134,7 @@ impl Default for MapParams {
             delta_rep: 0.3,
             pi_cov: 0.5,
             strands: Strands::Both,
+            merge_collinear: true,
         }
     }
 }
@@ -624,7 +628,12 @@ impl<C: Chainer> Mapper<C> {
         let seeds = self.seeder.seed_parsed(&seq);
         let anchors = anchor::anchors(&self.idx, &seeds, &self.p.anchor);
         let n_anchors = anchors.len() as u32;
-        let cands = anchor::candidates(&self.idx, anchors, &self.p.anchor);
+        let mut cands = anchor::candidates(&self.idx, anchors, &self.p.anchor);
+        if self.p.merge_collinear {
+            for c in &mut cands {
+                anchor::merge_collinear(&self.idx, c);
+            }
+        }
         let mut hits: Vec<TxHit> = cands
             .iter()
             .flat_map(|c| self.chainer.chain(&self.idx, c))

@@ -133,3 +133,42 @@ pub fn candidates(idx: &Index, mut anchors: Vec<Anchor>, p: &AnchorParams) -> Ve
     }
     out
 }
+
+/// Merge anchors of `c` that lie on one diagonal of the same unitig: anchor `b` extends a run
+/// ending at `a` if both map to the same unitig and advance equally in the read and the
+/// unitig (`off(b) - off(a) == qs(b) - qs(a) > 0`). In every transcript containing the unitig
+/// such anchors are collinear with zero gap discrepancy, so a merged anchor's weight is
+/// exactly the score a chain gains by stepping through the run. Chains that would enter or
+/// leave a run part-way through are no longer possible, and the chainer sees far fewer
+/// anchors. The merged anchor keeps its first node (for the unitig offset) and spans
+/// `[qs, qe)` of the whole run, which equals its transcript span.
+pub fn merge_collinear(idx: &Index, c: &mut Candidate) {
+    if c.anchors.len() < 2 {
+        return;
+    }
+    let unitig = idx.node_unitig();
+    let offset = idx.node_offset();
+    // Unitig -> (index of the open run in `out`, last anchor's qs, qe, unitig offset).
+    let mut open: rustc_hash::FxHashMap<u32, (usize, u32, u32, u32)> = rustc_hash::FxHashMap::default();
+    let mut out: Vec<Anchor> = Vec::with_capacity(c.anchors.len());
+    for &a in &c.anchors {
+        let (u, off) = (unitig[a.node as usize], offset[a.node as usize]);
+        if let Some(&(i, qs, qe, o)) = open.get(&u)
+            && a.qs > qs
+            && off > o
+            && off - o == a.qs - qs
+        {
+            // The chain gain of stepping from the run's last anchor to `a` (no discrepancy).
+            let qlen = (a.qe - a.qs) as f32;
+            let overlap = qe.saturating_sub(a.qs).min(a.qe - a.qs) as f32;
+            out[i].weight += a.weight * (1.0 - overlap / qlen);
+            out[i].qe = out[i].qe.max(a.qe);
+            open.insert(u, (i, a.qs, a.qe, off));
+            continue;
+        }
+        open.insert(u, (out.len(), a.qs, a.qe, off));
+        out.push(a);
+    }
+    out.sort_unstable_by_key(|a| (a.qs, a.qe, a.node));
+    c.anchors = out;
+}

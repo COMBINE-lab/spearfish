@@ -127,6 +127,9 @@ pub struct Args {
     /// transcripts (default: the preset's; on except for drna).
     #[arg(long)]
     raw_ends: Option<bool>,
+    /// Chain every anchor separately (no merging of collinear anchors within a unitig).
+    #[arg(long)]
+    no_merge: bool,
     /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
     #[arg(long)]
     tie_band: Option<usize>,
@@ -354,6 +357,7 @@ fn options(args: &Args) -> Result<MapOptions> {
         }
     }
     p.delta_rep = args.delta_rep;
+    p.merge_collinear = !args.no_merge;
     o.chainer = match args.chainer.as_str() {
         "oracle" => ChainerKind::Oracle,
         "refine" => ChainerKind::Refine { beam: args.beam },
