@@ -58,6 +58,13 @@ pub struct Args {
     /// Rescue: candidate genes per strand.
     #[arg(long, default_value_t = 16)]
     rescue_genes: usize,
+    /// Rescue: re-seed the other orientation only if its base-level best is within this
+    /// margin of the chosen one's (negative: never; default: always).
+    #[arg(long, allow_hyphen_values = true)]
+    rescue_other_margin: Option<f32>,
+    /// Rescue: candidate genes must score this fraction of the best gene's base score.
+    #[arg(long)]
+    rescue_alpha: Option<f32>,
     /// Rescue: re-seed whole transcripts instead of the window the read can occupy.
     #[arg(long)]
     rescue_full: bool,
@@ -105,6 +112,9 @@ pub struct Args {
     /// Tie-break: bonus for aligning through to the read's end (minimap2's --end-bonus).
     #[arg(long, default_value_t = 5)]
     end_bonus: i32,
+    /// Tie-break: X-drop for read-end extensions (default: the preset's).
+    #[arg(long)]
+    xdrop: Option<i32>,
     /// Tie-break: score charged per affine-score point below the best.
     #[arg(long, default_value_t = 1.0)]
     lambda: f32,
@@ -275,6 +285,9 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.lambda = args.lambda;
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
+        if let Some(x) = args.xdrop {
+            tb.xdrop = x;
+        }
         if let Some(x) = args.tie_pad {
             tb.pad = x;
         }
@@ -300,6 +313,12 @@ fn options(args: &Args) -> Result<MapOptions> {
         r.max_tx_per_gene = args.rescue_tx;
         if args.rescue_full {
             r.window = None;
+        }
+        if let Some(a) = args.rescue_alpha {
+            r.alpha = a;
+        }
+        if args.rescue_other_margin.is_some() {
+            r.other_margin = args.rescue_other_margin;
         }
     }
     p.delta_rep = args.delta_rep;

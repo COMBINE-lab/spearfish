@@ -27,6 +27,12 @@ pub struct RescueParams {
     /// window sequence once per read (isoforms usually agree around the read). `None`:
     /// whole transcripts.
     pub window: Option<(u32, u32)>,
+    /// Re-seed the other read orientation only if its base-level best score is within this
+    /// margin of the chosen orientation's (None: always).
+    pub other_margin: Option<f32>,
+    /// Candidate genes must score at least this fraction of the best gene's base-level
+    /// score (0: any gene with an anchor).
+    pub alpha: f32,
 }
 
 impl Default for RescueParams {
@@ -37,6 +43,8 @@ impl Default for RescueParams {
             max_tx_len: 50_000,
             max_tx_per_gene: 128,
             window: Some((100, 5)),
+            other_margin: Some(30.0),
+            alpha: 0.5,
         }
     }
 }
@@ -165,7 +173,7 @@ impl Rescuer {
         let all = AnchorParams {
             f_keep: self.p.max_genes,
             f_max: self.p.max_genes,
-            alpha_fam: 0.0,
+            alpha_fam: self.p.alpha,
             ..ap.clone()
         };
         let cands = anchor::candidates(idx, anchors, &all);

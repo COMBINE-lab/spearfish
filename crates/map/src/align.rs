@@ -168,15 +168,26 @@ const NEG: i32 = i32::MIN / 4;
 /// more than `band` off the diagonals spanning the two lengths are not computed, so the
 /// result is a lower bound (pass `usize::MAX` for the exact score).
 pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
-    affine_dp(pattern, text, mode, sc, band, false).0
+    affine_dp(pattern, text, mode, sc, band, None).0
 }
 
 /// Best affine score of an extension from the start of both sequences, with both far ends
 /// free: the maximum over all DP cells (as minimap2's extension, without z-drop). Read tails
 /// that don't align (adapters, junk) are clipped instead of forced through the alignment.
-pub fn affine_extend(pattern: &[u8], text: &[u8], sc: &Affine, band: usize, end_bonus: i32) -> i32 {
+///
+/// With `xdrop`, the extension stops once a whole row of the band scores more than `xdrop`
+/// below the best cell so far (minimap2-style X-drop): the rest of the read is junk for
+/// this text. Pass `i32::MAX` for none.
+pub fn affine_extend(
+    pattern: &[u8],
+    text: &[u8],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+) -> i32 {
     // Reaching the pattern's end earns `end_bonus` (minimap2's --end-bonus).
-    let (whole, clipped) = affine_dp(pattern, text, Mode::Prefix, sc, band, true);
+    let (whole, clipped) = affine_dp(pattern, text, Mode::Prefix, sc, band, Some(xdrop));
     clipped.max(whole.saturating_add(end_bonus))
 }
 
@@ -187,7 +198,16 @@ pub fn affine_extend(pattern: &[u8], text: &[u8], sc: &Affine, band: usize, end_
     "aarch64+neon"
 ))]
 /// (score in `mode`, best cell anywhere if `clip` else 0).
-fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, clip: bool) -> (i32, i32) {
+/// With `clip = Some(xdrop)`, also the best cell anywhere; stops early (returning NEG for the
+/// score in `mode`) once a row falls more than `xdrop` below it.
+fn affine_dp(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    band: usize,
+    clip: Option<i32>,
+) -> (i32, i32) {
     let (m, n) = (pattern.len(), text.len());
     // With `clip`, the best cell anywhere (0 aligns nothing).
     let mut clip_best = 0i32;
@@ -271,8 +291,12 @@ fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, 
                 nh[start + k] = hp[k].max(gs[k] - sc.ext * k as i32);
             }
         }
-        if clip {
-            clip_best = clip_best.max(nh[lo..=hi].iter().copied().max().unwrap_or(NEG));
+        if let Some(xdrop) = clip {
+            let row = nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
+            clip_best = clip_best.max(row);
+            if row < clip_best.saturating_sub(xdrop) {
+                return (NEG, clip_best);
+            }
         }
         std::mem::swap(&mut h, &mut nh);
         std::mem::swap(&mut f, &mut nf);
@@ -394,10 +418,10 @@ mod tests {
         let t = [0, 1, 2, 3, 0, 1, 2, 3];
         let p = [0, 1, 2, 3, 0, 1, 3, 3, 3, 3, 3];
         assert_eq!(
-            affine_extend(&p, &t, &sc, usize::MAX, 0),
+            affine_extend(&p, &t, &sc, usize::MAX, 0, i32::MAX),
             naive_extend(&p, &t, &sc)
         );
-        assert_eq!(affine_extend(&[], &t, &sc, usize::MAX, 0), 0);
+        assert_eq!(affine_extend(&[], &t, &sc, usize::MAX, 0, i32::MAX), 0);
     }
 
     #[test]
@@ -438,7 +462,7 @@ mod tests {
                 prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
             }
             if p.len() <= 40 && t.len() <= 60 {
-                prop_assert_eq!(affine_extend(&p, &t[..t.len().min(60)], &sc, usize::MAX, 0), naive_extend(&p, &t[..t.len().min(60)], &sc));
+                prop_assert_eq!(affine_extend(&p, &t[..t.len().min(60)], &sc, usize::MAX, 0, i32::MAX), naive_extend(&p, &t[..t.len().min(60)], &sc));
             }
         }
 

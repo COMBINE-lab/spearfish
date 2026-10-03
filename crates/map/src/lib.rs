@@ -53,6 +53,9 @@ pub struct TieBreak {
     pub clip_ends: bool,
     /// With `clip_ends`: bonus for aligning through to the read's end.
     pub end_bonus: i32,
+    /// With `clip_ends`: stop extending a read end once a row falls this far below the best
+    /// score so far (X-drop; `i32::MAX`: never).
+    pub xdrop: i32,
 }
 
 impl Default for TieBreak {
@@ -72,6 +75,7 @@ impl Default for TieBreak {
             affine_within: None,
             clip_ends: true,
             end_bonus: 5,
+            xdrop: 100,
         }
     }
 }
@@ -213,11 +217,18 @@ impl<C: Chainer> Mapper<C> {
     /// Distances of `read` against several texts with a shared band: the first is exact,
     /// later ones are capped at (best so far + `cap`) + 1.
     fn banded(read: &[u8], texts: &[Vec<u8>], mode: align::Mode, cap: u32) -> Vec<u32> {
+        // Identical texts (isoforms agreeing over the region) are aligned once. The band only
+        // tightens (k = best so far + cap), so a repeat's result is the first occurrence's
+        // re-capped at the current k: exact if d <= k, else k + 1, as a fresh call returns.
+        let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
         let mut best = u32::MAX;
         texts
             .iter()
             .map(|t| {
                 let k = best.saturating_add(cap);
+                if let Some(&d) = seen.get(t.as_slice()) {
+                    return if d <= k { d } else { k.saturating_add(1) };
+                }
                 stats::add(&stats::MYERS_CALLS, 1);
                 stats::add(
                     &stats::MYERS_CELLS,
@@ -225,6 +236,7 @@ impl<C: Chainer> Mapper<C> {
                 );
                 let d = align::distance(read, t, mode, k).unwrap_or(k.saturating_add(1));
                 best = best.min(d);
+                seen.insert(t.as_slice(), d);
                 d
             })
             .collect()
@@ -356,7 +368,7 @@ impl<C: Chainer> Mapper<C> {
                             stats::add(&stats::AFFINE_END_CELLS, cells);
                         }
                         let x = i64::from(if mode == align::Mode::Prefix && tb.clip_ends {
-                            align::affine_extend(&read, &texts[u], sc, tb.band, tb.end_bonus)
+                            align::affine_extend(&read, &texts[u], sc, tb.band, tb.end_bonus, tb.xdrop)
                         } else {
                             align::affine(&read, &texts[u], mode, sc, tb.band)
                         });
@@ -490,7 +502,17 @@ impl<C: Chainer> Mapper<C> {
             && Self::span_frac(st.hits.first(), st.seq.len()) < self.p.pi_cov
         {
             let mut a = r.rescue(&self.idx, &st.seq, &st.seeds, &self.p.anchor, &self.p.chain);
-            let mut b = r.rescue(&self.idx, &other.seq, &other.seeds, &self.p.anchor, &self.p.chain);
+            // The other orientation is re-seeded only if its base-level best comes within
+            // `other_margin` of this one's (None: always).
+            let try_other = match r.p.other_margin {
+                None => true,
+                Some(m) => other.hits.first().is_some_and(|o| o.score >= best(&st.hits) - m),
+            };
+            let mut b = if try_other {
+                r.rescue(&self.idx, &other.seq, &other.seeds, &self.p.anchor, &self.p.chain)
+            } else {
+                Vec::new()
+            };
             sort_hits(&mut a);
             sort_hits(&mut b);
             let (rev, hits, alt, seq) = if best(&b) > best(&a) {
