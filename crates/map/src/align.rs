@@ -191,15 +191,25 @@ pub fn affine_extend(
     clipped.max(whole.saturating_add(end_bonus))
 }
 
-#[multiversion::multiversion(targets(
-    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-    "x86_64+avx2+fma",
-    "x86_64+avx",
-    "aarch64+neon"
-))]
-/// (score in `mode`, best cell anywhere if `clip` else 0).
-/// With `clip = Some(xdrop)`, also the best cell anywhere; stops early (returning NEG for the
-/// score in `mode`) once a row falls more than `xdrop` below it.
+/// Reused per-thread DP rows.
+#[derive(Default)]
+struct DpBuf {
+    h: Vec<i32>,
+    f: Vec<i32>,
+    nh: Vec<i32>,
+    nf: Vec<i32>,
+    hp: Vec<i32>,
+    gs: Vec<i32>,
+}
+
+thread_local! {
+    static DP_BUF: std::cell::RefCell<DpBuf> = std::cell::RefCell::new(DpBuf::default());
+}
+
+/// (score in `mode`, best cell anywhere if `clip` else 0). With `clip = Some(xdrop)`, also the
+/// best cell anywhere; stops early (returning NEG for the score in `mode`) once a row falls
+/// more than `xdrop` below it. Rows live in per-thread buffers, and each pass runs over
+/// explicit slices so it vectorizes without bounds checks.
 fn affine_dp(
     pattern: &[u8],
     text: &[u8],
@@ -208,106 +218,136 @@ fn affine_dp(
     band: usize,
     clip: Option<i32>,
 ) -> (i32, i32) {
-    let (m, n) = (pattern.len(), text.len());
-    // With `clip`, the best cell anywhere (0 aligns nothing).
-    let mut clip_best = 0i32;
-    let go = sc.open + sc.ext;
-    // Row i (pattern) covers text columns [i - band - (m - n)⁺, i + band + (n - m)⁺]; Infix
-    // is unbanded.
-    let full = mode == Mode::Infix || band == usize::MAX;
-    let (below, above) = (
-        band.saturating_add(m.saturating_sub(n)),
-        band.saturating_add(n.saturating_sub(m)),
-    );
-    let range = |i: usize| {
-        if full {
-            (0, n)
-        } else {
-            (i.saturating_sub(below), i.saturating_add(above).min(n))
-        }
-    };
-    // h: best score ending at (i, j); f: ending in a gap that consumes pattern (vertical).
-    // Rows alternate between two buffers; cells outside a row's band stay NEG.
-    let (mut h, mut f) = (vec![NEG; n + 1], vec![NEG; n + 1]);
-    let (mut nh, mut nf) = (vec![NEG; n + 1], vec![NEG; n + 1]);
-    let (mut hp, mut gs): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
-    debug_assert!(sc.open >= 0 && sc.ext >= 0);
-    let (lo0, hi0) = range(0);
-    for (j, x) in h.iter_mut().enumerate().take(hi0 + 1).skip(lo0) {
-        *x = if j == 0 || mode == Mode::Infix {
-            0
-        } else {
-            -(sc.open + sc.ext * j as i32)
-        };
-    }
-    let mut prev = (lo0, hi0); // band of the row in h
-    let mut stale = (1, 0); // band of the row left in nh (empty)
-    for i in 1..=m {
-        let (lo, hi) = range(i);
-        nh[stale.0..=stale.1.min(n)].fill(NEG);
-        nf[stale.0..=stale.1.min(n)].fill(NEG);
-        let c = pattern[i - 1] & 3;
-        let mut start = lo;
-        // Horizontal gap (consumes text) ending at (i, start - 1): from column 0 if it is in
-        // the band, else unreachable.
-        let mut e = NEG;
-        if lo == 0 {
-            // Column 0: only a vertical gap reaches it.
-            let fj = (h[0] - go).max(f[0] - sc.ext);
-            nh[0] = fj;
-            nf[0] = fj;
-            e = fj - go;
-            start = 1;
-        }
-        if start <= hi {
-            // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H without horizontal
-            // gaps), from the previous row only. Cells left of the band are NEG in both rows.
-            let w = hi + 1 - start;
-            hp.clear();
-            hp.resize(w, NEG);
-            gs.clear();
-            gs.resize(w, NEG);
-            let (hprev, fprev, tx) = (&h[start - 1..=hi], &f[start..=hi], &text[start - 1..hi]);
-            for k in 0..w {
-                let fj = (hprev[k + 1] - go).max(fprev[k] - sc.ext).max(NEG);
-                let s = if c == tx[k] & 3 { sc.mat } else { -sc.mis };
-                let x = (hprev[k] + s).max(fj).max(NEG);
-                hp[k] = x;
-                gs[k] = x - go + sc.ext * (k as i32 + 1);
-                nf[start + k] = fj;
+    DP_BUF.with(|b| {
+        let b = &mut *b.borrow_mut();
+        #[multiversion::multiversion(targets(
+            "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
+            "x86_64+avx2+fma",
+            "x86_64+avx",
+            "aarch64+neon"
+        ))]
+        fn run(
+            pattern: &[u8],
+            text: &[u8],
+            mode: Mode,
+            sc: &Affine,
+            band: usize,
+            clip: Option<i32>,
+            b: &mut DpBuf,
+        ) -> (i32, i32) {
+            let (m, n) = (pattern.len(), text.len());
+            // With `clip`, the best cell anywhere (0 aligns nothing).
+            let mut clip_best = 0i32;
+            let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
+            let go = sc.open + sc.ext;
+            // Row i (pattern) covers text columns [i - band - (m - n)⁺, i + band +
+            // (n - m)⁺]; Infix is unbanded.
+            let full = mode == Mode::Infix || band == usize::MAX;
+            let (below, above) = (
+                band.saturating_add(m.saturating_sub(n)),
+                band.saturating_add(n.saturating_sub(m)),
+            );
+            let range = |i: usize| {
+                if full {
+                    (0, n)
+                } else {
+                    (i.saturating_sub(below), i.saturating_add(above).min(n))
+                }
+            };
+            // h: best score ending at (i, j); f: ending in a gap that consumes pattern
+            // (vertical). Rows alternate between two buffers; cells outside a row's
+            // band stay NEG.
+            for v in [&mut b.h, &mut b.f, &mut b.nh, &mut b.nf] {
+                v.clear();
+                v.resize(n + 1, NEG);
             }
-            // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1] - ext): opening
-            // from H = max(H', E) adds nothing. With g[k] = E[k] + ext*k this is a running max,
-            // g[k+1] = max(g[k], H'[k] - go + ext*(k+1)): pass 2 makes `gs` exclusive prefix
-            // maxima (one op per cell on the critical path), pass 3 (vectorizes) takes
-            // H = max(H', E).
-            let mut g = e;
-            for x in gs.iter_mut() {
-                let next = g.max(*x);
-                *x = g;
-                g = next;
+            debug_assert!(sc.open >= 0 && sc.ext >= 0);
+            let (lo0, hi0) = range(0);
+            for j in lo0..=hi0 {
+                b.h[j] = if j == 0 || mode == Mode::Infix {
+                    0
+                } else {
+                    -(sc.open + sc.ext * j as i32)
+                };
             }
-            for k in 0..w {
-                nh[start + k] = hp[k].max(gs[k] - sc.ext * k as i32);
+            let mut prev = (lo0, hi0); // band of the row in h
+            let mut stale = (1, 0); // band of the row left in nh (empty)
+            for i in 1..=m {
+                let (lo, hi) = range(i);
+                b.nh[stale.0..=stale.1.min(n)].fill(NEG);
+                b.nf[stale.0..=stale.1.min(n)].fill(NEG);
+                let c = pattern[i - 1] & 3;
+                let mut start = lo;
+                // Horizontal gap (consumes text) ending at (i, start - 1): from column
+                // 0 if it is in the band, else unreachable.
+                let mut e = NEG;
+                if lo == 0 {
+                    // Column 0: only a vertical gap reaches it.
+                    let fj = (b.h[0] - go).max(b.f[0] - ext);
+                    b.nh[0] = fj;
+                    b.nf[0] = fj;
+                    e = fj - go;
+                    start = 1;
+                }
+                if start <= hi {
+                    // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
+                    // without horizontal gaps), from the previous row only.
+                    let w = hi + 1 - start;
+                    if b.hp.len() < w {
+                        b.hp.resize(w, NEG);
+                        b.gs.resize(w, NEG);
+                    }
+                    let DpBuf { h, f, nh, nf, hp, gs } = &mut *b;
+                    let (hp, gs) = (&mut hp[..w], &mut gs[..w]);
+                    let hd = &h[start - 1..hi]; // H[i-1][j-1]
+                    let hu = &h[start..=hi]; // H[i-1][j]
+                    let fu = &f[start..=hi];
+                    let tx = &text[start - 1..hi];
+                    let nfr = &mut nf[start..=hi];
+                    for k in 0..w {
+                        let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
+                        let s = if c == tx[k] & 3 { mat } else { -mis };
+                        let x = (hd[k] + s).max(fj).max(NEG);
+                        hp[k] = x;
+                        gs[k] = x - go + ext * (k as i32 + 1);
+                        nfr[k] = fj;
+                    }
+                    // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
+                    // - ext): opening from H = max(H', E) adds nothing. With g[k] =
+                    // E[k] + ext*k this is a running max (pass 2: exclusive prefix
+                    // maxima, one op per cell on the critical path); pass 3
+                    // (vectorizes) takes H = max(H', E).
+                    let mut g = e;
+                    for x in gs.iter_mut() {
+                        let next = g.max(*x);
+                        *x = g;
+                        g = next;
+                    }
+                    let nhr = &mut nh[start..=hi];
+                    for k in 0..w {
+                        nhr[k] = hp[k].max(gs[k] - ext * k as i32);
+                    }
+                }
+                if let Some(xdrop) = clip {
+                    let row = b.nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
+                    clip_best = clip_best.max(row);
+                    if row < clip_best.saturating_sub(xdrop) {
+                        return (NEG, clip_best);
+                    }
+                }
+                std::mem::swap(&mut b.h, &mut b.nh);
+                std::mem::swap(&mut b.f, &mut b.nf);
+                stale = prev;
+                prev = (lo, hi);
             }
+            let score = match mode {
+                Mode::Global => b.h[n],
+                Mode::Prefix | Mode::Infix => b.h[prev.0..=prev.1].iter().copied().max().unwrap_or(NEG),
+            };
+            (score, clip_best)
         }
-        if let Some(xdrop) = clip {
-            let row = nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
-            clip_best = clip_best.max(row);
-            if row < clip_best.saturating_sub(xdrop) {
-                return (NEG, clip_best);
-            }
-        }
-        std::mem::swap(&mut h, &mut nh);
-        std::mem::swap(&mut f, &mut nf);
-        stale = prev;
-        prev = (lo, hi);
-    }
-    let score = match mode {
-        Mode::Global => h[n],
-        Mode::Prefix | Mode::Infix => h[prev.0..=prev.1].iter().copied().max().unwrap_or(NEG),
-    };
-    (score, clip_best)
+        run(pattern, text, mode, sc, band, clip, b)
+    })
 }
 
 #[cfg(test)]
