@@ -42,7 +42,7 @@ impl Default for RescueParams {
             max_genes: 16,
             max_tx_len: 50_000,
             max_tx_per_gene: 128,
-            window: Some((100, 5)),
+            window: Some((10, 50)),
             other_margin: Some(30.0),
             alpha: 0.5,
         }

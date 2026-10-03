@@ -62,6 +62,9 @@ pub struct Args {
     /// margin of the chosen one's (negative: never; default: always).
     #[arg(long, allow_hyphen_values = true)]
     rescue_other_margin: Option<f32>,
+    /// Rescue: window slack beyond the projected read, as PAD,DIV (PAD + read/DIV bases).
+    #[arg(long)]
+    rescue_window: Option<String>,
     /// Rescue: candidate genes must score this fraction of the best gene's base score.
     #[arg(long)]
     rescue_alpha: Option<f32>,
@@ -313,6 +316,12 @@ fn options(args: &Args) -> Result<MapOptions> {
         r.max_tx_per_gene = args.rescue_tx;
         if args.rescue_full {
             r.window = None;
+        }
+        if let Some(w) = &args.rescue_window {
+            let (a, b) = w
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("--rescue-window PAD,DIV"))?;
+            r.window = Some((a.parse()?, b.parse()?));
         }
         if let Some(a) = args.rescue_alpha {
             r.alpha = a;
