@@ -7,6 +7,7 @@
 //! oarfish's score-to-probability model, so a comparison isolates the mapper. Reads with the
 //! same transcripts and (quantized) weights form one equivalence class.
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -105,50 +106,84 @@ impl EqBuilder {
 /// Estimated read counts per transcript. Returns (counts, iterations).
 ///
 /// Converges when the largest relative change among transcripts with at least `0.01`
-/// estimated reads drops below `tol`. Classes are flattened once and each iteration is a
-/// single pass with no allocation.
+/// estimated reads drops below `tol`. Classes are flattened once into CSR arrays (each class's
+/// transcripts and weights), plus the transpose (each transcript's classes and weights). Each
+/// iteration is two passes on the current rayon pool, both without synchronization: per class,
+/// the scale `count / Σ α_t w_t`; per transcript, `α_t Σ_c w_ct scale_c`. Sums run in class
+/// order, so the result doesn't depend on the thread count.
 pub fn em(n_tx: usize, classes: &[EqClass], p: &QuantParams) -> (Vec<f64>, usize) {
     let total: f64 = classes.iter().map(|c| c.count).sum();
     if total == 0.0 {
         return (vec![0.0; n_tx], 0);
     }
+    // Classes → (transcript, weight).
     let mut off = Vec::with_capacity(classes.len() + 1);
     off.push(0usize);
-    let (mut txs, mut ws, mut counts) = (Vec::new(), Vec::new(), Vec::with_capacity(classes.len()));
+    let (mut txs, mut ws) = (Vec::new(), Vec::new());
     for c in classes {
-        txs.extend(c.txs.iter().map(|&t| t as usize));
+        txs.extend(c.txs.iter().copied());
         ws.extend_from_slice(&c.weights);
         off.push(txs.len());
-        counts.push(c.count);
+    }
+    let counts: Vec<f64> = classes.iter().map(|c| c.count).collect();
+    // Transcripts → (class, weight), classes ascending.
+    let mut toff = vec![0usize; n_tx + 1];
+    for &t in &txs {
+        toff[t as usize + 1] += 1;
+    }
+    for t in 0..n_tx {
+        toff[t + 1] += toff[t];
+    }
+    let mut fill = toff.clone();
+    let mut tcls = vec![0u32; txs.len()];
+    let mut tws = vec![0f64; txs.len()];
+    for c in 0..classes.len() {
+        for k in off[c]..off[c + 1] {
+            let t = txs[k] as usize;
+            tcls[fill[t]] = c as u32;
+            tws[fill[t]] = ws[k];
+            fill[t] += 1;
+        }
     }
     // Start from uniform shares within each class.
     let mut alpha = vec![0.0; n_tx];
     for (c, w) in off.windows(2).zip(&counts) {
         for &t in &txs[c[0]..c[1]] {
-            alpha[t] += w / (c[1] - c[0]) as f64;
+            alpha[t as usize] += w / (c[1] - c[0]) as f64;
         }
     }
     let mut next = vec![0.0; n_tx];
+    let mut scale = vec![0.0; classes.len()];
     let mut iters = 0;
     while iters < p.max_iter {
         iters += 1;
-        next.iter_mut().for_each(|x| *x = 0.0);
-        for (c, &n) in off.windows(2).zip(&counts) {
-            let (t, w) = (&txs[c[0]..c[1]], &ws[c[0]..c[1]]);
-            let denom: f64 = t.iter().zip(w).map(|(&t, &w)| alpha[t] * w).sum();
-            if denom > 0.0 {
-                let scale = n / denom;
-                for (&t, &w) in t.iter().zip(w) {
-                    next[t] += alpha[t] * w * scale;
+        scale.par_iter_mut().enumerate().for_each(|(c, s)| {
+            let r = off[c]..off[c + 1];
+            let denom: f64 = txs[r.clone()]
+                .iter()
+                .zip(&ws[r])
+                .map(|(&t, &w)| alpha[t as usize] * w)
+                .sum();
+            *s = if denom > 0.0 { counts[c] / denom } else { 0.0 };
+        });
+        let change = next
+            .par_iter_mut()
+            .enumerate()
+            .map(|(t, n)| {
+                let r = toff[t]..toff[t + 1];
+                let acc: f64 = tcls[r.clone()]
+                    .iter()
+                    .zip(&tws[r])
+                    .map(|(&c, &w)| w * scale[c as usize])
+                    .sum();
+                *n = alpha[t] * acc;
+                if *n >= 0.01 {
+                    (*n - alpha[t]).abs() / *n
+                } else {
+                    0.0
                 }
-            }
-        }
-        let change = alpha
-            .iter()
-            .zip(&next)
-            .filter(|&(_, &n)| n >= 0.01)
-            .map(|(&o, &n)| (n - o).abs() / n)
-            .fold(0.0, f64::max);
+            })
+            .reduce(|| 0.0, f64::max);
         std::mem::swap(&mut alpha, &mut next);
         if change < p.tol {
             break;

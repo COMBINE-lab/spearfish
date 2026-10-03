@@ -40,6 +40,9 @@ pub struct Args {
     /// Output TSV.
     #[arg(short, long)]
     output: PathBuf,
+    /// EM worker threads (0 = all cores).
+    #[arg(short, long, default_value_t = 0)]
+    threads: usize,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -110,7 +113,10 @@ pub fn run(args: Args) -> Result<()> {
     }
     let reads = b.reads;
     let classes = b.finish();
-    let (counts, iters) = em(names.len(), &classes, &p);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()?;
+    let (counts, iters) = pool.install(|| em(names.len(), &classes, &p));
     let mut out = std::io::BufWriter::new(std::fs::File::create(&args.output)?);
     writeln!(out, "transcript\tlength\treads")?;
     for ((n, l), c) in names.iter().zip(&lens).zip(&counts) {
