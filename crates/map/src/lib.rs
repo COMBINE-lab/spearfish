@@ -53,6 +53,9 @@ pub struct TieBreak {
     pub clip_ends: bool,
     /// With `clip_ends`: bonus for aligning through to the read's end.
     pub end_bonus: i32,
+    /// When tied hits share no anchor, group them by shared anchors (segmented within groups,
+    /// whole read across group representatives) instead of aligning every hit's whole read.
+    pub group_fallback: bool,
     /// With `clip_ends`: stop extending a read end once a row falls this far below the best
     /// score so far (X-drop; `i32::MAX`: never).
     pub xdrop: i32,
@@ -76,6 +79,7 @@ impl Default for TieBreak {
             clip_ends: true,
             end_bonus: 5,
             xdrop: 50,
+            group_fallback: false,
         }
     }
 }
@@ -201,17 +205,76 @@ impl<C: Chainer> Mapper<C> {
         } else {
             None
         };
-        let (cost, unit) = seg.unwrap_or_else(|| {
-            stats::add(&stats::TIEBREAK_WHOLE_READ, 1);
-            let d = self.whole_read(tb, &codes, &hits[..n]);
-            (d.into_iter().map(i64::from).collect(), tb.kappa)
-        });
-        let cmin = *cost.iter().min().unwrap();
-        for (h, &c) in hits[..n].iter_mut().zip(&cost) {
-            h.score = best - unit * (c - cmin) as f32;
+        // Score below the tie set's best, per hit.
+        let penalty: Vec<f32> = match seg {
+            Some((cost, unit)) => {
+                let cmin = *cost.iter().min().unwrap();
+                cost.iter().map(|&c| unit * (c - cmin) as f32).collect()
+            }
+            None => {
+                stats::add(&stats::TIEBREAK_WHOLE_READ, 1);
+                if tb.segmented && tb.group_fallback {
+                    self.grouped(tb, &codes, &hits[..n])
+                } else {
+                    let d = self.whole_read(tb, &codes, &hits[..n]);
+                    let dmin = *d.iter().min().unwrap();
+                    d.iter().map(|&x| tb.kappa * (x - dmin) as f32).collect()
+                }
+            }
+        };
+        for (h, &p) in hits[..n].iter_mut().zip(&penalty) {
+            h.score = best - p;
         }
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
         n as u32
+    }
+
+    /// Penalties for a tie set whose hits share no common anchor (typically paralogs): the
+    /// hits are grouped greedily so each group shares an anchor, scored by [`Self::segmented`]
+    /// within groups, and the groups are placed relative to each other by the whole-read edit
+    /// distance of each group's best hit (`kappa` per edit), as the two read orientations are.
+    /// Aligns one whole-read region per group instead of one per hit.
+    fn grouped(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Vec<f32> {
+        let mut groups: Vec<(rustc_hash::FxHashSet<u32>, Vec<usize>)> = Vec::new();
+        for (i, h) in hits.iter().enumerate() {
+            let qs: rustc_hash::FxHashSet<u32> = h.chain.iter().map(|a| a.0).collect();
+            match groups.iter_mut().find(|g| g.0.iter().any(|q| qs.contains(q))) {
+                Some(g) => {
+                    g.0.retain(|q| qs.contains(q));
+                    g.1.push(i);
+                }
+                None => groups.push((qs, vec![i])),
+            }
+        }
+        let mut penalty = vec![0f32; hits.len()];
+        let mut reps = Vec::with_capacity(groups.len());
+        for (_, members) in &groups {
+            let mut rep = members[0];
+            if members.len() > 1 {
+                let sub: Vec<TxHit> = members.iter().map(|&i| hits[i].clone()).collect();
+                // Members share an anchor by construction, so this is always Some.
+                if let Some((cost, unit)) = self.segmented(tb, codes, &sub) {
+                    let cmin = *cost.iter().min().unwrap();
+                    for (k, &i) in members.iter().enumerate() {
+                        penalty[i] = unit * (cost[k] - cmin) as f32;
+                    }
+                    rep = members[cost.iter().position(|&c| c == cmin).unwrap()];
+                }
+            }
+            reps.push(rep);
+        }
+        if groups.len() > 1 {
+            let rep_hits: Vec<TxHit> = reps.iter().map(|&i| hits[i].clone()).collect();
+            let d = self.whole_read(tb, codes, &rep_hits);
+            let dmin = *d.iter().min().unwrap();
+            for ((_, members), &dg) in groups.iter().zip(&d) {
+                let off = tb.kappa * (dg - dmin) as f32;
+                for &i in members {
+                    penalty[i] += off;
+                }
+            }
+        }
+        penalty
     }
 
     /// Distances of `read` against several texts with a shared band: the first is exact,

@@ -115,6 +115,10 @@ pub struct Args {
     /// Tie-break: bonus for aligning through to the read's end (minimap2's --end-bonus).
     #[arg(long, default_value_t = 5)]
     end_bonus: i32,
+    /// Tie-break: when tied hits share no anchor, group them by shared anchors instead of
+    /// aligning every hit's whole read (fewer whole-read alignments; helps real HiFi).
+    #[arg(long)]
+    tie_group: bool,
     /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
     #[arg(long)]
     tie_band: Option<usize>,
@@ -291,6 +295,7 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.lambda = args.lambda;
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
+        tb.group_fallback = args.tie_group;
         if let Some(b) = args.tie_band {
             tb.band = b;
         }

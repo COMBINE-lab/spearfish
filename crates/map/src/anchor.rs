@@ -99,15 +99,26 @@ fn greedy_score(anchors: &[Anchor]) -> f32 {
 pub fn candidates(idx: &Index, mut anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Candidate> {
     let fam = idx.unitig_family();
     let unitig = idx.node_unitig();
-    let family = |a: &Anchor| fam[unitig[a.node as usize] as usize];
-    anchors.retain(|a| family(a) != NO_FAMILY);
-    anchors.sort_unstable_by_key(|a| (family(a), a.qs, a.qe, a.node));
-    let mut out: Vec<Candidate> = anchors
-        .chunk_by(|a, b| family(a) == family(b))
-        .map(|g| Candidate {
-            family: family(&g[0]),
-            score: greedy_score(g),
-            anchors: g.to_vec(),
+    // Each anchor's family is looked up once (two dependent random reads), not on every
+    // comparison of the sort.
+    let mut keyed: Vec<(u32, Anchor)> = anchors
+        .drain(..)
+        .filter_map(|a| {
+            let f = fam[unitig[a.node as usize] as usize];
+            (f != NO_FAMILY).then_some((f, a))
+        })
+        .collect();
+    keyed.sort_unstable_by_key(|(f, a)| (*f, a.qs, a.qe, a.node));
+    let mut out: Vec<Candidate> = keyed
+        .chunk_by(|a, b| a.0 == b.0)
+        .map(|g| {
+            anchors.clear();
+            anchors.extend(g.iter().map(|x| x.1));
+            Candidate {
+                family: g[0].0,
+                score: greedy_score(&anchors),
+                anchors: anchors.clone(),
+            }
         })
         .collect();
     out.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.family.cmp(&b.family)));
