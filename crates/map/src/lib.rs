@@ -75,7 +75,7 @@ impl Default for TieBreak {
             affine_within: None,
             clip_ends: true,
             end_bonus: 5,
-            xdrop: 100,
+            xdrop: 50,
         }
     }
 }
