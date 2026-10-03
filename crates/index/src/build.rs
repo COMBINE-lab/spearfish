@@ -130,8 +130,37 @@ impl Uf {
     }
 }
 
-/// Per transcript: seeds, parsed length, content hash per seed, 2-bit packed parsed sequence.
-type Seeded = (Vec<Seed>, u32, Vec<u64>, Vec<u64>);
+/// Per transcript: seeds, parsed length, content hash per seed, 2-bit packed parsed sequence,
+/// and (HPC) the packed raw sequence with its raw-position checkpoints.
+type Seeded = (Vec<Seed>, u32, Vec<u64>, Vec<u64>, (Vec<u64>, Vec<u32>));
+
+/// Packed raw sequence and raw starts of every `RAW_CK`-th parsed base (through the parsed
+/// length), if the packed sequence's runs are exactly the parsed runs (non-ACGT bases pack
+/// as A and could merge runs).
+fn raw_packing(raw: &[u8], h: &lcp_core::hpc::Hpc) -> (Vec<u64>, Vec<u32>) {
+    let code = |b: u8| {
+        let c = lcp_core::encode::CODE[b as usize];
+        if c > 3 { 0 } else { c }
+    };
+    let plen = h.seq.len() as u32;
+    let mut runs = 0u32;
+    for (i, &b) in raw.iter().enumerate() {
+        if i == 0 || code(b) != code(raw[i - 1]) {
+            if runs >= plen || h.to_raw(runs, runs).0 != i as u32 {
+                return (Vec::new(), Vec::new());
+            }
+            runs += 1;
+        }
+    }
+    if runs != plen {
+        return (Vec::new(), Vec::new());
+    }
+    let ck = (0..=plen)
+        .step_by(crate::RAW_CK as usize)
+        .map(|i| h.to_raw(i, i).0)
+        .collect();
+    (crate::pack2(raw), ck)
+}
 
 pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport)> {
     let mut rep = BuildReport {
@@ -162,7 +191,8 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
                     )
                 })
                 .collect();
-            (seeds, seq.len() as u32, content, crate::pack2(seq))
+            let raw = h.as_ref().map(|h| raw_packing(&t.seq, h)).unwrap_or_default();
+            (seeds, seq.len() as u32, content, crate::pack2(seq), raw)
         })
         .collect();
     rep.seed_occurrences = seeded.iter().map(|s| s.0.len() as u64).sum();
@@ -220,7 +250,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     let mut succ = vec![UNSET; n];
     let mut node_len = vec![u32::MAX; n];
     let mut node_content = vec![0u64; n];
-    for ((s, _, content, _), v) in seeded.iter().zip(&nodes) {
+    for ((s, _, content, _, _), v) in seeded.iter().zip(&nodes) {
         for i in 0..v.len() {
             let c = &mut node_content[v[i] as usize];
             if node_len[v[i] as usize] == u32::MAX {
@@ -341,7 +371,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         .par_iter()
         .zip(&nodes)
         .enumerate()
-        .map(|(ti, ((s, _, _, _), v))| {
+        .map(|(ti, ((s, _, _, _, _), v))| {
             let mut out = Vec::new();
             let mut i = 0;
             while i < v.len() {
@@ -515,6 +545,28 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
                 off.push(words.len() as u64);
             }
             (off, words)
+        },
+        tx_raw: if p.hpc {
+            let mut words = Vec::new();
+            let mut off = vec![0u64];
+            for s in &seeded {
+                words.extend_from_slice(&s.4.0);
+                off.push(words.len() as u64);
+            }
+            (off, words)
+        } else {
+            Default::default()
+        },
+        tx_raw_ck: if p.hpc {
+            let mut ck = Vec::new();
+            let mut off = vec![0u64];
+            for s in &seeded {
+                ck.extend_from_slice(&s.4.1);
+                off.push(ck.len() as u64);
+            }
+            (off, ck)
+        } else {
+            Default::default()
         },
         tx_names: txs.iter().map(|t| t.name.clone()).collect(),
         gene_names: gene_names.iter().map(|s| s.to_string()).collect(),

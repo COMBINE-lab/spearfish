@@ -79,6 +79,8 @@ impl MapOptions {
             Preset::Drna => {
                 params.strands = Strands::Forward;
                 tb.affine_within = Some(4);
+                // No template-switch Gs at direct RNA read ends: raw ends cost 12% for nothing.
+                tb.raw_ends = false;
             }
             Preset::Hifi => tb.affine = Some(Affine::HIFI),
         }

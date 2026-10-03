@@ -119,6 +119,14 @@ pub struct Args {
     /// aligning every hit's whole read (fewer whole-read alignments; helps real HiFi).
     #[arg(long)]
     tie_group: bool,
+    /// Near-tied read orientations: compare by whole-read edit distance instead of clipped
+    /// affine scores.
+    #[arg(long)]
+    orient_edit: bool,
+    /// Tie-break: align read ends in raw (uncompressed) space, needing an index with raw
+    /// transcripts (default: the preset's; on except for drna).
+    #[arg(long)]
+    raw_ends: Option<bool>,
     /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
     #[arg(long)]
     tie_band: Option<usize>,
@@ -296,6 +304,10 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
         tb.group_fallback = args.tie_group;
+        tb.orient_clipped = !args.orient_edit;
+        if let Some(r) = args.raw_ends {
+            tb.raw_ends = r;
+        }
         if let Some(b) = args.tie_band {
             tb.band = b;
         }

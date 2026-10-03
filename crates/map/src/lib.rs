@@ -59,6 +59,14 @@ pub struct TieBreak {
     /// With `clip_ends`: stop extending a read end once a row falls this far below the best
     /// score so far (X-drop; `i32::MAX`: never).
     pub xdrop: i32,
+    /// Near-tied read orientations: compare their best hits by clipped affine alignment
+    /// scores (read ends past the transcript are clipped) instead of whole-read edit distance,
+    /// which charges a short transcript for the read's adapters.
+    pub orient_clipped: bool,
+    /// HPC indexes with raw transcripts: align read ends in raw (uncompressed) space, where
+    /// homopolymers at the read ends (e.g. a template-switch oligo's Gs) can't merge into the
+    /// transcript's first or last run.
+    pub raw_ends: bool,
 }
 
 impl Default for TieBreak {
@@ -80,6 +88,8 @@ impl Default for TieBreak {
             end_bonus: 5,
             xdrop: 50,
             group_fallback: false,
+            orient_clipped: true,
+            raw_ends: true,
         }
     }
 }
@@ -154,9 +164,23 @@ pub struct Mapper<C: Chainer> {
 }
 
 /// One orientation of a read: hits (sorted), the parsed sequence and its base seeds.
+/// A read orientation's raw bases (2-bit codes) and HPC run map, for raw-space read ends.
+struct RawRead {
+    codes: Vec<u8>,
+    hpc: lcp_core::hpc::Hpc,
+}
+
+impl RawRead {
+    /// Raw position where parsed base `p` starts (the raw length at the parsed length).
+    fn pos(&self, p: u32) -> usize {
+        self.hpc.to_raw(p, p).0 as usize
+    }
+}
+
 struct Strand {
     hits: Vec<TxHit>,
     seq: Vec<u8>,
+    raw: Option<RawRead>,
     seeds: Vec<seeds::Seed>,
     anchors: u32,
     candidates: u32,
@@ -180,7 +204,7 @@ impl<C: Chainer> Mapper<C> {
 
     /// Re-rank the near-tie set of `hits` (sorted, best first) by edit distance between the
     /// parsed read `seq` and each transcript. Returns the tie-set size.
-    fn tiebreak(&self, tb: &TieBreak, seq: &[u8], hits: &mut [TxHit]) -> u32 {
+    fn tiebreak(&self, tb: &TieBreak, seq: &[u8], raw: Option<&RawRead>, hits: &mut [TxHit]) -> u32 {
         let Some(best) = hits.first().map(|h| h.score) else {
             return 0;
         };
@@ -201,7 +225,7 @@ impl<C: Chainer> Mapper<C> {
             .collect();
         // Costs (edits, or negated affine scores) and the score charged per unit.
         let seg = if tb.segmented {
-            self.segmented(tb, &codes, &hits[..n])
+            self.segmented(tb, &codes, raw, &hits[..n])
         } else {
             None
         };
@@ -214,7 +238,7 @@ impl<C: Chainer> Mapper<C> {
             None => {
                 stats::add(&stats::TIEBREAK_WHOLE_READ, 1);
                 if tb.segmented && tb.group_fallback {
-                    self.grouped(tb, &codes, &hits[..n])
+                    self.grouped(tb, &codes, raw, &hits[..n])
                 } else {
                     let d = self.whole_read(tb, &codes, &hits[..n]);
                     let dmin = *d.iter().min().unwrap();
@@ -234,7 +258,7 @@ impl<C: Chainer> Mapper<C> {
     /// within groups, and the groups are placed relative to each other by the whole-read edit
     /// distance of each group's best hit (`kappa` per edit), as the two read orientations are.
     /// Aligns one whole-read region per group instead of one per hit.
-    fn grouped(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Vec<f32> {
+    fn grouped(&self, tb: &TieBreak, codes: &[u8], raw: Option<&RawRead>, hits: &[TxHit]) -> Vec<f32> {
         let mut groups: Vec<(rustc_hash::FxHashSet<u32>, Vec<usize>)> = Vec::new();
         for (i, h) in hits.iter().enumerate() {
             let qs: rustc_hash::FxHashSet<u32> = h.chain.iter().map(|a| a.0).collect();
@@ -253,7 +277,7 @@ impl<C: Chainer> Mapper<C> {
             if members.len() > 1 {
                 let sub: Vec<TxHit> = members.iter().map(|&i| hits[i].clone()).collect();
                 // Members share an anchor by construction, so this is always Some.
-                if let Some((cost, unit)) = self.segmented(tb, codes, &sub) {
+                if let Some((cost, unit)) = self.segmented(tb, codes, raw, &sub) {
                     let cmin = *cost.iter().min().unwrap();
                     for (k, &i) in members.iter().enumerate() {
                         penalty[i] = unit * (cost[k] - cmin) as f32;
@@ -323,6 +347,57 @@ impl<C: Chainer> Mapper<C> {
         self.idx.tx_codes(h.tx, lo, hi)
     }
 
+    /// Affine score of the read against one hit with both read ends clipped: the chained span
+    /// aligned globally, each read end extended from it into the padded transcript flank.
+    fn clipped(
+        &self,
+        tb: &TieBreak,
+        sc: &align::Affine,
+        codes: &[u8],
+        raw: Option<&RawRead>,
+        h: &TxHit,
+    ) -> i32 {
+        let plen = codes.len() as u32;
+        let tlen = self.idx.tx_plen()[h.tx as usize];
+        let slack = |ext: u32| tb.pad + ext / tb.pad_div;
+        let (qs, qe) = (h.qstart as usize, h.qend as usize);
+        let mid = align::affine(
+            &codes[qs..qe],
+            &self.idx.tx_codes(h.tx, h.tstart, h.tend),
+            align::Mode::Global,
+            sc,
+            tb.band,
+        );
+        let left = if qs > 0 {
+            let span = [(
+                h.tx,
+                h.tstart.saturating_sub(h.qstart + slack(h.qstart)),
+                h.tstart,
+            )];
+            let (read, text) = match self.raw_texts(tb, raw, &span) {
+                Some((r, mut t)) => (&r.codes[..r.pos(h.qstart)], t.pop().unwrap()),
+                None => (&codes[..qs], self.idx.tx_codes(h.tx, span[0].1, h.tstart)),
+            };
+            let read: Vec<u8> = read.iter().rev().copied().collect();
+            let text: Vec<u8> = text.into_iter().rev().collect();
+            align::affine_extend(&read, &text, sc, tb.band, tb.end_bonus, tb.xdrop)
+        } else {
+            tb.end_bonus
+        };
+        let rest = plen - h.qend;
+        let right = if rest > 0 {
+            let span = [(h.tx, h.tend, (h.tend + rest + slack(rest)).min(tlen))];
+            let (read, text) = match self.raw_texts(tb, raw, &span) {
+                Some((r, mut t)) => (&r.codes[r.pos(h.qend)..], t.pop().unwrap()),
+                None => (&codes[qe..], self.idx.tx_codes(h.tx, h.tend, span[0].2)),
+            };
+            align::affine_extend(read, &text, sc, tb.band, tb.end_bonus, tb.xdrop)
+        } else {
+            tb.end_bonus
+        };
+        mid + left + right
+    }
+
     /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
     fn whole_read_k(&self, tb: &TieBreak, codes: &[u8], h: &TxHit, k: u32) -> u32 {
         let text = self.hit_region(tb, codes.len() as u32, h);
@@ -334,12 +409,34 @@ impl<C: Chainer> Mapper<C> {
         align::distance(codes, &text, align::Mode::Infix, k).unwrap_or(k.saturating_add(1))
     }
 
+    /// Raw transcript texts for parsed spans `(transcript, lo, hi)`, if raw read ends are on
+    /// and the index has every transcript's raw sequence.
+    fn raw_texts<'r>(
+        &self,
+        tb: &TieBreak,
+        raw: Option<&'r RawRead>,
+        spans: &[(u32, u32, u32)],
+    ) -> Option<(&'r RawRead, Vec<Vec<u8>>)> {
+        let r = raw.filter(|_| tb.raw_ends)?;
+        let texts = spans
+            .iter()
+            .map(|&(t, lo, hi)| self.idx.tx_raw_codes(t, lo, hi))
+            .collect::<Option<Vec<_>>>()?;
+        Some((r, texts))
+    }
+
     /// Distances through anchors shared by every candidate: segments between consecutive
     /// shared anchors are aligned globally, but only where the candidates' transcript
     /// sequences differ (identical segments cost every candidate the same); the read ends are
     /// aligned against windows anchored at the outermost shared anchors. `None` if the
     /// candidates share no anchor.
-    fn segmented(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Option<(Vec<i64>, f32)> {
+    fn segmented(
+        &self,
+        tb: &TieBreak,
+        codes: &[u8],
+        raw: Option<&RawRead>,
+        hits: &[TxHit],
+    ) -> Option<(Vec<i64>, f32)> {
         // Query starts present in every chain, with each candidate's transcript start.
         let mut shared: Vec<u32> = hits[0].chain.iter().map(|a| a.0).collect();
         for h in &hits[1..] {
@@ -476,36 +573,54 @@ impl<C: Chainer> Mapper<C> {
         // Left end: read[0, q0) against transcript windows ending at each candidate's anchor.
         let q0 = shared[0];
         if q0 > 0 {
-            let texts = hits
+            let spans: Vec<(u32, u32, u32)> = hits
                 .iter()
                 .zip(&tpos)
-                .map(|(h, t)| {
-                    self.idx
-                        .tx_codes(h.tx, t[0].saturating_sub(q0 + tb.pad + q0 / tb.pad_div), t[0])
-                })
+                .map(|(h, t)| (h.tx, t[0].saturating_sub(q0 + tb.pad + q0 / tb.pad_div), t[0]))
                 .collect();
-            add(texts, &codes[..q0 as usize], align::Mode::Prefix, true);
+            match self.raw_texts(tb, raw, &spans) {
+                Some((r, texts)) => add(texts, &r.codes[..r.pos(q0)], align::Mode::Prefix, true),
+                None => add(
+                    spans
+                        .iter()
+                        .map(|&(t, lo, hi)| self.idx.tx_codes(t, lo, hi))
+                        .collect(),
+                    &codes[..q0 as usize],
+                    align::Mode::Prefix,
+                    true,
+                ),
+            }
         }
         // Right end: read[q_last, plen) against windows starting at the last shared anchor.
         let ql = *shared.last().unwrap();
         let rest = plen - ql;
-        let texts = hits
+        let spans: Vec<(u32, u32, u32)> = hits
             .iter()
             .zip(&tpos)
             .map(|(h, t)| {
                 let tlen = self.idx.tx_plen()[h.tx as usize];
                 let s = *t.last().unwrap();
-                self.idx
-                    .tx_codes(h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
+                (h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
             })
             .collect();
-        add(texts, &codes[ql as usize..], align::Mode::Prefix, false);
+        match self.raw_texts(tb, raw, &spans) {
+            Some((r, texts)) => add(texts, &r.codes[r.pos(ql)..], align::Mode::Prefix, false),
+            None => add(
+                spans
+                    .iter()
+                    .map(|&(t, lo, hi)| self.idx.tx_codes(t, lo, hi))
+                    .collect(),
+                &codes[ql as usize..],
+                align::Mode::Prefix,
+                false,
+            ),
+        }
         let unit = if tb.affine.is_some() { tb.lambda } else { tb.kappa };
         Some((cost, unit))
     }
 
     fn map_strand(&self, raw: &[u8]) -> Strand {
-        let seq = self.seeder.parsed(raw).map_or_else(|| raw.to_vec(), |h| h.seq);
+        let (seq, raw_read) = Self::parse(&self.seeder, raw);
         let seeds = self.seeder.seed_parsed(&seq);
         let anchors = anchor::anchors(&self.idx, &seeds, &self.p.anchor);
         let n_anchors = anchors.len() as u32;
@@ -518,9 +633,25 @@ impl<C: Chainer> Mapper<C> {
         Strand {
             hits,
             seq,
+            raw: raw_read,
             seeds,
             anchors: n_anchors,
             candidates: cands.len() as u32,
+        }
+    }
+
+    /// Parsed sequence and, with HPC, the raw read for raw-space read ends.
+    fn parse(seeder: &BaseSeeder, raw: &[u8]) -> (Vec<u8>, Option<RawRead>) {
+        match seeder.parsed(raw) {
+            Some(mut h) => {
+                let seq = std::mem::take(&mut h.seq);
+                let codes = raw
+                    .iter()
+                    .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
+                    .collect();
+                (seq, Some(RawRead { codes, hpc: h }))
+            }
+            None => (raw.to_vec(), None),
         }
     }
 
@@ -543,7 +674,8 @@ impl<C: Chainer> Mapper<C> {
         };
         let skip = |s: &Self, r: &[u8]| Strand {
             hits: Vec::new(),
-            seq: s.seeder.parsed(r).map_or_else(|| r.to_vec(), |h| h.seq),
+            seq: Self::parse(&s.seeder, r).0,
+            raw: None,
             seeds: Vec::new(),
             anchors: 0,
             candidates: 0,
@@ -600,25 +732,47 @@ impl<C: Chainer> Mapper<C> {
             let margin = |s: f32| tb.margin_abs.max(tb.margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
-            tiebreak_size = self.tiebreak(tb, &st.seq, &mut st.hits);
+            tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits);
             if both {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
-                tiebreak_size += self.tiebreak(tb, &other.seq, &mut other.hits);
+                tiebreak_size += self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits);
                 let codes = |s: &[u8]| -> Vec<u8> {
                     s.iter()
                         .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
                         .collect()
                 };
-                let da = self.whole_read(tb, &codes(&st.seq), &st.hits[..1])[0];
-                let db = self.whole_read_k(tb, &codes(&other.seq), &other.hits[0], da.saturating_add(tb.cap));
-                if db < da {
+                // Costs of the two best hits and the score charged per unit.
+                let (ca, cb, unit) = match &tb.affine {
+                    Some(sc) if tb.orient_clipped => (
+                        -i64::from(self.clipped(tb, sc, &codes(&st.seq), st.raw.as_ref(), &st.hits[0])),
+                        -i64::from(self.clipped(
+                            tb,
+                            sc,
+                            &codes(&other.seq),
+                            other.raw.as_ref(),
+                            &other.hits[0],
+                        )),
+                        tb.lambda,
+                    ),
+                    _ => {
+                        let da = self.whole_read(tb, &codes(&st.seq), &st.hits[..1])[0];
+                        let db = self.whole_read_k(
+                            tb,
+                            &codes(&other.seq),
+                            &other.hits[0],
+                            da.saturating_add(tb.cap),
+                        );
+                        (i64::from(da), i64::from(db), tb.kappa)
+                    }
+                };
+                if cb < ca {
                     std::mem::swap(&mut st, &mut other);
                     reverse = !reverse;
                 }
-                let target = st.hits[0].score - tb.kappa * da.abs_diff(db) as f32;
+                let target = st.hits[0].score - unit * ca.abs_diff(cb) as f32;
                 let shift = target - other.hits[0].score;
                 for h in &mut other.hits {
                     h.score += shift;

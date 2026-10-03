@@ -21,6 +21,8 @@ use store::{Store, Writer};
 pub const NO_FAMILY: u32 = u32::MAX;
 /// `node_flags` bit: the node's unitig is masked (color touches too many genes).
 pub const FLAG_MASKED: u8 = 1;
+/// Parsed bases between raw-position checkpoints (`tx_raw_ck`).
+pub const RAW_CK: u32 = 64;
 
 /// Owned index contents, as produced by `build`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,12 @@ pub struct IndexData {
     /// Parsed transcript sequences, 2-bit packed (32 bases per word, base i at bits
     /// 2(i mod 32)); each transcript starts on a word boundary: (word offsets, words).
     pub tx_seq: (Vec<u64>, Vec<u64>),
+    /// HPC indexes: raw transcript sequences, packed as `tx_seq` (empty for a transcript whose
+    /// non-ACGT bases make its packed runs differ from its parsed runs).
+    pub tx_raw: (Vec<u64>, Vec<u64>),
+    /// HPC indexes: raw position of every `RAW_CK`-th parsed base, per transcript
+    /// (offsets, positions; empty where `tx_raw` is).
+    pub tx_raw_ck: (Vec<u64>, Vec<u32>),
     pub tx_names: Vec<String>,
     pub gene_names: Vec<String>,
 }
@@ -101,6 +109,12 @@ impl IndexData {
         w.add("tx_plen", &self.tx_plen);
         w.add("tx_seq_off", &self.tx_seq.0);
         w.add("tx_seq", &self.tx_seq.1);
+        if !self.tx_raw.0.is_empty() {
+            w.add("tx_raw_off", &self.tx_raw.0);
+            w.add("tx_raw", &self.tx_raw.1);
+            w.add("tx_raw_ck_off", &self.tx_raw_ck.0);
+            w.add("tx_raw_ck", &self.tx_raw_ck.1);
+        }
         let (o, b) = pool(&self.tx_names);
         w.add("tx_name_off", &o);
         w.add("tx_names", &b);
@@ -228,10 +242,19 @@ sections!(
     gene_names: u8,
 );
 
+/// Optional sections: raw transcript sequences (HPC indexes).
+struct RawSections {
+    off: Raw<u64>,
+    words: Raw<u64>,
+    ck_off: Raw<u64>,
+    ck: Raw<u32>,
+}
+
 /// A loaded (memory-mapped) index.
 pub struct Index {
     store: Store,
     s: Sections,
+    raw: Option<RawSections>,
     meta: Vec<(String, String)>,
     dir_shift: u32,
 }
@@ -253,6 +276,15 @@ impl Index {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let s = Sections::load(&store)?;
+        let raw = (|| -> Result<RawSections> {
+            Ok(RawSections {
+                off: Raw::of(store.get::<u64>("tx_raw_off")?),
+                words: Raw::of(store.get::<u64>("tx_raw")?),
+                ck_off: Raw::of(store.get::<u64>("tx_raw_ck_off")?),
+                ck: Raw::of(store.get::<u32>("tx_raw_ck")?),
+            })
+        })()
+        .ok();
         let bits = label_dir_bits(s.labels.len);
         anyhow::ensure!(
             s.label_dir.len == (1usize << bits) + 1,
@@ -261,6 +293,7 @@ impl Index {
         Ok(Index {
             store,
             s,
+            raw,
             meta,
             dir_shift: 64 - bits,
         })
@@ -309,6 +342,37 @@ impl Index {
         let map: [u8; 4] = if ascii { *b"ACGT" } else { [0, 1, 2, 3] };
         out.reserve((hi - lo) as usize);
         out.extend((lo..hi).map(|i| map[((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as usize]));
+    }
+
+    /// Raw 2-bit codes of transcript `t` over the raw span of its parsed bases `[lo, hi)`
+    /// (whole homopolymer runs), or None if the index has no raw sequence for `t`.
+    pub fn tx_raw_codes(&self, t: u32, lo: u32, hi: u32) -> Option<Vec<u8>> {
+        let r = self.raw.as_ref()?;
+        // SAFETY: borrowed from self.store, which outlives these slices.
+        let (off, words, ck_off, ck) =
+            unsafe { (r.off.slice(), r.words.slice(), r.ck_off.slice(), r.ck.slice()) };
+        let t = t as usize;
+        let ck = &ck[ck_off[t] as usize..ck_off[t + 1] as usize];
+        if ck.is_empty() {
+            return None;
+        }
+        let words = &words[off[t] as usize..off[t + 1] as usize];
+        let base = |i: u32| ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8;
+        let rlen = self.tx_len()[t];
+        // Raw start of parsed base p: from the checkpoint, skip whole runs.
+        let pos = |p: u32| {
+            let mut r = ck[(p / RAW_CK) as usize];
+            for _ in 0..p % RAW_CK {
+                let b = base(r);
+                r += 1;
+                while r < rlen && base(r) == b {
+                    r += 1;
+                }
+            }
+            r
+        };
+        let (a, b) = (pos(lo), pos(hi));
+        Some((a..b).map(base).collect())
     }
 
     /// Nodes of unitig `u`, in order.

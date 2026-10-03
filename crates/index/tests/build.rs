@@ -72,6 +72,35 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
         let n = idx.tx_plen()[t];
         assert_eq!(idx.tx_codes(t as u32, 0, n), codes);
     }
+    // HPC: raw windows of parsed spans decode to the raw sequence's whole runs.
+    for (t, tx) in txs.iter().enumerate() {
+        let Some(h) = seeder.parsed(&tx.seq) else {
+            assert_eq!(idx.tx_raw_codes(t as u32, 0, 0), None);
+            continue;
+        };
+        let n = idx.tx_plen()[t];
+        let raw: Vec<u8> = tx
+            .seq
+            .iter()
+            .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
+            .collect();
+        for (lo, hi) in [
+            (0, n),
+            (0, 0),
+            (n, n),
+            (n / 3, n / 2),
+            (n.saturating_sub(70), n),
+            (1.min(n), n),
+        ] {
+            let (a, b) = h.to_raw(lo, hi);
+            assert_eq!(
+                idx.tx_raw_codes(t as u32, lo, hi).as_deref(),
+                Some(&raw[a as usize..b as usize]),
+                "{spec}: transcript {} [{lo}, {hi})",
+                tx.name
+            );
+        }
+    }
     // Colors agree with occurrences.
     for u in 0..idx.n_unitigs() as u32 {
         let (ts, _) = idx.occurrences(u);
@@ -182,6 +211,33 @@ fn transcriptome() -> impl Strategy<Value = Vec<TxInput>> {
         }
         txs
     })
+}
+
+#[test]
+fn raw_sequence_skipped_where_non_acgt_merges_runs() {
+    // "AN" is two parsed runs but packs as "AA" (one run): no raw sequence for that transcript.
+    let txs = vec![
+        TxInput {
+            name: "a".into(),
+            gene: "g".into(),
+            seq: b"ACGTTGCAANCCGGTTAACGTAGCATGCATCGA".to_vec(),
+        },
+        TxInput {
+            name: "b".into(),
+            gene: "g".into(),
+            seq: b"ACGTTGCAAGCCGGTTAACGTAGCATGCATCGA".to_vec(),
+        },
+    ];
+    let p = BuildParams {
+        spec: "lcp:K=3".into(),
+        hpc: true,
+        f_max: 20,
+        allow_collisions: false,
+        collapse: Collapse::Gene,
+    };
+    let idx = Index::from_bytes(&build(&txs, &p).unwrap().0.to_bytes()).unwrap();
+    assert_eq!(idx.tx_raw_codes(0, 0, 3), None);
+    assert_eq!(idx.tx_raw_codes(1, 0, 3), Some(vec![0, 1, 2]));
 }
 
 proptest! {
