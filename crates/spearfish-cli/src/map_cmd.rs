@@ -103,7 +103,7 @@ pub struct Args {
     affine_within: Option<u32>,
     /// Tie-break: transcript bases beyond the read's projected ends (plus 1/`tie_pad_div` of
     /// the unanchored end).
-    /// Default from the preset (drna: 20 + 1/10, others: 50 + 1/6).
+    /// Default 20 + 1/10.
     #[arg(long)]
     tie_pad: Option<u32>,
     #[arg(long)]

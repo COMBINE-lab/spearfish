@@ -79,8 +79,6 @@ impl MapOptions {
             Preset::Drna => {
                 params.strands = Strands::Forward;
                 tb.affine_within = Some(4);
-                tb.pad = 20;
-                tb.pad_div = 10;
             }
             Preset::Hifi => tb.affine = Some(Affine::HIFI),
         }
