@@ -115,6 +115,9 @@ pub struct Args {
     /// Tie-break: bonus for aligning through to the read's end (minimap2's --end-bonus).
     #[arg(long, default_value_t = 5)]
     end_bonus: i32,
+    /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
+    #[arg(long)]
+    tie_band: Option<usize>,
     /// Tie-break: X-drop for read-end extensions (default: the preset's).
     #[arg(long)]
     xdrop: Option<i32>,
@@ -288,6 +291,9 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.lambda = args.lambda;
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
+        if let Some(b) = args.tie_band {
+            tb.band = b;
+        }
         if let Some(x) = args.xdrop {
             tb.xdrop = x;
         }
