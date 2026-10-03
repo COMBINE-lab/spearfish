@@ -721,6 +721,9 @@ dependencies = [
 [[package]]
 name = "quant"
 version = "0.1.0"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "quick-error"

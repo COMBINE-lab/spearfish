@@ -82,7 +82,14 @@ impl MapOptions {
                 // No template-switch Gs at direct RNA read ends: raw ends cost 12% for nothing.
                 tb.raw_ends = false;
             }
-            Preset::Hifi => tb.affine = Some(Affine::HIFI),
+            Preset::Hifi => {
+                tb.affine = Some(Affine::HIFI);
+                // Accurate reads: tied hits without a common anchor are grouped by shared
+                // anchors rather than aligned whole, and level-2 rescue finds nothing level-3
+                // seeds missed. Half the mapping work at identical accuracy (D26).
+                tb.group_fallback = true;
+                params.rescue = None;
+            }
         }
         MapOptions {
             params,

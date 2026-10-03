@@ -116,7 +116,7 @@ pub struct Args {
     #[arg(long, default_value_t = 5)]
     end_bonus: i32,
     /// Tie-break: when tied hits share no anchor, group them by shared anchors instead of
-    /// aligning every hit's whole read (fewer whole-read alignments; helps real HiFi).
+    /// aligning every hit's whole read (fewer whole-read alignments; default for hifi).
     #[arg(long)]
     tie_group: bool,
     /// Near-tied read orientations: compare by whole-read edit distance instead of clipped
@@ -306,7 +306,7 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.lambda = args.lambda;
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
-        tb.group_fallback = args.tie_group;
+        tb.group_fallback |= args.tie_group;
         tb.orient_clipped = !args.orient_edit;
         if let Some(r) = args.raw_ends {
             tb.raw_ends = r;
