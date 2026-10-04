@@ -109,6 +109,7 @@ impl MapOptions {
                 // anchors rather than aligned whole, and level-2 rescue finds nothing level-3
                 // seeds missed. Half the mapping work at identical accuracy (D26).
                 tb.group_fallback = true;
+                tb.end_diagonal = true;
                 params.rescue = None;
                 // HiFi anchors already end within a few bases of the read's ends: extending
                 // spans changes no spike-in estimate (D27). Positional models turn it on.

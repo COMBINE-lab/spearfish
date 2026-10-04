@@ -59,6 +59,10 @@ pub struct TieBreak {
     /// With `clip_ends`: stop extending a read end once a row falls this far below the best
     /// score so far (X-drop; `i32::MAX`: never).
     pub xdrop: i32,
+    /// With `clip_ends`: keep read-end bands on the diagonal from the shared anchor instead of
+    /// widening them over the window's slack. Accurate reads barely drift from it, and long
+    /// read ends then cost `2 * band + 1` cells per row instead of `slack` more.
+    pub end_diagonal: bool,
     /// Near-tied read orientations: compare their best hits by clipped affine alignment
     /// scores (read ends past the transcript are clipped) instead of whole-read edit distance,
     /// which charges a short transcript for the read's adapters.
@@ -87,6 +91,7 @@ impl Default for TieBreak {
             clip_ends: true,
             end_bonus: 5,
             xdrop: 50,
+            end_diagonal: false,
             group_fallback: false,
             orient_clipped: true,
             raw_ends: true,
@@ -333,11 +338,25 @@ impl<C: Chainer> Mapper<C> {
             reps.push(rep);
         }
         if groups.len() > 1 {
-            let rep_hits: Vec<TxHit> = reps.iter().map(|&i| hits[i].clone()).collect();
-            let d = self.whole_read(tb, codes, &rep_hits);
-            let dmin = *d.iter().min().unwrap();
-            for ((_, members), &dg) in groups.iter().zip(&d) {
-                let off = tb.kappa * (dg - dmin) as f32;
+            // Costs of each group's representative, and the score charged per unit: clipped
+            // affine alignments where available (as for read orientations), else whole-read
+            // edit distances.
+            let (cost, unit): (Vec<i64>, f32) = match &tb.affine {
+                Some(sc) if tb.orient_clipped => (
+                    reps.iter()
+                        .map(|&i| -i64::from(self.clipped(tb, sc, codes, raw, &hits[i])))
+                        .collect(),
+                    tb.lambda,
+                ),
+                _ => {
+                    let rep_hits: Vec<TxHit> = reps.iter().map(|&i| hits[i].clone()).collect();
+                    let d = self.whole_read(tb, codes, &rep_hits);
+                    (d.into_iter().map(i64::from).collect(), tb.kappa)
+                }
+            };
+            let cmin = *cost.iter().min().unwrap();
+            for ((_, members), &cg) in groups.iter().zip(&cost) {
+                let off = unit * (cg - cmin) as f32;
                 for &i in members {
                     penalty[i] += off;
                 }
@@ -567,12 +586,23 @@ impl<C: Chainer> Mapper<C> {
                         }
                         let (m, n) = (read.len() as u64, texts[u].len() as u64);
                         stats::add(&stats::AFFINE_CALLS, 1);
-                        let cells = m * (2 * tb.band as u64 + m.abs_diff(n) + 1).min(n + 1);
+                        let diag = mode == align::Mode::Prefix && tb.clip_ends && tb.end_diagonal;
+                        let drift = if diag && n >= m { 0 } else { m.abs_diff(n) };
+                        let cells = m * (2 * tb.band as u64 + drift + 1).min(n + 1);
                         stats::add(&stats::AFFINE_CELLS, cells);
                         if mode == align::Mode::Prefix {
                             stats::add(&stats::AFFINE_END_CELLS, cells);
                         }
-                        let x = i64::from(if mode == align::Mode::Prefix && tb.clip_ends {
+                        let x = i64::from(if diag {
+                            align::affine_extend_diagonal(
+                                &read,
+                                &texts[u],
+                                sc,
+                                tb.band,
+                                tb.end_bonus,
+                                tb.xdrop,
+                            )
+                        } else if mode == align::Mode::Prefix && tb.clip_ends {
                             align::affine_extend(&read, &texts[u], sc, tb.band, tb.end_bonus, tb.xdrop)
                         } else {
                             align::affine(&read, &texts[u], mode, sc, tb.band)

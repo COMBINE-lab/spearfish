@@ -199,6 +199,23 @@ pub fn affine_extend(
     d.clip_best.max(d.score.saturating_add(end_bonus))
 }
 
+/// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
+/// row) however much longer the text is: for accurate reads, whose extensions stay near it.
+/// A text shorter than the pattern (a transcript ending inside the read's flank) keeps the
+/// band of [`affine_extend`], which can place the read's extra bases.
+pub fn affine_extend_diagonal(
+    pattern: &[u8],
+    text: &[u8],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+) -> i32 {
+    let geom = pattern.len().min(text.len());
+    let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some((xdrop, false)), geom);
+    d.clip_best.max(d.score.saturating_add(end_bonus))
+}
+
 /// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases,
 /// text bases read).
 pub fn affine_extend_end(
@@ -274,7 +291,7 @@ thread_local! {
 /// none) and, if `cell`, where it is, and stops early (returning NEG for the score in `mode`)
 /// once a row falls more than `xdrop` below it. Rows live in per-thread buffers, and each pass runs over
 /// explicit slices so it vectorizes without bounds checks.
-/// The band is laid out for a text of `geom` bases (`geom >= text.len()`; usually equal).
+/// The band is laid out for a text of `geom` bases (usually `text.len()`).
 fn affine_dp(
     pattern: &[u8],
     text: &[u8],
