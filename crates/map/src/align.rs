@@ -186,7 +186,17 @@ pub fn affine_extend(
     end_bonus: i32,
     xdrop: i32,
 ) -> i32 {
-    affine_extend_end(pattern, text, sc, band, end_bonus, xdrop).0
+    // Reaching the pattern's end earns `end_bonus` (minimap2's --end-bonus).
+    let d = affine_dp(
+        pattern,
+        text,
+        Mode::Prefix,
+        sc,
+        band,
+        Some((xdrop, false)),
+        text.len(),
+    );
+    d.clip_best.max(d.score.saturating_add(end_bonus))
 }
 
 /// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases,
@@ -222,7 +232,7 @@ pub fn affine_extend_window(
         Mode::Prefix,
         sc,
         band,
-        Some(xdrop),
+        Some((xdrop, true)),
         window.max(text.len()),
     );
     let whole = d.score.saturating_add(end_bonus);
@@ -260,9 +270,9 @@ thread_local! {
     static DP_BUF: std::cell::RefCell<DpBuf> = std::cell::RefCell::new(DpBuf::default());
 }
 
-/// The score in `mode`; with `clip = Some(xdrop)`, also the best cell anywhere (0 if none), and
-/// stops early (returning NEG for the score in `mode`) once a row falls more than `xdrop`
-/// below it. Rows live in per-thread buffers, and each pass runs over
+/// The score in `mode`; with `clip = Some((xdrop, cell))`, also the best score anywhere (0 if
+/// none) and, if `cell`, where it is, and stops early (returning NEG for the score in `mode`)
+/// once a row falls more than `xdrop` below it. Rows live in per-thread buffers, and each pass runs over
 /// explicit slices so it vectorizes without bounds checks.
 /// The band is laid out for a text of `geom` bases (`geom >= text.len()`; usually equal).
 fn affine_dp(
@@ -271,7 +281,7 @@ fn affine_dp(
     mode: Mode,
     sc: &Affine,
     band: usize,
-    clip: Option<i32>,
+    clip: Option<(i32, bool)>,
     geom: usize,
 ) -> Dp {
     DP_BUF.with(|b| {
@@ -288,7 +298,7 @@ fn affine_dp(
             mode: Mode,
             sc: &Affine,
             (band, geom): (usize, usize),
-            clip: Option<i32>,
+            clip: Option<(i32, bool)>,
             b: &mut DpBuf,
         ) -> Dp {
             let (m, n) = (pattern.len(), text.len());
@@ -396,12 +406,14 @@ fn affine_dp(
                         nhr[k] = hp[k].max(gs[k] - ext * k as i32);
                     }
                 }
-                if let Some(xdrop) = clip {
+                if let Some((xdrop, cell)) = clip {
                     let row = b.nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
                     if row > clip_best {
                         clip_best = row;
-                        let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
-                        clip_cell = (i, lo + j);
+                        if cell {
+                            let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
+                            clip_cell = (i, lo + j);
+                        }
                     }
                     if row < clip_best.saturating_sub(xdrop) {
                         return Dp {

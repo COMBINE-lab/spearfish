@@ -74,6 +74,20 @@ pub struct MapOptions {
 }
 
 impl MapOptions {
+    /// Turn on span extension (if the preset left it off), scored as the preset scores.
+    pub fn extend_ends(&mut self, p: Preset) {
+        if self.params.ends.is_none() {
+            let sc = match p {
+                Preset::Hifi => Affine::HIFI,
+                Preset::Ont | Preset::Drna => Affine::ONT,
+            };
+            self.params.ends = Some(map::Ends {
+                sc,
+                ..Default::default()
+            });
+        }
+    }
+
     pub fn preset(p: Preset) -> Self {
         let mut params = MapParams::default();
         let tb = params.tiebreak.as_mut().expect("tie-break on by default");
@@ -96,9 +110,9 @@ impl MapOptions {
                 // seeds missed. Half the mapping work at identical accuracy (D26).
                 tb.group_fallback = true;
                 params.rescue = None;
-                if let Some(e) = &mut params.ends {
-                    e.sc = Affine::HIFI;
-                }
+                // HiFi anchors already end within a few bases of the read's ends: extending
+                // spans changes no spike-in estimate (D27). Positional models turn it on.
+                params.ends = None;
             }
         }
         MapOptions {

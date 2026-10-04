@@ -133,7 +133,7 @@ pub struct Args {
     #[arg(long)]
     no_merge: bool,
     /// Extend reported spans past the outermost anchors to where the read's alignment ends
-    /// (default: the preset's; on except for drna). Off: spans run from the first to the last
+    /// (default: the preset's; on for ont). Off: spans run from the first to the last
     /// anchor.
     #[arg(long)]
     extend_ends: Option<bool>,
@@ -374,11 +374,11 @@ fn options(args: &Args) -> Result<MapOptions> {
     p.delta_rep = args.delta_rep;
     p.merge_collinear = !args.no_merge;
     match args.extend_ends {
-        Some(false) => p.ends = None,
-        Some(true) if p.ends.is_none() => p.ends = Some(spearfish::Ends::default()),
-        _ => {}
+        Some(false) => o.params.ends = None,
+        Some(true) => o.extend_ends(preset),
+        None => {}
     }
-    if let Some(e) = &mut p.ends {
+    if let Some(e) = &mut o.params.ends {
         e.within = args.extend_within;
     }
     o.chainer = match args.chainer.as_str() {
