@@ -1,13 +1,15 @@
 name: Deploy website
 
 # Publishes the Astro/Starlight site in `website/` to
-# https://combine-lab.github.io/spearfish/.
-#
-# Manual trigger only for now: publishing makes the documentation public, which
-# should wait until spearfish itself is. To deploy on every push to main once it
-# is, add a `push` trigger with `paths: ['website/**']`, as cuttlefish does.
+# https://combine-lab.github.io/spearfish/ on every push to main that changes
+# the site (or this workflow), and on manual dispatch.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
