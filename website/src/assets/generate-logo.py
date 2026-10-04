@@ -2,10 +2,12 @@
 """Generate the spearfish logo.
 
 The fish is drawn from what spearfish does. Its spear-like bill is a long read,
-studded with the seeds that anchor it. Its body carries the read's candidate
-isoforms as colored lanes that run together where the isoforms share exons and
-part in the forked tail where they diverge: the tail fork is the delta of delta
-mapping, which aligns only where candidates differ.
+studded with the seeds that anchor it. Its body holds a splicing graph: exons
+on the midline, and the read's candidate isoforms as colored paths of junction
+arcs between the exons each one includes, two skipping a cassette exon. The
+isoforms part in the forked tail, each lobe holding an alternative last exon:
+the fork is the delta of delta mapping, which aligns only where candidates
+differ.
 
 Usage: generate-logo.py light|dark|favicon-light|favicon-dark > out.svg
 """
@@ -70,33 +72,87 @@ def tail():
     return lobe(-1) + " " + lobe(+1)
 
 
-# Lane offsets (y) through the body, pinched through the peduncle, and each
-# lane's path inside its tail lobe (outer lanes ride the lobes' leading edges).
-BODY_Y = [119.0, 125.0, 131.0, 137.0]
-PED_Y = [124.6, 126.9, 129.1, 131.4]
-TAIL = [
-    ((434, 118), (450, 96), (470, 66)),
-    ((438, 122), (456, 102), (476, 76)),
-    ((438, 134), (456, 154), (476, 180)),
-    ((434, 138), (450, 160), (470, 190)),
+# The splicing graph inside the body: exons on the midline (x ranges), and
+# each isoform's path through them. Isoforms 0-1 draw their junctions above
+# the exon line and end in the upper tail lobe's alternative last exon;
+# isoforms 2-3 draw below and end in the lower lobe. Isoform 1 skips exon 2 and
+# isoform 2 skips exon 1 (cassette exons), so their arcs rise higher.
+MID = 128.0
+EXONS = [(190, 212), (228, 254), (270, 292), (308, 336), (352, 374)]
+PATHS = [
+    [0, 1, 2, 3, 4],
+    [0, 1, 3, 4],
+    [0, 2, 3, 4],
+    [0, 1, 2, 3, 4],
 ]
+SIDE = [-1, -1, 1, 1]  # -1: arcs above the exon line, +1: below
+EXON_H = 9.0
+# Alternative last exons in the tail lobes: centre and angle (degrees).
+LAST = {-1: ((455, 93), -52), 1: ((455, 163), 52)}
+LAST_LEN = 22.0
 
 
-def lanes():
-    """Isoform lanes: shared through the body, splitting in the tail lobes."""
+def junctions():
+    """Junction arcs, offset where several isoforms share a junction."""
+    import math
+
     out = []
-    for i, c in enumerate(ISO):
-        y = BODY_Y[i]
-        (c1x, c1y), (c2x, c2y), (ex, ey) = TAIL[i]
-        d = (
-            f"M 196 128 C 214 {128 + (y - 128) * 0.35:.1f} 236 {y} 262 {y} "
-            f"L 370 {y} "
-            f"C 392 {y} 404 {PED_Y[i]} 420 {PED_Y[i]} "
-            f"C {c1x} {c1y} {c2x} {c2y} {ex} {ey}"
-        )
+    use = {}
+    for i, path in enumerate(PATHS):
+        for a, b in zip(path, path[1:]):
+            use.setdefault((SIDE[i], a, b), []).append(i)
+    for (side, a, b), isos in use.items():
+        for k, i in enumerate(isos):
+            # Nested like a rainbow: a later isoform's arc starts further out
+            # on both exons and rises higher.
+            x0, x1 = EXONS[a][1] - 3 - 3.2 * k, EXONS[b][0] + 3 + 3.2 * k
+            span = x1 - x0
+            h = 5 + 0.20 * span + 2.4 * k
+            y0 = MID + side * EXON_H / 2
+            d = (
+                f"M {x0:.1f} {y0} C {x0 + span * 0.2:.1f} {y0 + side * h * 1.3:.1f} "
+                f"{x1 - span * 0.2:.1f} {y0 + side * h * 1.3:.1f} {x1:.1f} {y0}"
+            )
+            out.append(
+                f'<path d="{d}" fill="none" stroke="{ISO[i]}" stroke-width="3.4" '
+                f'stroke-linecap="round"/>'
+            )
+    # Last junction: from the final shared exon into each lobe's last exon.
+    for side in (-1, 1):
+        (cx, cy), ang = LAST[side]
+        t = math.radians(ang)
+        sx, sy = cx - LAST_LEN / 2 * math.cos(t), cy - LAST_LEN / 2 * math.sin(t)
+        isos = [i for i in range(len(PATHS)) if SIDE[i] == side]
+        y0 = MID + side * EXON_H / 2
+        for k, i in enumerate(isos):
+            x0 = EXONS[-1][1] - 3 - 3.2 * k
+            o = k * 3.6
+            d = (
+                f"M {x0:.1f} {y0} C {x0 + 10:.1f} {y0 + side * (12 + o):.1f} "
+                f"{sx - 22:.1f} {sy + side * (4 + o):.1f} {sx:.1f} {sy:.1f}"
+            )
+            out.append(
+                f'<path d="{d}" fill="none" stroke="{ISO[i]}" stroke-width="3.4" '
+                f'stroke-linecap="round"/>'
+            )
+    return out
+
+
+def exons(theme):
+    """Exon blocks: on the midline, and the alternative last exons in the tail."""
+    fill, edge = EYE[theme], BODY[theme]
+    out = []
+    for x0, x1 in EXONS:
         out.append(
-            f'<path d="{d}" fill="none" stroke="{c}" stroke-width="4.6" '
-            f'stroke-linecap="round" stroke-linejoin="round"/>'
+            f'<rect x="{x0}" y="{MID - EXON_H / 2}" width="{x1 - x0}" height="{EXON_H}" rx="2.4" '
+            f'fill="{fill}" stroke="{edge}" stroke-width="1.2"/>'
+        )
+    for side in (-1, 1):
+        (cx, cy), ang = LAST[side]
+        out.append(
+            f'<rect x="{cx - LAST_LEN / 2}" y="{cy - EXON_H / 2}" width="{LAST_LEN}" height="{EXON_H}" '
+            f'rx="2.4" fill="{fill}" stroke="{edge}" stroke-width="1.2" '
+            f'transform="rotate({ang} {cx} {cy})"/>'
         )
     return out
 
@@ -127,7 +183,8 @@ def logo(theme):
         f'<path d="{tail()}" fill="{col}" opacity="0.38"/>',
         f'<path d="{body_path()}" fill="{col}"/>',
         f'<path d="{pectoral_fin()}" fill="{col}" opacity="0.55"/>',
-        *lanes(),
+        *junctions(),
+        *exons(theme),
         *bill(theme),
         f'<circle cx="176" cy="120" r="7.5" fill="{EYE[theme]}"/>',
         f'<circle cx="174" cy="120" r="3.6" fill="{col}"/>',
