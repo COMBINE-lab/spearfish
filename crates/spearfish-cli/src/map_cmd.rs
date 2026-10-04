@@ -5,8 +5,9 @@
 //! read whose orientations nearly tie (antisense transcripts) is reported on both.
 //! read, read_len, strand, rank, transcript, score, qstart, qend, tstart, tend, anchors,
 //! anchored, max_disc, flags. qstart/qend are raw read coordinates on the read's forward
-//! strand; tstart/tend are transcript coordinates scaled from homopolymer-compressed to raw
-//! length; anchored counts compressed bases. Unmapped reads get one line with transcript `*`.
+//! strand and tstart/tend raw transcript coordinates of the alignment, extended past the
+//! outermost anchors (`--extend-ends`); anchored counts compressed bases. Unmapped reads
+//! get one line with transcript `*`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -130,6 +131,11 @@ pub struct Args {
     /// Chain every anchor separately (no merging of collinear anchors within a unitig).
     #[arg(long)]
     no_merge: bool,
+    /// Extend reported spans past the outermost anchors to where the read's alignment ends
+    /// (default: the preset's; on except for drna). Off: spans run from the first to the last
+    /// anchor.
+    #[arg(long)]
+    extend_ends: Option<bool>,
     /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
     #[arg(long)]
     tie_band: Option<usize>,
@@ -358,6 +364,11 @@ fn options(args: &Args) -> Result<MapOptions> {
     }
     p.delta_rep = args.delta_rep;
     p.merge_collinear = !args.no_merge;
+    match args.extend_ends {
+        Some(false) => p.ends = None,
+        Some(true) if p.ends.is_none() => p.ends = Some(spearfish::Ends::default()),
+        _ => {}
+    }
     o.chainer = match args.chainer.as_str() {
         "oracle" => ChainerKind::Oracle,
         "refine" => ChainerKind::Refine { beam: args.beam },

@@ -37,6 +37,9 @@ counters!(
     MYERS_CALLS,
     MYERS_CELLS,
     BOTH_ORIENTATIONS,
+    SPAN_ENDS,
+    SPAN_END_CALLS,
+    SPAN_END_CELLS,
 );
 
 #[inline]

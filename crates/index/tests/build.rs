@@ -100,6 +100,10 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
                 tx.name
             );
         }
+        // Every parsed position maps to the raw start of its run.
+        for q in 0..=n {
+            assert_eq!(idx.tx_raw_pos(t as u32, q), Some(h.to_raw(q, q).0), "{spec}: {q}");
+        }
     }
     // Colors agree with occurrences.
     for u in 0..idx.n_unitigs() as u32 {

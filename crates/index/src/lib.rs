@@ -24,6 +24,12 @@ pub const FLAG_MASKED: u8 = 1;
 /// Parsed bases between raw-position checkpoints (`tx_raw_ck`).
 pub const RAW_CK: u32 = 64;
 
+/// Base `i` of 2-bit packed `words`.
+#[inline]
+fn base_at(words: &[u64], i: u32) -> u8 {
+    ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8
+}
+
 /// Owned index contents, as produced by `build`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexData {
@@ -347,6 +353,30 @@ impl Index {
     /// Raw 2-bit codes of transcript `t` over the raw span of its parsed bases `[lo, hi)`
     /// (whole homopolymer runs), or None if the index has no raw sequence for `t`.
     pub fn tx_raw_codes(&self, t: u32, lo: u32, hi: u32) -> Option<Vec<u8>> {
+        let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
+        let (words, _) = self.raw_words(t)?;
+        Some((a..b).map(|i| base_at(words, i)).collect())
+    }
+
+    /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
+    /// parsed length), if the index has its raw sequence.
+    pub fn tx_raw_pos(&self, t: u32, p: u32) -> Option<u32> {
+        let (words, ck) = self.raw_words(t)?;
+        let rlen = self.tx_len()[t as usize];
+        // From the checkpoint, skip whole runs.
+        let mut r = ck[(p / RAW_CK) as usize];
+        for _ in 0..p % RAW_CK {
+            let b = base_at(words, r);
+            r += 1;
+            while r < rlen && base_at(words, r) == b {
+                r += 1;
+            }
+        }
+        Some(r)
+    }
+
+    /// Transcript `t`'s packed raw bases and run checkpoints, if present.
+    fn raw_words(&self, t: u32) -> Option<(&[u64], &[u32])> {
         let r = self.raw.as_ref()?;
         // SAFETY: borrowed from self.store, which outlives these slices.
         let (off, words, ck_off, ck) =
@@ -356,23 +386,7 @@ impl Index {
         if ck.is_empty() {
             return None;
         }
-        let words = &words[off[t] as usize..off[t + 1] as usize];
-        let base = |i: u32| ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8;
-        let rlen = self.tx_len()[t];
-        // Raw start of parsed base p: from the checkpoint, skip whole runs.
-        let pos = |p: u32| {
-            let mut r = ck[(p / RAW_CK) as usize];
-            for _ in 0..p % RAW_CK {
-                let b = base(r);
-                r += 1;
-                while r < rlen && base(r) == b {
-                    r += 1;
-                }
-            }
-            r
-        };
-        let (a, b) = (pos(lo), pos(hi));
-        Some((a..b).map(base).collect())
+        Some((&words[off[t] as usize..off[t + 1] as usize], ck))
     }
 
     /// Nodes of unitig `u`, in order.

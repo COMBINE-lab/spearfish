@@ -112,6 +112,41 @@ pub struct MapParams {
     /// Merge collinear anchors within a unitig before chaining (see
     /// [`anchor::merge_collinear`]).
     pub merge_collinear: bool,
+    /// Extend reported spans from the outermost anchors to where the read's alignment ends
+    /// (None: spans end at the outermost anchors).
+    pub ends: Option<Ends>,
+}
+
+/// X-drop extension of each reported hit from its first and last anchors toward the read's
+/// ends, as minimap2 extends its chains. The anchors stop short of the read's ends by up to a
+/// seed spacing; where the read really starts and ends on the transcript is what positional
+/// models (truncation, 3' bias) need, and adapters or poly(A) tails are clipped by the X-drop.
+#[derive(Clone, Debug)]
+pub struct Ends {
+    pub sc: align::Affine,
+    pub band: usize,
+    pub end_bonus: i32,
+    pub xdrop: i32,
+    /// Transcript flank searched beyond the read flank's length: `pad + flank / pad_div`.
+    pub pad: u32,
+    pub pad_div: u32,
+}
+
+/// End extensions of one read: (left side, reverse, read position, transcript flank) to the
+/// read and transcript bases they cover.
+type EndCache = rustc_hash::FxHashMap<(bool, bool, u32, Vec<u8>), (u32, u32)>;
+
+impl Default for Ends {
+    fn default() -> Self {
+        Ends {
+            sc: align::Affine::ONT,
+            band: 16,
+            end_bonus: 5,
+            xdrop: 50,
+            pad: 20,
+            pad_div: 10,
+        }
+    }
 }
 
 /// Which orientations of a read to map against the transcripts.
@@ -135,6 +170,7 @@ impl Default for MapParams {
             pi_cov: 0.5,
             strands: Strands::Both,
             merge_collinear: true,
+            ends: Some(Ends::default()),
         }
     }
 }
@@ -664,6 +700,45 @@ impl<C: Chainer> Mapper<C> {
         }
     }
 
+    /// Extend `h`'s span over the read flanks outside its outermost anchors (`codes`: the
+    /// parsed read in `h`'s orientation). Isoforms sharing a flank's sequence share its
+    /// extension, so `seen` caches extensions by (side, orientation, read position, text).
+    fn extend_ends(&self, e: &Ends, codes: &[u8], h: &mut TxHit, seen: &mut EndCache) {
+        let plen = codes.len() as u32;
+        let tlen = self.idx.tx_plen()[h.tx as usize];
+        let slack = |x: u32| e.pad + x / e.pad_div;
+        let mut ext = |left: bool, q: u32, read: Vec<u8>, text: Vec<u8>| -> (u32, u32) {
+            stats::add(&stats::SPAN_ENDS, 1);
+            *seen.entry((left, h.reverse, q, text)).or_insert_with_key(|k| {
+                let (m, n) = (read.len() as u64, k.3.len() as u64);
+                stats::add(&stats::SPAN_END_CALLS, 1);
+                stats::add(
+                    &stats::SPAN_END_CELLS,
+                    m * (2 * e.band as u64 + m.abs_diff(n) + 1).min(n + 1),
+                );
+                let (_, qi, tj) = align::affine_extend_end(&read, &k.3, &e.sc, e.band, e.end_bonus, e.xdrop);
+                (qi as u32, tj as u32)
+            })
+        };
+        if h.qstart > 0 && h.tstart > 0 {
+            let lo = h.tstart.saturating_sub(h.qstart + slack(h.qstart));
+            let mut text = self.idx.tx_codes(h.tx, lo, h.tstart);
+            text.reverse();
+            let read = codes[..h.qstart as usize].iter().rev().copied().collect();
+            let (qi, tj) = ext(true, h.qstart, read, text);
+            h.qstart -= qi;
+            h.tstart -= tj;
+        }
+        let rest = plen - h.qend;
+        if rest > 0 && h.tend < tlen {
+            let hi = (h.tend + rest + slack(rest)).min(tlen);
+            let text = self.idx.tx_codes(h.tx, h.tend, hi);
+            let (qi, tj) = ext(false, h.qend, codes[h.qend as usize..].to_vec(), text);
+            h.qend += qi;
+            h.tend += tj;
+        }
+    }
+
     fn span_frac(h: Option<&TxHit>, plen: usize) -> f32 {
         h.map_or(0.0, |h| (h.qend - h.qstart) as f32 / plen.max(1) as f32)
     }
@@ -802,6 +877,20 @@ impl<C: Chainer> Mapper<C> {
             let floor = top.score - self.p.delta_rep * top.score.abs();
             low_coverage = ((top.qend - top.qstart) as f32) < self.p.pi_cov * plen as f32;
             hits.retain(|h| h.score >= floor);
+        }
+        if let Some(e) = &self.p.ends {
+            let codes = |s: &[u8]| -> Vec<u8> {
+                s.iter()
+                    .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
+                    .collect()
+            };
+            let this = codes(&st.seq);
+            let that = if both { codes(&other.seq) } else { Vec::new() };
+            let mut seen = rustc_hash::FxHashMap::default();
+            for h in &mut hits {
+                let c = if h.reverse == reverse { &this } else { &that };
+                self.extend_ends(e, c, h, &mut seen);
+            }
         }
         ReadResult {
             len: raw.len() as u32,

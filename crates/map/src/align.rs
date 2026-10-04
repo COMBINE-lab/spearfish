@@ -168,7 +168,7 @@ const NEG: i32 = i32::MIN / 4;
 /// more than `band` off the diagonals spanning the two lengths are not computed, so the
 /// result is a lower bound (pass `usize::MAX` for the exact score).
 pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
-    affine_dp(pattern, text, mode, sc, band, None).0
+    affine_dp(pattern, text, mode, sc, band, None).score
 }
 
 /// Best affine score of an extension from the start of both sequences, with both far ends
@@ -186,9 +186,36 @@ pub fn affine_extend(
     end_bonus: i32,
     xdrop: i32,
 ) -> i32 {
+    affine_extend_end(pattern, text, sc, band, end_bonus, xdrop).0
+}
+
+/// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases).
+pub fn affine_extend_end(
+    pattern: &[u8],
+    text: &[u8],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+) -> (i32, usize, usize) {
     // Reaching the pattern's end earns `end_bonus` (minimap2's --end-bonus).
-    let (whole, clipped) = affine_dp(pattern, text, Mode::Prefix, sc, band, Some(xdrop));
-    clipped.max(whole.saturating_add(end_bonus))
+    let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some(xdrop));
+    let whole = d.score.saturating_add(end_bonus);
+    if d.clip_best >= whole {
+        (d.clip_best, d.clip_cell.0, d.clip_cell.1)
+    } else {
+        (whole, pattern.len(), d.score_col)
+    }
+}
+
+/// What one DP pass found.
+struct Dp {
+    /// Score in the pass's mode, and the text column where it ends (Prefix mode).
+    score: i32,
+    score_col: usize,
+    /// With `clip`, the best cell anywhere and its (pattern, text) position.
+    clip_best: i32,
+    clip_cell: (usize, usize),
 }
 
 /// Reused per-thread DP rows.
@@ -206,18 +233,11 @@ thread_local! {
     static DP_BUF: std::cell::RefCell<DpBuf> = std::cell::RefCell::new(DpBuf::default());
 }
 
-/// (score in `mode`, best cell anywhere if `clip` else 0). With `clip = Some(xdrop)`, also the
-/// best cell anywhere; stops early (returning NEG for the score in `mode`) once a row falls
-/// more than `xdrop` below it. Rows live in per-thread buffers, and each pass runs over
+/// The score in `mode`; with `clip = Some(xdrop)`, also the best cell anywhere (0 if none), and
+/// stops early (returning NEG for the score in `mode`) once a row falls more than `xdrop`
+/// below it. Rows live in per-thread buffers, and each pass runs over
 /// explicit slices so it vectorizes without bounds checks.
-fn affine_dp(
-    pattern: &[u8],
-    text: &[u8],
-    mode: Mode,
-    sc: &Affine,
-    band: usize,
-    clip: Option<i32>,
-) -> (i32, i32) {
+fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, clip: Option<i32>) -> Dp {
     DP_BUF.with(|b| {
         let b = &mut *b.borrow_mut();
         #[multiversion::multiversion(targets(
@@ -234,10 +254,11 @@ fn affine_dp(
             band: usize,
             clip: Option<i32>,
             b: &mut DpBuf,
-        ) -> (i32, i32) {
+        ) -> Dp {
             let (m, n) = (pattern.len(), text.len());
             // With `clip`, the best cell anywhere (0 aligns nothing).
             let mut clip_best = 0i32;
+            let mut clip_cell = (0usize, 0usize);
             let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
             let go = sc.open + sc.ext;
             // Row i (pattern) covers text columns [i - band - (m - n)⁺, i + band +
@@ -330,9 +351,18 @@ fn affine_dp(
                 }
                 if let Some(xdrop) = clip {
                     let row = b.nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
-                    clip_best = clip_best.max(row);
+                    if row > clip_best {
+                        clip_best = row;
+                        let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
+                        clip_cell = (i, lo + j);
+                    }
                     if row < clip_best.saturating_sub(xdrop) {
-                        return (NEG, clip_best);
+                        return Dp {
+                            score: NEG,
+                            score_col: 0,
+                            clip_best,
+                            clip_cell,
+                        };
                     }
                 }
                 std::mem::swap(&mut b.h, &mut b.nh);
@@ -340,11 +370,20 @@ fn affine_dp(
                 stale = prev;
                 prev = (lo, hi);
             }
-            let score = match mode {
-                Mode::Global => b.h[n],
-                Mode::Prefix | Mode::Infix => b.h[prev.0..=prev.1].iter().copied().max().unwrap_or(NEG),
+            let (score, score_col) = match mode {
+                Mode::Global => (b.h[n], n),
+                Mode::Prefix | Mode::Infix => {
+                    let row = &b.h[prev.0..=prev.1];
+                    let x = row.iter().copied().max().unwrap_or(NEG);
+                    (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
+                }
             };
-            (score, clip_best)
+            Dp {
+                score,
+                score_col,
+                clip_best,
+                clip_cell,
+            }
         }
         run(pattern, text, mode, sc, band, clip, b)
     })
@@ -462,6 +501,23 @@ mod tests {
             naive_extend(&p, &t, &sc)
         );
         assert_eq!(affine_extend(&[], &t, &sc, usize::MAX, 0, i32::MAX), 0);
+    }
+
+    #[test]
+    fn affine_extend_end_examples() {
+        let sc = Affine::default();
+        // The read's last 5 bases are junk: the extension ends after 6 read and text bases.
+        let t = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1];
+        let p = [0, 1, 2, 3, 0, 1, 3, 3, 3, 3, 3];
+        assert_eq!(affine_extend_end(&p, &t, &sc, 16, 0, 50), (12, 6, 6));
+        // A whole read with one deleted text base reaches its end at text base 7.
+        let p = [0, 1, 2, 0, 1, 2, 3];
+        assert_eq!(affine_extend_end(&p, &t, &sc, 16, 5, 50), (14 - 6 + 5, 7, 8));
+        // Nothing aligns: no bases.
+        assert_eq!(
+            affine_extend_end(&[3, 3, 3], &[0, 0, 0], &sc, 16, 0, 50),
+            (0, 0, 0)
+        );
     }
 
     #[test]

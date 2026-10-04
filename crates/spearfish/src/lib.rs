@@ -16,8 +16,10 @@
 //!
 //! [`Mapper`] is `Send + Sync`; share one across threads (scratch buffers are per thread).
 //! Mapping works internally in homopolymer-compressed coordinates; [`Hit`] reports query
-//! coordinates in raw read bases (exact) and transcript coordinates scaled from compressed
-//! to raw transcript length (approximate within homopolymer runs).
+//! coordinates in raw read bases and transcript coordinates in raw transcript bases, both exact
+//! (transcript coordinates fall back to scaling from compressed lengths for an index without
+//! raw sequence). Spans run from where the read's alignment starts to where it ends, extended
+//! past the outermost seeds (see [`Ends`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +30,7 @@ use lcp_core::hpc::Hpc;
 use map::{AnyChainer, ChainParams, MapParams, OracleChainer, RefineChainer, Strands, TieBreak};
 
 pub use index::BuildReport;
+pub use map::Ends;
 pub use map::align::Affine;
 pub use quant;
 
@@ -81,6 +84,10 @@ impl MapOptions {
                 tb.affine_within = Some(4);
                 // No template-switch Gs at direct RNA read ends: raw ends cost 12% for nothing.
                 tb.raw_ends = false;
+                // Direct RNA spans extended to the read ends change no spike-in estimate under
+                // the default model and cost 31% more instructions (D27). Positional models
+                // turn them back on.
+                params.ends = None;
             }
             Preset::Hifi => {
                 tb.affine = Some(Affine::HIFI);
@@ -89,6 +96,9 @@ impl MapOptions {
                 // seeds missed. Half the mapping work at identical accuracy (D26).
                 tb.group_fallback = true;
                 params.rescue = None;
+                if let Some(e) = &mut params.ends {
+                    e.sc = Affine::HIFI;
+                }
             }
         }
         MapOptions {
@@ -274,7 +284,8 @@ pub struct Hit {
     /// Query span on the read's forward strand, raw bases.
     pub query_start: u32,
     pub query_end: u32,
-    /// Transcript span, raw bases (scaled from compressed coordinates).
+    /// Transcript span, raw bases (exact if the index holds raw transcript sequence, else
+    /// scaled from compressed coordinates).
     pub target_start: u32,
     pub target_end: u32,
     /// Anchors in the chain, the read bases they cover (compressed), and the largest gap
@@ -343,7 +354,7 @@ impl Mapper {
                     idx.tx_len()[h.tx as usize] as u64,
                     idx.tx_plen()[h.tx as usize].max(1) as u64,
                 );
-                let scale = |x: u32| ((x as u64 * tl) / tpl) as u32;
+                let scale = |x: u32| idx.tx_raw_pos(h.tx, x).unwrap_or(((x as u64 * tl) / tpl) as u32);
                 Hit {
                     tx: h.tx,
                     reverse: h.reverse,
