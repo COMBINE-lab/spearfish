@@ -168,7 +168,7 @@ const NEG: i32 = i32::MIN / 4;
 /// more than `band` off the diagonals spanning the two lengths are not computed, so the
 /// result is a lower bound (pass `usize::MAX` for the exact score).
 pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize) -> i32 {
-    affine_dp(pattern, text, mode, sc, band, None).score
+    affine_dp(pattern, text, mode, sc, band, None, text.len()).score
 }
 
 /// Best affine score of an extension from the start of both sequences, with both far ends
@@ -189,7 +189,8 @@ pub fn affine_extend(
     affine_extend_end(pattern, text, sc, band, end_bonus, xdrop).0
 }
 
-/// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases).
+/// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases,
+/// text bases read).
 pub fn affine_extend_end(
     pattern: &[u8],
     text: &[u8],
@@ -197,14 +198,38 @@ pub fn affine_extend_end(
     band: usize,
     end_bonus: i32,
     xdrop: i32,
-) -> (i32, usize, usize) {
+) -> (i32, usize, usize, usize) {
+    affine_extend_window(pattern, text, text.len(), sc, band, end_bonus, xdrop)
+}
+
+/// [`affine_extend_end`] on a text cut from a window of `window` bases (`text.len() <=
+/// window`): the band is laid out for the whole window, so the result depends on the text only
+/// through the bases read and, if it read them all, the text's length. Texts cut from windows
+/// of one length share results on that basis.
+pub fn affine_extend_window(
+    pattern: &[u8],
+    text: &[u8],
+    window: usize,
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+) -> (i32, usize, usize, usize) {
     // Reaching the pattern's end earns `end_bonus` (minimap2's --end-bonus).
-    let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some(xdrop));
+    let d = affine_dp(
+        pattern,
+        text,
+        Mode::Prefix,
+        sc,
+        band,
+        Some(xdrop),
+        window.max(text.len()),
+    );
     let whole = d.score.saturating_add(end_bonus);
     if d.clip_best >= whole {
-        (d.clip_best, d.clip_cell.0, d.clip_cell.1)
+        (d.clip_best, d.clip_cell.0, d.clip_cell.1, d.text_read)
     } else {
-        (whole, pattern.len(), d.score_col)
+        (whole, pattern.len(), d.score_col, d.text_read)
     }
 }
 
@@ -216,6 +241,8 @@ struct Dp {
     /// With `clip`, the best cell anywhere and its (pattern, text) position.
     clip_best: i32,
     clip_cell: (usize, usize),
+    /// Text bases the pass read (a prefix of the text).
+    text_read: usize,
 }
 
 /// Reused per-thread DP rows.
@@ -237,7 +264,16 @@ thread_local! {
 /// stops early (returning NEG for the score in `mode`) once a row falls more than `xdrop`
 /// below it. Rows live in per-thread buffers, and each pass runs over
 /// explicit slices so it vectorizes without bounds checks.
-fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, clip: Option<i32>) -> Dp {
+/// The band is laid out for a text of `geom` bases (`geom >= text.len()`; usually equal).
+fn affine_dp(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    band: usize,
+    clip: Option<i32>,
+    geom: usize,
+) -> Dp {
     DP_BUF.with(|b| {
         let b = &mut *b.borrow_mut();
         #[multiversion::multiversion(targets(
@@ -251,7 +287,7 @@ fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, 
             text: &[u8],
             mode: Mode,
             sc: &Affine,
-            band: usize,
+            (band, geom): (usize, usize),
             clip: Option<i32>,
             b: &mut DpBuf,
         ) -> Dp {
@@ -261,12 +297,12 @@ fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, 
             let mut clip_cell = (0usize, 0usize);
             let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
             let go = sc.open + sc.ext;
-            // Row i (pattern) covers text columns [i - band - (m - n)⁺, i + band +
-            // (n - m)⁺]; Infix is unbanded.
+            // Row i (pattern) covers text columns [i - band - (m - g)⁺, i + band +
+            // (g - m)⁺] up to n, for the band's text length g; Infix is unbanded.
             let full = mode == Mode::Infix || band == usize::MAX;
             let (below, above) = (
-                band.saturating_add(m.saturating_sub(n)),
-                band.saturating_add(n.saturating_sub(m)),
+                band.saturating_add(m.saturating_sub(geom)),
+                band.saturating_add(geom.saturating_sub(m)),
             );
             let range = |i: usize| {
                 if full {
@@ -295,6 +331,17 @@ fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, 
             let mut stale = (1, 0); // band of the row left in nh (empty)
             for i in 1..=m {
                 let (lo, hi) = range(i);
+                if lo > hi {
+                    // Past the text's end by more than the band (only when geom > n): no
+                    // cell is reachable, so the rest of the pattern can't align.
+                    return Dp {
+                        score: NEG,
+                        score_col: 0,
+                        clip_best,
+                        clip_cell,
+                        text_read: n,
+                    };
+                }
                 b.nh[stale.0..=stale.1.min(n)].fill(NEG);
                 b.nf[stale.0..=stale.1.min(n)].fill(NEG);
                 let c = pattern[i - 1] & 3;
@@ -362,6 +409,7 @@ fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, 
                             score_col: 0,
                             clip_best,
                             clip_cell,
+                            text_read: hi,
                         };
                     }
                 }
@@ -383,9 +431,10 @@ fn affine_dp(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize, 
                 score_col,
                 clip_best,
                 clip_cell,
+                text_read: prev.1,
             }
         }
-        run(pattern, text, mode, sc, band, clip, b)
+        run(pattern, text, mode, sc, (band, geom), clip, b)
     })
 }
 
@@ -506,18 +555,52 @@ mod tests {
     #[test]
     fn affine_extend_end_examples() {
         let sc = Affine::default();
+        let end = |p: &[u8], t: &[u8], bonus| {
+            let (x, i, j, _) = affine_extend_end(p, t, &sc, 16, bonus, 50);
+            (x, i, j)
+        };
         // The read's last 5 bases are junk: the extension ends after 6 read and text bases.
         let t = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1];
-        let p = [0, 1, 2, 3, 0, 1, 3, 3, 3, 3, 3];
-        assert_eq!(affine_extend_end(&p, &t, &sc, 16, 0, 50), (12, 6, 6));
-        // A whole read with one deleted text base reaches its end at text base 7.
-        let p = [0, 1, 2, 0, 1, 2, 3];
-        assert_eq!(affine_extend_end(&p, &t, &sc, 16, 5, 50), (14 - 6 + 5, 7, 8));
+        assert_eq!(end(&[0, 1, 2, 3, 0, 1, 3, 3, 3, 3, 3], &t, 0), (12, 6, 6));
+        // A whole read with one deleted text base reaches its end at text base 8.
+        assert_eq!(end(&[0, 1, 2, 0, 1, 2, 3], &t, 5), (14 - 6 + 5, 7, 8));
         // Nothing aligns: no bases.
-        assert_eq!(
-            affine_extend_end(&[3, 3, 3], &[0, 0, 0], &sc, 16, 0, 50),
-            (0, 0, 0)
-        );
+        assert_eq!(end(&[3, 3, 3], &[0, 0, 0], 0), (0, 0, 0));
+    }
+
+    /// In a window, a text cut anywhere after the bases the DP read gives the same result, and
+    /// a text it read to the end is matched only at that length.
+    #[test]
+    fn affine_extend_window_cuts() {
+        let sc = Affine::default();
+        let t: Vec<u8> = (0..140).map(|i| ((i * 5 + i / 4) % 4) as u8).collect();
+        let mut p = t[..70].to_vec();
+        p.extend((0..40).map(|i| [3, 3, 0, 0][i % 4]));
+        let r = affine_extend_window(&p, &t, t.len(), &sc, 16, 5, 30);
+        assert!(r.3 < t.len(), "{r:?}");
+        for cut in [r.3, r.3 + 1, t.len() - 1] {
+            assert_eq!(affine_extend_window(&p, &t[..cut], t.len(), &sc, 16, 5, 30).0, r.0);
+        }
+        // Cut inside the alignment: the DP reads the whole (shorter) text and stops there.
+        let short = affine_extend_window(&p, &t[..40], t.len(), &sc, 16, 5, 30);
+        assert_eq!((short.2, short.3), (40, 40));
+    }
+
+    /// The result depends on the text only through its length and the prefix the DP read.
+    #[test]
+    fn affine_extend_end_reads_a_prefix() {
+        let sc = Affine::default();
+        let t: Vec<u8> = (0..120).map(|i| ((i * 7 + i / 3) % 4) as u8).collect();
+        let mut p = t[..60].to_vec();
+        // A 40-base junk tail: the X-drop stops the DP before it reads the whole text.
+        p.extend((0..40).map(|i| [3, 3, 0, 0][i % 4]));
+        let r = affine_extend_end(&p, &t, &sc, 16, 5, 30);
+        assert!(r.3 < t.len(), "{r:?}");
+        let mut u = t.clone();
+        for x in &mut u[r.3..] {
+            *x = 3 - *x;
+        }
+        assert_eq!(affine_extend_end(&p, &u, &sc, 16, 5, 30), r);
     }
 
     #[test]

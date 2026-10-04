@@ -259,6 +259,7 @@ impl Rescuer {
                     max_discrepancy: *maxd,
                     chain: chain.iter().map(|&(qs, _, ts, len)| (qs, ts + lo, len)).collect(),
                     reverse: false,
+                    extended: false,
                 });
             }
         }

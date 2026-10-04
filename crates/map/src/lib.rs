@@ -130,11 +130,15 @@ pub struct Ends {
     /// Transcript flank searched beyond the read flank's length: `pad + flank / pad_div`.
     pub pad: u32,
     pub pad_div: u32,
+    /// Extend only hits scoring within this fraction of the read's best (oarfish keeps
+    /// alignments within 5% of the best by default); the others keep their anchor spans.
+    pub within: f32,
 }
 
-/// End extensions of one read: (left side, reverse, read position, transcript flank) to the
-/// read and transcript bases they cover.
-type EndCache = rustc_hash::FxHashMap<(bool, bool, u32, Vec<u8>), (u32, u32)>;
+/// End extensions of one read, keyed by (left side, reverse, read position): the transcript
+/// flank prefix each extension read, whether that was the whole flank, and the read and
+/// transcript bases it covers.
+type EndCache = rustc_hash::FxHashMap<(bool, bool, u32), Vec<(Vec<u8>, bool, (u32, u32))>>;
 
 impl Default for Ends {
     fn default() -> Self {
@@ -145,6 +149,7 @@ impl Default for Ends {
             xdrop: 50,
             pad: 20,
             pad_div: 10,
+            within: 0.05,
         }
     }
 }
@@ -701,39 +706,46 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Extend `h`'s span over the read flanks outside its outermost anchors (`codes`: the
-    /// parsed read in `h`'s orientation). Isoforms sharing a flank's sequence share its
-    /// extension, so `seen` caches extensions by (side, orientation, read position, text).
+    /// parsed read in `h`'s orientation). The transcript flank is a window of the read flank's
+    /// length plus slack, cut short at the transcript's end. The extension depends on it only
+    /// through the bases it read (and, if it read them all, the flank's length), so isoforms
+    /// whose flanks agree there share it; `seen` holds the read's extensions.
     fn extend_ends(&self, e: &Ends, codes: &[u8], h: &mut TxHit, seen: &mut EndCache) {
         let plen = codes.len() as u32;
         let tlen = self.idx.tx_plen()[h.tx as usize];
-        let slack = |x: u32| e.pad + x / e.pad_div;
-        let mut ext = |left: bool, q: u32, read: Vec<u8>, text: Vec<u8>| -> (u32, u32) {
+        let window = |x: u32| x + e.pad + x / e.pad_div;
+        let mut ext = |left: bool, q: u32, read: &[u8], text: Vec<u8>| -> (u32, u32) {
             stats::add(&stats::SPAN_ENDS, 1);
-            *seen.entry((left, h.reverse, q, text)).or_insert_with_key(|k| {
-                let (m, n) = (read.len() as u64, k.3.len() as u64);
-                stats::add(&stats::SPAN_END_CALLS, 1);
-                stats::add(
-                    &stats::SPAN_END_CELLS,
-                    m * (2 * e.band as u64 + m.abs_diff(n) + 1).min(n + 1),
-                );
-                let (_, qi, tj) = align::affine_extend_end(&read, &k.3, &e.sc, e.band, e.end_bonus, e.xdrop);
-                (qi as u32, tj as u32)
-            })
+            let done = seen.entry((left, h.reverse, q)).or_default();
+            let hit = done
+                .iter()
+                .find(|(p, all, _)| text.starts_with(p) && (!*all || text.len() == p.len()));
+            if let Some((_, _, r)) = hit {
+                return *r;
+            }
+            let (m, w) = (read.len() as u64, window(read.len() as u32) as usize);
+            stats::add(&stats::SPAN_END_CALLS, 1);
+            stats::add(&stats::SPAN_END_CELLS, m * (2 * e.band as u64 + w as u64 - m + 1));
+            let (_, qi, tj, used) =
+                align::affine_extend_window(read, &text, w, &e.sc, e.band, e.end_bonus, e.xdrop);
+            let r = (qi as u32, tj as u32);
+            done.push((text[..used].to_vec(), used == text.len(), r));
+            r
         };
         if h.qstart > 0 && h.tstart > 0 {
-            let lo = h.tstart.saturating_sub(h.qstart + slack(h.qstart));
+            let lo = h.tstart.saturating_sub(window(h.qstart));
             let mut text = self.idx.tx_codes(h.tx, lo, h.tstart);
             text.reverse();
-            let read = codes[..h.qstart as usize].iter().rev().copied().collect();
-            let (qi, tj) = ext(true, h.qstart, read, text);
+            let read: Vec<u8> = codes[..h.qstart as usize].iter().rev().copied().collect();
+            let (qi, tj) = ext(true, h.qstart, &read, text);
             h.qstart -= qi;
             h.tstart -= tj;
         }
         let rest = plen - h.qend;
         if rest > 0 && h.tend < tlen {
-            let hi = (h.tend + rest + slack(rest)).min(tlen);
+            let hi = (h.tend + window(rest)).min(tlen);
             let text = self.idx.tx_codes(h.tx, h.tend, hi);
-            let (qi, tj) = ext(false, h.qend, codes[h.qend as usize..].to_vec(), text);
+            let (qi, tj) = ext(false, h.qend, &codes[h.qend as usize..], text);
             h.qend += qi;
             h.tend += tj;
         }
@@ -887,9 +899,11 @@ impl<C: Chainer> Mapper<C> {
             let this = codes(&st.seq);
             let that = if both { codes(&other.seq) } else { Vec::new() };
             let mut seen = rustc_hash::FxHashMap::default();
-            for h in &mut hits {
+            let floor = hits.first().map_or(0.0, |t| t.score - e.within * t.score.abs());
+            for h in hits.iter_mut().filter(|h| h.score >= floor) {
                 let c = if h.reverse == reverse { &this } else { &that };
                 self.extend_ends(e, c, h, &mut seen);
+                h.extended = true;
             }
         }
         ReadResult {

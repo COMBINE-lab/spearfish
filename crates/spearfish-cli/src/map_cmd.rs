@@ -6,8 +6,9 @@
 //! read, read_len, strand, rank, transcript, score, qstart, qend, tstart, tend, anchors,
 //! anchored, max_disc, flags. qstart/qend are raw read coordinates on the read's forward
 //! strand and tstart/tend raw transcript coordinates of the alignment, extended past the
-//! outermost anchors (`--extend-ends`); anchored counts compressed bases. Unmapped reads
-//! get one line with transcript `*`.
+//! outermost anchors for hits within `--extend-within` of the best score (`--extend-ends`);
+//! other hits' spans run between their outermost anchors and carry the flag `anchor_span`.
+//! anchored counts compressed bases. Unmapped reads get one line with transcript `*`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -136,6 +137,9 @@ pub struct Args {
     /// anchor.
     #[arg(long)]
     extend_ends: Option<bool>,
+    /// Extend only hits scoring within this fraction of the read's best.
+    #[arg(long, default_value_t = 0.05)]
+    extend_within: f32,
     /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
     #[arg(long)]
     tie_band: Option<usize>,
@@ -204,6 +208,11 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         };
         for (rank, h) in r.hits.iter().enumerate() {
             let strand = if h.reverse { '-' } else { '+' };
+            let flags = match (h.extended, flags) {
+                (true, f) => f.to_string(),
+                (false, "-") => "anchor_span".to_string(),
+                (false, f) => format!("{f},anchor_span"),
+            };
             let _ = writeln!(
                 self.buf,
                 "{name}\t{}\t{strand}\t{rank}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{flags}",
@@ -368,6 +377,9 @@ fn options(args: &Args) -> Result<MapOptions> {
         Some(false) => p.ends = None,
         Some(true) if p.ends.is_none() => p.ends = Some(spearfish::Ends::default()),
         _ => {}
+    }
+    if let Some(e) = &mut p.ends {
+        e.within = args.extend_within;
     }
     o.chainer = match args.chainer.as_str() {
         "oracle" => ChainerKind::Oracle,

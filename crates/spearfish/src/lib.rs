@@ -293,6 +293,9 @@ pub struct Hit {
     pub anchors: u32,
     pub anchored: u32,
     pub max_discrepancy: f32,
+    /// The span reaches the read's alignment ends; otherwise it runs from the first to the
+    /// last anchor (hits scoring well below the best, or extension off).
+    pub extended: bool,
 }
 
 /// All hits of one read, best first.
@@ -366,6 +369,7 @@ impl Mapper {
                     anchors: h.anchors,
                     anchored: h.anchored,
                     max_discrepancy: h.max_discrepancy,
+                    extended: h.extended,
                 }
             })
             .collect();

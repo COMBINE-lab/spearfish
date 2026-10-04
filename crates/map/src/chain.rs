@@ -64,6 +64,8 @@ pub struct TxHit {
     pub chain: Vec<(u32, u32, u32)>,
     /// The read's reverse complement was chained (set by the mapper).
     pub reverse: bool,
+    /// The span was extended past the outermost anchors to the read's ends (set by the mapper).
+    pub extended: bool,
 }
 
 /// A transcript's hit from its chain, given as (qs, qe, ts, len) per anchor in query order.
@@ -97,6 +99,7 @@ pub(crate) fn hit_from_path(
         max_discrepancy,
         chain,
         reverse: false,
+        extended: false,
     }
 }
 
