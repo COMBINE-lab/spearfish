@@ -1,0 +1,56 @@
+---
+title: spearfish
+description: Fast long-read transcriptome mapping by delta mapping. Every compatible isoform, scored, with each piece of evidence computed once.
+template: splash
+hero:
+  tagline: Fast long-read transcriptome mapping. Every isoform a read is compatible with, scored, with each piece of evidence computed once instead of once per isoform.
+  image:
+    file: ../../assets/spearfish-logo.svg
+  actions:
+    - text: Get started
+      link: getting-started/introduction/
+      icon: right-arrow
+    - text: How it works
+      link: concepts/delta-mapping/
+      icon: document
+      variant: secondary
+    - text: View on GitHub
+      link: https://github.com/COMBINE-lab/spearfish
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+:::caution[Early development]
+spearfish is research software under active development. Command-line options and the output
+format may still change between versions.
+:::
+
+## What spearfish does
+
+The isoforms of a gene are built from a shared pool of exons, so a long read is usually
+compatible with many transcripts at once. Mappers designed for genomes treat each transcript as
+a separate target and repeat the same seeding, chaining and alignment for every isoform that
+contains an exon. spearfish does that work once per distinct piece of sequence, and reports, for
+each read, every compatible transcript with its position and its score relative to the best.
+We call this [delta mapping](concepts/delta-mapping/).
+
+<CardGrid stagger>
+  <Card title="Built for long reads" icon="seti:pipeline">
+    Presets for ONT cDNA, ONT direct RNA and PacBio HiFi. Seeds from locally consistent parsing
+    survive the errors of long reads, and read ends are clipped where adapters hang off them.
+  </Card>
+  <Card title="Delta mapping" icon="seti:graphql">
+    Each candidate transcript gets an exact chain score and, for near-ties, base-level score
+    differences computed only where the candidates differ.
+  </Card>
+  <Card title="Fast and small" icon="rocket">
+    8.5 to 28 times faster than minimap2 on the transcriptome, in under 2 GB of memory, with a
+    1.3 GB index for all of GENCODE.
+  </Card>
+  <Card title="Made for quantification" icon="seti:db">
+    The scored transcript sets are what an EM needs. Quantify with the built-in `spearfish quant`,
+    or use spearfish as the mapping front end of oarfish.
+  </Card>
+</CardGrid>

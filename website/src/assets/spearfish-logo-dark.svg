@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="12 34 484 188" width="484" height="188" role="img" aria-label="A spearfish whose bill is a long read and whose body carries isoform lanes that split in its forked tail">
+<path d="M 190 101 C 196 80 204 62 216 56 C 252 62 310 80 364 100 C 320 95 258 94 190 101 Z" fill="#EAF0F7" opacity="0.38"/>
+<line x1="204" y1="99" x2="210" y2="66" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<line x1="222" y1="99" x2="230" y2="62" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<line x1="242" y1="99" x2="250" y2="66" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<line x1="262" y1="99" x2="270" y2="71" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<line x1="282" y1="99" x2="290" y2="76" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<line x1="302" y1="99" x2="310" y2="82" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<line x1="322" y1="99" x2="330" y2="88" stroke="#EAF0F7" stroke-width="1.6" opacity="0.6"/>
+<path d="M 414 132 C 436 148 458 174 484 208 C 482 178 468 150 446 130 Z M 414 124 C 436 108 458 82 484 48 C 482 78 468 106 446 126 Z" fill="#EAF0F7" opacity="0.38"/>
+<path d="M 150 128 C 172 104 222 90 286 92 C 344 94 396 114 422 123 L 422 133 C 396 142 344 162 286 164 C 222 166 172 152 150 128 Z" fill="#EAF0F7"/>
+<path d="M 214 148 C 224 154 234 162 242 170 C 230 167 220 161 212 154 Z" fill="#EAF0F7" opacity="0.55"/>
+<path d="M 196 128 C 214 124.8 236 119.0 262 119.0 L 370 119.0 C 392 119.0 404 124.6 420 124.6 C 434 118 450 96 470 66" fill="none" stroke="#E4572E" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 196 128 C 214 127.0 236 125.0 262 125.0 L 370 125.0 C 392 125.0 404 126.9 420 126.9 C 438 122 456 102 476 76" fill="none" stroke="#F2A93B" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 196 128 C 214 129.1 236 131.0 262 131.0 L 370 131.0 C 392 131.0 404 129.1 420 129.1 C 438 134 456 154 476 180" fill="none" stroke="#17A398" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 196 128 C 214 131.2 236 137.0 262 137.0 L 370 137.0 C 392 137.0 404 131.4 420 131.4 C 434 138 450 160 470 190" fill="none" stroke="#4C6EF5" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 22 124.5 L 156 123 L 156 133 L 22 131.5 Z" fill="#EAF0F7"/>
+<circle cx="22" cy="128" r="3.4" fill="#EAF0F7"/>
+<circle cx="44" cy="128" r="5.6" fill="#E4572E"/>
+<circle cx="70" cy="128" r="5.6" fill="#F2A93B"/>
+<circle cx="96" cy="128" r="5.6" fill="#17A398"/>
+<circle cx="122" cy="128" r="5.6" fill="#4C6EF5"/>
+<circle cx="176" cy="120" r="7.5" fill="#22303F"/>
+<circle cx="174" cy="120" r="3.6" fill="#EAF0F7"/>
+</svg>
