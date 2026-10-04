@@ -16,7 +16,8 @@ into a transcriptome *core graph* that factors out splicing and paralog redundan
 computes exact per-transcript chain scores while sharing work across isoforms, and base-level
 alignment is restricted to the read segments where tied isoforms differ.
 
-Documentation: the Astro/Starlight site in `website/` (`cd website && npm install && npm run dev`).
+Documentation: https://combine-lab.github.io/spearfish/ (source in `website/`; preview locally with
+`cd website && npm install && npm run dev`).
 
 **Status:** early development. See `PLAN.md` for the schedule and `DECISIONS.md` for
 design decisions and the evidence behind them.
