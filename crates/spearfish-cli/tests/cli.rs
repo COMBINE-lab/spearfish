@@ -262,3 +262,46 @@ fn simulate_and_map_on_toy() {
     }
     assert!(correct >= 195, "{correct}/200 top hits correct");
 }
+
+/// `quant` skips reads flagged `low_coverage` whatever other flags the line carries.
+#[test]
+fn quant_skips_low_coverage_reads_with_other_flags() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let (map, out) = (dir.join("flags_map.tsv"), dir.join("flags_quant.tsv"));
+    let head = "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n";
+    let line = |r: &str, t: &str, flags: &str| {
+        format!("{r}\t1000\t+\t0\t{t}\t100.00\t0\t1000\t0\t1000\t10\t500\t0\t{flags}\n")
+    };
+    let tsv = [
+        head.to_string(),
+        line("r1", "TOYT0000001", "-"),
+        line("r2", "TOYT0000002", "low_coverage,anchor_span"),
+        line("r3", "TOYT0000002", "rescued,low_coverage"),
+        line("r4", "TOYT0000003", "anchor_span"),
+    ]
+    .concat();
+    std::fs::write(&map, tsv).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .args([
+            "quant".as_ref(),
+            toy().as_os_str(),
+            map.as_os_str(),
+            "-o".as_ref(),
+            out.as_os_str(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let counts: std::collections::HashMap<String, f64> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0].to_string(), f[2].parse().unwrap())
+        })
+        .collect();
+    assert_eq!(counts["TOYT0000001"], 1.0);
+    assert_eq!(counts["TOYT0000002"], 0.0);
+    assert_eq!(counts["TOYT0000003"], 1.0);
+}

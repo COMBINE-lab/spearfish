@@ -82,7 +82,8 @@ pub fn run(args: Args) -> Result<()> {
         let read = it.next().unwrap_or("");
         let tx = it.nth(3).unwrap_or("*");
         let score: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
-        let low = line.ends_with("low_coverage");
+        let flags = line.rsplit('\t').next().unwrap_or("");
+        let low = flags.split(',').any(|f| f == "low_coverage");
         if read != cur {
             if !hits.is_empty() {
                 b.add(&hits, &lens, &p);

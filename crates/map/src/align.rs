@@ -579,7 +579,10 @@ mod tests {
         let r = affine_extend_window(&p, &t, t.len(), &sc, 16, 5, 30);
         assert!(r.3 < t.len(), "{r:?}");
         for cut in [r.3, r.3 + 1, t.len() - 1] {
-            assert_eq!(affine_extend_window(&p, &t[..cut], t.len(), &sc, 16, 5, 30).0, r.0);
+            assert_eq!(
+                affine_extend_window(&p, &t[..cut], t.len(), &sc, 16, 5, 30).0,
+                r.0
+            );
         }
         // Cut inside the alignment: the DP reads the whole (shorter) text and stops there.
         let short = affine_extend_window(&p, &t[..40], t.len(), &sc, 16, 5, 30);
