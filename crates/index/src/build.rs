@@ -40,10 +40,18 @@ pub struct BuildParams {
 /// base-level seeds (same labels at the same relative offsets) held by at most `max_tx`
 /// transcripts. Isoforms that share an exon share long runs; a single seed shared by chance,
 /// or a run inside a repeat held by many transcripts, links nothing.
+///
+/// A second, attach-only pass then joins each small group (at most `attach_max` transcripts)
+/// to a larger group with which it shares runs of `attach_span` seeds, if those runs point to
+/// that group unambiguously: short isoforms and fragments often share real exons with their
+/// gene but no long run. Large groups never merge in this pass, so it cannot chain groups.
+/// `attach_span = 0` skips it.
 #[derive(Clone, Copy, Debug)]
 pub struct InferGenes {
     pub span: usize,
     pub max_tx: u32,
+    pub attach_span: usize,
+    pub attach_max: usize,
 }
 
 /// What a graph node is.
@@ -184,9 +192,9 @@ fn raw_packing(raw: &[u8], h: &lcp_core::hpc::Hpc) -> (Vec<u64>, Vec<u32>) {
 /// transcripts that hold a run unless more than `max_tx` do. Groups are named `group<k>`,
 /// numbered in order of their first transcript. Returns (group per transcript, names, largest
 /// group size).
-fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
-    let n = txs.len();
-    let (span, max_tx) = (inf.span.max(1), inf.max_tx);
+/// (run hash, transcript) for every run of `span` consecutive seeds, sorted and deduplicated.
+fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
+    let span = span.max(1);
     let mut pairs: Vec<(u64, u32)> = seeded
         .par_iter()
         .enumerate()
@@ -204,6 +212,61 @@ fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>
         .collect();
     pairs.par_sort_unstable();
     pairs.dedup();
+    pairs
+}
+
+/// The attach-only pass of [`InferGenes`]: each group of at most `attach_max` transcripts joins
+/// the larger group holding the most of its `attach_span`-seed runs (runs in at most `max_tx`
+/// transcripts), if that group holds at least twice as many as any other.
+fn attach_small(seeded: &[Seeded], parent: &mut [u32], inf: InferGenes, find: fn(&mut [u32], u32) -> u32) {
+    let n = parent.len();
+    let root: Vec<u32> = (0..n as u32).map(|t| find(parent, t)).collect();
+    let mut size: HashMap<u32, usize> = HashMap::new();
+    for &r in &root {
+        *size.entry(r).or_default() += 1;
+    }
+    let small = |r: u32| size[&r] <= inf.attach_max;
+    let pairs = seed_runs(seeded, inf.attach_span);
+    // (small root, other root) -> runs shared.
+    let mut votes: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut i = 0;
+    while i < pairs.len() {
+        let mut j = i + 1;
+        while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+            j += 1;
+        }
+        if j - i > 1 && j - i <= inf.max_tx as usize {
+            let mut roots: Vec<u32> = pairs[i..j].iter().map(|&(_, t)| root[t as usize]).collect();
+            roots.sort_unstable();
+            roots.dedup();
+            for &a in roots.iter().filter(|&&a| small(a)) {
+                for &b in roots.iter().filter(|&&b| b != a && size[&b] > size[&a]) {
+                    *votes.entry((a, b)).or_default() += 1;
+                }
+            }
+        }
+        i = j;
+    }
+    let mut best: HashMap<u32, (u32, u32, u32)> = HashMap::new(); // small -> (target, top, second)
+    for (&(a, b), &v) in &votes {
+        let e = best.entry(a).or_insert((u32::MAX, 0, 0));
+        if v > e.1 {
+            *e = (b, v, e.1);
+        } else if v > e.2 {
+            e.2 = v;
+        }
+    }
+    for (a, (b, top, second)) in best {
+        if top >= 2 * second.max(1) {
+            parent[a as usize] = b;
+        }
+    }
+}
+
+fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
+    let n = txs.len();
+    let max_tx = inf.max_tx;
+    let pairs = seed_runs(seeded, inf.span);
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
@@ -230,6 +293,10 @@ fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>
             }
         }
         i = j;
+    }
+    drop(pairs);
+    if inf.attach_span > 0 {
+        attach_small(seeded, &mut parent, inf, find);
     }
     let mut group_of_root: HashMap<u32, u32> = HashMap::new();
     let mut size: Vec<usize> = Vec::new();

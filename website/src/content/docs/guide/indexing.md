@@ -21,8 +21,11 @@ transcripts belong together. There are three ways to tell it:
   annotation.
 - **Inferred from sequence**, `--infer-genes`, for transcriptomes without an annotation (other
   species, de novo assemblies). Transcripts that share a run of 12 consecutive seeds (about 300
-  bases) are grouped, ignoring runs found in more than 64 transcripts, which are repeats. On human
-  GENCODE these groups give the same mapping accuracy as the annotated genes.
+  bases) are grouped, ignoring runs found in more than 64 transcripts, which are repeats; then
+  short transcripts left on their own join the one group they share shorter runs (about 100
+  bases) with. On human GENCODE these groups give the same mapping accuracy as the annotated
+  genes. They merge gene families whose copies are near-identical, which reads cannot tell apart
+  either.
 
 Without any of these, every transcript is its own gene and `spearfish index` prints a warning.
 Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB, and fewer reads are
@@ -55,6 +58,8 @@ For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in ab
 | `--t2g` | | Transcript-to-gene table (see above). |
 | `--infer-genes [N]` | off (N = 64) | Infer genes from shared seed runs, ignoring runs in more than N transcripts. |
 | `--infer-span` | `12` | Consecutive seeds a shared run must span. |
+| `--infer-attach-span` | `4` | Shorter runs by which small groups attach to a larger one (0 = off). |
+| `--infer-attach-max` | `3` | Largest group, in transcripts, that may attach. |
 | `--write-t2g` | | Write the transcript-to-gene grouping used. |
 
 `spearfish index-stats` reports on a built index.

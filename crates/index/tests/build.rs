@@ -236,7 +236,12 @@ fn inferred_genes_follow_shared_exons() {
             f_max: 20,
             allow_collisions: false,
             collapse: Collapse::Gene,
-            infer_genes: Some(InferGenes { span, max_tx }),
+            infer_genes: Some(InferGenes {
+                span,
+                max_tx,
+                attach_span: 4,
+                attach_max: 3,
+            }),
         };
         build(&txs, &p).unwrap().1.tx_gene
     };

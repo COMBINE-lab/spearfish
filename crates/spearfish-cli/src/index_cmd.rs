@@ -27,6 +27,13 @@ pub struct Args {
     /// 300 bases of shared sequence).
     #[arg(long, default_value_t = 12)]
     infer_span: usize,
+    /// Gene inference, attach pass: shorter runs (in seeds; 0 = off) by which small groups join
+    /// the one larger group they point to.
+    #[arg(long, default_value_t = 4)]
+    infer_attach_span: usize,
+    /// Gene inference, attach pass: largest group (in transcripts) that may attach.
+    #[arg(long, default_value_t = 3)]
+    infer_attach_max: usize,
     /// Write the transcript-to-gene grouping used (given or inferred) to this TSV.
     #[arg(long)]
     write_t2g: Option<PathBuf>,
@@ -116,6 +123,8 @@ pub fn run(args: Args) -> Result<()> {
         infer_genes: args.infer_genes.map(|max_tx| index::InferGenes {
             span: args.infer_span,
             max_tx,
+            attach_span: args.infer_attach_span,
+            attach_max: args.infer_attach_max,
         }),
     };
     let (data, rep) = pool.install(|| build(&txs, &params))?;
