@@ -31,6 +31,19 @@ pub struct BuildParams {
     /// Build even if a label maps to two different contents (otherwise an error).
     pub allow_collisions: bool,
     pub collapse: Collapse,
+    /// Group transcripts into genes from their sequence instead of `TxInput::gene`, for
+    /// transcriptomes without a transcript-to-gene annotation (see [`InferGenes`]).
+    pub infer_genes: Option<InferGenes>,
+}
+
+/// Gene inference: two transcripts share a group if they share a run of `span` consecutive
+/// base-level seeds (same labels at the same relative offsets) held by at most `max_tx`
+/// transcripts. Isoforms that share an exon share long runs; a single seed shared by chance,
+/// or a run inside a repeat held by many transcripts, links nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct InferGenes {
+    pub span: usize,
+    pub max_tx: u32,
 }
 
 /// What a graph node is.
@@ -82,6 +95,11 @@ pub struct BuildReport {
     pub heads_start: usize,
     pub heads_multi_pred: usize,
     pub heads_pred_branches: usize,
+    /// The gene index of each transcript (inferred or given), and the gene names.
+    pub tx_gene: Vec<u32>,
+    pub gene_names: Vec<String>,
+    /// With `infer_genes`: the largest group, in transcripts.
+    pub largest_group_tx: usize,
     pub seconds: Vec<(&'static str, f64)>,
 }
 
@@ -162,6 +180,75 @@ fn raw_packing(raw: &[u8], h: &lcp_core::hpc::Hpc) -> (Vec<u64>, Vec<u32>) {
     (crate::pack2(raw), ck)
 }
 
+/// Transcript groups from shared seed runs: union-find over transcripts, linking all
+/// transcripts that hold a run unless more than `max_tx` do. Groups are named `group<k>`,
+/// numbered in order of their first transcript. Returns (group per transcript, names, largest
+/// group size).
+fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
+    let n = txs.len();
+    let (span, max_tx) = (inf.span.max(1), inf.max_tx);
+    let mut pairs: Vec<(u64, u32)> = seeded
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(t, s)| {
+            let seeds = &s.0;
+            (0..seeds.len().saturating_sub(span - 1)).map(move |i| {
+                let mut h = xxhash_rust::xxh3::Xxh3::with_seed(0x6e_6e_65_73);
+                for x in &seeds[i..i + span] {
+                    h.update(&x.label.to_le_bytes());
+                    h.update(&(x.start - seeds[i].start).to_le_bytes());
+                }
+                (h.digest(), t as u32)
+            })
+        })
+        .collect();
+    pairs.par_sort_unstable();
+    pairs.dedup();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize];
+            x = parent[x as usize];
+        }
+        x
+    }
+    let mut i = 0;
+    while i < pairs.len() {
+        let mut j = i + 1;
+        while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+            j += 1;
+        }
+        if j - i > 1 && j - i <= max_tx as usize {
+            let r0 = find(&mut parent, pairs[i].1);
+            for &(_, t) in &pairs[i + 1..j] {
+                let r = find(&mut parent, t);
+                if r != r0 {
+                    // Union by smaller index keeps roots at a group's first transcript.
+                    let (a, b) = if r < r0 { (r, r0) } else { (r0, r) };
+                    parent[b as usize] = a;
+                }
+            }
+        }
+        i = j;
+    }
+    let mut group_of_root: HashMap<u32, u32> = HashMap::new();
+    let mut size: Vec<usize> = Vec::new();
+    let tx_gene: Vec<u32> = (0..n as u32)
+        .map(|t| {
+            let r = find(&mut parent, t);
+            let g = *group_of_root.entry(r).or_insert_with(|| {
+                size.push(0);
+                size.len() as u32 - 1
+            });
+            size[g as usize] += 1;
+            g
+        })
+        .collect();
+    let names = (0..size.len()).map(|g| format!("group{g}")).collect();
+    let largest = size.iter().copied().max().unwrap_or(0);
+    (tx_gene, names, largest)
+}
+
 pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport)> {
     let mut rep = BuildReport {
         transcripts: txs.len(),
@@ -201,18 +288,29 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
 
     // 2. Genes and nodes. A node is a (label, scope) pair, scope = gene or 0; nodes are
     // sorted by label, so each label's nodes are contiguous.
-    let mut gene_ids: HashMap<&str, u32> = HashMap::new();
-    let mut gene_names: Vec<&str> = Vec::new();
-    let tx_gene: Vec<u32> = txs
-        .iter()
-        .map(|t| {
-            *gene_ids.entry(&t.gene).or_insert_with(|| {
-                gene_names.push(&t.gene);
-                gene_names.len() as u32 - 1
-            })
-        })
-        .collect();
+    let (tx_gene, gene_names): (Vec<u32>, Vec<String>) = match p.infer_genes {
+        Some(inf) => {
+            let (tx_gene, names, largest) = infer_genes(txs, &seeded, inf);
+            rep.largest_group_tx = largest;
+            (tx_gene, names)
+        }
+        None => {
+            let mut gene_ids: HashMap<&str, u32> = HashMap::new();
+            let mut names: Vec<String> = Vec::new();
+            let tx_gene = txs
+                .iter()
+                .map(|t| {
+                    *gene_ids.entry(&t.gene).or_insert_with(|| {
+                        names.push(t.gene.clone());
+                        names.len() as u32 - 1
+                    })
+                })
+                .collect();
+            (tx_gene, names)
+        }
+    };
     rep.genes = gene_names.len();
+    lap(&mut rep, "genes");
     let scope = |t: usize| {
         if p.collapse == Collapse::Gene {
             tx_gene[t]
@@ -569,7 +667,9 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
             Default::default()
         },
         tx_names: txs.iter().map(|t| t.name.clone()).collect(),
-        gene_names: gene_names.iter().map(|s| s.to_string()).collect(),
+        gene_names: gene_names.clone(),
     };
+    rep.tx_gene = data.tx_gene.clone();
+    rep.gene_names = gene_names;
     Ok((data, rep))
 }

@@ -60,6 +60,7 @@ fn check(spec: &str, rate: f64) {
             f_max: 20,
             allow_collisions: false,
             collapse: Collapse::Gene,
+            infer_genes: None,
         },
     )
     .unwrap();
@@ -143,6 +144,7 @@ fn antisense_overlap_reports_both_orientations() {
             f_max: 20,
             allow_collisions: false,
             collapse: Collapse::Gene,
+            infer_genes: None,
         },
     )
     .unwrap();

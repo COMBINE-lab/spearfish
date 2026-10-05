@@ -7,10 +7,28 @@ description: Index a transcriptome with spearfish index.
 spearfish index transcripts.fa.gz -o transcripts.sfi -t 16
 ```
 
-The input is a transcript FASTA, plain or compressed. spearfish reads gene membership from
-GENCODE-style headers (`transcript|gene|...`); with other headers each transcript is its own
-gene. Gene membership matters: seeds are collapsed within a gene, which is where isoforms share
-their exons.
+The input is a transcript FASTA, plain or compressed.
+
+## Gene membership
+
+spearfish collapses seeds within a gene, which is where isoforms share their exons, and it picks
+candidate genes for each read before scoring their transcripts. So it needs to know which
+transcripts belong together. There are three ways to tell it:
+
+- **GENCODE-style headers** (`transcript|gene|...`): used automatically.
+- **A transcript-to-gene table**, `--t2g t2g.tsv`, with one `transcript gene` pair per line
+  (whitespace-separated; further columns are ignored). Use this for Ensembl, RefSeq or any other
+  annotation.
+- **Inferred from sequence**, `--infer-genes`, for transcriptomes without an annotation (other
+  species, de novo assemblies). Transcripts that share a run of 12 consecutive seeds (about 300
+  bases) are grouped, ignoring runs found in more than 64 transcripts, which are repeats. On human
+  GENCODE these groups give the same mapping accuracy as the annotated genes.
+
+Without any of these, every transcript is its own gene and `spearfish index` prints a warning.
+Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB, and fewer reads are
+assigned to the right transcript (top-1 95.9% falls to 92.5% on simulated ONT reads), because the
+per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
+writes the grouping that was used.
 
 For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in about 6 seconds on
 32 threads. Map against an index built from the same transcript FASTA you quantify against.
@@ -34,5 +52,9 @@ For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in ab
 | `--hpc` | `true` | Homopolymer-compress transcripts, and reads at mapping time. |
 | `--collapse` | `gene` | Collapse seeds per (label, gene) or globally (`global`, larger and slower). |
 | `--f-max` | `20` | Mask unitigs shared by more than this many genes (repeats). |
+| `--t2g` | | Transcript-to-gene table (see above). |
+| `--infer-genes [N]` | off (N = 64) | Infer genes from shared seed runs, ignoring runs in more than N transcripts. |
+| `--infer-span` | `12` | Consecutive seeds a shared run must span. |
+| `--write-t2g` | | Write the transcript-to-gene grouping used. |
 
 `spearfish index-stats` reports on a built index.

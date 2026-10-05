@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use index::{BuildParams, Collapse, Index, TxInput, build};
+use index::{BuildParams, Collapse, Index, InferGenes, TxInput, build};
 use proptest::prelude::*;
 use seeds::BaseSeeder;
 
@@ -34,6 +34,7 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
         f_max: 20,
         allow_collisions: false,
         collapse,
+        infer_genes: None,
     };
     let (data, rep) = build(txs, &p).unwrap();
     assert_eq!(rep.inconsistent_lengths, 0, "{spec}");
@@ -166,6 +167,7 @@ fn file_roundtrip() {
             f_max: 20,
             allow_collisions: false,
             collapse: Collapse::Gene,
+            infer_genes: None,
         },
     )
     .unwrap();
@@ -217,6 +219,46 @@ fn transcriptome() -> impl Strategy<Value = Vec<TxInput>> {
     })
 }
 
+/// Gene inference on the toy transcriptome: isoforms that share exons are grouped, the paralog
+/// pair (GENEC, GENECP) stays apart at the default run length, and a run held by more than
+/// `max_tx` transcripts links nothing.
+#[test]
+fn inferred_genes_follow_shared_exons() {
+    let mut txs = toy();
+    let annotated: Vec<String> = txs.iter().map(|t| t.gene.clone()).collect();
+    for t in &mut txs {
+        t.gene = t.name.clone();
+    }
+    let groups = |span, max_tx| {
+        let p = BuildParams {
+            spec: "lcp:K=3".into(),
+            hpc: true,
+            f_max: 20,
+            allow_collisions: false,
+            collapse: Collapse::Gene,
+            infer_genes: Some(InferGenes { span, max_tx }),
+        };
+        build(&txs, &p).unwrap().1.tx_gene
+    };
+    // Same partition as the annotation: same group iff same annotated gene.
+    let g = groups(12, 64);
+    for i in 0..txs.len() {
+        for j in 0..txs.len() {
+            assert_eq!(
+                g[i] == g[j],
+                annotated[i] == annotated[j],
+                "{} {}",
+                txs[i].name,
+                txs[j].name
+            );
+        }
+    }
+    // Runs held by two or more transcripts are all above max_tx = 1: nothing is linked.
+    let g = groups(12, 1);
+    let distinct: HashSet<u32> = g.iter().copied().collect();
+    assert_eq!(distinct.len(), txs.len());
+}
+
 #[test]
 fn raw_sequence_skipped_where_non_acgt_merges_runs() {
     // "AN" is two parsed runs but packs as "AA" (one run): no raw sequence for that transcript.
@@ -238,6 +280,7 @@ fn raw_sequence_skipped_where_non_acgt_merges_runs() {
         f_max: 20,
         allow_collisions: false,
         collapse: Collapse::Gene,
+        infer_genes: None,
     };
     let idx = Index::from_bytes(&build(&txs, &p).unwrap().0.to_bytes()).unwrap();
     assert_eq!(idx.tx_raw_codes(0, 0, 3), None);

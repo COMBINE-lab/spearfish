@@ -87,6 +87,7 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
             f_max: 1000,
             allow_collisions: false,
             collapse: Collapse::Gene,
+            infer_genes: None,
         },
     )
     .unwrap();

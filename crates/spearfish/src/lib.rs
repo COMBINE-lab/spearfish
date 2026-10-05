@@ -214,6 +214,7 @@ impl Index {
             } else {
                 Collapse::Global
             },
+            infer_genes: None,
         };
         index::build(&txs, &params)
     }

@@ -12,8 +12,24 @@ use paraseq::{ReaderBuilder, Record};
 #[derive(clap::Args, Debug)]
 pub struct Args {
     /// Transcript FASTA (optionally compressed). GENCODE headers (`tx|gene|...`) give gene
-    /// IDs; otherwise each transcript is its own gene.
+    /// IDs; otherwise use --t2g or --infer-genes, or each transcript is its own gene.
     transcripts: PathBuf,
+    /// Transcript-to-gene table: whitespace-separated `transcript gene` per line (further
+    /// columns ignored). Overrides gene IDs from the FASTA headers.
+    #[arg(long, conflicts_with = "infer_genes")]
+    t2g: Option<PathBuf>,
+    /// Group transcripts into genes from their sequence, for transcriptomes without a gene
+    /// annotation: transcripts sharing a run of --infer-span consecutive seeds are grouped,
+    /// ignoring runs held by more than N transcripts (repeats).
+    #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "64")]
+    infer_genes: Option<u32>,
+    /// Gene inference: consecutive seeds a shared run must span (12 level-3 seeds is about
+    /// 300 bases of shared sequence).
+    #[arg(long, default_value_t = 12)]
+    infer_span: usize,
+    /// Write the transcript-to-gene grouping used (given or inferred) to this TSV.
+    #[arg(long)]
+    write_t2g: Option<PathBuf>,
     /// Base seed scheme (its highest level is used).
     #[arg(short, long, default_value = "lcp:K=3")]
     scheme: String,
@@ -67,6 +83,22 @@ pub fn run(args: Args) -> Result<()> {
             });
         }
     }
+    let mut missing = 0usize;
+    if let Some(path) = &args.t2g {
+        let mut map = std::collections::HashMap::new();
+        for line in std::fs::read_to_string(path)?.lines() {
+            let mut f = line.split_whitespace();
+            if let (Some(t), Some(g)) = (f.next(), f.next()) {
+                map.insert(t.to_string(), g.to_string());
+            }
+        }
+        for t in &mut txs {
+            match map.get(&t.name) {
+                Some(g) => t.gene = g.clone(),
+                None => missing += 1,
+            }
+        }
+    }
     let read_s = t0.elapsed().as_secs_f64();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
@@ -81,8 +113,18 @@ pub fn run(args: Args) -> Result<()> {
         } else {
             Collapse::Global
         },
+        infer_genes: args.infer_genes.map(|max_tx| index::InferGenes {
+            span: args.infer_span,
+            max_tx,
+        }),
     };
     let (data, rep) = pool.install(|| build(&txs, &params))?;
+    if let Some(path) = &args.write_t2g {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for (t, g) in txs.iter().zip(&rep.tx_gene) {
+            writeln!(w, "{}\t{}", t.name, rep.gene_names[*g as usize])?;
+        }
+    }
     drop(txs);
     let t = Instant::now();
     let bytes = data.write(&args.output)?;
@@ -101,6 +143,30 @@ pub fn run(args: Args) -> Result<()> {
         "  transcripts {} ({} unseeded), genes {}",
         rep.transcripts, rep.unseeded_transcripts, rep.genes
     )?;
+    if let Some(n) = args.infer_genes {
+        writeln!(
+            e,
+            "  genes inferred from shared runs of {} seeds (in at most {n} transcripts); largest group {} transcripts",
+            args.infer_span, rep.largest_group_tx
+        )?;
+    }
+    if missing > 0 {
+        writeln!(
+            e,
+            "  warning: {missing} transcripts not in --t2g; their gene IDs come from the FASTA"
+        )?;
+    }
+    if args.infer_genes.is_none()
+        && args.collapse == "gene"
+        && rep.transcripts > 1
+        && rep.genes == rep.transcripts
+    {
+        writeln!(
+            e,
+            "  warning: every transcript is its own gene (no gene IDs in the headers): isoforms are \
+             not collapsed, so the index is larger and mapping less accurate; give --t2g or --infer-genes"
+        )?;
+    }
     writeln!(
         e,
         "  seed occurrences {}, nodes {}",

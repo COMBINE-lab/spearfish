@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub use build::{BuildParams, BuildReport, Collapse, TxInput, build};
+pub use build::{BuildParams, BuildReport, Collapse, InferGenes, TxInput, build};
 use store::{Store, Writer};
 
 /// `unitig_family` value for masked or unused unitigs.
