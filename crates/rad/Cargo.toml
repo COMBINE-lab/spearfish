@@ -1,0 +1,12 @@
+[package]
+name = "long-read-rad"
+description = "RAD records for bulk long-read mappings (one record per read, all of its alignments), shared by spearfish and oarfish"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libradicl = { version = "0.21", features = ["zstd"] }
+bio-types = "1.0.4"

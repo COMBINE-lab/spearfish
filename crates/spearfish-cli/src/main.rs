@@ -27,6 +27,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once; the size difference between subcommands does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Build the index from a transcript FASTA.

@@ -222,6 +222,7 @@ fn simulate_and_map_on_toy() {
         "-o".as_ref(),
         reads.as_os_str(),
     ]);
+    let out_rad = dir.join("toy_map.rad");
     run(&[
         "map".as_ref(),
         idx.as_os_str(),
@@ -230,6 +231,8 @@ fn simulate_and_map_on_toy() {
         "2".as_ref(),
         "-o".as_ref(),
         out_tsv.as_os_str(),
+        "--rad".as_ref(),
+        out_rad.as_os_str(),
     ]);
     // Every read maps, its source transcript is among its top-scoring hits (truncated reads
     // can tie between isoforms), and each read's lines are contiguous (reads may appear in
@@ -261,6 +264,47 @@ fn simulate_and_map_on_toy() {
         correct += hits.iter().any(|h| h.0 == best && h.1 == parts[1]) as usize;
     }
     assert!(correct >= 195, "{correct}/200 top hits correct");
+
+    // The RAD file holds the same hits as the TSV (it has no read names, so compare the
+    // multisets of hits), and its header the targets and counts.
+    let key = |t: &str, strand: &str, score: f32, ts: u32, te: u32| {
+        format!("{t}\t{strand}\t{score:.2}\t{ts}\t{te}")
+    };
+    let mut tsv_hits: Vec<String> = text
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let n = |i: usize| f[i].parse::<u32>().unwrap();
+            key(f[4], f[2], f[5].parse().unwrap(), n(8), n(9))
+        })
+        .collect();
+    let (h, mut r) = long_read_rad::open(&out_rad, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+    assert_eq!(h.meta.mapper, "spearfish");
+    assert_eq!(h.meta.score_denom, 2.0);
+    assert_eq!(h.counts.reads, 200);
+    assert_eq!(h.counts.mapped, 200);
+    assert_eq!(h.ref_names.len(), h.ref_lengths.len());
+    let rad_hits = std::sync::Mutex::new(Vec::new());
+    r.process_parallel(std::num::NonZeroUsize::new(2).unwrap(), |mc| {
+        for c in mc.iter() {
+            for rec in &c.reads {
+                for a in rec.alns() {
+                    let strand = if a.fw { "+" } else { "-" };
+                    let t = &h.ref_names[a.tid as usize];
+                    rad_hits
+                        .lock()
+                        .unwrap()
+                        .push(key(t, strand, a.score, a.ref_start, a.ref_end));
+                }
+            }
+        }
+    })
+    .unwrap();
+    let mut rad_hits = rad_hits.into_inner().unwrap();
+    tsv_hits.sort();
+    rad_hits.sort();
+    assert_eq!(rad_hits, tsv_hits);
 }
 
 /// `quant` skips reads flagged `low_coverage` whatever other flags the line carries.

@@ -18,6 +18,7 @@ index = { path = "crates/index" }
 map = { path = "crates/map" }
 quant = { path = "crates/quant" }
 spearfish = { path = "crates/spearfish" }
+long-read-rad = { path = "crates/rad" }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 proptest = "1.11"
 cc = "1.5"

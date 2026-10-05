@@ -26,6 +26,9 @@ equivalence classes and runs in parallel over them.
 ## With oarfish
 
 [oarfish](https://github.com/COMBINE-lab/oarfish) is a long-read transcript quantifier with
-coverage and positional models. A spearfish mapping backend for oarfish, which maps reads in
-process and passes the scored sets to its EM, is in development and not yet part of a released
-oarfish.
+coverage and positional models. Two ways to use it with spearfish are in development and not
+yet part of a released oarfish: a mapping backend that maps reads in process and passes the
+scored sets to its EM, and reading a RAD file from `spearfish map --rad` with
+`oarfish -a mappings.rad`. The RAD file's tags tell oarfish the transcripts and the score scale,
+so no further options are needed. For oarfish's truncation model, map with
+`--extend-ends true` so that spans reach the read ends.

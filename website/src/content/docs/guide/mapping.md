@@ -27,6 +27,8 @@ orientations mapped.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-t, --threads` | all cores | Worker threads. |
+| `--rad` | | Also write the mappings as a RAD file (see [Output format](/spearfish/guide/output/#rad-output)). Without `-o`, only the RAD file is written. |
+| `--rad-codec` | `lz4` | Per-chunk compression of the RAD file: `lz4`, `zstd` or `none`. |
 | `--delta-rep` | `0.3` | Report transcripts scoring within this fraction of the read's best. Quantifiers usually keep a tighter set (95% of the best), so the default is generous. |
 | `--extend-ends` | preset | Extend each reported span past its outermost anchors to where the read's alignment ends. Needed by models that use read positions, such as a truncation model. |
 | `--extend-within` | `0.05` | Extend only hits within this fraction of the best score. |

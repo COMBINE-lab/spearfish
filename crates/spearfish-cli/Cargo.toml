@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 spearfish.workspace = true
+long-read-rad.workspace = true
 anyhow.workspace = true
 mimalloc.workspace = true
 clap.workspace = true

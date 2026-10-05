@@ -9,6 +9,11 @@
 //! outermost anchors for hits within `--extend-within` of the best score (`--extend-ends`);
 //! other hits' spans run between their outermost anchors and carry the flag `anchor_span`.
 //! anchored counts compressed bases. Unmapped reads get one line with transcript `*`.
+//!
+//! With `--rad`, the mappings are also written as a RAD file of `bulk_long_read` records (see
+//! the `long-read-rad` crate), one per mapped read, in chunks compressed per `--rad-codec`.
+//! oarfish quantifies these directly; the file's tags carry the preset, the score scale, and
+//! whether spans were extended to the read ends.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,9 +34,15 @@ pub struct Args {
     /// Worker threads (0 = all cores).
     #[arg(short, long, default_value_t = 0)]
     threads: usize,
-    /// Output TSV (default stdout).
+    /// Output TSV (default stdout, unless `--rad` is given).
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Write the mappings as a RAD file (`bulk_long_read` records, which oarfish reads).
+    #[arg(long)]
+    rad: Option<PathBuf>,
+    /// RAD chunk compression: `lz4`, `zstd` or `none`.
+    #[arg(long, default_value = "lz4")]
+    rad_codec: String,
     /// Reads per work batch (smaller batches balance load better when read costs vary).
     #[arg(long, default_value_t = 32)]
     batch_size: usize,
@@ -179,7 +190,9 @@ type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 struct Processor {
     mapper: Arc<Mapper>,
     buf: Vec<u8>,
-    out: Out,
+    out: Option<Out>,
+    rad: Option<long_read_rad::Sink>,
+    rec: long_read_rad::ReadRecord,
     stats: Arc<Mutex<(u64, u64, u64)>>,
     local: (u64, u64, u64),
 }
@@ -188,9 +201,41 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     fn process_record(&mut self, record: Rf) -> paraseq::Result<()> {
         let seq = record.seq();
         let r = self.mapper.map(&seq);
-        let name = record.id_str().split_whitespace().next().unwrap_or("");
         self.local.0 += 1;
         self.local.2 += seq.len() as u64;
+        if !r.hits.is_empty() {
+            self.local.1 += 1;
+        }
+        if let Some(rad) = &mut self.rad
+            && !r.hits.is_empty()
+        {
+            use long_read_rad::{Aln, aln_flags, read_flags};
+            let rec = &mut self.rec;
+            rec.clear();
+            rec.read_len = r.len;
+            rec.flags = if r.low_coverage {
+                read_flags::LOW_COVERAGE
+            } else {
+                0
+            } | if r.rescued { read_flags::RESCUED } else { 0 };
+            for h in &r.hits {
+                rec.push(Aln {
+                    tid: h.tx,
+                    fw: !h.reverse,
+                    ref_start: h.target_start,
+                    ref_end: h.target_end,
+                    query_start: h.query_start,
+                    query_end: h.query_end,
+                    score: h.score,
+                    flags: if h.extended { 0 } else { aln_flags::ANCHOR_SPAN },
+                });
+            }
+            rad.push(rec).map_err(std::io::Error::other)?;
+        }
+        if self.out.is_none() {
+            return Ok(());
+        }
+        let name = record.id_str().split_whitespace().next().unwrap_or("");
         if r.hits.is_empty() {
             let _ = writeln!(
                 self.buf,
@@ -199,7 +244,6 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
             );
             return Ok(());
         }
-        self.local.1 += 1;
         let flags = match (r.low_coverage, r.rescued) {
             (true, true) => "rescued,low_coverage",
             (true, false) => "low_coverage",
@@ -234,12 +278,17 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     /// Write the batch's records. All mappings of a read are contiguous; reads appear in
     /// completion order, not input order.
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
-        self.out.lock().unwrap().write_all(&self.buf)?;
-        self.buf.clear();
+        if let Some(out) = &self.out {
+            out.lock().unwrap().write_all(&self.buf)?;
+            self.buf.clear();
+        }
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        if let Some(rad) = &mut self.rad {
+            rad.flush().map_err(std::io::Error::other)?;
+        }
         let mut s = self.stats.lock().unwrap();
         s.0 += self.local.0;
         s.1 += self.local.1;
@@ -254,19 +303,28 @@ pub fn run(args: Args) -> Result<()> {
     let idx = Arc::new(Index::open(&args.index)?);
     let mapper = Arc::new(Mapper::new(idx, &options(&args)?)?);
     let load = t0.elapsed().as_secs_f64();
-    let sink: Box<dyn Write + Send> = match &args.output {
-        Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    let sink: Option<Box<dyn Write + Send>> = match (&args.output, &args.rad) {
+        (Some(p), _) => Some(Box::new(std::io::BufWriter::new(std::fs::File::create(p)?))),
+        (None, None) => Some(Box::new(std::io::BufWriter::new(std::io::stdout()))),
+        (None, Some(_)) => None,
     };
-    let out: Out = Arc::new(Mutex::new(sink));
-    out.lock().unwrap().write_all(
-        b"read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n",
-    )?;
+    let out: Option<Out> = sink.map(|s| Arc::new(Mutex::new(s)));
+    if let Some(out) = &out {
+        out.lock().unwrap().write_all(
+            b"read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n",
+        )?;
+    }
+    let rad = match &args.rad {
+        Some(p) => Some(rad_writer(p, &args, &mapper)?),
+        None => None,
+    };
     let stats = Arc::new(Mutex::new((0u64, 0u64, 0u64)));
     let mut proc = Processor {
         mapper,
         buf: Vec::new(),
         out: out.clone(),
+        rad: rad.as_ref().map(|w| w.sink()),
+        rec: long_read_rad::ReadRecord::default(),
         stats: stats.clone(),
         local: (0, 0, 0),
     };
@@ -276,7 +334,10 @@ pub fn run(args: Args) -> Result<()> {
         .build()?;
     let t1 = Instant::now();
     reader.process_parallel(&mut proc, args.threads)?;
-    out.lock().unwrap().flush()?;
+    if let Some(out) = &out {
+        out.lock().unwrap().flush()?;
+    }
+    drop(proc);
     let secs = t1.elapsed().as_secs_f64();
     if map::stats::on() {
         for (k, v) in map::stats::snapshot() {
@@ -284,6 +345,13 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
     let (n, mapped, bases) = *stats.lock().unwrap();
+    if let Some(w) = rad {
+        w.finish(long_read_rad::Counts {
+            reads: n,
+            mapped,
+            bases,
+        })?;
+    }
     eprintln!(
         "map: {n} reads ({:.1}% mapped), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",
         100.0 * mapped as f64 / n.max(1) as f64,
@@ -292,6 +360,45 @@ pub fn run(args: Args) -> Result<()> {
         bases as f64 / 1e6 / secs
     );
     Ok(())
+}
+
+/// A RAD writer over the index's transcripts, with the tags oarfish uses to read the scores
+/// and spans.
+fn rad_writer(path: &std::path::Path, args: &Args, mapper: &Mapper) -> Result<long_read_rad::RadWriter> {
+    let codec = match args.rad_codec.as_str() {
+        "lz4" => long_read_rad::ChunkCodec::Lz4,
+        "zstd" => long_read_rad::ChunkCodec::Zstd,
+        "none" => long_read_rad::ChunkCodec::None,
+        c => anyhow::bail!("unknown --rad-codec {c:?} (lz4, zstd, none)"),
+    };
+    let idx = mapper.index();
+    let refs: Vec<(&str, u32)> = (0..idx.n_transcripts() as u32)
+        .map(|t| (idx.tx_name(t), idx.tx_len(t)))
+        .collect();
+    let opts = options(args)?;
+    let meta = long_read_rad::Meta {
+        mapper: "spearfish".into(),
+        mapper_version: env!("CARGO_PKG_VERSION").into(),
+        cmdline: std::env::args().collect::<Vec<_>>().join(" "),
+        params: format!("{:?}", opts.params),
+        preset: args.preset.clone(),
+        seq_tech: match args.preset.parse::<Preset>()? {
+            Preset::Ont => "ont-cdna",
+            Preset::Drna => "ont-drna",
+            Preset::Hifi => "pac-bio-hifi",
+        }
+        .into(),
+        // spearfish weighs a hit scoring d below the best by exp(-d / 2) (DECISIONS.md D16).
+        score_denom: 2.0,
+        ends_extended: opts.params.ends.is_some(),
+        strands: match opts.params.strands {
+            map::Strands::Both => "both",
+            map::Strands::Forward => "fwd",
+            map::Strands::Reverse => "rev",
+        }
+        .into(),
+    };
+    long_read_rad::RadWriter::create(path, &refs, &meta, codec)
 }
 
 /// Mapping options: the preset's, then any explicit flags.
