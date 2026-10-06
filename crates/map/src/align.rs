@@ -288,6 +288,57 @@ pub fn affine_extend_window(
     }
 }
 
+/// Exclusive prefix maxima of `xs` in place, starting from `init`: `xs[k]` becomes the
+/// maximum of `init` and `xs[..k]`. The scalar loop is one dependent max per element; with
+/// AVX-512 a 16-lane block is scanned in four shift-and-max steps and the block maximum carried.
+#[inline]
+fn excl_prefix_max(xs: &mut [i32], init: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        // SAFETY: AVX-512F is available (checked above).
+        unsafe { excl_prefix_max_avx512(xs, init) };
+        return;
+    }
+    let mut g = init;
+    for x in xs.iter_mut() {
+        let next = g.max(*x);
+        *x = g;
+        g = next;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
+    use std::arch::x86_64::*;
+    let neg = _mm512_set1_epi32(NEG);
+    let last = _mm512_set1_epi32(15);
+    // The running maximum, broadcast to every lane (kept in a register between blocks).
+    let mut cv = _mm512_set1_epi32(init);
+    let mut chunks = xs.chunks_exact_mut(16);
+    for c in &mut chunks {
+        // SAFETY: `c` holds 16 i32s; unaligned loads and stores.
+        let mut v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
+        // Inclusive prefix max within the block: lane k takes the max of lanes <= k.
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<15>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<14>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<12>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
+        v = _mm512_max_epi32(v, cv);
+        // Exclusive: shift up one lane, the carry entering lane 0.
+        let out = _mm512_alignr_epi32::<15>(v, cv);
+        unsafe { _mm512_storeu_si512(c.as_mut_ptr().cast(), out) };
+        // Lane 15 holds the block's (inclusive) maximum.
+        cv = _mm512_permutexvar_epi32(last, v);
+    }
+    let mut carry = _mm512_cvtsi512_si32(cv);
+    for x in chunks.into_remainder() {
+        let next = carry.max(*x);
+        *x = carry;
+        carry = next;
+    }
+}
+
 /// First and last columns of `h` within `band` scoring at least `thr` ((1, 0) if none).
 #[inline]
 fn live_cols(h: &[i32], band: (usize, usize), thr: i32) -> (usize, usize) {
@@ -664,12 +715,7 @@ fn run(
             // E[k] + ext*k this is a running max (pass 2: exclusive prefix
             // maxima, one op per cell on the critical path); pass 3
             // (vectorizes) takes H = max(H', E).
-            let mut g = e;
-            for x in gs.iter_mut() {
-                let next = g.max(*x);
-                *x = g;
-                g = next;
-            }
+            excl_prefix_max(gs, e);
             let nhr = &mut nh[start..=hi];
             for k in 0..w {
                 nhr[k] = hp[k].max(gs[k] - ext * k as i32);
@@ -914,6 +960,23 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
+
+        /// The vectorized prefix maxima equal the scalar loop.
+        #[test]
+        fn prefix_max_matches_scalar(
+            xs in prop::collection::vec(-100000i32..100000, 0..200), init in -100000i32..100000,
+        ) {
+            let mut want = xs.clone();
+            let mut g = init;
+            for x in want.iter_mut() {
+                let next = g.max(*x);
+                *x = g;
+                g = next;
+            }
+            let mut got = xs.clone();
+            excl_prefix_max(&mut got, init);
+            prop_assert_eq!(got, want);
+        }
 
         /// Sorted texts sharing prefixes (isoform flanks) give the same scores through the
         /// row-sharing batch as one at a time, with and without X-drop stops and bands.
