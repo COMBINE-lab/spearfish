@@ -105,42 +105,58 @@ fn greedy_score(anchors: &[Anchor]) -> f32 {
 }
 
 /// Group anchors by gene family and keep the best-scoring families.
-pub fn candidates(idx: &Index, mut anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Candidate> {
+pub fn candidates(idx: &Index, anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Candidate> {
     let fam = idx.unitig_family();
     let unitig = idx.node_unitig();
-    // Each anchor's family is looked up once (two dependent random reads), not on every
-    // comparison of the sort.
-    let mut keyed: Vec<(u32, Anchor)> = anchors
-        .drain(..)
-        .filter_map(|a| {
-            let f = fam[unitig[a.node as usize] as usize];
-            (f != NO_FAMILY).then_some((f, a))
-        })
-        .collect();
-    keyed.sort_unstable_by_key(|(f, a)| (*f, a.qs, a.qe, a.node));
-    let mut out: Vec<Candidate> = keyed
-        .chunk_by(|a, b| a.0 == b.0)
-        .map(|g| {
-            anchors.clear();
-            anchors.extend(g.iter().map(|x| x.1));
-            Candidate {
-                family: g[0].0,
-                score: greedy_score(&anchors),
-                anchors: anchors.clone(),
-            }
-        })
-        .collect();
-    out.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.family.cmp(&b.family)));
-    if let Some(best) = out.first().map(|c| c.score) {
-        out.retain(|c| c.score >= p.alpha_fam * best);
-        // Don't cut through a tie: multi-copy families give many genes the same score.
-        if let Some(last) = out.get(p.f_keep.max(1) - 1).map(|c| c.score) {
-            let floor = last - p.f_tie * last.abs();
-            let n = out.iter().take_while(|c| c.score >= floor).count();
-            out.truncate(n.min(p.f_max.max(p.f_keep)));
+    // Group by family with a sort of packed (family, input index) keys: each anchor's family
+    // is looked up once (two dependent random reads). Seeds arrive sorted by (start, end) and
+    // a seed's nodes ascend, so within a family the input order is already (qs, qe, node);
+    // check it, and sort a family's anchors only if not.
+    let mut keys: Vec<u64> = Vec::with_capacity(anchors.len());
+    for (i, a) in anchors.iter().enumerate() {
+        let f = fam[unitig[a.node as usize] as usize];
+        if f != NO_FAMILY {
+            keys.push(((f as u64) << 32) | i as u64);
         }
     }
-    out
+    keys.sort_unstable();
+    let mut ordered: Vec<Anchor> = keys.iter().map(|&k| anchors[k as u32 as usize]).collect();
+    // (family, range in `ordered`, score) per family.
+    let mut groups: Vec<(u32, std::ops::Range<usize>, f32)> = Vec::new();
+    let mut lo = 0;
+    while lo < keys.len() {
+        let f = (keys[lo] >> 32) as u32;
+        let mut hi = lo + 1;
+        while hi < keys.len() && (keys[hi] >> 32) as u32 == f {
+            hi += 1;
+        }
+        let g = &mut ordered[lo..hi];
+        if !g.is_sorted_by_key(|a| (a.qs, a.qe, a.node)) {
+            g.sort_unstable_by_key(|a| (a.qs, a.qe, a.node));
+        }
+        groups.push((f, lo..hi, greedy_score(g)));
+        lo = hi;
+    }
+    drop(anchors);
+    // Rank and cut families on their scores alone; anchors are copied out only for the kept.
+    groups.sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    if let Some(best) = groups.first().map(|g| g.2) {
+        groups.retain(|g| g.2 >= p.alpha_fam * best);
+        // Don't cut through a tie: multi-copy families give many genes the same score.
+        if let Some(last) = groups.get(p.f_keep.max(1) - 1).map(|g| g.2) {
+            let floor = last - p.f_tie * last.abs();
+            let n = groups.iter().take_while(|g| g.2 >= floor).count();
+            groups.truncate(n.min(p.f_max.max(p.f_keep)));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(family, r, score)| Candidate {
+            family,
+            score,
+            anchors: ordered[r].to_vec(),
+        })
+        .collect()
 }
 
 /// Merge anchors of `c` that lie on one diagonal of the same unitig: anchor `b` extends a run
@@ -178,6 +194,8 @@ pub fn merge_collinear(idx: &Index, c: &mut Candidate) {
         open.insert(u, (out.len(), a.qs, a.qe, off));
         out.push(a);
     }
-    out.sort_unstable_by_key(|a| (a.qs, a.qe, a.node));
+    if !out.is_sorted_by_key(|a| (a.qs, a.qe, a.node)) {
+        out.sort_unstable_by_key(|a| (a.qs, a.qe, a.node));
+    }
     c.anchors = out;
 }

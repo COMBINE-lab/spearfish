@@ -35,6 +35,23 @@ impl Hpc {
         Hpc { seq, raw_start }
     }
 
+    /// `Hpc::new(&revcomp(raw))`, from this compression of `raw`, provided `raw` is all
+    /// A/C/G/T (either case): runs map to runs in reverse order, each starting with the
+    /// complement (upper case, as `revcomp` writes it) of its base. Other symbols all become
+    /// `N` under `revcomp` and can merge runs, so callers must check.
+    pub fn revcomp_acgt(&self) -> Self {
+        let n = self.raw_len();
+        let k = self.seq.len();
+        let seq = self
+            .seq
+            .iter()
+            .rev()
+            .map(|&b| b"TGCA"[(crate::encode::CODE[b as usize] & 3) as usize])
+            .collect();
+        let raw_start = (0..=k).map(|i| n - self.raw_start[k - i]).collect();
+        Hpc { seq, raw_start }
+    }
+
     pub fn raw_len(&self) -> u32 {
         *self.raw_start.last().unwrap()
     }
@@ -57,6 +74,18 @@ impl Hpc {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    proptest! {
+        /// The mirrored compression equals compressing the reverse complement.
+        #[test]
+        fn revcomp_mirrors(raw in "[ACGTacgt]{0,200}") {
+            let raw = raw.as_bytes();
+            let a = Hpc::new(raw).revcomp_acgt();
+            let b = Hpc::new(&crate::encode::revcomp(raw));
+            prop_assert_eq!(&a.seq, &b.seq);
+            prop_assert_eq!(&a.raw_start, &b.raw_start);
+        }
+    }
 
     #[test]
     fn compresses_runs() {

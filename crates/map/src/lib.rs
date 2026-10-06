@@ -709,8 +709,7 @@ impl<C: Chainer> Mapper<C> {
         Some((cost, unit))
     }
 
-    fn map_strand(&self, raw: &[u8]) -> Strand {
-        let (seq, raw_read) = Self::parse(&self.seeder, raw);
+    fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>)) -> Strand {
         let seeds = self.seeder.seed_parsed(&seq);
         let anchors = anchor::anchors(&self.idx, &seeds, &self.p.anchor);
         let n_anchors = anchors.len() as u32;
@@ -732,6 +731,29 @@ impl<C: Chainer> Mapper<C> {
             seeds,
             anchors: n_anchors,
             candidates: cands.len() as u32,
+        }
+    }
+
+    /// [`Self::parse`] of `raw` and of its reverse complement. A read of A/C/G/T only (almost
+    /// all) is compressed once: the reverse strand's compression and codes mirror the forward
+    /// one's.
+    fn parse_both(seeder: &BaseSeeder, raw: &[u8]) -> [(Vec<u8>, Option<RawRead>); 2] {
+        let acgt = || raw.iter().all(|&b| lcp_core::encode::CODE[b as usize] < 4);
+        match seeder.parsed(raw) {
+            Some(h) if acgt() => {
+                let rc = h.revcomp_acgt();
+                let codes: Vec<u8> = raw
+                    .iter()
+                    .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
+                    .collect();
+                let rcodes = codes.iter().rev().map(|&c| 3 - c).collect();
+                let done = |mut h: lcp_core::hpc::Hpc, codes| {
+                    let seq = std::mem::take(&mut h.seq);
+                    (seq, Some(RawRead { codes, hpc: h }))
+                };
+                [done(h, codes), done(rc, rcodes)]
+            }
+            _ => [Self::parse(seeder, raw), Self::parse(seeder, &revcomp(raw))],
         }
     }
 
@@ -819,18 +841,19 @@ impl<C: Chainer> Mapper<C> {
         } else {
             raw
         };
-        let skip = |s: &Self, r: &[u8]| Strand {
+        let skip = |p: (Vec<u8>, Option<RawRead>)| Strand {
             hits: Vec::new(),
-            seq: Self::parse(&s.seeder, r).0,
+            seq: p.0,
             raw: None,
             seeds: Vec::new(),
             anchors: 0,
             candidates: 0,
         };
+        let [pf, pr] = Self::parse_both(&self.seeder, raw);
         let (fwd, rc) = match self.p.strands {
-            Strands::Both => (self.map_strand(raw), self.map_strand(&revcomp(raw))),
-            Strands::Forward => (self.map_strand(raw), skip(self, &revcomp(raw))),
-            Strands::Reverse => (skip(self, raw), self.map_strand(&revcomp(raw))),
+            Strands::Both => (self.map_strand(pf), self.map_strand(pr)),
+            Strands::Forward => (self.map_strand(pf), skip(pr)),
+            Strands::Reverse => (skip(pf), self.map_strand(pr)),
         };
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);
         let (mut reverse, mut st, mut other) = if best(&rc.hits) > best(&fwd.hits) {
