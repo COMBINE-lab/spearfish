@@ -568,7 +568,7 @@ mod packed_tests {
             // A run start: position 0 or a change.
             let starts: Vec<u32> =
                 (0..n).filter(|&i| i == 0 || bases[i as usize] != bases[i as usize - 1]).collect();
-            let r = starts[(a % starts.len())];
+            let r = starts[a % starts.len()];
             let mut want = r;
             for _ in 0..q {
                 if want >= n { break; }
