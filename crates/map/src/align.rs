@@ -20,31 +20,50 @@ const W: usize = 64;
 
 /// One Myers block step; returns the horizontal delta out of row `bit`.
 #[inline(always)]
-fn block(pv: &mut u64, mv: &mut u64, mut eq: u64, hin: i32, bit: usize) -> i32 {
+fn block(pv: &mut u64, mv: &mut u64, eq: u64, hin: i32, bit: usize) -> i32 {
+    // The incoming delta's sign as bits, without branches (it is unpredictable).
+    let (neg, pos) = ((hin < 0) as u64, (hin > 0) as u64);
     let (p, m) = (*pv, *mv);
     let xv = eq | m;
-    if hin < 0 {
-        eq |= 1;
-    }
+    let eq = eq | neg;
     let xh = ((eq & p).wrapping_add(p) ^ p) | eq;
-    let mut ph = m | !(xh | p);
-    let mut mh = p & xh;
+    let ph = m | !(xh | p);
+    let mh = p & xh;
     let hout = ((ph >> bit) & 1) as i32 - ((mh >> bit) & 1) as i32;
-    ph <<= 1;
-    mh <<= 1;
-    if hin < 0 {
-        mh |= 1;
-    } else if hin > 0 {
-        ph |= 1;
-    }
+    let ph = (ph << 1) | pos;
+    let mh = (mh << 1) | neg;
     *pv = mh | !(xv | ph);
     *mv = ph & xv;
     hout
 }
 
+/// A pattern's match masks per 64-row block, built once and reused across texts.
+pub struct Pattern {
+    m: usize,
+    peq: Vec<[u64; 4]>,
+}
+
+impl Pattern {
+    pub fn new(pattern: &[u8]) -> Self {
+        let mut peq = vec![[0u64; 4]; pattern.len().div_ceil(W)];
+        for (i, &c) in pattern.iter().enumerate() {
+            peq[i / W][(c & 3) as usize] |= 1 << (i % W);
+        }
+        Pattern {
+            m: pattern.len(),
+            peq,
+        }
+    }
+}
+
 /// Edit distance in `mode`, or `None` if it exceeds `k`.
 pub fn distance(pattern: &[u8], text: &[u8], mode: Mode, k: u32) -> Option<u32> {
-    let m = pattern.len();
+    distance_with(&Pattern::new(pattern), text, mode, k)
+}
+
+/// [`distance`] with the pattern's masks prebuilt.
+pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u32> {
+    let m = pat.m;
     let n = text.len();
     if m == 0 {
         let d = if mode == Mode::Global { n as u32 } else { 0 };
@@ -55,10 +74,7 @@ pub fn distance(pattern: &[u8], text: &[u8], mode: Mode, k: u32) -> Option<u32> 
     let last_bit = (m - 1) % W;
     let rows = |b: usize| if b + 1 == blocks { last_bit + 1 } else { W };
     let bit = |b: usize| if b + 1 == blocks { last_bit } else { W - 1 };
-    let mut peq = vec![[0u64; 4]; blocks];
-    for (i, &c) in pattern.iter().enumerate() {
-        peq[i / W][(c & 3) as usize] |= 1 << (i % W);
-    }
+    let peq = &pat.peq;
     // Horizontal delta entering row 0: D[0][j] is 0 (free text start) or j.
     let top: i32 = if mode == Mode::Infix { 0 } else { 1 };
     let mut pv = vec![u64::MAX; blocks];

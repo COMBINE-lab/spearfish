@@ -373,6 +373,7 @@ impl<C: Chainer> Mapper<C> {
         // re-capped at the current k: exact if d <= k, else k + 1, as a fresh call returns.
         let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
         let mut best = u32::MAX;
+        let pat = align::Pattern::new(read);
         texts
             .iter()
             .map(|t| {
@@ -385,7 +386,7 @@ impl<C: Chainer> Mapper<C> {
                     &stats::MYERS_CELLS,
                     (read.len() as u64).div_ceil(64) * t.len() as u64,
                 );
-                let d = align::distance(read, t, mode, k).unwrap_or(k.saturating_add(1));
+                let d = align::distance_with(&pat, t, mode, k).unwrap_or(k.saturating_add(1));
                 best = best.min(d);
                 seen.insert(t.as_slice(), d);
                 d
