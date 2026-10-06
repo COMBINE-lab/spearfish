@@ -315,8 +315,8 @@ unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
     let last = _mm512_set1_epi32(15);
     // The running maximum, broadcast to every lane (kept in a register between blocks).
     let mut cv = _mm512_set1_epi32(init);
-    let mut chunks = xs.chunks_exact_mut(16);
-    for c in &mut chunks {
+    let (blocks, rest) = xs.as_chunks_mut::<16>();
+    for c in blocks {
         // SAFETY: `c` holds 16 i32s; unaligned loads and stores.
         let mut v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
         // Inclusive prefix max within the block: lane k takes the max of lanes <= k.
@@ -332,7 +332,7 @@ unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
         cv = _mm512_permutexvar_epi32(last, v);
     }
     let mut carry = _mm512_cvtsi512_si32(cv);
-    for x in chunks.into_remainder() {
+    for x in rest {
         let next = carry.max(*x);
         *x = carry;
         carry = next;
