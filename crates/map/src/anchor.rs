@@ -59,7 +59,16 @@ pub struct Candidate {
 pub fn anchors(idx: &Index, seeds: &[Seed], p: &AnchorParams) -> Vec<Anchor> {
     let flags = idx.node_flags();
     let mut out = Vec::with_capacity(seeds.len());
-    for s in seeds {
+    // Lookups miss in cache twice (directory entry, then labels): request the directory entry
+    // 2 * AHEAD seeds ahead and the labels AHEAD seeds ahead.
+    const AHEAD: usize = 8;
+    for (i, s) in seeds.iter().enumerate() {
+        if let Some(x) = seeds.get(i + 2 * AHEAD) {
+            idx.prefetch_dir(x.label);
+        }
+        if let Some(x) = seeds.get(i + AHEAD) {
+            idx.prefetch_labels(x.label);
+        }
         let r = idx.lookup(s.label);
         let genes = r.len();
         if genes == 0 || genes > p.h_max {

@@ -149,9 +149,13 @@ pub(crate) fn transition(p: &ChainParams, x: Pt, y: Pt) -> Option<(f32, f32)> {
     } else {
         p.alpha * d + p.beta * (1.0 + dq.max(dt).max(0) as f32).log2()
     };
+    // Without overlap the gain is y.w exactly (0 / qlen = 0), so skip the division.
+    let overlap = x.qe.saturating_sub(y.qs).min(y.qe - y.qs);
+    if overlap == 0 {
+        return Some((y.w - gamma, d));
+    }
     let qlen = (y.qe - y.qs) as f32;
-    let overlap = (x.qe.saturating_sub(y.qs)).min(y.qe - y.qs) as f32;
-    Some((y.w * (1.0 - overlap / qlen) - gamma, d))
+    Some((y.w * (1.0 - overlap as f32 / qlen) - gamma, d))
 }
 
 /// Best local colinear chain over points sorted by (qs, ts), with predecessors among the

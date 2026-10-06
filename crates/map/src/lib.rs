@@ -425,6 +425,7 @@ impl<C: Chainer> Mapper<C> {
         let tlen = self.idx.tx_plen()[h.tx as usize];
         let slack = |ext: u32| tb.pad + ext / tb.pad_div;
         let (qs, qe) = (h.qstart as usize, h.qend as usize);
+        let w0 = align::dp_work();
         let mid = align::affine(
             &codes[qs..qe],
             &self.idx.tx_codes(h.tx, h.tstart, h.tend),
@@ -432,6 +433,7 @@ impl<C: Chainer> Mapper<C> {
             sc,
             tb.band,
         );
+        let w1 = align::dp_work();
         let left = if qs > 0 {
             let span = [(
                 h.tx,
@@ -459,6 +461,13 @@ impl<C: Chainer> Mapper<C> {
         } else {
             tb.end_bonus
         };
+        if stats::on() {
+            let w2 = align::dp_work();
+            stats::add(&stats::DP_CLIP_MID_CELLS, w1.0 - w0.0);
+            stats::add(&stats::DP_CLIP_MID_ROWS, w1.1 - w0.1);
+            stats::add(&stats::DP_CLIP_END_CELLS, w2.0 - w1.0);
+            stats::add(&stats::DP_CLIP_END_ROWS, w2.1 - w1.1);
+        }
         mid + left + right
     }
 
@@ -578,35 +587,41 @@ impl<C: Chainer> Mapper<C> {
                     }
                     let mut score = vec![None::<i64>; uniq.len()];
                     let mut best: Option<(u32, i64)> = None; // (unit distance, affine score)
-                    for (k, &u) in uniq.iter().enumerate() {
-                        if let Some((d, w)) = &unit
-                            && d[k] > dmin + w
-                        {
-                            continue;
-                        }
-                        let (m, n) = (read.len() as u64, texts[u].len() as u64);
+                    // Distinct texts to score, in sorted order, so isoforms that agree near
+                    // the anchor share the rows that read only those bases.
+                    let todo: Vec<usize> = (0..uniq.len())
+                        .filter(|&k| unit.as_ref().is_none_or(|(d, w)| d[k] <= dmin + w))
+                        .collect();
+                    let diag = mode == align::Mode::Prefix && tb.clip_ends && tb.end_diagonal;
+                    for &k in &todo {
+                        let (m, n) = (read.len() as u64, texts[uniq[k]].len() as u64);
                         stats::add(&stats::AFFINE_CALLS, 1);
-                        let diag = mode == align::Mode::Prefix && tb.clip_ends && tb.end_diagonal;
                         let drift = if diag && n >= m { 0 } else { m.abs_diff(n) };
                         let cells = m * (2 * tb.band as u64 + drift + 1).min(n + 1);
                         stats::add(&stats::AFFINE_CELLS, cells);
                         if mode == align::Mode::Prefix {
                             stats::add(&stats::AFFINE_END_CELLS, cells);
                         }
-                        let x = i64::from(if diag {
-                            align::affine_extend_diagonal(
-                                &read,
-                                &texts[u],
-                                sc,
-                                tb.band,
-                                tb.end_bonus,
-                                tb.xdrop,
-                            )
-                        } else if mode == align::Mode::Prefix && tb.clip_ends {
-                            align::affine_extend(&read, &texts[u], sc, tb.band, tb.end_bonus, tb.xdrop)
+                    }
+                    let tx: Vec<&[u8]> = todo.iter().map(|&k| texts[uniq[k]].as_slice()).collect();
+                    let w0 = align::dp_work();
+                    let xs = if mode == align::Mode::Prefix && tb.clip_ends {
+                        align::affine_extend_sorted(&read, &tx, sc, tb.band, tb.end_bonus, tb.xdrop, diag)
+                    } else {
+                        align::affine_sorted(&read, &tx, mode, sc, tb.band)
+                    };
+                    if stats::on() {
+                        let w1 = align::dp_work();
+                        let (c, r) = if mode == align::Mode::Prefix {
+                            (&stats::DP_TBEND_CELLS, &stats::DP_TBEND_ROWS)
                         } else {
-                            align::affine(&read, &texts[u], mode, sc, tb.band)
-                        });
+                            (&stats::DP_SEG_CELLS, &stats::DP_SEG_ROWS)
+                        };
+                        stats::add(c, w1.0 - w0.0);
+                        stats::add(r, w1.1 - w0.1);
+                    }
+                    for (&k, &x) in todo.iter().zip(&xs) {
+                        let x = i64::from(x);
                         score[k] = Some(x);
                         let du = unit.as_ref().map_or(0, |(d, _)| d[k]);
                         if best.is_none_or(|(bd, bx)| (du, -x) < (bd, -bx)) {
@@ -756,8 +771,14 @@ impl<C: Chainer> Mapper<C> {
             let (m, w) = (read.len() as u64, window(read.len() as u32) as usize);
             stats::add(&stats::SPAN_END_CALLS, 1);
             stats::add(&stats::SPAN_END_CELLS, m * (2 * e.band as u64 + w as u64 - m + 1));
+            let w0 = align::dp_work();
             let (_, qi, tj, used) =
                 align::affine_extend_window(read, &text, w, &e.sc, e.band, e.end_bonus, e.xdrop);
+            if stats::on() {
+                let w1 = align::dp_work();
+                stats::add(&stats::DP_SPAN_CELLS, w1.0 - w0.0);
+                stats::add(&stats::DP_SPAN_ROWS, w1.1 - w0.1);
+            }
             let r = (qi as u32, tj as u32);
             done.push((text[..used].to_vec(), used == text.len(), r));
             r

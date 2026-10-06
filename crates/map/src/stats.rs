@@ -40,6 +40,16 @@ counters!(
     SPAN_ENDS,
     SPAN_END_CALLS,
     SPAN_END_CELLS,
+    DP_SEG_CELLS,
+    DP_SEG_ROWS,
+    DP_TBEND_CELLS,
+    DP_TBEND_ROWS,
+    DP_CLIP_MID_CELLS,
+    DP_CLIP_MID_ROWS,
+    DP_CLIP_END_CELLS,
+    DP_CLIP_END_ROWS,
+    DP_SPAN_CELLS,
+    DP_SPAN_ROWS,
 );
 
 #[inline]

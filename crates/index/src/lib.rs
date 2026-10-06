@@ -140,6 +140,19 @@ impl IndexData {
     }
 }
 
+/// A cache hint for the line holding `p` (no effect off x86-64; never faults).
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint: it reads nothing and cannot fault, whatever the address.
+    #[allow(unused_unsafe)]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 /// Bits of the label directory for `n` nodes: about one node per bucket.
 pub fn label_dir_bits(n: usize) -> u32 {
     (usize::BITS - n.max(2).leading_zeros() - 1).clamp(1, 30)
@@ -319,6 +332,24 @@ impl Index {
 
     pub fn n_transcripts(&self) -> usize {
         self.tx_gene().len()
+    }
+
+    /// Ask the caches for the directory entry `lookup(label)` reads first. Lookups are random
+    /// accesses into large arrays; issuing these a few seeds ahead overlaps their misses.
+    #[inline]
+    pub fn prefetch_dir(&self, label: u64) {
+        let b = (label >> self.dir_shift) as usize;
+        prefetch(self.label_dir().as_ptr().wrapping_add(b));
+    }
+
+    /// Ask the caches for the labels and node flags `lookup(label)` scans (reads the directory
+    /// entry, so call it after [`Self::prefetch_dir`] has had time to land).
+    #[inline]
+    pub fn prefetch_labels(&self, label: u64) {
+        let b = (label >> self.dir_shift) as usize;
+        let lo = self.label_dir()[b] as usize;
+        prefetch(self.labels().as_ptr().wrapping_add(lo));
+        prefetch(self.node_flags().as_ptr().wrapping_add(lo));
     }
 
     /// Nodes carrying a seed label (empty if the index lacks it). With global collapsing at

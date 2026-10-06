@@ -199,6 +199,34 @@ pub fn affine_extend(
     d.clip_best.max(d.score.saturating_add(end_bonus))
 }
 
+/// [`affine`] for each of `texts`, which must be sorted: equal to separate calls, but rows
+/// that read only a prefix shared with the previous text are not recomputed.
+pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, band: usize) -> Vec<i32> {
+    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n)
+        .into_iter()
+        .map(|d| d.score)
+        .collect()
+}
+
+/// [`affine_extend`] (or, with `diagonal`, [`affine_extend_diagonal`]) for each of `texts`,
+/// which must be sorted, sharing rows as [`affine_sorted`] does.
+pub fn affine_extend_sorted(
+    pattern: &[u8],
+    texts: &[&[u8]],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+    diagonal: bool,
+) -> Vec<i32> {
+    let m = pattern.len();
+    let geom = |n: usize| if diagonal { m.min(n) } else { n };
+    affine_dp_sorted(pattern, texts, Mode::Prefix, sc, band, Some((xdrop, false)), geom)
+        .into_iter()
+        .map(|d| d.clip_best.max(d.score.saturating_add(end_bonus)))
+        .collect()
+}
+
 /// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
 /// row) however much longer the text is: for accurate reads, whose extensions stay near it.
 /// A text shorter than the pattern (a transcript ending inside the read's flank) keeps the
@@ -261,6 +289,7 @@ pub fn affine_extend_window(
 }
 
 /// What one DP pass found.
+#[derive(Clone, Copy)]
 struct Dp {
     /// Score in the pass's mode, and the text column where it ends (Prefix mode).
     score: i32,
@@ -270,6 +299,21 @@ struct Dp {
     clip_cell: (usize, usize),
     /// Text bases the pass read (a prefix of the text).
     text_read: usize,
+    /// The last row computed: the pattern length, or the row where the pass stopped.
+    last_row: usize,
+}
+
+/// A computed DP row (`h` and `f` over its band `[lo, hi]`) and the clip state after it, from
+/// which a pass over a text sharing the bases the rows up to it read can resume.
+#[derive(Clone, Default)]
+struct Snap {
+    row: usize,
+    lo: usize,
+    hi: usize,
+    h: Vec<i32>,
+    f: Vec<i32>,
+    clip_best: i32,
+    clip_cell: (usize, usize),
 }
 
 /// Reused per-thread DP rows.
@@ -281,10 +325,18 @@ struct DpBuf {
     nf: Vec<i32>,
     hp: Vec<i32>,
     gs: Vec<i32>,
+    snaps: Vec<Snap>,
 }
 
 thread_local! {
     static DP_BUF: std::cell::RefCell<DpBuf> = std::cell::RefCell::new(DpBuf::default());
+    /// DP cells and rows computed on this thread (counted only with `SPEARFISH_STATS`).
+    static DP_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Cells and rows `affine_dp` has computed on this thread so far (profiling).
+pub fn dp_work() -> (u64, u64) {
+    DP_WORK.with(|w| w.get())
 }
 
 /// The score in `mode`; with `clip = Some((xdrop, cell))`, also the best score anywhere (0 if
@@ -302,50 +354,165 @@ fn affine_dp(
     geom: usize,
 ) -> Dp {
     DP_BUF.with(|b| {
-        let b = &mut *b.borrow_mut();
-        #[multiversion::multiversion(targets(
-            "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-            "x86_64+avx2+fma",
-            "x86_64+avx",
-            "aarch64+neon"
-        ))]
-        fn run(
-            pattern: &[u8],
-            text: &[u8],
-            mode: Mode,
-            sc: &Affine,
-            (band, geom): (usize, usize),
-            clip: Option<(i32, bool)>,
-            b: &mut DpBuf,
-        ) -> Dp {
-            let (m, n) = (pattern.len(), text.len());
-            // With `clip`, the best cell anywhere (0 aligns nothing).
-            let mut clip_best = 0i32;
-            let mut clip_cell = (0usize, 0usize);
-            let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
-            let go = sc.open + sc.ext;
-            // Row i (pattern) covers text columns [i - band - (m - g)⁺, i + band +
-            // (g - m)⁺] up to n, for the band's text length g; Infix is unbanded.
-            let full = mode == Mode::Infix || band == usize::MAX;
-            let (below, above) = (
-                band.saturating_add(m.saturating_sub(geom)),
-                band.saturating_add(geom.saturating_sub(m)),
-            );
-            let range = |i: usize| {
-                if full {
-                    (0, n)
-                } else {
-                    (i.saturating_sub(below), i.saturating_add(above).min(n))
-                }
-            };
-            // h: best score ending at (i, j); f: ending in a gap that consumes pattern
-            // (vertical). Rows alternate between two buffers; cells outside a row's
-            // band stay NEG.
-            for v in [&mut b.h, &mut b.f, &mut b.nh, &mut b.nf] {
-                v.clear();
-                v.resize(n + 1, NEG);
+        run(
+            pattern,
+            text,
+            mode,
+            sc,
+            (band, geom),
+            clip,
+            &mut b.borrow_mut(),
+            None,
+            &mut [],
+        )
+    })
+}
+
+/// [`affine_dp`] over several texts in sorted order with one pattern, band and clip: a pass
+/// resumes from the previous text's rows wherever they read only bases the two texts share
+/// and the bands have the same shape, so isoforms that agree near the anchor are aligned
+/// there once. Results equal separate [`affine_dp`] calls.
+fn affine_dp_sorted(
+    pattern: &[u8],
+    texts: &[&[u8]],
+    mode: Mode,
+    sc: &Affine,
+    band: usize,
+    clip: Option<(i32, bool)>,
+    geom: impl Fn(usize) -> usize,
+) -> Vec<Dp> {
+    let m = pattern.len();
+    let shape = |n: usize| {
+        let g = geom(n);
+        (
+            band.saturating_add(m.saturating_sub(g)),
+            band.saturating_add(g.saturating_sub(m)),
+        )
+    };
+    let full = mode == Mode::Infix || band == usize::MAX;
+    // Row up to which text k's pass equals text k - 1's: rows i read text bases below i + above
+    // (capped at the text's end), so rows with i + above <= the common prefix agree. The last
+    // row is always computed (its score depends on the mode and the text's length).
+    let resume: Vec<usize> = (0..texts.len())
+        .map(|k| {
+            if k == 0 || full || shape(texts[k].len()) != shape(texts[k - 1].len()) {
+                return 0;
             }
-            debug_assert!(sc.open >= 0 && sc.ext >= 0);
+            let l = texts[k]
+                .iter()
+                .zip(texts[k - 1])
+                .take_while(|(a, b)| a == b)
+                .count();
+            l.saturating_sub(shape(texts[k].len()).1).min(m.saturating_sub(1))
+        })
+        .collect();
+    let mut want: Vec<usize> = resume.iter().copied().filter(|&r| r > 0).collect();
+    want.sort_unstable();
+    want.dedup();
+    DP_BUF.with(|b| {
+        let b = &mut *b.borrow_mut();
+        let mut snaps = std::mem::take(&mut b.snaps);
+        snaps.resize_with(want.len(), Snap::default);
+        for (s, &r) in snaps.iter_mut().zip(&want) {
+            s.row = r;
+        }
+        let mut out: Vec<Dp> = Vec::with_capacity(texts.len());
+        for (k, t) in texts.iter().enumerate() {
+            let r = resume[k];
+            let d = if r == 0 {
+                run(
+                    pattern,
+                    t,
+                    mode,
+                    sc,
+                    (band, geom(t.len())),
+                    clip,
+                    b,
+                    None,
+                    &mut snaps,
+                )
+            } else if out[k - 1].last_row <= r {
+                // The previous pass stopped within the shared rows: so does this one.
+                out[k - 1]
+            } else {
+                let i = want.binary_search(&r).unwrap();
+                let s = std::mem::take(&mut snaps[i]);
+                let d = run(
+                    pattern,
+                    t,
+                    mode,
+                    sc,
+                    (band, geom(t.len())),
+                    clip,
+                    b,
+                    Some(&s),
+                    &mut snaps,
+                );
+                snaps[i] = s;
+                d
+            };
+            out.push(d);
+        }
+        b.snaps = snaps;
+        out
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[multiversion::multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
+    "x86_64+avx2+fma",
+    "x86_64+avx",
+    "aarch64+neon"
+))]
+fn run(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    (band, geom): (usize, usize),
+    clip: Option<(i32, bool)>,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    let (m, n) = (pattern.len(), text.len());
+    // With `clip`, the best cell anywhere (0 aligns nothing).
+    let mut clip_best = 0i32;
+    let mut clip_cell = (0usize, 0usize);
+    let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
+    let go = sc.open + sc.ext;
+    // Row i (pattern) covers text columns [i - band - (m - g)⁺, i + band +
+    // (g - m)⁺] up to n, for the band's text length g; Infix is unbanded.
+    let full = mode == Mode::Infix || band == usize::MAX;
+    let (below, above) = (
+        band.saturating_add(m.saturating_sub(geom)),
+        band.saturating_add(geom.saturating_sub(m)),
+    );
+    let range = |i: usize| {
+        if full {
+            (0, n)
+        } else {
+            (i.saturating_sub(below), i.saturating_add(above).min(n))
+        }
+    };
+    // h: best score ending at (i, j); f: ending in a gap that consumes pattern
+    // (vertical). Rows alternate between two buffers; cells outside a row's
+    // band stay NEG.
+    for v in [&mut b.h, &mut b.f, &mut b.nh, &mut b.nf] {
+        v.clear();
+        v.resize(n + 1, NEG);
+    }
+    debug_assert!(sc.open >= 0 && sc.ext >= 0);
+    let (mut prev, first) = match resume {
+        Some(s) => {
+            b.h[s.lo..=s.hi].copy_from_slice(&s.h);
+            b.f[s.lo..=s.hi].copy_from_slice(&s.f);
+            clip_best = s.clip_best;
+            clip_cell = s.clip_cell;
+            ((s.lo, s.hi), s.row + 1)
+        }
+        None => {
             let (lo0, hi0) = range(0);
             for j in lo0..=hi0 {
                 b.h[j] = if j == 0 || mode == Mode::Infix {
@@ -354,117 +521,138 @@ fn affine_dp(
                     -(sc.open + sc.ext * j as i32)
                 };
             }
-            let mut prev = (lo0, hi0); // band of the row in h
-            let mut stale = (1, 0); // band of the row left in nh (empty)
-            for i in 1..=m {
-                let (lo, hi) = range(i);
-                if lo > hi {
-                    // Past the text's end by more than the band (only when geom > n): no
-                    // cell is reachable, so the rest of the pattern can't align.
-                    return Dp {
-                        score: NEG,
-                        score_col: 0,
-                        clip_best,
-                        clip_cell,
-                        text_read: n,
-                    };
-                }
-                b.nh[stale.0..=stale.1.min(n)].fill(NEG);
-                b.nf[stale.0..=stale.1.min(n)].fill(NEG);
-                let c = pattern[i - 1] & 3;
-                let mut start = lo;
-                // Horizontal gap (consumes text) ending at (i, start - 1): from column
-                // 0 if it is in the band, else unreachable.
-                let mut e = NEG;
-                if lo == 0 {
-                    // Column 0: only a vertical gap reaches it.
-                    let fj = (b.h[0] - go).max(b.f[0] - ext);
-                    b.nh[0] = fj;
-                    b.nf[0] = fj;
-                    e = fj - go;
-                    start = 1;
-                }
-                if start <= hi {
-                    // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
-                    // without horizontal gaps), from the previous row only.
-                    let w = hi + 1 - start;
-                    if b.hp.len() < w {
-                        b.hp.resize(w, NEG);
-                        b.gs.resize(w, NEG);
-                    }
-                    let DpBuf { h, f, nh, nf, hp, gs } = &mut *b;
-                    let (hp, gs) = (&mut hp[..w], &mut gs[..w]);
-                    let hd = &h[start - 1..hi]; // H[i-1][j-1]
-                    let hu = &h[start..=hi]; // H[i-1][j]
-                    let fu = &f[start..=hi];
-                    let tx = &text[start - 1..hi];
-                    let nfr = &mut nf[start..=hi];
-                    for k in 0..w {
-                        let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
-                        let s = if c == tx[k] & 3 { mat } else { -mis };
-                        let x = (hd[k] + s).max(fj).max(NEG);
-                        hp[k] = x;
-                        gs[k] = x - go + ext * (k as i32 + 1);
-                        nfr[k] = fj;
-                    }
-                    // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
-                    // - ext): opening from H = max(H', E) adds nothing. With g[k] =
-                    // E[k] + ext*k this is a running max (pass 2: exclusive prefix
-                    // maxima, one op per cell on the critical path); pass 3
-                    // (vectorizes) takes H = max(H', E).
-                    let mut g = e;
-                    for x in gs.iter_mut() {
-                        let next = g.max(*x);
-                        *x = g;
-                        g = next;
-                    }
-                    let nhr = &mut nh[start..=hi];
-                    for k in 0..w {
-                        nhr[k] = hp[k].max(gs[k] - ext * k as i32);
-                    }
-                }
-                if let Some((xdrop, cell)) = clip {
-                    let row = b.nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
-                    if row > clip_best {
-                        clip_best = row;
-                        if cell {
-                            let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
-                            clip_cell = (i, lo + j);
-                        }
-                    }
-                    if row < clip_best.saturating_sub(xdrop) {
-                        return Dp {
-                            score: NEG,
-                            score_col: 0,
-                            clip_best,
-                            clip_cell,
-                            text_read: hi,
-                        };
-                    }
-                }
-                std::mem::swap(&mut b.h, &mut b.nh);
-                std::mem::swap(&mut b.f, &mut b.nf);
-                stale = prev;
-                prev = (lo, hi);
-            }
-            let (score, score_col) = match mode {
-                Mode::Global => (b.h[n], n),
-                Mode::Prefix | Mode::Infix => {
-                    let row = &b.h[prev.0..=prev.1];
-                    let x = row.iter().copied().max().unwrap_or(NEG);
-                    (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
-                }
-            };
-            Dp {
-                score,
-                score_col,
+            ((lo0, hi0), 1)
+        }
+    }; // band of the row in h
+    let mut stale = (1, 0); // band of the row left in nh (empty)
+    let mut next_snap = snaps.partition_point(|s| s.row < first);
+    for i in first..=m {
+        let (lo, hi) = range(i);
+        if lo > hi {
+            // Past the text's end by more than the band (only when geom > n): no
+            // cell is reachable, so the rest of the pattern can't align.
+            return Dp {
+                score: NEG,
+                score_col: 0,
                 clip_best,
                 clip_cell,
-                text_read: prev.1,
+                text_read: n,
+                last_row: i,
+            };
+        }
+        b.nh[stale.0..=stale.1.min(n)].fill(NEG);
+        b.nf[stale.0..=stale.1.min(n)].fill(NEG);
+        let c = pattern[i - 1] & 3;
+        let mut start = lo;
+        // Horizontal gap (consumes text) ending at (i, start - 1): from column
+        // 0 if it is in the band, else unreachable.
+        let mut e = NEG;
+        if lo == 0 {
+            // Column 0: only a vertical gap reaches it.
+            let fj = (b.h[0] - go).max(b.f[0] - ext);
+            b.nh[0] = fj;
+            b.nf[0] = fj;
+            e = fj - go;
+            start = 1;
+        }
+        if crate::stats::on() {
+            DP_WORK.with(|x| {
+                let (c, r) = x.get();
+                x.set((c + (hi + 1 - lo) as u64, r + 1));
+            });
+        }
+        if start <= hi {
+            // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
+            // without horizontal gaps), from the previous row only.
+            let w = hi + 1 - start;
+            if b.hp.len() < w {
+                b.hp.resize(w, NEG);
+                b.gs.resize(w, NEG);
+            }
+            let DpBuf {
+                h, f, nh, nf, hp, gs, ..
+            } = &mut *b;
+            let (hp, gs) = (&mut hp[..w], &mut gs[..w]);
+            let hd = &h[start - 1..hi]; // H[i-1][j-1]
+            let hu = &h[start..=hi]; // H[i-1][j]
+            let fu = &f[start..=hi];
+            let tx = &text[start - 1..hi];
+            let nfr = &mut nf[start..=hi];
+            for k in 0..w {
+                let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
+                let s = if c == tx[k] & 3 { mat } else { -mis };
+                let x = (hd[k] + s).max(fj).max(NEG);
+                hp[k] = x;
+                gs[k] = x - go + ext * (k as i32 + 1);
+                nfr[k] = fj;
+            }
+            // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
+            // - ext): opening from H = max(H', E) adds nothing. With g[k] =
+            // E[k] + ext*k this is a running max (pass 2: exclusive prefix
+            // maxima, one op per cell on the critical path); pass 3
+            // (vectorizes) takes H = max(H', E).
+            let mut g = e;
+            for x in gs.iter_mut() {
+                let next = g.max(*x);
+                *x = g;
+                g = next;
+            }
+            let nhr = &mut nh[start..=hi];
+            for k in 0..w {
+                nhr[k] = hp[k].max(gs[k] - ext * k as i32);
             }
         }
-        run(pattern, text, mode, sc, (band, geom), clip, b)
-    })
+        if let Some((xdrop, cell)) = clip {
+            let row = b.nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
+            if row > clip_best {
+                clip_best = row;
+                if cell {
+                    let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
+                    clip_cell = (i, lo + j);
+                }
+            }
+            if row < clip_best.saturating_sub(xdrop) {
+                return Dp {
+                    score: NEG,
+                    score_col: 0,
+                    clip_best,
+                    clip_cell,
+                    text_read: hi,
+                    last_row: i,
+                };
+            }
+        }
+        std::mem::swap(&mut b.h, &mut b.nh);
+        std::mem::swap(&mut b.f, &mut b.nf);
+        stale = prev;
+        prev = (lo, hi);
+        if next_snap < snaps.len() && snaps[next_snap].row == i {
+            let s = &mut snaps[next_snap];
+            (s.lo, s.hi) = (lo, hi);
+            s.h.clear();
+            s.h.extend_from_slice(&b.h[lo..=hi]);
+            s.f.clear();
+            s.f.extend_from_slice(&b.f[lo..=hi]);
+            (s.clip_best, s.clip_cell) = (clip_best, clip_cell);
+            next_snap += 1;
+        }
+    }
+    let (score, score_col) = match mode {
+        Mode::Global => (b.h[n], n),
+        Mode::Prefix | Mode::Infix => {
+            let row = &b.h[prev.0..=prev.1];
+            let x = row.iter().copied().max().unwrap_or(NEG);
+            (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
+        }
+    };
+    Dp {
+        score,
+        score_col,
+        clip_best,
+        clip_cell,
+        text_read: prev.1,
+        last_row: m,
+    }
 }
 
 #[cfg(test)]
@@ -650,6 +838,54 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
+
+        /// Sorted texts sharing prefixes (isoform flanks) give the same scores through the
+        /// row-sharing batch as one at a time, with and without X-drop stops and bands.
+        #[test]
+        fn sorted_batch_matches_single(
+            base in prop::collection::vec(0u8..4, 1..160),
+            edits in prop::collection::vec((0usize..160, 0u8..4, 0u8..3), 0..12),
+            variants in prop::collection::vec((0usize..160, prop::collection::vec(0u8..4, 0..40), 0usize..60), 1..8),
+            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8,
+        ) {
+            let mut p = base.clone();
+            for (pos, b, kind) in edits {
+                if p.is_empty() { break; }
+                let i = pos % p.len();
+                match kind { 0 => p[i] = b, 1 => p.insert(i, b), _ => { p.remove(i); } }
+            }
+            // Each variant keeps a prefix of the base text, then diverges and is cut to a length.
+            let mut texts: Vec<Vec<u8>> = vec![base.clone()];
+            for (keep, tail, cut) in variants {
+                let mut t = base[..keep.min(base.len())].to_vec();
+                t.extend(tail);
+                t.extend_from_slice(&base[keep.min(base.len())..]);
+                t.truncate(t.len().saturating_sub(cut % 20));
+                texts.push(t);
+            }
+            texts.sort();
+            texts.dedup();
+            let refs: Vec<&[u8]> = texts.iter().map(|t| t.as_slice()).collect();
+            for sc in [Affine::default(), Affine::HIFI] {
+                for mode in [Mode::Global, Mode::Prefix] {
+                    let got = affine_sorted(&p, &refs, mode, &sc, band);
+                    let want: Vec<i32> = refs.iter().map(|t| affine(&p, t, mode, &sc, band)).collect();
+                    prop_assert_eq!(got, want, "mode {:?}", mode);
+                }
+                for diag in [false, true] {
+                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag);
+                    let want: Vec<i32> = refs
+                        .iter()
+                        .map(|t| if diag {
+                            affine_extend_diagonal(&p, t, &sc, band, bonus, xdrop)
+                        } else {
+                            affine_extend(&p, t, &sc, band, bonus, xdrop)
+                        })
+                        .collect();
+                    prop_assert_eq!(got, want, "diag {}", diag);
+                }
+            }
+        }
 
         #[test]
         fn affine_vs_naive(
