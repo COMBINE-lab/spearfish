@@ -595,15 +595,26 @@ fn run(
     // h: best score ending at (i, j); f: ending in a gap that consumes pattern
     // (vertical). Rows alternate between two buffers; cells outside a row's
     // band stay NEG.
+    // Rows are not cleared: a row's band is written in full and a sentinel is put on each
+    // side of it, and a row reads the previous row only within one column of its band.
     for v in [&mut b.h, &mut b.f, &mut b.nh, &mut b.nf] {
-        v.clear();
-        v.resize(n + 1, NEG);
+        if v.len() < n + 2 {
+            v.resize(n + 2, NEG);
+        }
     }
+    let edges = |v: &mut Vec<i32>, lo: usize, hi: usize| {
+        if lo > 0 {
+            v[lo - 1] = NEG;
+        }
+        v[hi + 1] = NEG;
+    };
     debug_assert!(sc.open >= 0 && sc.ext >= 0);
     let (mut prev, first) = match resume {
         Some(s) => {
             b.h[s.lo..=s.hi].copy_from_slice(&s.h);
             b.f[s.lo..=s.hi].copy_from_slice(&s.f);
+            edges(&mut b.h, s.lo, s.hi);
+            edges(&mut b.f, s.lo, s.hi);
             clip_best = s.clip_best;
             clip_cell = s.clip_cell;
             ((s.lo, s.hi), s.row + 1)
@@ -617,10 +628,12 @@ fn run(
                     -(sc.open + sc.ext * j as i32)
                 };
             }
+            b.f[lo0..=hi0].fill(NEG);
+            edges(&mut b.h, lo0, hi0);
+            edges(&mut b.f, lo0, hi0);
             ((lo0, hi0), 1)
         }
     }; // band of the row in h
-    let mut stale = (1, 0); // band of the row left in nh (empty)
     let mut next_snap = snaps.partition_point(|s| s.row < first);
     // X-drop pruning (experimental): cells more than `xdrop` below the best are dead, and a
     // row's band shrinks to the columns its predecessor's live cells can reach (one diagonal
@@ -680,8 +693,11 @@ fn run(
                 last_row: i,
             };
         }
-        b.nh[stale.0..=stale.1.min(n)].fill(NEG);
-        b.nf[stale.0..=stale.1.min(n)].fill(NEG);
+        if hi > prev.1 + 1 {
+            // Only with pruning: the band reaches past the column after the previous row's.
+            b.h[prev.1 + 2..=hi].fill(NEG);
+            b.f[prev.1 + 2..=hi].fill(NEG);
+        }
         let c = pattern[i - 1] & 3;
         let mut start = lo;
         // Horizontal gap (consumes text) ending at (i, start - 1): from column
@@ -708,14 +724,19 @@ fn run(
             // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
             // without horizontal gaps), from the previous row only.
             let w = hi + 1 - start;
-            if b.hp.len() < w {
-                b.hp.resize(w, NEG);
-                b.gs.resize(w, NEG);
+            // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
+            // only adds outputs after every real one.
+            let wp = w.next_multiple_of(16);
+            if b.hp.len() < wp {
+                b.hp.resize(wp, NEG);
+                b.gs.resize(wp, NEG);
             }
             let DpBuf {
                 h, f, nh, nf, hp, gs, ..
             } = &mut *b;
-            let (hp, gs) = (&mut hp[..w], &mut gs[..w]);
+            gs[w..wp].fill(NEG);
+            let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
+            let gs = &mut gs_all[..w];
             let hd = &h[start - 1..hi]; // H[i-1][j-1]
             let hu = &h[start..=hi]; // H[i-1][j]
             let fu = &f[start..=hi];
@@ -734,7 +755,8 @@ fn run(
             // E[k] + ext*k this is a running max (pass 2: exclusive prefix
             // maxima, one op per cell on the critical path); pass 3
             // (vectorizes) takes H = max(H', E).
-            excl_prefix_max(gs, e);
+            excl_prefix_max(gs_all, e);
+            let gs = &gs_all[..w];
             let nhr = &mut nh[start..=hi];
             let mut m = NEG;
             for k in 0..w {
@@ -767,9 +789,10 @@ fn run(
                 live = live_cols(&b.nh, (lo, hi), clip_best.saturating_sub(xdrop));
             }
         }
+        edges(&mut b.nh, lo, hi);
+        edges(&mut b.nf, lo, hi);
         std::mem::swap(&mut b.h, &mut b.nh);
         std::mem::swap(&mut b.f, &mut b.nf);
-        stale = prev;
         prev = (lo, hi);
         if next_snap < snaps.len() && snaps[next_snap].row == i {
             let s = &mut snaps[next_snap];
