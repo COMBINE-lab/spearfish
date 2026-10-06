@@ -15,18 +15,23 @@ pub struct Hpc {
 
 impl Hpc {
     pub fn new(raw: &[u8]) -> Self {
-        let mut seq = Vec::with_capacity(raw.len());
-        let mut raw_start = Vec::with_capacity(raw.len() + 1);
-        let mut prev: Option<u8> = None;
+        // Branchless: every base is written to the next free slot, which is kept only when the
+        // base starts a run (runs compare case-insensitively; a run keeps its first base).
+        let n = raw.len();
+        let mut seq = vec![0u8; n];
+        let mut raw_start = vec![0u32; n + 1];
+        let mut k = 0usize;
+        let mut prev = u16::MAX; // matches no base
         for (i, &b) in raw.iter().enumerate() {
-            let u = b.to_ascii_uppercase();
-            if prev != Some(u) {
-                seq.push(b);
-                raw_start.push(i as u32);
-                prev = Some(u);
-            }
+            let u = b.to_ascii_uppercase() as u16;
+            seq[k] = b;
+            raw_start[k] = i as u32;
+            k += (u != prev) as usize;
+            prev = u;
         }
-        raw_start.push(raw.len() as u32);
+        seq.truncate(k);
+        raw_start[k] = n as u32;
+        raw_start.truncate(k + 1);
         Hpc { seq, raw_start }
     }
 

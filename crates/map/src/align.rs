@@ -288,6 +288,25 @@ pub fn affine_extend_window(
     }
 }
 
+/// First and last columns of `h` within `band` scoring at least `thr` ((1, 0) if none).
+#[inline]
+fn live_cols(h: &[i32], band: (usize, usize), thr: i32) -> (usize, usize) {
+    let row = &h[band.0..=band.1];
+    match (
+        row.iter().position(|&x| x >= thr),
+        row.iter().rposition(|&x| x >= thr),
+    ) {
+        (Some(a), Some(z)) => (band.0 + a, band.0 + z),
+        _ => (1, 0),
+    }
+}
+
+/// Experimental X-drop band pruning, on with `SPEARFISH_XDROP_PRUNE` in the environment.
+fn xdrop_prune() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPEARFISH_XDROP_PRUNE").is_some())
+}
+
 /// What one DP pass found.
 #[derive(Clone, Copy)]
 struct Dp {
@@ -419,7 +438,17 @@ fn affine_dp_sorted(
         let mut out: Vec<Dp> = Vec::with_capacity(texts.len());
         for (k, t) in texts.iter().enumerate() {
             let r = resume[k];
-            let d = if r == 0 {
+            // A pass depends on its text only through the bases it read (below the band's
+            // clamp at the text's end): a text agreeing with the previous one there, with a
+            // band of the same shape, has the same result. With clipping the pass usually
+            // reads far less than the window (X-drop).
+            let same = k > 0 && clip.is_some() && !full && {
+                let (p, tr) = (texts[k - 1], out[k - 1].text_read);
+                shape(t.len()) == shape(p.len()) && tr < p.len() && tr < t.len() && t[..tr] == p[..tr]
+            };
+            let d = if same {
+                out[k - 1]
+            } else if r == 0 {
                 run(
                     pattern,
                     t,
@@ -526,8 +555,52 @@ fn run(
     }; // band of the row in h
     let mut stale = (1, 0); // band of the row left in nh (empty)
     let mut next_snap = snaps.partition_point(|s| s.row < first);
+    // X-drop pruning (experimental): cells more than `xdrop` below the best are dead, and a
+    // row's band shrinks to the columns its predecessor's live cells can reach (one diagonal
+    // step plus as far as a horizontal gap stays above the threshold).
+    let prune = !full && xdrop_prune() && clip.is_some();
+    let (xd, reach) = match clip {
+        Some((x, _)) => (x, ((x - go).max(0) / ext.max(1) + 1) as usize),
+        None => (0, 0),
+    };
+    let mut live = if prune {
+        live_cols(&b.h, prev, clip_best.saturating_sub(xd))
+    } else {
+        prev
+    };
     for i in first..=m {
-        let (lo, hi) = range(i);
+        let (mut lo, mut hi) = range(i);
+        if prune && lo <= hi {
+            if live.0 > live.1 {
+                return Dp {
+                    score: NEG,
+                    score_col: 0,
+                    clip_best,
+                    clip_cell,
+                    text_read: prev.1,
+                    last_row: i,
+                };
+            }
+            // Dead edges of the previous row propagate nothing.
+            b.h[prev.0..live.0].fill(NEG);
+            b.f[prev.0..live.0].fill(NEG);
+            if live.1 < prev.1 {
+                b.h[live.1 + 1..=prev.1].fill(NEG);
+                b.f[live.1 + 1..=prev.1].fill(NEG);
+            }
+            lo = lo.max(live.0);
+            hi = hi.min(live.1 + 1 + reach);
+            if lo > hi {
+                return Dp {
+                    score: NEG,
+                    score_col: 0,
+                    clip_best,
+                    clip_cell,
+                    text_read: prev.1,
+                    last_row: i,
+                };
+            }
+        }
         if lo > hi {
             // Past the text's end by more than the band (only when geom > n): no
             // cell is reachable, so the rest of the pattern can't align.
@@ -620,6 +693,9 @@ fn run(
                     text_read: hi,
                     last_row: i,
                 };
+            }
+            if prune {
+                live = live_cols(&b.nh, (lo, hi), clip_best.saturating_sub(xdrop));
             }
         }
         std::mem::swap(&mut b.h, &mut b.nh);
