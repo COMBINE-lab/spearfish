@@ -26,8 +26,57 @@ pub const RAW_CK: u32 = 64;
 
 /// Base `i` of 2-bit packed `words`.
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 fn base_at(words: &[u64], i: u32) -> u8 {
     ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8
+}
+
+/// Bases `[lo, hi)` of 2-bit packed `words`, through `map`, appended to `out` a word at a time.
+fn decode_into(words: &[u64], lo: u32, hi: u32, map: [u8; 4], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.resize(start + (hi - lo) as usize, 0);
+    let dst = &mut out[start..];
+    let (mut i, mut d) = (lo, 0usize);
+    while i < hi {
+        let w = words[(i / 32) as usize] >> (2 * (i % 32));
+        let take = ((32 - i % 32).min(hi - i)) as usize;
+        for (k, x) in dst[d..d + take].iter_mut().enumerate() {
+            *x = map[((w >> (2 * k)) & 3) as usize];
+        }
+        i += take as u32;
+        d += take;
+    }
+}
+
+/// The `q`-th position after `r` (q >= 1) where the base differs from the one before it, in
+/// 2-bit packed `words` of `rlen` bases, or `rlen` if there are fewer: where `q` runs after the
+/// run starting at `r` end. Changes are found a word at a time (XOR with the shifted word).
+fn nth_run_start(words: &[u64], rlen: u32, r: u32, mut q: u32) -> u32 {
+    let mut j0 = r + 1;
+    while j0 < rlen {
+        let wi = (j0 / 32) as usize;
+        let w = words[wi];
+        // The base before the word's first (no change at position 0: it is never asked for).
+        let prev = if wi == 0 { w & 3 } else { words[wi - 1] >> 62 };
+        let x = w ^ ((w << 2) | prev);
+        // One bit per base (the low bit of its field): set where the base changes.
+        let mut m = (x | (x >> 1)) & 0x5555_5555_5555_5555;
+        m &= !0u64 << (2 * (j0 % 32));
+        let end = rlen - wi as u32 * 32;
+        if end < 32 {
+            m &= (1u64 << (2 * end)) - 1;
+        }
+        let c = m.count_ones();
+        if c >= q {
+            for _ in 1..q {
+                m &= m - 1;
+            }
+            return wi as u32 * 32 + m.trailing_zeros() / 2;
+        }
+        q -= c;
+        j0 = (wi as u32 + 1) * 32;
+    }
+    rlen
 }
 
 /// Owned index contents, as produced by `build`.
@@ -391,8 +440,7 @@ impl Index {
     pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>, ascii: bool) {
         let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
         let map: [u8; 4] = if ascii { *b"ACGT" } else { [0, 1, 2, 3] };
-        out.reserve((hi - lo) as usize);
-        out.extend((lo..hi).map(|i| map[((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as usize]));
+        decode_into(words, lo, hi, map, out);
     }
 
     /// Raw 2-bit codes of transcript `t` over the raw span of its parsed bases `[lo, hi)`
@@ -400,7 +448,9 @@ impl Index {
     pub fn tx_raw_codes(&self, t: u32, lo: u32, hi: u32) -> Option<Vec<u8>> {
         let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
         let (words, _) = self.raw_words(t)?;
-        Some((a..b).map(|i| base_at(words, i)).collect())
+        let mut v = Vec::new();
+        decode_into(words, a, b, [0, 1, 2, 3], &mut v);
+        Some(v)
     }
 
     /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
@@ -409,15 +459,11 @@ impl Index {
         let (words, ck) = self.raw_words(t)?;
         let rlen = self.tx_len()[t as usize];
         // From the checkpoint, skip whole runs.
-        let mut r = ck[(p / RAW_CK) as usize];
-        for _ in 0..p % RAW_CK {
-            let b = base_at(words, r);
-            r += 1;
-            while r < rlen && base_at(words, r) == b {
-                r += 1;
-            }
-        }
-        Some(r)
+        let r = ck[(p / RAW_CK) as usize];
+        Some(match p % RAW_CK {
+            0 => r,
+            q => nth_run_start(words, rlen, r, q),
+        })
     }
 
     /// Transcript `t`'s packed raw bases and run checkpoints, if present.
@@ -488,6 +534,52 @@ impl Index {
             v.sort_unstable_by_key(|&(n, p)| (p, n));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn pack(bases: &[u8]) -> Vec<u64> {
+        let mut w = vec![0u64; bases.len().div_ceil(32).max(1)];
+        for (i, &b) in bases.iter().enumerate() {
+            w[i / 32] |= (b as u64) << (2 * (i % 32));
+        }
+        w
+    }
+
+    proptest! {
+        /// Word-at-a-time decoding and run skipping equal the base-at-a-time loops.
+        #[test]
+        fn packed_ops_match_scalar(
+            bases in prop::collection::vec(prop_oneof![0u8..4, Just(1u8)], 1..300),
+            a in 0usize..300, b in 0usize..300, q in 1u32..64,
+        ) {
+            let w = pack(&bases);
+            let n = bases.len() as u32;
+            let (lo, hi) = ((a as u32).min(n), (b as u32).min(n));
+            let (lo, hi) = (lo.min(hi), lo.max(hi));
+            let mut got = Vec::new();
+            decode_into(&w, lo, hi, *b"ACGT", &mut got);
+            let want: Vec<u8> = (lo..hi).map(|i| b"ACGT"[base_at(&w, i) as usize]).collect();
+            prop_assert_eq!(got, want);
+            // A run start: position 0 or a change.
+            let starts: Vec<u32> =
+                (0..n).filter(|&i| i == 0 || bases[i as usize] != bases[i as usize - 1]).collect();
+            let r = starts[(a % starts.len())];
+            let mut want = r;
+            for _ in 0..q {
+                if want >= n { break; }
+                let c = base_at(&w, want);
+                want += 1;
+                while want < n && base_at(&w, want) == c {
+                    want += 1;
+                }
+            }
+            prop_assert_eq!(nth_run_start(&w, n, r, q), want);
+        }
     }
 }
 

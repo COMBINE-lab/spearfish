@@ -671,6 +671,8 @@ fn run(
         // Horizontal gap (consumes text) ending at (i, start - 1): from column
         // 0 if it is in the band, else unreachable.
         let mut e = NEG;
+        // The row's maximum, kept as the row is written (for clipping).
+        let mut row_max = NEG;
         if lo == 0 {
             // Column 0: only a vertical gap reaches it.
             let fj = (b.h[0] - go).max(b.f[0] - ext);
@@ -678,6 +680,7 @@ fn run(
             b.nf[0] = fj;
             e = fj - go;
             start = 1;
+            row_max = fj;
         }
         if crate::stats::on() {
             DP_WORK.with(|x| {
@@ -717,12 +720,16 @@ fn run(
             // (vectorizes) takes H = max(H', E).
             excl_prefix_max(gs, e);
             let nhr = &mut nh[start..=hi];
+            let mut m = NEG;
             for k in 0..w {
-                nhr[k] = hp[k].max(gs[k] - ext * k as i32);
+                let v = hp[k].max(gs[k] - ext * k as i32);
+                nhr[k] = v;
+                m = m.max(v);
             }
+            row_max = row_max.max(m);
         }
         if let Some((xdrop, cell)) = clip {
-            let row = b.nh[lo..=hi].iter().copied().max().unwrap_or(NEG);
+            let row = row_max;
             if row > clip_best {
                 clip_best = row;
                 if cell {
