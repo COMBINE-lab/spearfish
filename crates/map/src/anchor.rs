@@ -78,6 +78,7 @@ pub fn anchors(idx: &Index, seeds: &[Seed], p: &AnchorParams) -> Vec<Anchor> {
         let weight = (s.end - s.start).min(p.s_max) as f32 * specificity.max(0.0);
         for node in r {
             if flags[node as usize] & FLAG_MASKED == 0 {
+                idx.prefetch_node(node);
                 out.push(Anchor {
                     qs: s.start,
                     qe: s.end,
@@ -113,7 +114,11 @@ pub fn candidates(idx: &Index, anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Ca
     // a seed's nodes ascend, so within a family the input order is already (qs, qe, node);
     // check it, and sort a family's anchors only if not.
     let mut keys: Vec<u64> = Vec::with_capacity(anchors.len());
+    const AHEAD: usize = 8;
     for (i, a) in anchors.iter().enumerate() {
+        if let Some(x) = anchors.get(i + AHEAD) {
+            idx.prefetch_family(x.node);
+        }
         let f = fam[unitig[a.node as usize] as usize];
         if f != NO_FAMILY {
             keys.push(((f as u64) << 32) | i as u64);

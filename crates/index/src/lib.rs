@@ -352,6 +352,20 @@ impl Index {
         prefetch(self.node_flags().as_ptr().wrapping_add(lo));
     }
 
+    /// Ask the caches for node `node`'s unitig entry (read by family grouping and chaining).
+    #[inline]
+    pub fn prefetch_node(&self, node: u32) {
+        prefetch(self.node_unitig().as_ptr().wrapping_add(node as usize));
+    }
+
+    /// Ask the caches for the family entry of `node`'s unitig (reads the unitig entry, so call
+    /// it once [`Self::prefetch_node`] has had time to land).
+    #[inline]
+    pub fn prefetch_family(&self, node: u32) {
+        let u = self.node_unitig()[node as usize] as usize;
+        prefetch(self.unitig_family().as_ptr().wrapping_add(u));
+    }
+
     /// Nodes carrying a seed label (empty if the index lacks it). With global collapsing at
     /// most one; with per-gene collapsing one per gene containing the label.
     #[inline]
