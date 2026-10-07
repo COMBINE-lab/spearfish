@@ -355,25 +355,6 @@ unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
     }
 }
 
-/// First and last columns of `h` within `band` scoring at least `thr` ((1, 0) if none).
-#[inline]
-fn live_cols(h: &[i32], band: (usize, usize), thr: i32) -> (usize, usize) {
-    let row = &h[band.0..=band.1];
-    match (
-        row.iter().position(|&x| x >= thr),
-        row.iter().rposition(|&x| x >= thr),
-    ) {
-        (Some(a), Some(z)) => (band.0 + a, band.0 + z),
-        _ => (1, 0),
-    }
-}
-
-/// Experimental X-drop band pruning, on with `SPEARFISH_XDROP_PRUNE` in the environment.
-fn xdrop_prune() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPEARFISH_XDROP_PRUNE").is_some())
-}
-
 /// What one DP pass found.
 #[derive(Clone, Copy)]
 struct Dp {
@@ -635,52 +616,8 @@ fn run(
         }
     }; // band of the row in h
     let mut next_snap = snaps.partition_point(|s| s.row < first);
-    // X-drop pruning (experimental): cells more than `xdrop` below the best are dead, and a
-    // row's band shrinks to the columns its predecessor's live cells can reach (one diagonal
-    // step plus as far as a horizontal gap stays above the threshold).
-    let prune = !full && xdrop_prune() && clip.is_some();
-    let (xd, reach) = match clip {
-        Some((x, _)) => (x, ((x - go).max(0) / ext.max(1) + 1) as usize),
-        None => (0, 0),
-    };
-    let mut live = if prune {
-        live_cols(&b.h, prev, clip_best.saturating_sub(xd))
-    } else {
-        prev
-    };
     for i in first..=m {
-        let (mut lo, mut hi) = range(i);
-        if prune && lo <= hi {
-            if live.0 > live.1 {
-                return Dp {
-                    score: NEG,
-                    score_col: 0,
-                    clip_best,
-                    clip_cell,
-                    text_read: prev.1,
-                    last_row: i,
-                };
-            }
-            // Dead edges of the previous row propagate nothing.
-            b.h[prev.0..live.0].fill(NEG);
-            b.f[prev.0..live.0].fill(NEG);
-            if live.1 < prev.1 {
-                b.h[live.1 + 1..=prev.1].fill(NEG);
-                b.f[live.1 + 1..=prev.1].fill(NEG);
-            }
-            lo = lo.max(live.0);
-            hi = hi.min(live.1 + 1 + reach);
-            if lo > hi {
-                return Dp {
-                    score: NEG,
-                    score_col: 0,
-                    clip_best,
-                    clip_cell,
-                    text_read: prev.1,
-                    last_row: i,
-                };
-            }
-        }
+        let (lo, hi) = range(i);
         if lo > hi {
             // Past the text's end by more than the band (only when geom > n): no
             // cell is reachable, so the rest of the pattern can't align.
@@ -692,11 +629,6 @@ fn run(
                 text_read: n,
                 last_row: i,
             };
-        }
-        if hi > prev.1 + 1 {
-            // Only with pruning: the band reaches past the column after the previous row's.
-            b.h[prev.1 + 2..=hi].fill(NEG);
-            b.f[prev.1 + 2..=hi].fill(NEG);
         }
         let c = pattern[i - 1] & 3;
         let mut start = lo;
@@ -784,9 +716,6 @@ fn run(
                     text_read: hi,
                     last_row: i,
                 };
-            }
-            if prune {
-                live = live_cols(&b.nh, (lo, hi), clip_best.saturating_sub(xdrop));
             }
         }
         edges(&mut b.nh, lo, hi);
