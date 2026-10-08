@@ -649,6 +649,16 @@ impl<C: Chainer> Mapper<C> {
         };
         // Interior segments [shared_k, shared_k+1).
         for k in 0..shared.len() - 1 {
+            // Most segments are the same in every candidate: compare the packed sequences
+            // before decoding any of them.
+            let (h0, lo0) = (hits[0].tx, tpos[0][k]);
+            let len0 = tpos[0][k + 1].max(lo0) - lo0;
+            if hits.iter().zip(&tpos).skip(1).all(|(h, t)| {
+                let len = t[k + 1].max(t[k]) - t[k];
+                len == len0 && self.idx.tx_codes_eq(h0, lo0, h.tx, t[k], len)
+            }) {
+                continue;
+            }
             let texts = hits
                 .iter()
                 .zip(&tpos)

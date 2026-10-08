@@ -48,6 +48,33 @@ fn decode_into(words: &[u64], lo: u32, hi: u32, map: [u8; 4], out: &mut Vec<u8>)
     }
 }
 
+/// 32 bases of 2-bit packed `words` starting at base `i` (bases past the end of `words` read
+/// as 0).
+#[inline]
+fn word_at(words: &[u64], i: u32) -> u64 {
+    let (q, s) = ((i / 32) as usize, 2 * (i % 32));
+    let lo = words[q] >> s;
+    if s == 0 {
+        lo
+    } else {
+        lo | words.get(q + 1).map_or(0, |w| w << (64 - s))
+    }
+}
+
+/// Whether bases `[alo, alo + len)` of packed `a` equal bases `[blo, blo + len)` of packed `b`,
+/// compared 32 at a time without decoding.
+fn packed_eq(a: &[u64], alo: u32, b: &[u64], blo: u32, len: u32) -> bool {
+    let mut k = 0;
+    while k + 32 <= len {
+        if word_at(a, alo + k) != word_at(b, blo + k) {
+            return false;
+        }
+        k += 32;
+    }
+    let r = len - k;
+    r == 0 || (word_at(a, alo + k) ^ word_at(b, blo + k)) & ((1u64 << (2 * r)) - 1) == 0
+}
+
 /// The `q`-th position after `r` (q >= 1) where the base differs from the one before it, in
 /// 2-bit packed `words` of `rlen` bases, or `rlen` if there are fewer: where `q` runs after the
 /// run starting at `r` end. Changes are found a word at a time (XOR with the shifted word).
@@ -443,6 +470,19 @@ impl Index {
         decode_into(words, lo, hi, map, out);
     }
 
+    /// Whether the parsed transcripts `t` from `lo` and `u` from `ulo` agree on `len` bases,
+    /// compared on the packed sequence (no decoding).
+    pub fn tx_codes_eq(&self, t: u32, lo: u32, u: u32, ulo: u32, len: u32) -> bool {
+        let (seq, off) = (self.tx_seq(), self.tx_seq_off());
+        packed_eq(
+            &seq[off[t as usize] as usize..],
+            lo,
+            &seq[off[u as usize] as usize..],
+            ulo,
+            len,
+        )
+    }
+
     /// Raw 2-bit codes of transcript `t` over the raw span of its parsed bases `[lo, hi)`
     /// (whole homopolymer runs), or None if the index has no raw sequence for `t`.
     pub fn tx_raw_codes(&self, t: u32, lo: u32, hi: u32) -> Option<Vec<u8>> {
@@ -579,6 +619,28 @@ mod packed_tests {
                 }
             }
             prop_assert_eq!(nth_run_start(&w, n, r, q), want);
+        }
+
+        /// Packed range comparison equals comparing the bases, for equal and nearly equal
+        /// ranges at any alignment.
+        #[test]
+        fn packed_eq_matches_scalar(
+            bases in prop::collection::vec(0u8..4, 1..300),
+            a in 0usize..300, b in 0usize..300, len in 0usize..300, flip in prop::option::of(0usize..300),
+        ) {
+            let n = bases.len();
+            let (a, b) = (a % n, b % n);
+            let len = len.min(n - a).min(n - b);
+            // A second sequence equal to the first except, optionally, one base.
+            let mut other = bases.clone();
+            if let Some(f) = flip {
+                other[f % n] ^= 1;
+            }
+            let (w, v) = (pack(&bases), pack(&other));
+            let want = bases[a..a + len] == other[b..b + len];
+            prop_assert_eq!(packed_eq(&w, a as u32, &v, b as u32, len as u32), want);
+            // Same range of the same sequence.
+            prop_assert!(packed_eq(&w, a as u32, &w, a as u32, len as u32));
         }
     }
 }
