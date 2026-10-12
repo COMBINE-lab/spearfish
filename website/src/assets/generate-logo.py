@@ -9,7 +9,10 @@ isoforms part in the forked tail, each lobe holding an alternative last exon:
 the fork is the delta of delta mapping, which aligns only where candidates
 differ.
 
-Usage: generate-logo.py light|dark|favicon-light|favicon-dark > out.svg
+Usage: generate-logo.py light|dark|favicon|favicon-light|favicon-dark > out.svg
+
+`favicon` follows the browser's color scheme (prefers-color-scheme), since a tab bar can be
+dark while the site is light or the other way round.
 """
 
 import sys
@@ -194,24 +197,33 @@ def logo(theme):
 
 
 def favicon(theme):
+    """`theme` is "light", "dark", or "auto" (light colors, switched to dark ones by a media
+    query in the SVG)."""
     # A different drawing, not the logo scaled down: at 16 px the lanes, seeds
     # and fin rays turn to mush, and a wide fish is a sliver in a square tab.
     # Keep the spear, a solid body and two heavy lanes splitting into the tail
     # fork, and tilt the fish nose-up so it fills the square.
-    col = BODY[theme]
+    col = BODY["light" if theme == "auto" else theme]
     fish = [
-        f'<path d="{tail()}" fill="{col}" opacity="0.45"/>',
-        f'<path d="{body_path()}" fill="{col}"/>',
+        f'<path class="body" d="{tail()}" fill="{col}" opacity="0.45"/>',
+        f'<path class="body" d="{body_path()}" fill="{col}"/>',
         f'<path d="M 230 121 L 392 121 C 420 121 440 96 472 64" fill="none" stroke="{ISO[0]}" '
         'stroke-width="16" stroke-linecap="round"/>',
         f'<path d="M 230 135 L 392 135 C 420 135 440 160 472 192" fill="none" stroke="{ISO[2]}" '
         'stroke-width="16" stroke-linecap="round"/>',
-        f'<path d="M 24 121 L 156 118 L 156 138 L 24 135 Z" fill="{col}"/>',
+        f'<path class="body" d="M 24 121 L 156 118 L 156 138 L 24 135 Z" fill="{col}"/>',
     ]
     return "\n".join(
         [
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" '
             'role="img" aria-label="spearfish">',
+            *(
+                [
+                    f'<style>@media (prefers-color-scheme: dark) {{ .body {{ fill: {BODY["dark"]}; }} }}</style>'
+                ]
+                if theme == "auto"
+                else []
+            ),
             '<g transform="translate(128 128) rotate(38) scale(0.6) translate(-255 -128)">',
             *fish,
             "</g>",
@@ -223,6 +235,6 @@ def favicon(theme):
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "light"
     if which.startswith("favicon"):
-        print(favicon(which.split("-")[1] if "-" in which else "light"))
+        print(favicon(which.split("-")[1] if "-" in which else "auto"))
     else:
         print(logo(which))

@@ -1,9 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="spearfish">
+<style>@media (prefers-color-scheme: dark) { .body { fill: #EAF0F7; } }</style>
 <g transform="translate(128 128) rotate(38) scale(0.6) translate(-255 -128)">
-<path d="M 414 132 C 436 148 458 174 484 208 C 482 178 468 150 446 130 Z M 414 124 C 436 108 458 82 484 48 C 482 78 468 106 446 126 Z" fill="#22303F" opacity="0.45"/>
-<path d="M 150 128 C 172 104 222 90 286 92 C 344 94 396 114 422 123 L 422 133 C 396 142 344 162 286 164 C 222 166 172 152 150 128 Z" fill="#22303F"/>
+<path class="body" d="M 414 132 C 436 148 458 174 484 208 C 482 178 468 150 446 130 Z M 414 124 C 436 108 458 82 484 48 C 482 78 468 106 446 126 Z" fill="#22303F" opacity="0.45"/>
+<path class="body" d="M 150 128 C 172 104 222 90 286 92 C 344 94 396 114 422 123 L 422 133 C 396 142 344 162 286 164 C 222 166 172 152 150 128 Z" fill="#22303F"/>
 <path d="M 230 121 L 392 121 C 420 121 440 96 472 64" fill="none" stroke="#E4572E" stroke-width="16" stroke-linecap="round"/>
 <path d="M 230 135 L 392 135 C 420 135 440 160 472 192" fill="none" stroke="#17A398" stroke-width="16" stroke-linecap="round"/>
-<path d="M 24 121 L 156 118 L 156 138 L 24 135 Z" fill="#22303F"/>
+<path class="body" d="M 24 121 L 156 118 L 156 138 L 24 135 Z" fill="#22303F"/>
 </g>
 </svg>
