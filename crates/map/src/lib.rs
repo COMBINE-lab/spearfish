@@ -386,7 +386,8 @@ impl<C: Chainer> Mapper<C> {
     /// distance of each group's best hit (`kappa` per edit), as the two read orientations are.
     /// Aligns one whole-read region per group instead of one per hit.
     fn grouped(&self, tb: &TieBreak, codes: &[u8], raw: Option<&RawRead>, hits: &[TxHit]) -> Vec<f32> {
-        let mut groups: Vec<(rustc_hash::FxHashSet<(u32, u32)>, Vec<usize>)> = Vec::new();
+        type AnchorGroup = (rustc_hash::FxHashSet<(u32, u32)>, Vec<usize>);
+        let mut groups: Vec<AnchorGroup> = Vec::new();
         for (i, h) in hits.iter().enumerate() {
             let qs: rustc_hash::FxHashSet<(u32, u32)> = h.chain.iter().map(|a| (a.0, a.2)).collect();
             match groups.iter_mut().find(|g| g.0.iter().any(|q| qs.contains(q))) {
@@ -599,15 +600,17 @@ impl<C: Chainer> Mapper<C> {
             stats::add(&stats::TIEBREAK_SEGMENTS, 1);
             // An insertion-only global gap depends only on its length. Avoid
             // copying DP inputs, sorting distinct strings, and allocating DP rows.
-            if mode == align::Mode::Global && read.is_empty() && tb.affine_within.is_none() {
-                if let Some(sc) = &tb.affine {
-                    for (c, text) in cost.iter_mut().zip(&texts) {
-                        if !text.is_empty() {
-                            *c += i64::from(sc.open) + i64::from(sc.ext) * text.len() as i64;
-                        }
+            if mode == align::Mode::Global
+                && read.is_empty()
+                && tb.affine_within.is_none()
+                && let Some(sc) = &tb.affine
+            {
+                for (c, text) in cost.iter_mut().zip(&texts) {
+                    if !text.is_empty() {
+                        *c += i64::from(sc.open) + i64::from(sc.ext) * text.len() as i64;
                     }
-                    return;
                 }
+                return;
             }
             let (read, texts): (Vec<u8>, Vec<Vec<u8>>) = if rev {
                 (
