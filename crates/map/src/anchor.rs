@@ -37,7 +37,7 @@ impl Default for AnchorParams {
             h_max: 1000,
             s_max: 100,
             // Effectively off: at genome scale, down-weighting multi-gene seeds hid the true
-            // locus of reads from multi-copy and repeat-rich genes (reports/genome-v0.md).
+            // locus of reads from multi-copy and repeat-rich genes.
             g_max: 1e9,
             alpha_fam: 0.5,
             f_keep: 8,

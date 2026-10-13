@@ -388,7 +388,7 @@ fn rad_writer(path: &std::path::Path, args: &Args, mapper: &Mapper) -> Result<lo
             Preset::Hifi => "pac-bio-hifi",
         }
         .into(),
-        // spearfish weighs a hit scoring d below the best by exp(-d / 2) (DECISIONS.md D16).
+        // spearfish weighs a hit scoring d below the best by exp(-d / 2).
         score_denom: 2.0,
         ends_extended: opts.params.ends.is_some(),
         strands: match opts.params.strands {

@@ -35,7 +35,7 @@ pub struct ChainParams {
 impl Default for ChainParams {
     fn default() -> Self {
         ChainParams {
-            // Tuned on simulated chr21 ONT reads (reports/baseline-v0.md).
+            // Tuned on simulated chr21 ONT reads.
             alpha: 1.5,
             beta: 0.0,
             rho: 1.0,

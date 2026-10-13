@@ -1,5 +1,5 @@
 //! `spearfish quant`: EM quantification from a mapping TSV (`spearfish map` output, or
-//! minimap2 converted by `bench/scripts/sam_to_maptsv.py`). Output: transcript, length,
+//! another mapper's alignments converted to the same columns). Output: transcript, length,
 //! estimated reads.
 
 use std::collections::HashMap;

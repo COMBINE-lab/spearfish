@@ -1,5 +1,4 @@
 //! `spearfish`: fast long-read RNA-seq mapping with locally consistent parsing.
-//! Subcommands arrive as their milestones complete (see PLAN.md).
 
 mod annot;
 mod halo_cmd;

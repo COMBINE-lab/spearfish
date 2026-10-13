@@ -19,8 +19,7 @@ alignment is restricted to the read segments where tied isoforms differ.
 Documentation: https://combine-lab.github.io/spearfish/ (source in `website/`; preview locally with
 `cd website && npm install && npm run dev`).
 
-**Status:** early development. See `PLAN.md` for the schedule and `DECISIONS.md` for
-design decisions and the evidence behind them.
+**Status:** early development.
 
 ## Layout
 
@@ -32,7 +31,6 @@ design decisions and the evidence behind them.
 | `crates/index`, `map`, `quant` | core-graph index, read mapping and chaining, EM (in progress) |
 | `crates/spearfish` | the `spearfish` binary |
 | `fixtures/toy` | toy transcriptome with an exon skip, an alternative 3′ site and a paralog pair |
-| `bench/` | data acquisition and benchmark workflow |
 
 ## Building
 

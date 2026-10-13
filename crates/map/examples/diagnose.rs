@@ -1,5 +1,5 @@
 //! Classify reads whose true transcript is not reported. Reads are named
-//! `r<i>|<transcript>|<strand>|...` (spearfish simulate / bench/scripts/pbsim_reads.py).
+//! `r<i>|<transcript>|<strand>|...` (as `spearfish simulate` writes them).
 //! Usage: diagnose <index> <reads.fa> [max_reads]
 use std::collections::HashMap;
 use std::sync::Arc;

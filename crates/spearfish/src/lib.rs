@@ -99,7 +99,7 @@ impl MapOptions {
                 // No template-switch Gs at direct RNA read ends: raw ends cost 12% for nothing.
                 tb.raw_ends = false;
                 // Direct RNA spans extended to the read ends change no spike-in estimate under
-                // the default model and cost 31% more instructions (D27). Positional models
+                // the default model and cost 31% more instructions. Positional models
                 // turn them back on.
                 params.ends = None;
             }
@@ -107,12 +107,12 @@ impl MapOptions {
                 tb.affine = Some(Affine::HIFI);
                 // Accurate reads: tied hits without a common anchor are grouped by shared
                 // anchors rather than aligned whole, and level-2 rescue finds nothing level-3
-                // seeds missed. Half the mapping work at identical accuracy (D26).
+                // seeds missed. Half the mapping work at identical accuracy.
                 tb.group_fallback = true;
                 tb.end_diagonal = true;
                 params.rescue = None;
                 // HiFi anchors already end within a few bases of the read's ends: extending
-                // spans changes no spike-in estimate (D27). Positional models turn it on.
+                // spans changes no spike-in estimate. Positional models turn it on.
                 params.ends = None;
             }
         }
