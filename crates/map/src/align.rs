@@ -191,6 +191,10 @@ pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize)
 /// free: the maximum over all DP cells (as minimap2's extension, without z-drop). Read tails
 /// that don't align (adapters, junk) are clipped instead of forced through the alignment.
 ///
+/// The accepted exact anchor is outside these slices: H[0][0] = 0 is the
+/// relative score at its boundary. Leading gaps pay affine penalties; no local
+/// restart or anchor realignment is needed to stay attached.
+///
 /// With `xdrop`, the extension stops once a whole row of the band scores more than `xdrop`
 /// below the best cell so far (minimap2-style X-drop): the rest of the read is junk for
 /// this text. Pass `i32::MAX` for none.
@@ -554,6 +558,23 @@ fn run(
     snaps: &mut [Snap],
 ) -> Dp {
     let (m, n) = (pattern.len(), text.len());
+    // A global alignment with either side empty has exactly one possible path.
+    // Compute its affine gap cost without allocating or initializing DP buffers.
+    if mode == Mode::Global && clip.is_none() && (m == 0 || n == 0) {
+        let len = m.max(n);
+        return Dp {
+            score: if len == 0 {
+                0
+            } else {
+                -(sc.open + sc.ext * len as i32)
+            },
+            score_col: n,
+            clip_best: 0,
+            clip_cell: (0, 0),
+            text_read: n,
+            last_row: m,
+        };
+    }
     // With `clip`, the best cell anywhere (0 aligns nothing).
     let mut clip_best = 0i32;
     let mut clip_cell = (0usize, 0usize);
@@ -867,6 +888,18 @@ mod tests {
     }
 
     #[test]
+    fn extension_starts_at_accepted_anchor_boundary() {
+        let sc = Affine::ONT;
+        // A leading mismatch cannot restart locally at the later exact suffix.
+        assert_eq!(affine_extend(&[0, 1, 2], &[3, 1, 2], &sc, 16, 0, 50), 0);
+        // A leading deletion remains attached through its paid gap.
+        assert_eq!(affine_extend(&[0, 1, 2, 3], &[3, 0, 1, 2, 3], &sc, 16, 5, 50), 7);
+        // Entire junk tails clip to the accepted anchor's relative zero score.
+        assert_eq!(affine_extend(&[0, 0], &[3, 3], &sc, 16, 5, 50), 0);
+        assert_eq!(affine_extend(&[], &[], &sc, 16, 5, 50), 5);
+    }
+
+    #[test]
     fn affine_extend_end_examples() {
         let sc = Affine::default();
         let end = |p: &[u8], t: &[u8], bonus| {
@@ -931,6 +964,34 @@ mod tests {
         assert_eq!(affine(&p, &t, Mode::Prefix, &sc, usize::MAX), 16);
         assert_eq!(affine(&[], &[0, 1], Mode::Global, &sc, usize::MAX), -8);
         assert_eq!(affine(&[0, 1], &[], Mode::Global, &sc, usize::MAX), -8);
+    }
+
+    #[test]
+    fn empty_global_gaps_do_no_dp_work() {
+        for sc in [Affine::ONT, Affine::HIFI] {
+            let before = dp_work();
+            for len in [0, 1, 2, 100] {
+                let bases = vec![0; len];
+                let expected = if len == 0 {
+                    0
+                } else {
+                    -(sc.open + sc.ext * len as i32)
+                };
+                for band in [0, 16, usize::MAX] {
+                    assert_eq!(affine(&[], &bases, Mode::Global, &sc, band), expected);
+                    assert_eq!(affine(&bases, &[], Mode::Global, &sc, band), expected);
+                    assert_eq!(
+                        affine_sorted(&[], &[&[], &bases], Mode::Global, &sc, band),
+                        [0, expected]
+                    );
+                }
+            }
+            assert_eq!(dp_work(), before);
+            if crate::stats::on() {
+                affine(&[0], &[0], Mode::Global, &sc, 16);
+                assert!(dp_work().0 > before.0); // Check that instrumentation is active.
+            }
+        }
     }
 
     proptest! {

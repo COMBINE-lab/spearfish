@@ -227,6 +227,83 @@ impl RawRead {
     }
 }
 
+/// A shared exact block, in half-open parsed query/target coordinates.
+#[derive(Debug, PartialEq)]
+struct SharedBlock {
+    query: std::ops::Range<u32>,
+    targets: Vec<std::ops::Range<u32>>,
+}
+
+/// Match complete query intervals; TxHit does not retain seed/unitig identity.
+/// Overlapping intervals can cover one exact block only if their query-to-target
+/// translations agree in every chain. Otherwise no valid anchored segmentation exists.
+/// Adjacent intervals remain separate: a target insertion may lie between them.
+fn shared_blocks(hits: &[TxHit]) -> Option<Vec<SharedBlock>> {
+    let first = hits.first()?;
+    // Chains are already ordered by query start. Keep one monotone cursor per
+    // candidate, rather than rebuilding placement hash maps for every tie set.
+    let mut cursors = vec![0usize; hits.len()];
+    let mut targets = Vec::with_capacity(hits.len());
+    let mut lengths = Vec::new();
+    let mut blocks: Vec<SharedBlock> = Vec::new();
+    let mut group = 0;
+    while group < first.chain.len() {
+        let q = first.chain[group].0;
+        let mut next = group + 1;
+        while next < first.chain.len() && first.chain[next].0 == q {
+            next += 1;
+        }
+        lengths.clear();
+        lengths.extend(first.chain[group..next].iter().map(|a| a.2));
+        // Only equal-start groups need ordering; normal chains have one anchor
+        // per query start. Distinct lengths still denote distinct anchors.
+        lengths.sort_unstable();
+        lengths.dedup();
+        group = next;
+        for (h, cursor) in hits.iter().zip(&mut cursors) {
+            while *cursor < h.chain.len() && h.chain[*cursor].0 < q {
+                *cursor += 1;
+            }
+        }
+        for &len in &lengths {
+            targets.clear();
+            for (h, &cursor) in hits.iter().zip(&cursors) {
+                let placement = h.chain[cursor..]
+                    .iter()
+                    .take_while(|a| a.0 == q)
+                    .find(|a| a.2 == len);
+                let Some(&(_, t, _)) = placement else { break };
+                targets.push(t..t.checked_add(len)?);
+            }
+            if targets.len() != hits.len() {
+                continue;
+            }
+            let end = q.checked_add(len)?;
+            if let Some(b) = blocks.last_mut() {
+                if q < b.query.end {
+                    for (old, new) in b.targets.iter_mut().zip(&targets) {
+                        if old.start.checked_add(q - b.query.start)? != new.start {
+                            return None;
+                        }
+                        old.end = old.end.max(new.end);
+                    }
+                    b.query.end = b.query.end.max(end);
+                    continue;
+                }
+                // Reversed target gaps cannot be aligned globally. Use the existing fallback.
+                if b.targets.iter().zip(&targets).any(|(a, b)| a.end > b.start) {
+                    return None;
+                }
+            }
+            blocks.push(SharedBlock {
+                query: q..end,
+                targets: targets.clone(),
+            });
+        }
+    }
+    (!blocks.is_empty()).then_some(blocks)
+}
+
 struct Strand {
     hits: Vec<TxHit>,
     seq: Vec<u8>,
@@ -279,7 +356,7 @@ impl<C: Chainer> Mapper<C> {
         } else {
             None
         };
-        // Score below the tie set's best, per hit.
+        // Alignment deficit relative to the tie set's best alignment, per hit.
         let penalty: Vec<f32> = match seg {
             Some((cost, unit)) => {
                 let cmin = *cost.iter().min().unwrap();
@@ -297,7 +374,7 @@ impl<C: Chainer> Mapper<C> {
             }
         };
         for (h, &p) in hits[..n].iter_mut().zip(&penalty) {
-            h.score = best - p;
+            h.score -= p; // Preserve this transcript's original chain score.
         }
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
         n as u32
@@ -309,9 +386,10 @@ impl<C: Chainer> Mapper<C> {
     /// distance of each group's best hit (`kappa` per edit), as the two read orientations are.
     /// Aligns one whole-read region per group instead of one per hit.
     fn grouped(&self, tb: &TieBreak, codes: &[u8], raw: Option<&RawRead>, hits: &[TxHit]) -> Vec<f32> {
-        let mut groups: Vec<(rustc_hash::FxHashSet<u32>, Vec<usize>)> = Vec::new();
+        type AnchorGroup = (rustc_hash::FxHashSet<(u32, u32)>, Vec<usize>);
+        let mut groups: Vec<AnchorGroup> = Vec::new();
         for (i, h) in hits.iter().enumerate() {
-            let qs: rustc_hash::FxHashSet<u32> = h.chain.iter().map(|a| a.0).collect();
+            let qs: rustc_hash::FxHashSet<(u32, u32)> = h.chain.iter().map(|a| (a.0, a.2)).collect();
             match groups.iter_mut().find(|g| g.0.iter().any(|q| qs.contains(q))) {
                 Some(g) => {
                     g.0.retain(|q| qs.contains(q));
@@ -326,7 +404,7 @@ impl<C: Chainer> Mapper<C> {
             let mut rep = members[0];
             if members.len() > 1 {
                 let sub: Vec<TxHit> = members.iter().map(|&i| hits[i].clone()).collect();
-                // Members share an anchor by construction, so this is always Some.
+                // Members share a complete interval; inconsistent placements may still fall back.
                 if let Some((cost, unit)) = self.segmented(tb, codes, raw, &sub) {
                     let cmin = *cost.iter().min().unwrap();
                     for (k, &i) in members.iter().enumerate() {
@@ -502,8 +580,9 @@ impl<C: Chainer> Mapper<C> {
     /// Distances through anchors shared by every candidate: segments between consecutive
     /// shared anchors are aligned globally, but only where the candidates' transcript
     /// sequences differ (identical segments cost every candidate the same); the read ends are
-    /// aligned against windows anchored at the outermost shared anchors. `None` if the
-    /// candidates share no anchor.
+    /// aligned against windows anchored at the outermost shared anchors. Anchor bases are
+    /// excluded from every DP slice. `None` if no complete query interval is shared or if
+    /// the placements cannot form consistent, ordered shared blocks.
     fn segmented(
         &self,
         tb: &TieBreak,
@@ -511,30 +590,7 @@ impl<C: Chainer> Mapper<C> {
         raw: Option<&RawRead>,
         hits: &[TxHit],
     ) -> Option<(Vec<i64>, f32)> {
-        // Query starts present in every chain, with each candidate's transcript start.
-        let mut shared: Vec<u32> = hits[0].chain.iter().map(|a| a.0).collect();
-        for h in &hits[1..] {
-            let qs: rustc_hash::FxHashSet<u32> = h.chain.iter().map(|a| a.0).collect();
-            shared.retain(|q| qs.contains(q));
-        }
-        if shared.is_empty() {
-            return None;
-        }
-        let tpos: Vec<Vec<u32>> = hits
-            .iter()
-            .map(|h| {
-                let mut it = h.chain.iter().peekable();
-                shared
-                    .iter()
-                    .map(|&q| {
-                        while it.peek().is_some_and(|a| a.0 < q) {
-                            it.next();
-                        }
-                        it.peek().unwrap().1
-                    })
-                    .collect()
-            })
-            .collect();
+        let blocks = shared_blocks(hits)?;
         let plen = codes.len() as u32;
         let mut cost = vec![0i64; hits.len()];
         let mut add = |texts: Vec<Vec<u8>>, read: &[u8], mode: align::Mode, rev: bool| {
@@ -542,6 +598,20 @@ impl<C: Chainer> Mapper<C> {
                 return; // same cost for every candidate
             }
             stats::add(&stats::TIEBREAK_SEGMENTS, 1);
+            // An insertion-only global gap depends only on its length. Avoid
+            // copying DP inputs, sorting distinct strings, and allocating DP rows.
+            if mode == align::Mode::Global
+                && read.is_empty()
+                && tb.affine_within.is_none()
+                && let Some(sc) = &tb.affine
+            {
+                for (c, text) in cost.iter_mut().zip(&texts) {
+                    if !text.is_empty() {
+                        *c += i64::from(sc.open) + i64::from(sc.ext) * text.len() as i64;
+                    }
+                }
+                return;
+            }
             let (read, texts): (Vec<u8>, Vec<Vec<u8>>) = if rev {
                 (
                     read.iter().rev().copied().collect(),
@@ -647,37 +717,47 @@ impl<C: Chainer> Mapper<C> {
                 }
             }
         };
-        // Interior segments [shared_k, shared_k+1).
-        for k in 0..shared.len() - 1 {
-            // Most segments are the same in every candidate: compare the packed sequences
-            // before decoding any of them.
-            let (h0, lo0) = (hits[0].tx, tpos[0][k]);
-            let len0 = tpos[0][k + 1].max(lo0) - lo0;
-            if hits.iter().zip(&tpos).skip(1).all(|(h, t)| {
-                let len = t[k + 1].max(t[k]) - t[k];
-                len == len0 && self.idx.tx_codes_eq(h0, lo0, h.tx, t[k], len)
+        // Strict interior gaps [previous anchor end, next anchor start).
+        for pair in blocks.windows(2) {
+            let (left, right) = (&pair[0], &pair[1]);
+            let lo0 = left.targets[0].end;
+            let len0 = right.targets[0].start - lo0;
+            if hits.iter().enumerate().skip(1).all(|(i, h)| {
+                let lo = left.targets[i].end;
+                let len = right.targets[i].start - lo;
+                len == len0 && self.idx.tx_codes_eq(hits[0].tx, lo0, h.tx, lo, len)
             }) {
                 continue;
             }
             let texts = hits
                 .iter()
-                .zip(&tpos)
-                .map(|(h, t)| self.idx.tx_codes(h.tx, t[k], t[k + 1].max(t[k])))
+                .enumerate()
+                .map(|(i, h)| {
+                    self.idx
+                        .tx_codes(h.tx, left.targets[i].end, right.targets[i].start)
+                })
                 .collect();
             add(
                 texts,
-                &codes[shared[k] as usize..shared[k + 1] as usize],
+                &codes[left.query.end as usize..right.query.start as usize],
                 align::Mode::Global,
                 false,
             );
         }
         // Left end: read[0, q0) against transcript windows ending at each candidate's anchor.
-        let q0 = shared[0];
+        let first = &blocks[0];
+        let q0 = first.query.start;
         if q0 > 0 {
             let spans: Vec<(u32, u32, u32)> = hits
                 .iter()
-                .zip(&tpos)
-                .map(|(h, t)| (h.tx, t[0].saturating_sub(q0 + tb.pad + q0 / tb.pad_div), t[0]))
+                .zip(&first.targets)
+                .map(|(h, t)| {
+                    (
+                        h.tx,
+                        t.start.saturating_sub(q0 + tb.pad + q0 / tb.pad_div),
+                        t.start,
+                    )
+                })
                 .collect();
             match self.raw_texts(tb, raw, &spans) {
                 Some((r, texts)) => add(texts, &r.codes[..r.pos(q0)], align::Mode::Prefix, true),
@@ -692,15 +772,16 @@ impl<C: Chainer> Mapper<C> {
                 ),
             }
         }
-        // Right end: read[q_last, plen) against windows starting at the last shared anchor.
-        let ql = *shared.last().unwrap();
+        // Right end: read[last anchor end, plen); accepted anchor bases never enter DP.
+        let last = blocks.last().unwrap();
+        let ql = last.query.end;
         let rest = plen - ql;
         let spans: Vec<(u32, u32, u32)> = hits
             .iter()
-            .zip(&tpos)
+            .zip(&last.targets)
             .map(|(h, t)| {
                 let tlen = self.idx.tx_plen()[h.tx as usize];
-                let s = *t.last().unwrap();
+                let s = t.end;
                 (h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
             })
             .collect();
@@ -1007,4 +1088,249 @@ impl<C: Chainer> Mapper<C> {
 
 fn sort_hits(hits: &mut [TxHit]) {
     hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
+}
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::*;
+
+    fn hit(tx: u32, score: f32, chain: &[(u32, u32, u32)]) -> TxHit {
+        chain::hit_from_path(tx, score, 0.0, chain.iter().map(|&(q, t, l)| (q, q + l, t, l)))
+    }
+
+    fn mapper(texts: &[&[u8]], hpc: bool) -> Mapper<OracleChainer> {
+        let txs: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| index::TxInput {
+                name: format!("t{i}"),
+                gene: "g".into(),
+                seq: seq.to_vec(),
+            })
+            .collect();
+        let (data, _) = index::build(
+            &txs,
+            &index::BuildParams {
+                spec: "lcp:K=3".into(),
+                hpc,
+                f_max: 100,
+                allow_collisions: false,
+                collapse: index::Collapse::Gene,
+                infer_genes: None,
+            },
+        )
+        .unwrap();
+        Mapper::new(
+            Arc::new(Index::from_bytes(&data.to_bytes()).unwrap()),
+            OracleChainer {
+                p: Default::default(),
+            },
+            MapParams::default(),
+        )
+        .unwrap()
+    }
+
+    fn codes(s: &[u8]) -> Vec<u8> {
+        s.iter()
+            .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
+            .collect()
+    }
+
+    #[test]
+    fn complete_intervals_and_overlapping_blocks() {
+        assert!(shared_blocks(&[hit(0, 1., &[(2, 2, 3)]), hit(1, 1., &[(2, 2, 4)])]).is_none());
+        let same_start = [hit(0, 1., &[(2, 4, 3), (2, 8, 4)]), hit(1, 1., &[(2, 9, 4)])];
+        assert_eq!(
+            shared_blocks(&same_start).unwrap(),
+            vec![SharedBlock {
+                query: 2..6,
+                targets: vec![8..12, 9..13],
+            }]
+        );
+        let hits = [
+            hit(0, 1., &[(2, 4, 5), (4, 6, 2), (6, 8, 5), (11, 15, 2)]),
+            hit(1, 1., &[(2, 5, 5), (4, 7, 2), (6, 9, 5), (11, 16, 2)]),
+        ];
+        assert_eq!(
+            shared_blocks(&hits).unwrap(),
+            vec![
+                SharedBlock {
+                    query: 2..11,
+                    targets: vec![4..13, 5..14]
+                },
+                SharedBlock {
+                    query: 11..13,
+                    targets: vec![15..17, 16..18]
+                },
+            ]
+        );
+        // Inconsistent overlapping translations and reversed disjoint target gaps fall back.
+        assert!(shared_blocks(&[hit(0, 1., &[(2, 2, 5), (4, 5, 5)])]).is_none());
+        assert!(shared_blocks(&[hit(0, 1., &[(2, 2, 3), (6, 4, 3)])]).is_none());
+    }
+
+    #[test]
+    fn ordered_intersection_skips_unshared_groups_and_handles_unsorted_lengths() {
+        let hits = [
+            hit(
+                0,
+                1.,
+                &[(0, 0, 1), (2, 2, 4), (2, 2, 3), (2, 2, 3), (8, 8, 2), (12, 12, 2)],
+            ),
+            hit(1, 1., &[(1, 2, 1), (2, 3, 3), (2, 3, 4), (7, 8, 1), (12, 15, 2)]),
+            hit(2, 1., &[(2, 4, 4), (2, 4, 3), (10, 12, 1), (12, 16, 2)]),
+        ];
+        assert_eq!(
+            shared_blocks(&hits).unwrap(),
+            vec![
+                SharedBlock {
+                    query: 2..6,
+                    targets: vec![2..6, 3..7, 4..8]
+                },
+                SharedBlock {
+                    query: 12..14,
+                    targets: vec![12..14, 15..17, 16..18]
+                },
+            ]
+        );
+        let mut empty = hits[1].clone();
+        empty.chain.clear();
+        assert!(shared_blocks(&[hits[0].clone(), empty]).is_none());
+    }
+
+    #[test]
+    fn paper_example_segments_and_per_transcript_scores() {
+        let q = b"ACGTATGCACGATCTCAGTA";
+        let texts: [&[u8]; 4] = [
+            q,
+            b"GACGTATGCACGATCTCAGT",
+            b"ACGTATGCACATGATCTCAGT",
+            b"ACGTACGTGCACGATCTCAGT",
+        ];
+        let m = mapper(&texts, false);
+        let mut hits = vec![
+            hit(0, 15., &[(7, 7, 3), (10, 10, 8)]),
+            hit(1, 15., &[(7, 8, 3), (10, 11, 8)]),
+            hit(2, 12., &[(7, 7, 3), (10, 12, 8)]),
+            hit(3, 11., &[(7, 9, 3), (10, 12, 8)]),
+        ];
+        let b = shared_blocks(&hits).unwrap();
+        assert_eq!(b[0].query.end..b[1].query.start, 10..10);
+        let gaps: Vec<_> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| m.idx.tx_codes(h.tx, b[0].targets[i].end, b[1].targets[i].start))
+            .collect();
+        assert_eq!(gaps, vec![vec![], vec![], codes(b"AT"), vec![]]);
+        let sc = align::Affine::ONT;
+        let tb = TieBreak::default();
+        let mut totals = vec![0; 4];
+        for (i, h) in hits.iter().enumerate() {
+            let left = m.idx.tx_codes(h.tx, 0, b[0].targets[i].start);
+            let left = align::affine_extend(
+                &codes(&q[..7]).into_iter().rev().collect::<Vec<_>>(),
+                &left.into_iter().rev().collect::<Vec<_>>(),
+                &sc,
+                tb.band,
+                tb.end_bonus,
+                tb.xdrop,
+            );
+            let interior = align::affine(&[], &gaps[i], align::Mode::Global, &sc, tb.band);
+            let right_text = m.idx.tx_codes(h.tx, b[1].targets[i].end, m.idx.tx_plen()[i]);
+            let right = align::affine_extend(
+                &codes(&q[18..]),
+                &right_text,
+                &sc,
+                tb.band,
+                tb.end_bonus,
+                tb.xdrop,
+            );
+            assert_eq!(
+                (left, interior, right),
+                [(19, 0, 9), (19, 0, 2), (19, -8, 2), (11, 0, 2)][i]
+            );
+            totals[i] = left + interior + right;
+        }
+        assert_eq!(totals, [28, 21, 13, 13]);
+        assert_eq!(
+            m.segmented(&tb, &codes(q), None, &hits).unwrap().0,
+            [-28, -21, -13, -13]
+        );
+        assert_eq!(m.tiebreak(&tb, q, None, &mut hits), 4);
+        assert_eq!(
+            hits.iter().map(|h| h.score).collect::<Vec<_>>(),
+            [15., 8., -3., -4.]
+        );
+    }
+
+    #[test]
+    fn score_scaling_and_no_common_anchor_fallback() {
+        let m = mapper(&[b"ACGTAC", b"ACAC"], false);
+        let q = b"ACGTAC";
+        let mut hits = [
+            hit(0, 15., &[(0, 0, 2), (4, 4, 2)]),
+            hit(1, 12., &[(0, 0, 2), (4, 2, 2)]),
+        ];
+        let tb = TieBreak {
+            lambda: 0.5,
+            ..Default::default()
+        };
+        m.tiebreak(&tb, q, None, &mut hits);
+        assert_eq!((hits[0].score, hits[1].score), (15., 6.));
+        let m = mapper(&[q, q], false);
+        for grouped in [false, true] {
+            let mut hits = [hit(0, 15., &[(0, 0, 2)]), hit(1, 12., &[(3, 3, 2)])];
+            let tb = TieBreak {
+                group_fallback: grouped,
+                ..Default::default()
+            };
+            assert!(m.segmented(&tb, &codes(q), None, &hits).is_none());
+            m.tiebreak(&tb, q, None, &mut hits);
+            assert_eq!((hits[0].score, hits[1].score), (15., 12.));
+        }
+    }
+
+    #[test]
+    fn empty_and_deleted_interior_gaps() {
+        let m = mapper(&[b"ACGTAC", b"ACAC"], false);
+        let hits = [
+            hit(0, 4., &[(0, 0, 2), (4, 4, 2)]),
+            hit(1, 4., &[(0, 0, 2), (4, 2, 2)]),
+        ];
+        let tb = TieBreak::default();
+        assert_eq!(
+            m.segmented(&tb, &codes(b"ACGTAC"), None, &hits).unwrap().0,
+            [-4, 8]
+        );
+        // Identical gaps contribute no relative cost, including empty query/target gaps.
+        assert_eq!(
+            m.segmented(&tb, &codes(b"ACGTAC"), None, &[hits[0].clone(), hits[0].clone()])
+                .unwrap()
+                .0,
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn raw_hpc_end_boundaries() {
+        let q = b"AACCCGGTTTAA";
+        let raw = RawRead {
+            codes: codes(q),
+            hpc: lcp_core::hpc::Hpc::new(q),
+        };
+        let m = mapper(&[q, b"ACGTA"], true);
+        let hits = [hit(0, 3., &[(1, 1, 2)]), hit(1, 3., &[(1, 1, 2)])];
+        let blocks = shared_blocks(&hits).unwrap();
+        assert_eq!(
+            (raw.pos(blocks[0].query.start), raw.pos(blocks[0].query.end)),
+            (2, 7)
+        );
+        let mut tb = TieBreak::default();
+        let parsed = codes(&raw.hpc.seq);
+        let costs = m.segmented(&tb, &parsed, Some(&raw), &hits).unwrap().0;
+        // Raw left AA vs A: 9 vs 2; raw right TTTAA vs TA: 15 vs 2.
+        assert_eq!(costs, [-24, -4]);
+        tb.raw_ends = false;
+        assert_eq!(m.segmented(&tb, &parsed, Some(&raw), &hits).unwrap().0, [0, 0]);
+    }
 }
