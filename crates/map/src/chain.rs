@@ -243,12 +243,7 @@ thread_local! {
 /// Scores of extending each predecessor `m` in `lo..k` with `y` (`-inf` if invalid) and the
 /// gap discrepancies, branch-free so it vectorizes; the arithmetic is exactly `transition`'s
 /// (with β = 0), so results are bit-identical.
-#[multiversion::multiversion(targets(
-    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-    "x86_64+avx2+fma",
-    "x86_64+avx",
-    "aarch64+neon"
-))]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn pred_scores(
     alpha: f32,
@@ -282,6 +277,68 @@ fn pred_scores(
         let delta = yw * (1.0 - overlap / qlen) - gamma;
         cs[m] = if valid { xf[m] + delta } else { f32::NEG_INFINITY };
         cd[m] = d;
+    }
+}
+
+/// A transcript's placements as structure-of-arrays: identity, query start and end, relative
+/// target start and end, weight.
+type Soa<'a> = (&'a [u32], &'a [i32], &'a [i32], &'a [i32], &'a [i32], &'a [f32]);
+
+/// One transcript's forward DP with β = 0 over `lcp..n` (`f`, `back`, `disc` hold the shared
+/// prefix's values below `lcp`), compiled per target as a whole so the per-anchor work
+/// (predecessor scores, their maximum) stays in one vectorized loop without dispatch.
+#[multiversion::multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
+    "x86_64+avx2+fma",
+    "x86_64+avx",
+    "aarch64+neon"
+))]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0(
+    p: &ChainParams,
+    (a, qs, qe, ts, te, w): Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    let n = a.len();
+    let mut lo = 0;
+    for k in lcp..n {
+        let ya = a[k];
+        while (a[lo] as usize) + p.h < ya as usize {
+            lo += 1;
+        }
+        let y = (ya, qs[k], qe[k], ts[k], w[k]);
+        let (mut best, mut arg, mut bd) = (y.4, u32::MAX, 0.0f32);
+        if k > lo {
+            let m = k - lo;
+            pred_scores(
+                p.alpha,
+                p.rho,
+                p.o_max as i32,
+                p.g_max as i32,
+                &a[lo..k],
+                &qs[lo..k],
+                &qe[lo..k],
+                &ts[lo..k],
+                &te[lo..k],
+                &f[lo..k],
+                y,
+                &mut cs[..m],
+                &mut cd[..m],
+            );
+            let mx = cs[..m].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if mx > best {
+                let j = cs[..m].iter().position(|&v| v == mx).unwrap();
+                (best, arg, bd) = (mx, (lo + j) as u32, cd[j]);
+            }
+        }
+        f[k] = best;
+        back[k] = arg;
+        disc[k] = bd;
     }
 }
 
@@ -406,39 +463,31 @@ impl OracleChainer {
             sc.back.resize(n, u32::MAX);
             sc.disc.truncate(lcp);
             sc.disc.resize(n, 0.0);
+            if p.beta == 0.0 {
+                if sc.cs.len() < n {
+                    sc.cs.resize(n, 0.0);
+                    sc.cd.resize(n, 0.0);
+                }
+                dp_beta0(
+                    p,
+                    (&sc.a, &sc.qs, &sc.qe, &sc.ts, &sc.te, &sc.w),
+                    &mut sc.f,
+                    &mut sc.back,
+                    &mut sc.disc,
+                    lcp,
+                    &mut sc.cs,
+                    &mut sc.cd,
+                );
+            }
             let mut lo = 0;
-            for k in lcp..n {
+            for k in (lcp..n).filter(|_| p.beta != 0.0) {
                 let ya = sc.a[k];
                 while (sc.a[lo] as usize) + p.h < ya as usize {
                     lo += 1;
                 }
-                let y = (ya, sc.qs[k], sc.qe[k], sc.ts[k], sc.w[k]);
-                let (mut best, mut arg, mut bd) = (y.4, u32::MAX, 0.0f32);
+                let (mut best, mut arg, mut bd) = (sc.w[k], u32::MAX, 0.0f32);
                 if k > lo {
-                    if p.beta == 0.0 {
-                        sc.cs.resize(k - lo, 0.0);
-                        sc.cd.resize(k - lo, 0.0);
-                        pred_scores(
-                            p.alpha,
-                            p.rho,
-                            p.o_max as i32,
-                            p.g_max as i32,
-                            &sc.a[lo..k],
-                            &sc.qs[lo..k],
-                            &sc.qe[lo..k],
-                            &sc.ts[lo..k],
-                            &sc.te[lo..k],
-                            &sc.f[lo..k],
-                            y,
-                            &mut sc.cs[..k - lo],
-                            &mut sc.cd[..k - lo],
-                        );
-                        let mx = sc.cs[..k - lo].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        if mx > best {
-                            let j = sc.cs[..k - lo].iter().position(|&v| v == mx).unwrap();
-                            (best, arg, bd) = (mx, (lo + j) as u32, sc.cd[j]);
-                        }
-                    } else {
+                    {
                         let pt = |m: usize| Pt {
                             qs: sc.qs[m] as u32,
                             qe: sc.qe[m] as u32,
