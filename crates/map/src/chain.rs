@@ -332,7 +332,10 @@ fn dp_beta0(
                 &mut cs[..m],
                 &mut cd[..m],
             );
-            let mx = cs[..m].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            // Comparison form: one max instruction per step (scores are never NaN).
+            let mx = cs[..m]
+                .iter()
+                .fold(f32::NEG_INFINITY, |a, &v| if v > a { v } else { a });
             if mx > best {
                 let j = cs[..m].iter().position(|&v| v == mx).unwrap();
                 (best, arg, bd) = (mx, (lo + j) as u32, cd[j]);
@@ -526,7 +529,7 @@ impl OracleChainer {
             path.clear();
             loop {
                 path.push(k);
-                maxd = maxd.max(sc.disc[k]);
+                maxd = if sc.disc[k] > maxd { sc.disc[k] } else { maxd };
                 if sc.back[k] == u32::MAX {
                     break;
                 }
