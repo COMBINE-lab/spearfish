@@ -50,6 +50,13 @@ counters!(
     DP_CLIP_END_ROWS,
     DP_SPAN_CELLS,
     DP_SPAN_ROWS,
+    ANCHORS,
+    FAMILIES,
+    KEPT_FAMILIES,
+    KEPT_ANCHORS,
+    MERGED_ANCHORS,
+    CHAIN_TX,
+    CHAIN_PLACEMENTS,
 );
 
 #[inline]

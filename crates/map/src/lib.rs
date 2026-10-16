@@ -211,6 +211,8 @@ pub struct Mapper<C: Chainer> {
     pub chainer: C,
     pub p: MapParams,
     rescuer: Option<Rescuer>,
+    /// [`anchor::node_families`] of `idx`.
+    node_fam: Vec<u32>,
 }
 
 /// One orientation of a read: hits (sorted), the parsed sequence and its base seeds.
@@ -320,7 +322,9 @@ impl<C: Chainer> Mapper<C> {
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";
         let seeder = BaseSeeder::new(spec, hpc)?;
         let rescuer = p.rescue.clone().map(|r| Rescuer::new(&idx, r)).transpose()?;
+        let node_fam = anchor::node_families(&idx);
         Ok(Mapper {
+            node_fam,
             idx,
             seeder,
             chainer,
@@ -803,9 +807,7 @@ impl<C: Chainer> Mapper<C> {
 
     fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>)) -> Strand {
         let seeds = self.seeder.seed_parsed(&seq);
-        let anchors = anchor::anchors(&self.idx, &seeds, &self.p.anchor);
-        let n_anchors = anchors.len() as u32;
-        let mut cands = anchor::candidates(&self.idx, anchors, &self.p.anchor);
+        let (mut cands, n_anchors) = anchor::select(&self.idx, &self.node_fam, &seeds, &self.p.anchor);
         if self.p.merge_collinear {
             for c in &mut cands {
                 anchor::merge_collinear(&self.idx, c);

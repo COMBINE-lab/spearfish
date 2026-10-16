@@ -218,7 +218,7 @@ impl IndexData {
 
 /// A cache hint for the line holding `p` (no effect off x86-64; never faults).
 #[inline(always)]
-fn prefetch<T>(p: *const T) {
+pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: prefetching is a hint: it reads nothing and cannot fault, whatever the address.
     #[allow(unused_unsafe)]

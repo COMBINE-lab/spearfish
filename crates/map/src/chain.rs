@@ -322,6 +322,11 @@ impl OracleChainer {
             }
         }
 
+        crate::stats::add(&crate::stats::CHAIN_TX, used as u64);
+        crate::stats::add(
+            &crate::stats::CHAIN_PLACEMENTS,
+            sc.buckets[..used].iter().map(|b| b.len() as u64).sum(),
+        );
         let p = &self.p;
         // Visit transcripts sorted by their placement lists shifted to the first placement:
         // transcripts with a common prefix (relative to their first placement) have identical

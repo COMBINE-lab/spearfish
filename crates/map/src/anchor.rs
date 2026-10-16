@@ -142,6 +142,8 @@ pub fn candidates(idx: &Index, anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Ca
         groups.push((f, lo..hi, greedy_score(g)));
         lo = hi;
     }
+    crate::stats::add(&crate::stats::ANCHORS, anchors.len() as u64);
+    crate::stats::add(&crate::stats::FAMILIES, groups.len() as u64);
     drop(anchors);
     // Rank and cut families on their scores alone; anchors are copied out only for the kept.
     groups.sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
@@ -154,6 +156,11 @@ pub fn candidates(idx: &Index, anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Ca
             groups.truncate(n.min(p.f_max.max(p.f_keep)));
         }
     }
+    crate::stats::add(&crate::stats::KEPT_FAMILIES, groups.len() as u64);
+    crate::stats::add(
+        &crate::stats::KEPT_ANCHORS,
+        groups.iter().map(|g| g.1.len() as u64).sum(),
+    );
     groups
         .into_iter()
         .map(|(family, r, score)| Candidate {
@@ -162,6 +169,186 @@ pub fn candidates(idx: &Index, anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Ca
             anchors: ordered[r].to_vec(),
         })
         .collect()
+}
+
+/// [`select`]'s family table entry of a masked node.
+pub const MASKED_NODE: u32 = u32::MAX - 1;
+
+/// Each node's family (`NO_FAMILY` if unassigned, [`MASKED_NODE`] if masked), for [`select`]:
+/// a label's nodes are contiguous, so this turns two dependent random reads per anchor
+/// (unitig, then family) into a sequential scan.
+pub fn node_families(idx: &Index) -> Vec<u32> {
+    let (flags, unitig, fam) = (idx.node_flags(), idx.node_unitig(), idx.unitig_family());
+    unitig
+        .iter()
+        .zip(flags)
+        .map(|(&u, &f)| {
+            if f & FLAG_MASKED != 0 {
+                MASKED_NODE
+            } else {
+                fam[u as usize]
+            }
+        })
+        .collect()
+}
+
+/// Per-family state of [`select`]: greedy score and end of the last counted anchor (`end == 0`:
+/// untouched, as the first counted anchor sets it past 0). After ranking, a kept family's `end`
+/// holds `KEPT - slot`.
+#[derive(Clone, Copy, Default)]
+struct FamState {
+    end: u32,
+    score: f32,
+}
+
+const KEPT: u32 = u32::MAX;
+
+#[derive(Default)]
+struct SelectScratch {
+    fam: Vec<FamState>,
+    touched: Vec<u32>,
+    /// Per seed passing `h_max`: node range, query span and weight.
+    seeds: Vec<(u32, u32, u32, u32, f32)>,
+    groups: Vec<(u32, f32)>,
+}
+
+thread_local! {
+    static SELECT: std::cell::RefCell<SelectScratch> = std::cell::RefCell::new(SelectScratch::default());
+}
+
+/// [`anchors`] followed by [`candidates`], without materializing the anchors of discarded
+/// families: one pass over the seeds computes each family's greedy score in dense per-family
+/// state, and anchors are built only for the kept families. `node_fam` is
+/// [`node_families`]. Returns the candidates (same order, scores and anchors as
+/// `candidates(idx, anchors(idx, seeds, p), p)`) and the number of anchors `anchors` returns.
+pub fn select(idx: &Index, node_fam: &[u32], seeds: &[Seed], p: &AnchorParams) -> (Vec<Candidate>, u32) {
+    // The streaming greedy score equals the sorted one when anchors arrive in (qs, qe, node)
+    // order: seeds sorted by (start, end) with distinct spans, and a label's nodes ascend.
+    if !seeds
+        .windows(2)
+        .all(|w| (w[0].start, w[0].end) < (w[1].start, w[1].end))
+    {
+        let a = anchors(idx, seeds, p);
+        let n = a.len() as u32;
+        return (candidates(idx, a, p), n);
+    }
+    SELECT.with(|sc| select_with(idx, node_fam, seeds, p, &mut sc.borrow_mut()))
+}
+
+fn select_with(
+    idx: &Index,
+    node_fam: &[u32],
+    seeds: &[Seed],
+    p: &AnchorParams,
+    sc: &mut SelectScratch,
+) -> (Vec<Candidate>, u32) {
+    sc.touched.clear();
+    sc.seeds.clear();
+    let mut n_anchors = 0u32;
+    let mut best = f32::NEG_INFINITY;
+    // Label lookups miss in cache twice (directory entry, then labels): pipeline them as
+    // `anchors` does, keeping the node ranges of seeds that pass `h_max`.
+    const AHEAD: usize = 8;
+    for (i, s) in seeds.iter().enumerate() {
+        if let Some(x) = seeds.get(i + 2 * AHEAD) {
+            idx.prefetch_dir(x.label);
+        }
+        if let Some(x) = seeds.get(i + AHEAD) {
+            idx.prefetch_labels(x.label);
+        }
+        let r = idx.lookup(s.label);
+        let genes = r.len();
+        if genes == 0 || genes > p.h_max {
+            continue;
+        }
+        let specificity = 1.0 - (genes as f32).ln() / p.g_max.ln();
+        let weight = (s.end - s.start).min(p.s_max) as f32 * specificity.max(0.0);
+        sc.seeds.push((r.start, r.end, s.start, s.end, weight));
+    }
+    for i in 0..sc.seeds.len() {
+        if let Some(x) = sc.seeds.get(i + AHEAD) {
+            index::prefetch(node_fam.as_ptr().wrapping_add(x.0 as usize));
+        }
+        let (lo, hi, qs, qe, weight) = sc.seeds[i];
+        for &f in &node_fam[lo as usize..hi as usize] {
+            if f == MASKED_NODE {
+                continue;
+            }
+            n_anchors += 1;
+            if f == NO_FAMILY {
+                continue;
+            }
+            if f as usize >= sc.fam.len() {
+                sc.fam.resize(f as usize + 1, FamState::default());
+            }
+            let st = &mut sc.fam[f as usize];
+            if st.end == 0 {
+                sc.touched.push(f);
+            }
+            if qs >= st.end {
+                st.score += weight;
+                st.end = qe;
+                best = best.max(st.score);
+            }
+        }
+    }
+    crate::stats::add(&crate::stats::ANCHORS, n_anchors as u64);
+    crate::stats::add(&crate::stats::FAMILIES, sc.touched.len() as u64);
+    // Rank and cut as `candidates` does; filtering on the score floor first leaves the same
+    // sorted prefix with far fewer families to sort.
+    sc.groups.clear();
+    for &f in &sc.touched {
+        let st = std::mem::take(&mut sc.fam[f as usize]);
+        if st.score >= p.alpha_fam * best {
+            sc.groups.push((f, st.score));
+        }
+    }
+    sc.groups
+        .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    if let Some(last) = sc.groups.get(p.f_keep.max(1) - 1).map(|g| g.1) {
+        let floor = last - p.f_tie * last.abs();
+        let n = sc.groups.iter().take_while(|g| g.1 >= floor).count();
+        sc.groups.truncate(n.min(p.f_max.max(p.f_keep)));
+    }
+    crate::stats::add(&crate::stats::KEPT_FAMILIES, sc.groups.len() as u64);
+    if sc.groups.is_empty() {
+        return (Vec::new(), n_anchors);
+    }
+    let mut cands: Vec<Candidate> = sc
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(i, &(family, score))| {
+            sc.fam[family as usize].end = KEPT - i as u32;
+            Candidate {
+                family,
+                score,
+                anchors: Vec::new(),
+            }
+        })
+        .collect();
+    let max_fam = sc.fam.len();
+    for &(lo, hi, qs, qe, weight) in &sc.seeds {
+        for node in lo..hi {
+            let f = node_fam[node as usize] as usize;
+            if f < max_fam {
+                let e = sc.fam[f].end;
+                if e != 0 {
+                    cands[(KEPT - e) as usize]
+                        .anchors
+                        .push(Anchor { qs, qe, node, weight });
+                }
+            }
+        }
+    }
+    for g in &sc.groups {
+        sc.fam[g.0 as usize] = FamState::default();
+    }
+    crate::stats::add(
+        &crate::stats::KEPT_ANCHORS,
+        cands.iter().map(|c| c.anchors.len() as u64).sum(),
+    );
+    (cands, n_anchors)
 }
 
 /// Merge anchors of `c` that lie on one diagonal of the same unitig: anchor `b` extends a run
@@ -202,5 +389,6 @@ pub fn merge_collinear(idx: &Index, c: &mut Candidate) {
     if !out.is_sorted_by_key(|a| (a.qs, a.qe, a.node)) {
         out.sort_unstable_by_key(|a| (a.qs, a.qe, a.node));
     }
+    crate::stats::add(&crate::stats::MERGED_ANCHORS, out.len() as u64);
     c.anchors = out;
 }
