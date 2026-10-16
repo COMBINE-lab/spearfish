@@ -276,11 +276,11 @@ fn select_with(
         }
         let weight = (s.end - s.start).min(p.s_max) as f32 * sc.spec[genes];
         sc.seeds.push((r.start, r.end, s.start, s.end, weight));
+        // The family pass below reads the nodes' families: request them now, a whole
+        // lookup loop ahead.
+        index::prefetch(node_fam.as_ptr().wrapping_add(r.start as usize));
     }
     for i in 0..sc.seeds.len() {
-        if let Some(x) = sc.seeds.get(i + AHEAD) {
-            index::prefetch(node_fam.as_ptr().wrapping_add(x.0 as usize));
-        }
         let (lo, hi, qs, qe, weight) = sc.seeds[i];
         for &f in &node_fam[lo as usize..hi as usize] {
             if f == MASKED_NODE {
