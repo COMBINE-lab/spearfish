@@ -328,12 +328,16 @@ fn select_with(
         })
         .collect();
     let max_fam = sc.fam.len();
+    let (unitig, offset) = (idx.node_unitig(), idx.node_offset());
     for &(lo, hi, qs, qe, weight) in &sc.seeds {
         for node in lo..hi {
             let f = node_fam[node as usize] as usize;
             if f < max_fam {
                 let e = sc.fam[f].end;
                 if e != 0 {
+                    // Merging and chaining read the node's unitig and offset next.
+                    index::prefetch(unitig.as_ptr().wrapping_add(node as usize));
+                    index::prefetch(offset.as_ptr().wrapping_add(node as usize));
                     cands[(KEPT - e) as usize]
                         .anchors
                         .push(Anchor { qs, qe, node, weight });
@@ -363,10 +367,23 @@ pub fn merge_collinear(idx: &Index, c: &mut Candidate) {
     if c.anchors.len() < 2 {
         return;
     }
+    MERGE_OPEN.with(|open| merge_collinear_with(idx, c, &mut open.borrow_mut()));
+}
+
+thread_local! {
+    /// Unitig -> (index of the open run, last anchor's qs, qe, unitig offset), reused.
+    static MERGE_OPEN: std::cell::RefCell<rustc_hash::FxHashMap<u32, (u32, u32, u32, u32)>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+fn merge_collinear_with(
+    idx: &Index,
+    c: &mut Candidate,
+    open: &mut rustc_hash::FxHashMap<u32, (u32, u32, u32, u32)>,
+) {
     let unitig = idx.node_unitig();
     let offset = idx.node_offset();
-    // Unitig -> (index of the open run in `out`, last anchor's qs, qe, unitig offset).
-    let mut open: rustc_hash::FxHashMap<u32, (usize, u32, u32, u32)> = rustc_hash::FxHashMap::default();
+    open.clear();
     let mut out: Vec<Anchor> = Vec::with_capacity(c.anchors.len());
     for &a in &c.anchors {
         let (u, off) = (unitig[a.node as usize], offset[a.node as usize]);
@@ -378,12 +395,12 @@ pub fn merge_collinear(idx: &Index, c: &mut Candidate) {
             // The chain gain of stepping from the run's last anchor to `a` (no discrepancy).
             let qlen = (a.qe - a.qs) as f32;
             let overlap = qe.saturating_sub(a.qs).min(a.qe - a.qs) as f32;
-            out[i].weight += a.weight * (1.0 - overlap / qlen);
-            out[i].qe = out[i].qe.max(a.qe);
+            out[i as usize].weight += a.weight * (1.0 - overlap / qlen);
+            out[i as usize].qe = out[i as usize].qe.max(a.qe);
             open.insert(u, (i, a.qs, a.qe, off));
             continue;
         }
-        open.insert(u, (out.len(), a.qs, a.qe, off));
+        open.insert(u, (out.len() as u32, a.qs, a.qe, off));
         out.push(a);
     }
     if !out.is_sorted_by_key(|a| (a.qs, a.qe, a.node)) {
