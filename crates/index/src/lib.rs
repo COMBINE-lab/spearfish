@@ -526,6 +526,21 @@ impl Index {
         &self.unitig_nodes()[off[u as usize] as usize..off[u as usize + 1] as usize]
     }
 
+    /// Ask the caches for the offsets [`Self::occurrences`] reads first.
+    #[inline]
+    pub fn prefetch_occ_off(&self, u: u32) {
+        prefetch(self.occ_off().as_ptr().wrapping_add(u as usize));
+    }
+
+    /// Ask the caches for the occurrence lists of `u` (reads the offsets, so call it after
+    /// [`Self::prefetch_occ_off`] has had time to land).
+    #[inline]
+    pub fn prefetch_occurrences(&self, u: u32) {
+        let o = self.occ_off()[u as usize] as usize;
+        prefetch(self.occ_tx().as_ptr().wrapping_add(o));
+        prefetch(self.occ_pos().as_ptr().wrapping_add(o));
+    }
+
     /// Occurrences of unitig `u`: transcripts (sorted) and the position of its first seed.
     pub fn occurrences(&self, u: u32) -> (&[u32], &[u32]) {
         let off = self.occ_off();

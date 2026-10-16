@@ -306,7 +306,15 @@ impl OracleChainer {
         }
         sc.tx.clear();
         let mut used = 0;
+        // Occurrence lookups miss in cache twice (offsets, then lists): issue them ahead.
+        const AHEAD: usize = 4;
         for (i, a) in cand.anchors.iter().enumerate() {
+            if let Some(x) = cand.anchors.get(i + 2 * AHEAD) {
+                idx.prefetch_occ_off(unitig[x.node as usize]);
+            }
+            if let Some(x) = cand.anchors.get(i + AHEAD) {
+                idx.prefetch_occurrences(unitig[x.node as usize]);
+            }
             let (ts, ps) = idx.occurrences(unitig[a.node as usize]);
             let off = offset[a.node as usize];
             for (&t, &p) in ts.iter().zip(ps) {
