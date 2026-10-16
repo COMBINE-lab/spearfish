@@ -55,8 +55,8 @@ pub struct Args {
     /// Chaining: predecessor window (anchors).
     #[arg(long, default_value_t = 50)]
     window: usize,
-    /// Chainer: `oracle` (per-transcript DP with shared prefixes) or `refine` (multi-transcript
-    /// state DP with lazy color refinement). Both give identical scores with no beam.
+    /// Chainer: `oracle` (bidirectional prefix/suffix sharing with exact forward fallback)
+    /// or `refine` (multi-transcript state DP with lazy color refinement).
     #[arg(long, default_value = "oracle")]
     chainer: String,
     /// Refine chainer: keep at most this many states per anchor (default: unbounded, exact).

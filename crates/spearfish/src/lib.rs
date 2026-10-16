@@ -60,7 +60,7 @@ impl std::str::FromStr for Preset {
 /// Which chainer to run (both give identical scores with an unbounded beam).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainerKind {
-    /// Per-transcript DP with prefix sharing (fastest).
+    /// Bidirectional prefix/suffix sharing, with exact forward-prefix fallback.
     Oracle,
     /// Multi-transcript state DP with lazy color refinement; `beam` bounds states per anchor.
     Refine { beam: Option<usize> },
