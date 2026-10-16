@@ -210,6 +210,9 @@ struct SelectScratch {
     /// Per seed passing `h_max`: node range, query span and weight.
     seeds: Vec<(u32, u32, u32, u32, f32)>,
     groups: Vec<(u32, f32)>,
+    /// Seed specificity by gene count, for `spec_g_max`.
+    spec: Vec<f32>,
+    spec_g_max: f32,
 }
 
 thread_local! {
@@ -261,8 +264,17 @@ fn select_with(
         if genes == 0 || genes > p.h_max {
             continue;
         }
-        let specificity = 1.0 - (genes as f32).ln() / p.g_max.ln();
-        let weight = (s.end - s.start).min(p.s_max) as f32 * specificity.max(0.0);
+        // Specificity depends on the gene count alone: computed once per count (same
+        // arithmetic as `anchors`).
+        if sc.spec_g_max != p.g_max {
+            sc.spec.clear();
+            sc.spec_g_max = p.g_max;
+        }
+        while sc.spec.len() <= genes {
+            let g = sc.spec.len();
+            sc.spec.push((1.0 - (g as f32).ln() / p.g_max.ln()).max(0.0));
+        }
+        let weight = (s.end - s.start).min(p.s_max) as f32 * sc.spec[genes];
         sc.seeds.push((r.start, r.end, s.start, s.end, weight));
     }
     for i in 0..sc.seeds.len() {
@@ -288,7 +300,8 @@ fn select_with(
             if qs >= st.end {
                 st.score += weight;
                 st.end = qe;
-                best = best.max(st.score);
+                // Comparison form (a single max instruction; scores are never NaN).
+                best = if st.score > best { st.score } else { best };
             }
         }
     }
