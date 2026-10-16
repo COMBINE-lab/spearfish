@@ -17,10 +17,17 @@
 //! - Gain: `w' * (fraction of i' not overlapping i in the query)`; cost:
 //!   `γ = α|Δq - ρΔt| + β log2(1 + max(Δq, Δt, 0))`.
 //! - Chains are local: any anchor can start one with score `w`.
+//!
+//! The default library/CLI selection uses [`BidirectionalChainer`], which shares both halves
+//! and joins them within the identity window. `OracleChainer` remains the forward-only
+//! reference and exact fallback when numerical equivalence or tie behavior is uncertified.
 
 use index::Index;
 
 use crate::anchor::Candidate;
+
+mod bidirectional;
+pub use bidirectional::BidirectionalChainer;
 
 #[derive(Clone, Debug)]
 pub struct ChainParams {
@@ -290,60 +297,74 @@ impl Chainer for OracleChainer {
     }
 }
 
-impl OracleChainer {
-    fn chain_with(&self, idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> Vec<TxHit> {
-        let unitig = idx.node_unitig();
-        let offset = idx.node_offset();
-        // An anchor's transcript span equals its query span (exact core matches; merged
-        // collinear runs).
-        let len = |i: usize| cand.anchors[i].qe - cand.anchors[i].qs;
-        // Bucket placements by transcript; visiting anchors in order keeps each bucket sorted
-        // by (anchor, target position).
-        sc.bucket_of.clear();
-        sc.tx.clear();
-        let mut used = 0;
-        for (i, a) in cand.anchors.iter().enumerate() {
-            let (ts, ps) = idx.occurrences(unitig[a.node as usize]);
-            let off = offset[a.node as usize];
-            for (&t, &p) in ts.iter().zip(ps) {
-                let b = *sc.bucket_of.entry(t).or_insert_with(|| {
-                    if used == sc.buckets.len() {
-                        sc.buckets.push(Vec::new());
-                    }
-                    sc.buckets[used].clear();
-                    sc.tx.push(t);
-                    used += 1;
-                    used as u32 - 1
-                });
-                sc.buckets[b as usize].push(Placed {
-                    a: i as u32,
-                    ts: p + off,
-                });
-            }
-        }
-
-        let p = &self.p;
-        // Visit transcripts sorted by their placement lists shifted to the first placement:
-        // transcripts with a common prefix (relative to their first placement) have identical
-        // DP values over it, so each DP resumes where the previous transcript's list diverges.
-        sc.order.clear();
-        sc.order.extend(0..used as u32);
-        {
-            let b = &sc.buckets;
-            sc.order.sort_unstable_by(|&x, &y| {
-                let (u, v) = (&b[x as usize], &b[y as usize]);
-                let (u0, v0) = (u[0].ts as i64, v[0].ts as i64);
-                for (pu, pv) in u.iter().zip(v) {
-                    let c =
-                        pu.a.cmp(&pv.a)
-                            .then((pu.ts as i64 - u0).cmp(&(pv.ts as i64 - v0)));
-                    if c.is_ne() {
-                        return c;
-                    }
+fn collect_placements(idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> usize {
+    let unitig = idx.node_unitig();
+    let offset = idx.node_offset();
+    // Bucket placements by transcript; visiting anchors in order keeps each bucket sorted
+    // by (anchor, target position).
+    sc.bucket_of.clear();
+    sc.tx.clear();
+    let mut used = 0;
+    for (i, a) in cand.anchors.iter().enumerate() {
+        let (ts, ps) = idx.occurrences(unitig[a.node as usize]);
+        let off = offset[a.node as usize];
+        for (&t, &p) in ts.iter().zip(ps) {
+            let b = *sc.bucket_of.entry(t).or_insert_with(|| {
+                if used == sc.buckets.len() {
+                    sc.buckets.push(Vec::new());
                 }
-                u.len().cmp(&v.len())
+                sc.buckets[used].clear();
+                sc.tx.push(t);
+                used += 1;
+                used as u32 - 1
+            });
+            sc.buckets[b as usize].push(Placed {
+                a: i as u32,
+                ts: p + off,
             });
         }
+    }
+
+    used
+}
+
+fn sort_placements(sc: &mut DpScratch, used: usize) {
+    sc.order.clear();
+    sc.order.extend(0..used as u32);
+    {
+        let b = &sc.buckets;
+        sc.order.sort_unstable_by(|&x, &y| {
+            let (u, v) = (&b[x as usize], &b[y as usize]);
+            let (u0, v0) = (u[0].ts as i64, v[0].ts as i64);
+            for (pu, pv) in u.iter().zip(v) {
+                let c =
+                    pu.a.cmp(&pv.a)
+                        .then((pu.ts as i64 - u0).cmp(&(pv.ts as i64 - v0)));
+                if c.is_ne() {
+                    return c;
+                }
+            }
+            u.len().cmp(&v.len())
+        });
+    }
+}
+
+impl OracleChainer {
+    fn chain_with(&self, idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> Vec<TxHit> {
+        let used = collect_placements(idx, cand, sc);
+        self.chain_placed(cand, sc, used)
+    }
+
+    fn chain_placed(&self, cand: &Candidate, sc: &mut DpScratch, used: usize) -> Vec<TxHit> {
+        sort_placements(sc, used);
+        self.chain_ordered(cand, sc, used)
+    }
+
+    // The planner uses the same normalized full-list ordering as the forward reference.
+    // Reuse it on fallback instead of sorting those potentially long lists a second time.
+    fn chain_ordered(&self, cand: &Candidate, sc: &mut DpScratch, used: usize) -> Vec<TxHit> {
+        let len = |i: usize| cand.anchors[i].qe - cand.anchors[i].qs;
+        let p = &self.p;
         let mut hits = Vec::with_capacity(used);
         let mut prev: Option<usize> = None;
         for oi in 0..used {
@@ -481,6 +502,7 @@ impl OracleChainer {
 
 /// A chainer chosen at run time.
 pub enum AnyChainer {
+    /// Compatibility name for the default bidirectional chainer with forward fallback.
     Oracle(OracleChainer),
     Refine(crate::RefineChainer),
 }
@@ -488,7 +510,7 @@ pub enum AnyChainer {
 impl Chainer for AnyChainer {
     fn chain(&self, idx: &Index, cand: &Candidate) -> Vec<TxHit> {
         match self {
-            AnyChainer::Oracle(c) => c.chain(idx, cand),
+            AnyChainer::Oracle(c) => c.chain_bidirectional(idx, cand),
             AnyChainer::Refine(c) => c.chain(idx, cand),
         }
     }

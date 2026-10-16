@@ -5,7 +5,10 @@
 use std::collections::BTreeMap;
 
 use index::{BuildParams, Collapse, Index, TxInput, build};
-use map::{AnchorParams, ChainParams, Chainer, MapParams, Mapper, OracleChainer, RefineChainer, anchor};
+use map::{
+    AnchorParams, BidirectionalChainer, ChainParams, Chainer, MapParams, Mapper, OracleChainer,
+    RefineChainer, anchor,
+};
 use proptest::prelude::*;
 
 struct Rng(u64);
@@ -99,6 +102,7 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
     };
     let mapper = Mapper::new(idx.clone(), OracleChainer { p: p.clone() }, MapParams::default()).unwrap();
     let oracle = OracleChainer { p: p.clone() };
+    let bidirectional = BidirectionalChainer { p: p.clone() };
     let refine = RefineChainer { p, beam: None };
     let mut rng = Rng(seed.wrapping_mul(0x9e3779b97f4a7c15) | 1);
     for _ in 0..8 {
@@ -110,7 +114,17 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
         let seeds = mapper.seeder.seed(&read);
         let anchors = anchor::anchors(&idx, &seeds, &AnchorParams::default());
         for c in anchor::candidates(&idx, anchors, &AnchorParams::default()) {
-            let (o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
+            let (mut o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
+            let mut b = bidirectional.chain(&idx, &c);
+            o.sort_by_key(|h| h.tx);
+            b.sort_by_key(|h| h.tx);
+            prop_assert_eq!(
+                &o,
+                &b,
+                "bidirectional full hits: seed {} read from {}",
+                seed,
+                t.name
+            );
             prop_assert_eq!(scores(o), scores(r), "seed {} read from {}", seed, t.name);
         }
     }
