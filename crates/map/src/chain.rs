@@ -75,7 +75,7 @@ pub(crate) fn hit_from_path(
     max_discrepancy: f32,
     path: impl Iterator<Item = (u32, u32, u32, u32)>,
 ) -> TxHit {
-    let (mut chain, mut anchored, mut covered_to) = (Vec::new(), 0, 0);
+    let (mut chain, mut anchored, mut covered_to) = (Vec::with_capacity(path.size_hint().0), 0, 0);
     let mut qend = 0;
     for (qs, qe, ts, len) in path {
         chain.push((qs, ts, len));
@@ -234,6 +234,8 @@ struct DpScratch {
     // Candidate scores and discrepancies of one anchor's predecessors.
     cs: Vec<f32>,
     cd: Vec<f32>,
+    /// Traceback of the current transcript.
+    path: Vec<usize>,
 }
 
 thread_local! {
@@ -520,7 +522,8 @@ impl OracleChainer {
                 }
             }
             let (mut k, mut maxd) = (end, 0.0f32);
-            let mut path: Vec<usize> = Vec::new();
+            let path = &mut sc.path;
+            path.clear();
             loop {
                 path.push(k);
                 maxd = maxd.max(sc.disc[k]);
