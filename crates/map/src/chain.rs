@@ -214,8 +214,9 @@ const REL_BIAS: i64 = 1 << 29;
 /// Per-thread buffers for the oracle DP (reused across reads).
 #[derive(Default)]
 struct DpScratch {
-    /// Transcript -> bucket, and per-bucket placements in anchor order.
-    bucket_of: rustc_hash::FxHashMap<u32, u32>,
+    /// Transcript -> bucket + 1 (all 0 between calls), and per-bucket placements in anchor
+    /// order.
+    bucket_of: Vec<u32>,
     tx: Vec<u32>,
     buckets: Vec<Vec<Placed>>,
     // Structure-of-arrays for one transcript's placements.
@@ -299,27 +300,35 @@ impl OracleChainer {
         let len = |i: usize| cand.anchors[i].qe - cand.anchors[i].qs;
         // Bucket placements by transcript; visiting anchors in order keeps each bucket sorted
         // by (anchor, target position).
-        sc.bucket_of.clear();
+        // Transcript -> bucket + 1 (0: none yet), dense; reset below for the transcripts used.
+        if sc.bucket_of.len() < idx.n_transcripts() {
+            sc.bucket_of.resize(idx.n_transcripts(), 0);
+        }
         sc.tx.clear();
         let mut used = 0;
         for (i, a) in cand.anchors.iter().enumerate() {
             let (ts, ps) = idx.occurrences(unitig[a.node as usize]);
             let off = offset[a.node as usize];
             for (&t, &p) in ts.iter().zip(ps) {
-                let b = *sc.bucket_of.entry(t).or_insert_with(|| {
+                let mut b = sc.bucket_of[t as usize];
+                if b == 0 {
                     if used == sc.buckets.len() {
                         sc.buckets.push(Vec::new());
                     }
                     sc.buckets[used].clear();
                     sc.tx.push(t);
                     used += 1;
-                    used as u32 - 1
-                });
-                sc.buckets[b as usize].push(Placed {
+                    b = used as u32;
+                    sc.bucket_of[t as usize] = b;
+                }
+                sc.buckets[b as usize - 1].push(Placed {
                     a: i as u32,
                     ts: p + off,
                 });
             }
+        }
+        for &t in &sc.tx {
+            sc.bucket_of[t as usize] = 0;
         }
 
         crate::stats::add(&crate::stats::CHAIN_TX, used as u64);
