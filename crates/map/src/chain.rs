@@ -513,10 +513,46 @@ unsafe fn pred_scores_neon(
     );
 }
 
+/// [`max_score`] of `xs` and the first position equal to it, in one NEON pass: each lane keeps
+/// its maximum and where it first reached it (strictly greater values replace it), and the
+/// lowest position among the lanes at the overall maximum is the first one. The maximum is
+/// [`max_score`]'s up to the sign of a zero, which `==` ignores.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn max_first_neon(xs: &[f32]) -> (f32, usize) {
+    use std::arch::aarch64::*;
+    let (blocks, rest) = xs.as_chunks::<4>();
+    let lane: [u32; 4] = [0, 1, 2, 3];
+    // SAFETY: four u32s.
+    let mut at = unsafe { vld1q_u32(lane.as_ptr()) };
+    let (mut mxv, mut idx) = (vdupq_n_f32(f32::NEG_INFINITY), vdupq_n_u32(0));
+    for c in blocks {
+        // SAFETY: four f32s.
+        let v = unsafe { vld1q_f32(c.as_ptr()) };
+        let gt = vcgtq_f32(v, mxv);
+        mxv = vbslq_f32(gt, v, mxv);
+        idx = vbslq_u32(gt, at, idx);
+        at = vaddq_u32(at, vdupq_n_u32(4));
+    }
+    let mut mx = vmaxvq_f32(mxv);
+    let mut j = vminvq_u32(vbslq_u32(
+        vceqq_f32(mxv, vdupq_n_f32(mx)),
+        idx,
+        vdupq_n_u32(u32::MAX),
+    )) as usize;
+    for (i, &v) in rest.iter().enumerate() {
+        if v > mx {
+            (mx, j) = (v, 4 * blocks.len() + i);
+        }
+    }
+    (mx, j)
+}
+
 /// Maximum of `xs` (never NaN; equal to the in-order maximum up to the sign of a zero).
 /// Long windows reduce in 16 independent lanes; a single running maximum is one dependent
 /// step per element.
 #[inline(always)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn max_score(xs: &[f32]) -> f32 {
     // Comparison form: one max instruction per step (scores are never NaN).
     let max = |a: f32, v: f32| if v > a { v } else { a };
@@ -591,12 +627,24 @@ fn dp_beta0(
                 &mut cs[..m],
                 &mut cd[..m],
             );
-            let mx = max_score(&cs[..m]);
-            if mx > best {
-                // The first predecessor at the maximum, and its own value (which the
-                // in-order maximum would return, whatever the sign of a zero).
-                let j = cs[..m].iter().position(|&v| v == mx).unwrap();
-                (best, arg, bd) = (cs[j], (lo + j) as u32, cd[j]);
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mx = max_score(&cs[..m]);
+                if mx > best {
+                    // The first predecessor at the maximum, and its own value (which the
+                    // in-order maximum would return, whatever the sign of a zero).
+                    let j = cs[..m].iter().position(|&v| v == mx).unwrap();
+                    (best, arg, bd) = (cs[j], (lo + j) as u32, cd[j]);
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // As above, the position found in the same pass.
+                // SAFETY: NEON is part of the aarch64 baseline.
+                let (mx, j) = unsafe { max_first_neon(&cs[..m]) };
+                if mx > best {
+                    (best, arg, bd) = (cs[j], (lo + j) as u32, cd[j]);
+                }
             }
         }
         f[k] = best;
@@ -886,6 +934,25 @@ mod best_chain_tests {
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
             prop_assert_eq!(bits(&cs), bits(&ws));
             prop_assert_eq!(bits(&cd), bits(&wd));
+        }
+
+        /// The NEON maximum and first position at it equal the scalar ones, with ties,
+        /// signed zeros and unreachable (-inf) predecessors.
+        #[cfg(target_arch = "aarch64")]
+        #[test]
+        fn max_first_neon_matches_scalar(
+            xs in prop::collection::vec(prop_oneof![
+                Just(f32::NEG_INFINITY), Just(0.0f32), Just(-0.0f32), Just(1.5f32), -100.0f32..100.0,
+            ], 0..60),
+        ) {
+            let want = max_score(&xs);
+            // SAFETY: NEON is part of the aarch64 baseline.
+            let (mx, j) = unsafe { max_first_neon(&xs) };
+            prop_assert!(mx == want, "{} vs {}", mx, want);
+            if want > f32::NEG_INFINITY {
+                prop_assert_eq!(j, xs.iter().position(|&v| v == want).unwrap());
+                prop_assert_eq!(xs[j].to_bits(), xs[xs.iter().position(|&v| v == want).unwrap()].to_bits());
+            }
         }
 
         /// Shared-prefix chaining of several lists equals one call per list: lists are
