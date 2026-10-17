@@ -728,8 +728,8 @@ fn run(
         }
         None => {
             let (lo0, hi0) = range(0);
-            for j in lo0..=hi0 {
-                h[j] = if j == 0 || mode == Mode::Infix {
+            for (j, x) in h.iter_mut().enumerate().take(hi0 + 1).skip(lo0) {
+                *x = if j == 0 || mode == Mode::Infix {
                     0
                 } else {
                     -(sc.open + sc.ext * j as i32)
