@@ -283,18 +283,26 @@ fn shared_blocks(hits: &[TxHit]) -> Option<Vec<SharedBlock>> {
             let end = q.checked_add(len)?;
             if let Some(b) = blocks.last_mut() {
                 if q < b.query.end {
+                    // An overlapping anchor on another diagonal in some candidate: drop it and
+                    // keep the block (the gap after the block is aligned instead).
+                    let d = q - b.query.start;
+                    if b.targets
+                        .iter()
+                        .zip(&targets)
+                        .any(|(old, new)| old.start + d != new.start)
+                    {
+                        continue;
+                    }
                     for (old, new) in b.targets.iter_mut().zip(&targets) {
-                        if old.start.checked_add(q - b.query.start)? != new.start {
-                            return None;
-                        }
                         old.end = old.end.max(new.end);
                     }
                     b.query.end = b.query.end.max(end);
                     continue;
                 }
-                // Reversed target gaps cannot be aligned globally. Use the existing fallback.
+                // Target ranges that run backwards in some candidate cannot be aligned
+                // globally: drop the anchor.
                 if b.targets.iter().zip(&targets).any(|(a, b)| a.end > b.start) {
-                    return None;
+                    continue;
                 }
             }
             blocks.push(SharedBlock {
@@ -378,7 +386,7 @@ impl<C: Chainer> Mapper<C> {
             }
         };
         for (h, &p) in hits[..n].iter_mut().zip(&penalty) {
-            h.score -= p; // Preserve this transcript's original chain score.
+            h.score = best - p;
         }
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
         n as u32
@@ -833,16 +841,26 @@ impl<C: Chainer> Mapper<C> {
                 ),
             }
         }
-        // Right end: read[last anchor end, plen); accepted anchor bases never enter DP.
+        // Right end: read[last block end, plen) against windows from each candidate's block end.
+        // Blocks are exact in parsed space only: if the candidates' raw bases differ inside the
+        // last block (homopolymer run lengths), the raw read end is aligned through it.
         let last = blocks.last().unwrap();
-        let ql = last.query.end;
+        let t0 = &last.targets[0];
+        let through = raw.is_some()
+            && tb.raw_ends
+            && hits.iter().zip(&last.targets).skip(1).any(|(h, t)| {
+                self.idx
+                    .tx_raw_eq(hits[0].tx, t0.start, t0.end, h.tx, t.start, t.end)
+                    == Some(false)
+            });
+        let ql = if through { last.query.start } else { last.query.end };
         let rest = plen - ql;
         let spans: Vec<(u32, u32, u32)> = hits
             .iter()
             .zip(&last.targets)
             .map(|(h, t)| {
                 let tlen = self.idx.tx_plen()[h.tx as usize];
-                let s = t.end;
+                let s = if through { t.start } else { t.end };
                 (h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
             })
             .collect();
@@ -1223,9 +1241,20 @@ mod segmented_tests {
                 },
             ]
         );
-        // Inconsistent overlapping translations and reversed disjoint target gaps fall back.
-        assert!(shared_blocks(&[hit(0, 1., &[(2, 2, 5), (4, 5, 5)])]).is_none());
-        assert!(shared_blocks(&[hit(0, 1., &[(2, 2, 3), (6, 4, 3)])]).is_none());
+        // An overlapping anchor on another diagonal, or one whose target runs backwards, is
+        // dropped; the block before it stays.
+        let one = |q: std::ops::Range<u32>, t: std::ops::Range<u32>| SharedBlock {
+            query: q,
+            targets: vec![t],
+        };
+        assert_eq!(
+            shared_blocks(&[hit(0, 1., &[(2, 2, 5), (4, 5, 5)])]).unwrap(),
+            vec![one(2..7, 2..7)]
+        );
+        assert_eq!(
+            shared_blocks(&[hit(0, 1., &[(2, 2, 3), (6, 4, 3)])]).unwrap(),
+            vec![one(2..5, 2..5)]
+        );
     }
 
     #[test]
@@ -1318,7 +1347,7 @@ mod segmented_tests {
         assert_eq!(m.tiebreak(&tb, q, None, &mut hits), 4);
         assert_eq!(
             hits.iter().map(|h| h.score).collect::<Vec<_>>(),
-            [15., 8., -3., -4.]
+            [15., 8., 0., 0.]
         );
     }
 
@@ -1335,7 +1364,8 @@ mod segmented_tests {
             ..Default::default()
         };
         m.tiebreak(&tb, q, None, &mut hits);
-        assert_eq!((hits[0].score, hits[1].score), (15., 6.));
+        // Scores become the tie set's best chain score minus each deficit.
+        assert_eq!((hits[0].score, hits[1].score), (15., 9.));
         let m = mapper(&[q, q], false);
         for grouped in [false, true] {
             let mut hits = [hit(0, 15., &[(0, 0, 2)]), hit(1, 12., &[(3, 3, 2)])];
@@ -1345,7 +1375,7 @@ mod segmented_tests {
             };
             assert!(m.segmented(&tb, &codes(q), None, &hits).is_none());
             m.tiebreak(&tb, q, None, &mut hits);
-            assert_eq!((hits[0].score, hits[1].score), (15., 12.));
+            assert_eq!((hits[0].score, hits[1].score), (15., 15.));
         }
     }
 
@@ -1387,8 +1417,9 @@ mod segmented_tests {
         let mut tb = TieBreak::default();
         let parsed = codes(&raw.hpc.seq);
         let costs = m.segmented(&tb, &parsed, Some(&raw), &hits).unwrap().0;
-        // Raw left AA vs A: 9 vs 2; raw right TTTAA vs TA: 15 vs 2.
-        assert_eq!(costs, [-24, -4]);
+        // The block's raw bases differ (CCCGG vs CG), so the right end runs through it.
+        // Raw left AA vs A: 9 vs 2; raw right CCCGGTTTAA vs CGTA: 25 vs 2.
+        assert_eq!(costs, [-34, -4]);
         tb.raw_ends = false;
         assert_eq!(m.segmented(&tb, &parsed, Some(&raw), &hits).unwrap().0, [0, 0]);
     }

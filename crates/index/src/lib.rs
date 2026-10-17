@@ -493,6 +493,19 @@ impl Index {
         Some(v)
     }
 
+    /// Whether the raw bases under parsed `[lo, hi)` of transcript `t` equal those under parsed
+    /// `[ulo, uhi)` of `u` (homopolymer run lengths included), compared on the packed sequence.
+    /// None if the index lacks either raw sequence.
+    pub fn tx_raw_eq(&self, t: u32, lo: u32, hi: u32, u: u32, ulo: u32, uhi: u32) -> Option<bool> {
+        let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
+        let (ua, ub) = (self.tx_raw_pos(u, ulo)?, self.tx_raw_pos(u, uhi)?);
+        if b - a != ub - ua {
+            return Some(false);
+        }
+        let ((tw, _), (uw, _)) = (self.raw_words(t)?, self.raw_words(u)?);
+        Some(packed_eq(tw, a, uw, ua, b - a))
+    }
+
     /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
     /// parsed length), if the index has its raw sequence.
     pub fn tx_raw_pos(&self, t: u32, p: u32) -> Option<u32> {
