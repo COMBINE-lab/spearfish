@@ -392,8 +392,10 @@ fn rad_writer(path: &std::path::Path, args: &Args, mapper: &Mapper) -> Result<lo
             Preset::Hifi => "pac-bio-hifi",
         }
         .into(),
-        // spearfish weighs a hit scoring d below the best by exp(-d / 2).
-        score_denom: 2.0,
+        // A hit scoring d below the read's best is exp(-d) times as likely: the sharpest of
+        // the weightings tried with oarfish's EM on simulated reads and spike-ins (exp(-d / 2),
+        // used before, spread reads more evenly over near-ties).
+        score_denom: 1.0,
         ends_extended: opts.params.ends.is_some(),
         strands: match opts.params.strands {
             map::Strands::Both => "both",
