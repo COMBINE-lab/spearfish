@@ -338,8 +338,9 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Re-rank the near-tie set of `hits` (sorted, best first) by edit distance between the
-    /// parsed read `seq` and each transcript. Returns the tie-set size.
-    fn tiebreak(&self, tb: &TieBreak, seq: &[u8], raw: Option<&RawRead>, hits: &mut [TxHit]) -> u32 {
+    /// parsed read `seq` and each transcript. Returns the tie-set size. `salt` orders equal
+    /// scores (see [`sort_hits`]).
+    fn tiebreak(&self, tb: &TieBreak, seq: &[u8], raw: Option<&RawRead>, hits: &mut [TxHit], salt: u64) -> u32 {
         let Some(best) = hits.first().map(|h| h.score) else {
             return 0;
         };
@@ -384,7 +385,7 @@ impl<C: Chainer> Mapper<C> {
         for (h, &p) in hits[..n].iter_mut().zip(&penalty) {
             h.score = best - p;
         }
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
+        sort_hits(hits, salt);
         n as u32
     }
 
@@ -819,7 +820,7 @@ impl<C: Chainer> Mapper<C> {
         Some((cost, unit))
     }
 
-    fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>)) -> Strand {
+    fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>), salt: u64) -> Strand {
         let seeds = self.seeder.seed_parsed(&seq);
         let anchors = anchor::anchors(&self.idx, &seeds, &self.p.anchor);
         let n_anchors = anchors.len() as u32;
@@ -833,7 +834,7 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .flat_map(|c| self.chainer.chain(&self.idx, c))
             .collect();
-        sort_hits(&mut hits);
+        sort_hits(&mut hits, salt);
         Strand {
             hits,
             seq,
@@ -959,11 +960,14 @@ impl<C: Chainer> Mapper<C> {
             anchors: 0,
             candidates: 0,
         };
+        // Equal scores are ordered by a hash of the transcript salted with the read, so ties
+        // are broken the same way on every run without favouring the same transcript.
+        let salt = xxhash_rust::xxh3::xxh3_64(raw);
         let [pf, pr] = Self::parse_both(&self.seeder, raw);
         let (fwd, rc) = match self.p.strands {
-            Strands::Both => (self.map_strand(pf), self.map_strand(pr)),
-            Strands::Forward => (self.map_strand(pf), skip(pr)),
-            Strands::Reverse => (skip(pf), self.map_strand(pr)),
+            Strands::Both => (self.map_strand(pf, salt), self.map_strand(pr, salt)),
+            Strands::Forward => (self.map_strand(pf, salt), skip(pr)),
+            Strands::Reverse => (skip(pf), self.map_strand(pr, salt)),
         };
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);
         let (mut reverse, mut st, mut other) = if best(&rc.hits) > best(&fwd.hits) {
@@ -988,8 +992,8 @@ impl<C: Chainer> Mapper<C> {
             } else {
                 Vec::new()
             };
-            sort_hits(&mut a);
-            sort_hits(&mut b);
+            sort_hits(&mut a, salt);
+            sort_hits(&mut b, salt);
             let (rev, hits, alt, seq) = if best(&b) > best(&a) {
                 (!reverse, b, a, &other.seq)
             } else {
@@ -1012,13 +1016,13 @@ impl<C: Chainer> Mapper<C> {
             let margin = |s: f32| tb.margin_abs.max(tb.margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
-            tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits);
+            tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits, salt);
             if both {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
-                tiebreak_size += self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits);
+                tiebreak_size += self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits, salt);
                 let codes = |s: &[u8]| -> Vec<u8> {
                     s.iter()
                         .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
@@ -1066,7 +1070,7 @@ impl<C: Chainer> Mapper<C> {
         let mut hits = st.hits;
         if both {
             hits.append(&mut other.hits);
-            sort_hits(&mut hits);
+            sort_hits(&mut hits, salt);
         }
         let mut low_coverage = true;
         if let Some(top) = hits.first() {
@@ -1104,8 +1108,23 @@ impl<C: Chainer> Mapper<C> {
     }
 }
 
-fn sort_hits(hits: &mut [TxHit]) {
-    hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.tx.cmp(&b.tx)));
+/// Best score first; equal scores in the order of `tie_key(salt, tx)`, a per-read
+/// pseudo-random permutation of the transcripts.
+fn sort_hits(hits: &mut [TxHit], salt: u64) {
+    hits.sort_unstable_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| tie_key(salt, a.tx).cmp(&tie_key(salt, b.tx)))
+            .then(a.tx.cmp(&b.tx))
+    });
+}
+
+/// splitmix64 of the read salt and a transcript id.
+fn tie_key(salt: u64, tx: u32) -> u64 {
+    let mut z = salt ^ u64::from(tx).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -1285,7 +1304,7 @@ mod segmented_tests {
             m.segmented(&tb, &codes(q), None, &hits).unwrap().0,
             [-28, -21, -13, -13]
         );
-        assert_eq!(m.tiebreak(&tb, q, None, &mut hits), 4);
+        assert_eq!(m.tiebreak(&tb, q, None, &mut hits, 0), 4);
         assert_eq!(
             hits.iter().map(|h| h.score).collect::<Vec<_>>(),
             [15., 8., 0., 0.]
@@ -1304,7 +1323,7 @@ mod segmented_tests {
             lambda: 0.5,
             ..Default::default()
         };
-        m.tiebreak(&tb, q, None, &mut hits);
+        m.tiebreak(&tb, q, None, &mut hits, 0);
         // Scores become the tie set's best chain score minus each deficit.
         assert_eq!((hits[0].score, hits[1].score), (15., 9.));
         let m = mapper(&[q, q], false);
@@ -1315,7 +1334,7 @@ mod segmented_tests {
                 ..Default::default()
             };
             assert!(m.segmented(&tb, &codes(q), None, &hits).is_none());
-            m.tiebreak(&tb, q, None, &mut hits);
+            m.tiebreak(&tb, q, None, &mut hits, 0);
             assert_eq!((hits[0].score, hits[1].score), (15., 15.));
         }
     }
