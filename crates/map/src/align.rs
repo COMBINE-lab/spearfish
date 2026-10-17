@@ -697,7 +697,19 @@ fn run(
             v.resize(n + 2, NEG);
         }
     }
-    let edges = |v: &mut Vec<i32>, lo: usize, hi: usize| {
+    // Rows are swapped as local slices (in registers), not as the buffers' Vec headers in
+    // `b`: a store and reload of those per row stalls depending on where `b` lies.
+    let DpBuf {
+        h: hv,
+        f: fv,
+        nh: nhv,
+        nf: nfv,
+        hp: hpv,
+        gs: gsv,
+        ..
+    } = &mut *b;
+    let (mut h, mut f, mut nh, mut nf) = (&mut hv[..], &mut fv[..], &mut nhv[..], &mut nfv[..]);
+    let edges = |v: &mut [i32], lo: usize, hi: usize| {
         if lo > 0 {
             v[lo - 1] = NEG;
         }
@@ -706,10 +718,10 @@ fn run(
     debug_assert!(sc.open >= 0 && sc.ext >= 0);
     let (mut prev, first) = match resume {
         Some(s) => {
-            b.h[s.lo..=s.hi].copy_from_slice(&s.h);
-            b.f[s.lo..=s.hi].copy_from_slice(&s.f);
-            edges(&mut b.h, s.lo, s.hi);
-            edges(&mut b.f, s.lo, s.hi);
+            h[s.lo..=s.hi].copy_from_slice(&s.h);
+            f[s.lo..=s.hi].copy_from_slice(&s.f);
+            edges(h, s.lo, s.hi);
+            edges(f, s.lo, s.hi);
             clip_best = s.clip_best;
             clip_cell = s.clip_cell;
             ((s.lo, s.hi), s.row + 1)
@@ -717,15 +729,15 @@ fn run(
         None => {
             let (lo0, hi0) = range(0);
             for j in lo0..=hi0 {
-                b.h[j] = if j == 0 || mode == Mode::Infix {
+                h[j] = if j == 0 || mode == Mode::Infix {
                     0
                 } else {
                     -(sc.open + sc.ext * j as i32)
                 };
             }
-            b.f[lo0..=hi0].fill(NEG);
-            edges(&mut b.h, lo0, hi0);
-            edges(&mut b.f, lo0, hi0);
+            f[lo0..=hi0].fill(NEG);
+            edges(h, lo0, hi0);
+            edges(f, lo0, hi0);
             ((lo0, hi0), 1)
         }
     }; // band of the row in h
@@ -753,9 +765,9 @@ fn run(
         let mut row_max = NEG;
         if lo == 0 {
             // Column 0: only a vertical gap reaches it.
-            let fj = (b.h[0] - go).max(b.f[0] - ext);
-            b.nh[0] = fj;
-            b.nf[0] = fj;
+            let fj = (h[0] - go).max(f[0] - ext);
+            nh[0] = fj;
+            nf[0] = fj;
             e = fj - go;
             start = 1;
             row_max = fj;
@@ -768,7 +780,6 @@ fn run(
         }
         #[cfg(target_arch = "x86_64")]
         if start <= hi && avx512_rows() {
-            let DpBuf { h, f, nh, nf, .. } = &mut *b;
             // SAFETY: AVX-512F/BW/VL are available (checked above).
             let m = unsafe {
                 row_avx512(
@@ -790,13 +801,11 @@ fn run(
             // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
             // only adds outputs after every real one.
             let wp = w.next_multiple_of(16);
-            if b.hp.len() < wp {
-                b.hp.resize(wp, NEG);
-                b.gs.resize(wp, NEG);
+            if hpv.len() < wp {
+                hpv.resize(wp, NEG);
+                gsv.resize(wp, NEG);
             }
-            let DpBuf {
-                h, f, nh, nf, hp, gs, ..
-            } = &mut *b;
+            let (hp, gs) = (&mut hpv[..], &mut gsv[..]);
             gs[w..wp].fill(NEG);
             let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
             let gs = &mut gs_all[..w];
@@ -834,7 +843,7 @@ fn run(
             if row > clip_best {
                 clip_best = row;
                 if cell {
-                    let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
+                    let j = nh[lo..=hi].iter().position(|&x| x == row).unwrap();
                     clip_cell = (i, lo + j);
                 }
             }
@@ -849,26 +858,26 @@ fn run(
                 };
             }
         }
-        edges(&mut b.nh, lo, hi);
-        edges(&mut b.nf, lo, hi);
-        std::mem::swap(&mut b.h, &mut b.nh);
-        std::mem::swap(&mut b.f, &mut b.nf);
+        edges(nh, lo, hi);
+        edges(nf, lo, hi);
+        std::mem::swap(&mut h, &mut nh);
+        std::mem::swap(&mut f, &mut nf);
         prev = (lo, hi);
         if next_snap < snaps.len() && snaps[next_snap].row == i {
             let s = &mut snaps[next_snap];
             (s.lo, s.hi) = (lo, hi);
             s.h.clear();
-            s.h.extend_from_slice(&b.h[lo..=hi]);
+            s.h.extend_from_slice(&h[lo..=hi]);
             s.f.clear();
-            s.f.extend_from_slice(&b.f[lo..=hi]);
+            s.f.extend_from_slice(&f[lo..=hi]);
             (s.clip_best, s.clip_cell) = (clip_best, clip_cell);
             next_snap += 1;
         }
     }
     let (score, score_col) = match mode {
-        Mode::Global => (b.h[n], n),
+        Mode::Global => (h[n], n),
         Mode::Prefix | Mode::Infix => {
-            let row = &b.h[prev.0..=prev.1];
+            let row = &h[prev.0..=prev.1];
             let x = row.iter().copied().max().unwrap_or(NEG);
             (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
         }
