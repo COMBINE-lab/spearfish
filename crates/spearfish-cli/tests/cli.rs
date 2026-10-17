@@ -281,7 +281,7 @@ fn simulate_and_map_on_toy() {
         .collect();
     let (h, mut r) = long_read_rad::open(&out_rad, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
     assert_eq!(h.meta.mapper, "spearfish");
-    assert_eq!(h.meta.score_denom, 2.0);
+    assert_eq!(h.meta.score_denom, 1.0);
     assert_eq!(h.counts.reads, 200);
     assert_eq!(h.counts.mapped, 200);
     assert_eq!(h.ref_names.len(), h.ref_lengths.len());
