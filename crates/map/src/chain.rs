@@ -161,12 +161,13 @@ pub(crate) fn transition(p: &ChainParams, x: Pt, y: Pt) -> Option<(f32, f32)> {
 /// Best local colinear chain over points sorted by (qs, ts), with predecessors among the
 /// previous `2h` points. Returns (score, chain indices in order, max discrepancy), or `None`
 /// for no points.
+#[cfg(test)]
 pub(crate) fn best_chain(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>, f32)> {
     if pts.is_empty() {
         return None;
     }
     if p.beta == 0.0 {
-        return BEST.with(|sc| best_chain_beta0(p, pts, &mut sc.borrow_mut()));
+        return best_chains(p, &[pts]).pop().unwrap();
     }
     best_chain_scalar(p, pts)
 }
@@ -223,63 +224,127 @@ thread_local! {
     static BEST: std::cell::RefCell<DpScratch> = std::cell::RefCell::new(DpScratch::default());
 }
 
-/// [`best_chain`] with β = 0 through the oracle's vectorized DP: point `k` gets identity `k`
-/// and the window `2h`, so `dp_beta0` sees the same predecessors, and its transition
-/// arithmetic and tie-break (first maximum above the start score) are `transition`'s.
-fn best_chain_beta0(p: &ChainParams, pts: &[Pt], sc: &mut DpScratch) -> Option<(f32, Vec<usize>, f32)> {
-    let n = pts.len();
-    sc.a.clear();
-    sc.a.extend(0..n as u32);
-    sc.qs.clear();
-    sc.qs.extend(pts.iter().map(|x| x.qs as i32));
-    sc.qe.clear();
-    sc.qe.extend(pts.iter().map(|x| x.qe as i32));
-    sc.ts.clear();
-    sc.ts.extend(pts.iter().map(|x| x.ts as i32));
-    sc.te.clear();
-    sc.te.extend(pts.iter().map(|x| (x.ts + x.len) as i32));
-    sc.w.clear();
-    sc.w.extend(pts.iter().map(|x| x.w));
-    for v in [&mut sc.f, &mut sc.disc, &mut sc.cs, &mut sc.cd] {
-        if v.len() < n {
-            v.resize(n, 0.0);
-        }
+/// A chain result: (score, chain indices in order, max discrepancy).
+pub(crate) type ChainResult = (f32, Vec<usize>, f32);
+
+/// [`best_chain`] for each of `lists`, sharing work: with β = 0 the lists are visited in
+/// order of their points shifted to the first point's transcript start, and each DP resumes
+/// where the list diverges from the previous one (transitions depend on target positions
+/// only through differences, so equal shifted prefixes have equal DP values). The same
+/// results as separate calls.
+pub(crate) fn best_chains(p: &ChainParams, lists: &[&[Pt]]) -> Vec<Option<ChainResult>> {
+    if p.beta != 0.0 {
+        return lists.iter().map(|l| best_chain_scalar(p, l)).collect();
     }
-    if sc.back.len() < n {
-        sc.back.resize(n, u32::MAX);
+    BEST.with(|sc| best_chains_beta0(p, lists, &mut sc.borrow_mut()))
+}
+
+/// A point as the DP sees it: query span, target start relative to the list's first point,
+/// length and weight (bits).
+fn shifted(l: &[Pt], i: usize) -> (u32, u32, i64, u32, u32) {
+    let x = l[i];
+    (x.qs, x.qe, x.ts as i64 - l[0].ts as i64, x.len, x.w.to_bits())
+}
+
+/// [`best_chains`] with β = 0 through the oracle's vectorized DP: point `k` gets identity `k`
+/// and the window `2h`, so `dp_beta0` sees `best_chain`'s predecessors, and its transition
+/// arithmetic and tie-break (first maximum above the start score) are `transition`'s.
+fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Vec<Option<ChainResult>> {
+    let mut out: Vec<Option<ChainResult>> = vec![None; lists.len()];
+    sc.order.clear();
+    sc.order.extend(0..lists.len() as u32);
+    if lists.len() > 1 {
+        sc.order.sort_unstable_by(|&x, &y| {
+            let (u, v) = (lists[x as usize], lists[y as usize]);
+            (0..u.len().min(v.len()))
+                .map(|i| shifted(u, i).cmp(&shifted(v, i)))
+                .find(|o| o.is_ne())
+                .unwrap_or(u.len().cmp(&v.len()))
+        });
     }
     let wp = ChainParams {
         h: 2 * p.h,
         ..p.clone()
     };
-    dp_beta0(
-        &wp,
-        (&sc.a, &sc.qs, &sc.qe, &sc.ts, &sc.te, &sc.w),
-        &mut sc.f[..n],
-        &mut sc.back[..n],
-        &mut sc.disc[..n],
-        0,
-        &mut sc.cs,
-        &mut sc.cd,
-    );
-    let (f, back, disc) = (&sc.f[..n], &sc.back[..n], &sc.disc[..n]);
-    let mut end = 0;
-    for k in 1..n {
-        if f[k] > f[end] {
-            end = k;
+    // The list whose points and DP values the buffers hold.
+    let mut prev: Option<&[Pt]> = None;
+    let order = std::mem::take(&mut sc.order);
+    for &x in &order {
+        let pts = lists[x as usize];
+        let n = pts.len();
+        if n == 0 {
+            continue;
         }
-    }
-    let (mut k, mut chain, mut maxd) = (end, Vec::new(), 0f32);
-    loop {
-        chain.push(k);
-        maxd = maxd.max(disc[k]);
-        if back[k] == u32::MAX {
-            break;
+        let lcp = prev.map_or(0, |q| {
+            (0..q.len().min(n))
+                .take_while(|&i| shifted(q, i) == shifted(pts, i))
+                .count()
+        });
+        crate::stats::add(&crate::stats::RESCUE_PTS, n as u64);
+        crate::stats::add(&crate::stats::RESCUE_PTS_DP, (n - lcp) as u64);
+        for v in [&mut sc.qs, &mut sc.qe, &mut sc.ts, &mut sc.te] {
+            if v.len() < n {
+                v.resize(n, 0);
+            }
         }
-        k = back[k] as usize;
+        for v in [&mut sc.w, &mut sc.f, &mut sc.disc, &mut sc.cs, &mut sc.cd] {
+            if v.len() < n {
+                v.resize(n, 0.0);
+            }
+        }
+        if sc.a.len() < n {
+            sc.a.resize(n, 0);
+            sc.back.resize(n, u32::MAX);
+        }
+        let ts0 = pts[0].ts as i64;
+        for (i, x) in pts.iter().enumerate().skip(lcp) {
+            let ts = (x.ts as i64 - ts0) as i32;
+            sc.a[i] = i as u32;
+            sc.qs[i] = x.qs as i32;
+            sc.qe[i] = x.qe as i32;
+            sc.ts[i] = ts;
+            sc.te[i] = ts + x.len as i32;
+            sc.w[i] = x.w;
+        }
+        dp_beta0(
+            &wp,
+            (
+                &sc.a[..n],
+                &sc.qs[..n],
+                &sc.qe[..n],
+                &sc.ts[..n],
+                &sc.te[..n],
+                &sc.w[..n],
+            ),
+            &mut sc.f[..n],
+            &mut sc.back[..n],
+            &mut sc.disc[..n],
+            lcp,
+            &mut sc.cs,
+            &mut sc.cd,
+        );
+        prev = Some(pts);
+        let (f, back, disc) = (&sc.f[..n], &sc.back[..n], &sc.disc[..n]);
+        let mut end = 0;
+        for k in 1..n {
+            if f[k] > f[end] {
+                end = k;
+            }
+        }
+        let (mut k, mut chain, mut maxd) = (end, Vec::new(), 0f32);
+        loop {
+            chain.push(k);
+            maxd = maxd.max(disc[k]);
+            if back[k] == u32::MAX {
+                break;
+            }
+            k = back[k] as usize;
+        }
+        chain.reverse();
+        out[x as usize] = Some((f[end], chain, maxd));
     }
-    chain.reverse();
-    Some((f[end], chain, maxd))
+    sc.order = order;
+    out
 }
 
 /// Bias added to relative target positions so they stay positive.
@@ -356,6 +421,26 @@ fn pred_scores(
     }
 }
 
+/// Maximum of `xs` (never NaN; equal to the in-order maximum up to the sign of a zero).
+/// Long windows reduce in 16 independent lanes; a single running maximum is one dependent
+/// step per element.
+#[inline(always)]
+fn max_score(xs: &[f32]) -> f32 {
+    // Comparison form: one max instruction per step (scores are never NaN).
+    let max = |a: f32, v: f32| if v > a { v } else { a };
+    if xs.len() < 32 {
+        return xs.iter().fold(f32::NEG_INFINITY, |a, &v| max(a, v));
+    }
+    let (blocks, rest) = xs.as_chunks::<16>();
+    let mut acc = [f32::NEG_INFINITY; 16];
+    for c in blocks {
+        for l in 0..16 {
+            acc[l] = max(acc[l], c[l]);
+        }
+    }
+    rest.iter().chain(&acc).fold(f32::NEG_INFINITY, |a, &v| max(a, v))
+}
+
 /// A transcript's placements as structure-of-arrays: identity, query start and end, relative
 /// target start and end, weight.
 type Soa<'a> = (&'a [u32], &'a [i32], &'a [i32], &'a [i32], &'a [i32], &'a [f32]);
@@ -406,13 +491,12 @@ fn dp_beta0(
                 &mut cs[..m],
                 &mut cd[..m],
             );
-            // Comparison form: one max instruction per step (scores are never NaN).
-            let mx = cs[..m]
-                .iter()
-                .fold(f32::NEG_INFINITY, |a, &v| if v > a { v } else { a });
+            let mx = max_score(&cs[..m]);
             if mx > best {
+                // The first predecessor at the maximum, and its own value (which the
+                // in-order maximum would return, whatever the sign of a zero).
                 let j = cs[..m].iter().position(|&v| v == mx).unwrap();
-                (best, arg, bd) = (mx, (lo + j) as u32, cd[j]);
+                (best, arg, bd) = (cs[j], (lo + j) as u32, cd[j]);
             }
         }
         f[k] = best;
@@ -674,6 +758,59 @@ mod best_chain_tests {
                     prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
                 }
                 (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
+            }
+        }
+
+        /// Shared-prefix chaining of several lists equals one call per list: lists are
+        /// shifted copies of one point set, cut and extended differently (as isoform windows
+        /// are), plus unrelated ones.
+        #[test]
+        fn shared_lists_match_single(
+            raw in prop::collection::vec((0u32..3000, 0u32..3000, 1u32..40), 0..300),
+            cuts in prop::collection::vec((0usize..300, 0u32..2000, prop::collection::vec((0u32..3000, 0u32..3000, 1u32..40), 0..40)), 1..12),
+            h in 1usize..40,
+        ) {
+            let mk = |v: &[(u32, u32, u32)], shift: u32| {
+                let mut pts: Vec<Pt> = v
+                    .iter()
+                    .map(|&(qs, ts, len)| Pt { qs, qe: qs + len, ts: ts + shift, len, w: len as f32 })
+                    .collect();
+                pts.sort_unstable_by_key(|p| (p.qs, p.ts));
+                pts
+            };
+            let base = mk(&raw, 0);
+            let lists: Vec<Vec<Pt>> = cuts
+                .iter()
+                .map(|(cut, shift, extra)| {
+                    // A shifted prefix of the base, then other points after it in the query.
+                    let mut l: Vec<Pt> = base[..(*cut).min(base.len())]
+                        .iter()
+                        .map(|p| Pt { ts: p.ts + shift, ..*p })
+                        .collect();
+                    let q0 = l.last().map_or(0, |p| p.qs + 1);
+                    let mut tail = mk(extra, *shift);
+                    for p in &mut tail {
+                        p.qs += q0;
+                        p.qe += q0;
+                    }
+                    l.extend(tail);
+                    l
+                })
+                .collect();
+            let p = ChainParams { h, o_max: 30, g_max: 500, ..Default::default() };
+            let refs: Vec<&[Pt]> = lists.iter().map(|l| l.as_slice()).collect();
+            let got = best_chains(&p, &refs);
+            for (l, g) in lists.iter().zip(&got) {
+                let w = best_chain_scalar(&p, l);
+                match (w, g) {
+                    (None, None) => {}
+                    (Some(w), Some(g)) => {
+                        prop_assert_eq!(w.0.to_bits(), g.0.to_bits());
+                        prop_assert_eq!(&w.1, &g.1);
+                        prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
+                    }
+                    (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
+                }
             }
         }
     }

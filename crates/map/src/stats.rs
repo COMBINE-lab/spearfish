@@ -57,6 +57,8 @@ counters!(
     MERGED_ANCHORS,
     CHAIN_TX,
     CHAIN_PLACEMENTS,
+    RESCUE_PTS,
+    RESCUE_PTS_DP,
 );
 
 #[inline]
