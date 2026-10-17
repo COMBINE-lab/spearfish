@@ -453,9 +453,12 @@ impl<C: Chainer> Mapper<C> {
         // Identical texts (isoforms agreeing over the region) are aligned once. The band only
         // tightens (k = best so far + cap), so a repeat's result is the first occurrence's
         // re-capped at the current k: exact if d <= k, else k + 1, as a fresh call returns.
+        let pat = align::Pattern::new(read);
+        if mode == align::Mode::Infix {
+            return Self::banded_infix(&pat, read.len(), texts, cap);
+        }
         let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
         let mut best = u32::MAX;
-        let pat = align::Pattern::new(read);
         texts
             .iter()
             .map(|t| {
@@ -474,6 +477,60 @@ impl<C: Chainer> Mapper<C> {
                 d
             })
             .collect()
+    }
+
+    /// [`Self::banded`] in infix mode, aligning distinct texts in batches of eight
+    /// ([`align::infix_distances`]) with the threshold in force at each batch's first text:
+    /// later texts' thresholds are no larger (the best only falls), so a batch result is exact
+    /// wherever the sequential pass's would be, and re-capping it at each text's own threshold,
+    /// in order, gives the sequential results exactly.
+    fn banded_infix(pat: &align::Pattern, m: usize, texts: &[Vec<u8>], cap: u32) -> Vec<u32> {
+        // Each text's distinct-text index, and the distinct texts in first-occurrence order.
+        let mut first: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
+        let mut uniq: Vec<&[u8]> = Vec::new();
+        let mut at: Vec<usize> = Vec::new();
+        let id: Vec<u32> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                *first.entry(t.as_slice()).or_insert_with(|| {
+                    uniq.push(t.as_slice());
+                    at.push(i);
+                    uniq.len() as u32 - 1
+                })
+            })
+            .collect();
+        // Batch results (exact when within the batch's threshold), then the sequential values.
+        let mut raw: Vec<Option<u32>> = Vec::with_capacity(uniq.len());
+        let mut val = vec![0u32; uniq.len()];
+        let mut best = u32::MAX;
+        let mut out = Vec::with_capacity(texts.len());
+        for (i, &u) in id.iter().enumerate() {
+            let u = u as usize;
+            let k = best.saturating_add(cap);
+            if at[u] != i {
+                // A repeat: the first occurrence's value re-capped at the current threshold.
+                let d = val[u];
+                out.push(if d <= k { d } else { k.saturating_add(1) });
+                continue;
+            }
+            if u == raw.len() {
+                let batch = &uniq[u..(u + 8).min(uniq.len())];
+                for t in batch {
+                    stats::add(&stats::MYERS_CALLS, 1);
+                    stats::add(&stats::MYERS_CELLS, (m as u64).div_ceil(64) * t.len() as u64);
+                }
+                raw.extend(align::infix_distances(pat, batch, k));
+            }
+            let d = match raw[u] {
+                Some(d) if d <= k => d,
+                _ => k.saturating_add(1),
+            };
+            best = best.min(d);
+            val[u] = d;
+            out.push(d);
+        }
+        out
     }
 
     /// Whole read against each candidate's covered transcript region (projected to the read

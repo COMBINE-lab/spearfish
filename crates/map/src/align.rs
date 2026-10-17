@@ -139,6 +139,171 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
     (best <= k).then_some(best as u32)
 }
 
+/// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
+/// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
+/// lane, sharing the pattern's blocks.
+pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+    #[cfg(target_arch = "x86_64")]
+    if pat.m > 0 && std::arch::is_x86_feature_detected!("avx512f") {
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(8) {
+            // SAFETY: AVX-512F is available (checked above).
+            unsafe { infix_x8(pat, batch, k, &mut out) };
+        }
+        return out;
+    }
+    texts
+        .iter()
+        .map(|t| distance_with(pat, t, Mode::Infix, k))
+        .collect()
+}
+
+/// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
+/// [`distance_with`]'s recurrence; the band is the union of the lanes' Ukkonen bands (a block
+/// is added if any lane would add it, dropped only if every lane would), and blocks are
+/// added with the same upper-bound state. Every lane's band thus contains its own, which
+/// already holds every cell scoring <= k, so a lane's distance is exact when <= k, as in
+/// `distance_with`, and above k otherwise.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=8).contains(&texts.len()) && pat.m > 0);
+    let m = pat.m;
+    let n_max = texts.iter().map(|t| t.len()).max().unwrap();
+    let kk = k.min((m + n_max) as u32) as i64;
+    let blocks = m.div_ceil(W);
+    let last_bit = (m - 1) % W;
+    let rows = |b: usize| if b + 1 == blocks { last_bit + 1 } else { W };
+    // Text codes interleaved by lane: column j of lane l at 8j + l.
+    let mut tx = vec![0u8; 8 * n_max];
+    for (l, t) in texts.iter().enumerate() {
+        for (j, &c) in t.iter().enumerate() {
+            tx[8 * j + l] = c & 3;
+        }
+    }
+    // Lanes still inside their text, per column: lane l is live while j < len(l).
+    let lens = _mm512_set_epi64(
+        texts.get(7).map_or(0, |t| t.len() as i64),
+        texts.get(6).map_or(0, |t| t.len() as i64),
+        texts.get(5).map_or(0, |t| t.len() as i64),
+        texts.get(4).map_or(0, |t| t.len() as i64),
+        texts.get(3).map_or(0, |t| t.len() as i64),
+        texts.get(2).map_or(0, |t| t.len() as i64),
+        texts.get(1).map_or(0, |t| t.len() as i64),
+        texts[0].len() as i64,
+    );
+    // Each block's four match masks, twice over, so a lane's code selects its mask.
+    let peq: Vec<__m512i> = pat
+        .peq
+        .iter()
+        // SAFETY: four u64s.
+        .map(|q| _mm512_broadcast_i64x4(unsafe { _mm256_loadu_si256(q.as_ptr().cast()) }))
+        .collect();
+    let ones = _mm512_set1_epi64(-1);
+    let one = _mm512_set1_epi64(1);
+    let zero = _mm512_setzero_si512();
+    let mut pv = vec![ones; blocks];
+    let mut mv = vec![zero; blocks];
+    let mut score: Vec<__m512i> = (0..blocks)
+        .map(|b| _mm512_set1_epi64((b * W + rows(b)) as i64))
+        .collect();
+    let kv = _mm512_set1_epi64(kk);
+    let kw = _mm512_set1_epi64(kk + W as i64);
+    let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
+    // Column 0: D[m][0] = m.
+    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+        _mm512_set1_epi64(m as i64)
+    } else {
+        _mm512_set1_epi64(i64::MAX)
+    };
+    // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn step(
+        pv: &mut __m512i,
+        mv: &mut __m512i,
+        eq: __m512i,
+        (neg, pos): (__m512i, __m512i),
+        bitv: __m128i,
+        live: __mmask8,
+    ) -> (__m512i, __m512i) {
+        let (p, m) = (*pv, *mv);
+        let one = _mm512_set1_epi64(1);
+        let xv = _mm512_or_si512(eq, m);
+        let eq = _mm512_or_si512(eq, neg);
+        let xh = _mm512_or_si512(
+            _mm512_xor_si512(_mm512_add_epi64(_mm512_and_si512(eq, p), p), p),
+            eq,
+        );
+        let ph = _mm512_or_si512(m, _mm512_ternarylogic_epi64::<0x01>(xh, p, p));
+        let mh = _mm512_and_si512(p, xh);
+        let hp = _mm512_and_si512(_mm512_srl_epi64(ph, bitv), one);
+        let hm = _mm512_and_si512(_mm512_srl_epi64(mh, bitv), one);
+        let ph = _mm512_or_si512(_mm512_slli_epi64::<1>(ph), pos);
+        let mh = _mm512_or_si512(_mm512_slli_epi64::<1>(mh), neg);
+        let npv = _mm512_or_si512(mh, _mm512_ternarylogic_epi64::<0x01>(xv, ph, ph));
+        let nmv = _mm512_and_si512(ph, xv);
+        *pv = _mm512_mask_mov_epi64(p, live, npv);
+        *mv = _mm512_mask_mov_epi64(m, live, nmv);
+        (hm, hp)
+    }
+    let bitw = _mm_cvtsi64_si128((W - 1) as i64);
+    let bitl = _mm_cvtsi64_si128(last_bit as i64);
+    let bitv = |b: usize| if b + 1 == blocks { bitl } else { bitw };
+    for j in 0..n_max {
+        let live: __mmask8 = _mm512_cmpgt_epi64_mask(lens, _mm512_set1_epi64(j as i64));
+        // SAFETY: tx holds 8 codes per column.
+        let c = _mm512_cvtepu8_epi64(unsafe { _mm_loadl_epi64(tx.as_ptr().add(8 * j).cast()) });
+        // Infix: the top row is free (horizontal delta 0).
+        let mut h = (zero, zero);
+        for b in 0..=last as usize {
+            let eq = _mm512_permutexvar_epi64(c, peq[b]);
+            h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
+            score[b] = _mm512_mask_add_epi64(score[b], live, score[b], _mm512_sub_epi64(h.1, h.0));
+        }
+        let lb = last as usize;
+        let hin = _mm512_sub_epi64(h.1, h.0);
+        let mut added = false;
+        if lb + 1 < blocks {
+            let eqn = _mm512_permutexvar_epi64(c, peq[lb + 1]);
+            let top = _mm512_sub_epi64(score[lb], hin);
+            let want = _mm512_mask_cmple_epi64_mask(live, top, kv)
+                & (_mm512_test_epi64_mask(eqn, one) | _mm512_cmplt_epi64_mask(hin, zero));
+            if want != 0 {
+                let nb = lb + 1;
+                pv[nb] = ones;
+                mv[nb] = zero;
+                let hn = step(&mut pv[nb], &mut mv[nb], eqn, h, bitv(nb), live);
+                score[nb] = _mm512_add_epi64(
+                    _mm512_add_epi64(top, _mm512_set1_epi64(rows(nb) as i64)),
+                    _mm512_sub_epi64(hn.1, hn.0),
+                );
+                last += 1;
+                added = true;
+            }
+        }
+        if !added {
+            while last >= 0 && _mm512_mask_cmplt_epi64_mask(live, score[last as usize], kw) == 0 {
+                last -= 1;
+            }
+            if last < 0 {
+                break;
+            }
+        }
+        if last as usize + 1 == blocks {
+            best = _mm512_mask_min_epi64(best, live, best, score[blocks - 1]);
+        }
+    }
+    let mut bs = [0i64; 8];
+    // SAFETY: eight i64s.
+    unsafe { _mm512_storeu_si512(bs.as_mut_ptr().cast(), best) };
+    for (l, t) in texts.iter().enumerate() {
+        let kl = k.min((m + t.len()) as u32) as i64;
+        out.push((bs[l] <= kl).then_some(bs[l] as u32));
+    }
+}
+
 /// Minimum edit distance between `pattern` and any substring of `text` (no cutoff).
 pub fn infix_distance(pattern: &[u8], text: &[u8]) -> u32 {
     distance(pattern, text, Mode::Infix, u32::MAX).unwrap()
@@ -1235,6 +1400,50 @@ mod tests {
             for k in [d.saturating_sub(1), d, d + slack, u32::MAX] {
                 check(&p, &t, k)?;
             }
+        }
+
+        /// Batched infix distances equal one `distance_with` call per text: texts are
+        /// mutated copies of one sequence (as isoform regions are) of differing lengths,
+        /// some empty or unrelated, in batches of any size.
+        #[test]
+        fn infix_batch_matches_single(
+            base in prop::collection::vec(0u8..4, 0..700),
+            texts in prop::collection::vec(
+                (0usize..700, 0usize..700, prop::collection::vec((0usize..700, 0u8..4, 0u8..3), 0..25), any::<bool>()),
+                1..20,
+            ),
+            pa in 0usize..300, plen in 0usize..500,
+            pedits in prop::collection::vec((0usize..700, 0u8..4, 0u8..3), 0..40),
+            kdelta in prop_oneof![Just(None), (0u32..60).prop_map(Some)],
+            rnd in prop::collection::vec(0u8..4, 0..300),
+        ) {
+            let mutate = |mut v: Vec<u8>, edits: &[(usize, u8, u8)]| {
+                for &(pos, b, kind) in edits {
+                    if v.is_empty() { break; }
+                    let i = pos % v.len();
+                    match kind { 0 => v[i] = b, 1 => v.insert(i, b), _ => { v.remove(i); } }
+                }
+                v
+            };
+            let end = (pa + plen).min(base.len());
+            let p = mutate(base[pa.min(end)..end].to_vec(), &pedits);
+            let ts: Vec<Vec<u8>> = texts
+                .iter()
+                .map(|(a, l, e, unrelated)| {
+                    if *unrelated {
+                        rnd[..(*l).min(rnd.len())].to_vec()
+                    } else {
+                        let end = (a + l).min(base.len());
+                        mutate(base[(*a).min(end)..end].to_vec(), e)
+                    }
+                })
+                .collect();
+            let pat = Pattern::new(&p);
+            let exact: Vec<u32> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, u32::MAX).unwrap()).collect();
+            let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
+            let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
+            let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
+            prop_assert_eq!(infix_distances(&pat, &refs, k), want);
         }
     }
 }
