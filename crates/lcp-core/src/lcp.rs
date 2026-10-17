@@ -11,7 +11,7 @@
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::bits::{BitArena, dct_value, dct_value_words, value_width};
+use crate::bits::{BitArena, dct_value_words, value_width};
 use crate::encode::acgt_segments;
 use crate::{Core, Hierarchy, Level, Parser, ParserMeta};
 
@@ -327,7 +327,7 @@ fn dct_into(bits: &BitArena, d: usize, vals: &mut Vec<u64>) {
     vals.clear();
     vals.resize(n, 0);
     for (i, v) in vals.iter_mut().enumerate().skip(1) {
-        *v = dct_value(bits.get(i - 1), bits.get(i));
+        *v = bits.dct(i);
     }
     for t in 1..d {
         // Iteration t compresses cores i > t against their left neighbour's previous value.
