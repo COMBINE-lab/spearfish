@@ -165,6 +165,17 @@ pub(crate) fn best_chain(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>
     if pts.is_empty() {
         return None;
     }
+    if p.beta == 0.0 {
+        return BEST.with(|sc| best_chain_beta0(p, pts, &mut sc.borrow_mut()));
+    }
+    best_chain_scalar(p, pts)
+}
+
+/// [`best_chain`] one transition at a time (any β).
+fn best_chain_scalar(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>, f32)> {
+    if pts.is_empty() {
+        return None;
+    }
     let (mut f, mut back, mut disc) = (
         vec![0f32; pts.len()],
         vec![usize::MAX; pts.len()],
@@ -203,6 +214,69 @@ pub(crate) fn best_chain(p: &ChainParams, pts: &[Pt]) -> Option<(f32, Vec<usize>
             break;
         }
         k = back[k];
+    }
+    chain.reverse();
+    Some((f[end], chain, maxd))
+}
+
+thread_local! {
+    static BEST: std::cell::RefCell<DpScratch> = std::cell::RefCell::new(DpScratch::default());
+}
+
+/// [`best_chain`] with β = 0 through the oracle's vectorized DP: point `k` gets identity `k`
+/// and the window `2h`, so `dp_beta0` sees the same predecessors, and its transition
+/// arithmetic and tie-break (first maximum above the start score) are `transition`'s.
+fn best_chain_beta0(p: &ChainParams, pts: &[Pt], sc: &mut DpScratch) -> Option<(f32, Vec<usize>, f32)> {
+    let n = pts.len();
+    sc.a.clear();
+    sc.a.extend(0..n as u32);
+    sc.qs.clear();
+    sc.qs.extend(pts.iter().map(|x| x.qs as i32));
+    sc.qe.clear();
+    sc.qe.extend(pts.iter().map(|x| x.qe as i32));
+    sc.ts.clear();
+    sc.ts.extend(pts.iter().map(|x| x.ts as i32));
+    sc.te.clear();
+    sc.te.extend(pts.iter().map(|x| (x.ts + x.len) as i32));
+    sc.w.clear();
+    sc.w.extend(pts.iter().map(|x| x.w));
+    for v in [&mut sc.f, &mut sc.disc, &mut sc.cs, &mut sc.cd] {
+        if v.len() < n {
+            v.resize(n, 0.0);
+        }
+    }
+    if sc.back.len() < n {
+        sc.back.resize(n, u32::MAX);
+    }
+    let wp = ChainParams {
+        h: 2 * p.h,
+        ..p.clone()
+    };
+    dp_beta0(
+        &wp,
+        (&sc.a, &sc.qs, &sc.qe, &sc.ts, &sc.te, &sc.w),
+        &mut sc.f[..n],
+        &mut sc.back[..n],
+        &mut sc.disc[..n],
+        0,
+        &mut sc.cs,
+        &mut sc.cd,
+    );
+    let (f, back, disc) = (&sc.f[..n], &sc.back[..n], &sc.disc[..n]);
+    let mut end = 0;
+    for k in 1..n {
+        if f[k] > f[end] {
+            end = k;
+        }
+    }
+    let (mut k, mut chain, mut maxd) = (end, Vec::new(), 0f32);
+    loop {
+        chain.push(k);
+        maxd = maxd.max(disc[k]);
+        if back[k] == u32::MAX {
+            break;
+        }
+        k = back[k] as usize;
     }
     chain.reverse();
     Some((f[end], chain, maxd))
@@ -567,6 +641,40 @@ impl Chainer for AnyChainer {
         match self {
             AnyChainer::Oracle(c) => c.chain(idx, cand),
             AnyChainer::Refine(c) => c.chain(idx, cand),
+        }
+    }
+}
+
+#[cfg(test)]
+mod best_chain_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The vectorized β = 0 path returns exactly what the scalar DP does.
+        #[test]
+        fn beta0_matches_scalar(
+            raw in prop::collection::vec((0u32..3000, 0u32..3000, 1u32..40), 0..400),
+            h in 1usize..40,
+            alpha in prop_oneof![Just(1.5f32), Just(0.25f32)],
+        ) {
+            let mut pts: Vec<Pt> = raw
+                .iter()
+                .map(|&(qs, ts, len)| Pt { qs, qe: qs + len, ts, len, w: len as f32 })
+                .collect();
+            pts.sort_unstable_by_key(|p| (p.qs, p.ts));
+            let p = ChainParams { alpha, h, o_max: 30, g_max: 500, ..Default::default() };
+            let want = best_chain_scalar(&p, &pts);
+            let got = best_chain(&p, &pts);
+            match (want, got) {
+                (None, None) => {}
+                (Some(w), Some(g)) => {
+                    prop_assert_eq!(w.0.to_bits(), g.0.to_bits());
+                    prop_assert_eq!(w.1, g.1);
+                    prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
+                }
+                (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
+            }
         }
     }
 }
