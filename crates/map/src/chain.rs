@@ -421,6 +421,98 @@ fn pred_scores(
     }
 }
 
+/// [`pred_scores`] in 4-lane NEON blocks, the rest scalar: the same operations per element
+/// (conversions, products, quotient and sums in the same order), so the same bits.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pred_scores_neon(
+    alpha: f32,
+    rho: f32,
+    o_max: i32,
+    g_max: i32,
+    xa: &[u32],
+    xqs: &[i32],
+    xqe: &[i32],
+    xts: &[i32],
+    xte: &[i32],
+    xf: &[f32],
+    y: (u32, i32, i32, i32, f32),
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let n = cs.len();
+    let lens = [
+        xa.len(),
+        xqs.len(),
+        xqe.len(),
+        xts.len(),
+        xte.len(),
+        xf.len(),
+        cd.len(),
+    ];
+    assert!(lens.iter().all(|&l| l >= n));
+    let (ya, yqs, yqe, yts, yw) = y;
+    let (vya, vyqs, vyts) = (vdupq_n_u32(ya), vdupq_n_s32(yqs), vdupq_n_s32(yts));
+    let (lo, hi) = (vdupq_n_s32(-o_max), vdupq_n_s32(g_max));
+    let (vlen, vqlen) = (vdupq_n_s32(yqe - yqs), vdupq_n_f32((yqe - yqs) as f32));
+    let (valpha, vrho, vyw) = (vdupq_n_f32(alpha), vdupq_n_f32(rho), vdupq_n_f32(yw));
+    let (one, ninf) = (vdupq_n_f32(1.0), vdupq_n_f32(f32::NEG_INFINITY));
+    let mut m = 0;
+    while m + 4 <= n {
+        // SAFETY: m + 4 <= n, and every slice holds at least n elements (checked above).
+        let (a, qs, qe, ts, te, f) = unsafe {
+            (
+                vld1q_u32(xa.as_ptr().add(m)),
+                vld1q_s32(xqs.as_ptr().add(m)),
+                vld1q_s32(xqe.as_ptr().add(m)),
+                vld1q_s32(xts.as_ptr().add(m)),
+                vld1q_s32(xte.as_ptr().add(m)),
+                vld1q_f32(xf.as_ptr().add(m)),
+            )
+        };
+        let dq = vsubq_s32(vyqs, qe);
+        let dt = vsubq_s32(vyts, te);
+        let valid = vandq_u32(
+            vandq_u32(
+                vandq_u32(vcltq_u32(a, vya), vcgtq_s32(vyqs, qs)),
+                vcgtq_s32(vyts, ts),
+            ),
+            vandq_u32(
+                vandq_u32(vcgeq_s32(dq, lo), vcleq_s32(dq, hi)),
+                vandq_u32(vcgeq_s32(dt, lo), vcleq_s32(dt, hi)),
+            ),
+        );
+        let d = vabsq_f32(vsubq_f32(vcvtq_f32_s32(dq), vmulq_f32(vrho, vcvtq_f32_s32(dt))));
+        let gamma = vmulq_f32(valpha, d);
+        let overlap = vcvtq_f32_s32(vminq_s32(vmaxq_s32(vsubq_s32(qe, vyqs), vdupq_n_s32(0)), vlen));
+        let delta = vsubq_f32(vmulq_f32(vyw, vsubq_f32(one, vdivq_f32(overlap, vqlen))), gamma);
+        let c = vbslq_f32(valid, vaddq_f32(f, delta), ninf);
+        // SAFETY: as for the loads.
+        unsafe {
+            vst1q_f32(cs.as_mut_ptr().add(m), c);
+            vst1q_f32(cd.as_mut_ptr().add(m), d);
+        }
+        m += 4;
+    }
+    pred_scores(
+        alpha,
+        rho,
+        o_max,
+        g_max,
+        &xa[m..n],
+        &xqs[m..n],
+        &xqe[m..n],
+        &xts[m..n],
+        &xte[m..n],
+        &xf[m..n],
+        y,
+        &mut cs[m..],
+        &mut cd[m..n],
+    );
+}
+
 /// Maximum of `xs` (never NaN; equal to the in-order maximum up to the sign of a zero).
 /// Long windows reduce in 16 independent lanes; a single running maximum is one dependent
 /// step per element.
@@ -476,7 +568,15 @@ fn dp_beta0(
         let (mut best, mut arg, mut bd) = (y.4, u32::MAX, 0.0f32);
         if k > lo {
             let m = k - lo;
-            pred_scores(
+            // LLVM's cost model leaves the scalar loop unvectorized on aarch64.
+            #[cfg(target_arch = "aarch64")]
+            let pred = |a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12| {
+                // SAFETY: NEON is part of the aarch64 baseline.
+                unsafe { pred_scores_neon(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12) }
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let pred = pred_scores;
+            pred(
                 p.alpha,
                 p.rho,
                 p.o_max as i32,
@@ -759,6 +859,33 @@ mod best_chain_tests {
                 }
                 (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
             }
+        }
+
+        /// The NEON predecessor scores equal the scalar ones bit for bit, including invalid
+        /// predecessors, overlaps and gaps at the limits.
+        #[cfg(target_arch = "aarch64")]
+        #[test]
+        fn pred_scores_neon_matches_scalar(
+            xs in prop::collection::vec((0u32..60, -50i32..600, 0i32..80, -50i32..600, 0i32..80, -1000.0f32..1000.0), 0..40),
+            y in (0u32..60, 0i32..600, 1i32..80, 0i32..600, 0.0f32..100.0),
+            alpha in prop_oneof![Just(1.5f32), Just(0.25f32), 0.0f32..4.0],
+            rho in prop_oneof![Just(1.0f32), 0.5f32..2.0],
+        ) {
+            let xa: Vec<u32> = xs.iter().map(|x| x.0).collect();
+            let xqs: Vec<i32> = xs.iter().map(|x| x.1).collect();
+            let xqe: Vec<i32> = xs.iter().map(|x| x.1 + x.2).collect();
+            let xts: Vec<i32> = xs.iter().map(|x| x.3).collect();
+            let xte: Vec<i32> = xs.iter().map(|x| x.3 + x.4).collect();
+            let xf: Vec<f32> = xs.iter().map(|x| x.5).collect();
+            let y = (y.0, y.1, y.1 + y.2, y.3, y.4);
+            let n = xs.len();
+            let (mut cs, mut cd, mut ws, mut wd) = (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+            pred_scores(alpha, rho, 30, 500, &xa, &xqs, &xqe, &xts, &xte, &xf, y, &mut ws, &mut wd);
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { pred_scores_neon(alpha, rho, 30, 500, &xa, &xqs, &xqe, &xts, &xte, &xf, y, &mut cs, &mut cd) };
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            prop_assert_eq!(bits(&cs), bits(&ws));
+            prop_assert_eq!(bits(&cd), bits(&wd));
         }
 
         /// Shared-prefix chaining of several lists equals one call per list: lists are
