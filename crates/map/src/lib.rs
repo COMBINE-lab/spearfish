@@ -352,7 +352,14 @@ impl<C: Chainer> Mapper<C> {
     /// Re-rank the near-tie set of `hits` (sorted, best first) by edit distance between the
     /// parsed read `seq` and each transcript. Returns the tie-set size. `salt` orders equal
     /// scores (see [`sort_hits`]).
-    fn tiebreak(&self, tb: &TieBreak, seq: &[u8], raw: Option<&RawRead>, hits: &mut [TxHit], salt: u64) -> u32 {
+    fn tiebreak(
+        &self,
+        tb: &TieBreak,
+        seq: &[u8],
+        raw: Option<&RawRead>,
+        hits: &mut [TxHit],
+        salt: u64,
+    ) -> u32 {
         let Some(best) = hits.first().map(|h| h.score) else {
             return 0;
         };
@@ -877,9 +884,7 @@ impl<C: Chainer> Mapper<C> {
         // Only a read that shows a poly(A) tail (a run of TAIL_RUN A's in its raw right end)
         // gets the virtual tail; reads without one are scored as before.
         let tail = |mut texts: Vec<Vec<u8>>, rest: &[u8]| {
-            let has_tail = rest
-                .split(|&c| c != a_code)
-                .any(|run| run.len() >= TAIL_RUN);
+            let has_tail = rest.split(|&c| c != a_code).any(|run| run.len() >= TAIL_RUN);
             if tb.tail_a > 0 && has_tail {
                 let a = a_code;
                 for (t, &(tx, _, hi)) in texts.iter_mut().zip(&spans) {
@@ -902,7 +907,8 @@ impl<C: Chainer> Mapper<C> {
                     .iter()
                     .map(|&(t, lo, hi)| {
                         let mut x = self.idx.tx_codes(t, lo, hi);
-                        if tb.tail_a > 0 && hi == self.idx.tx_plen()[t as usize] && x.last() != Some(&a_code) {
+                        if tb.tail_a > 0 && hi == self.idx.tx_plen()[t as usize] && x.last() != Some(&a_code)
+                        {
                             x.push(a_code);
                         }
                         x
