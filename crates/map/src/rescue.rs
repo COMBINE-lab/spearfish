@@ -78,6 +78,43 @@ struct Scratch {
 /// as (qs, qe, ts relative to the window, len)).
 type WindowChain = (f32, f32, u32, Vec<(u32, u32, u32, u32)>);
 
+/// Rescue points chained per batch (320 kB of `Pt`s): a read whose windows hold more is
+/// chained in several batches rather than leaving a large pool on its thread.
+const POOL_CAP: usize = 1 << 14;
+
+/// Best chain of each window `wins` (ranges of `pool`), as [`WindowChain`]s.
+fn window_chains(cp: &ChainParams, pool: &[Pt], wins: &[(u32, u32)]) -> Vec<Option<WindowChain>> {
+    let lists: Vec<&[Pt]> = wins
+        .iter()
+        .map(|&(a, n)| &pool[a as usize..(a + n) as usize])
+        .collect();
+    best_chains(cp, &lists)
+        .into_iter()
+        .zip(&lists)
+        .map(|(res, pts)| {
+            let (score, chain, maxd) = res?;
+            let mut anchored = 0;
+            let mut to = 0;
+            for &k in &chain {
+                let from = pts[k].qs.max(to);
+                if pts[k].qe > from {
+                    anchored += pts[k].qe - from;
+                }
+                to = to.max(pts[k].qe);
+            }
+            Some((
+                score,
+                maxd,
+                anchored,
+                chain
+                    .iter()
+                    .map(|&k| (pts[k].qs, pts[k].qe, pts[k].ts, pts[k].len))
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
 thread_local! {
     static RESCUE: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
@@ -174,6 +211,9 @@ impl Rescuer {
         sc.pool.clear();
         sc.wins.clear();
         sc.reqs.clear();
+        // Window chains, computed in batches of at most POOL_CAP points so a read with many
+        // or long windows doesn't leave a large pool behind on its thread.
+        let mut results: Vec<Option<WindowChain>> = Vec::new();
         for c in &cands {
             // Transcripts of this gene that received base anchors, most anchors first, with
             // the range of their anchors' diagonals.
@@ -223,9 +263,14 @@ impl Rescuer {
                         let start = sc.pool.len() as u32;
                         self.points_in(&tseq, sc);
                         sc.tseq = tseq;
-                        let r = sc.wins.len() as u32;
+                        let r = (results.len() + sc.wins.len()) as u32;
                         sc.wins.push((start, sc.pool.len() as u32 - start));
                         sc.seen.insert(key, r);
+                        if sc.pool.len() >= POOL_CAP {
+                            results.extend(window_chains(cp, &sc.pool, &sc.wins));
+                            sc.pool.clear();
+                            sc.wins.clear();
+                        }
                         r
                     }
                 };
@@ -233,36 +278,10 @@ impl Rescuer {
             }
         }
         // Best chain per distinct window, isoform windows sharing their DP prefixes.
-        let lists: Vec<&[Pt]> = sc
-            .wins
-            .iter()
-            .map(|&(a, n)| &sc.pool[a as usize..(a + n) as usize])
-            .collect();
-        let results: Vec<Option<WindowChain>> = best_chains(cp, &lists)
-            .into_iter()
-            .zip(&lists)
-            .map(|(res, pts)| {
-                let (score, chain, maxd) = res?;
-                let mut anchored = 0;
-                let mut to = 0;
-                for &k in &chain {
-                    let from = pts[k].qs.max(to);
-                    if pts[k].qe > from {
-                        anchored += pts[k].qe - from;
-                    }
-                    to = to.max(pts[k].qe);
-                }
-                Some((
-                    score,
-                    maxd,
-                    anchored,
-                    chain
-                        .iter()
-                        .map(|&k| (pts[k].qs, pts[k].qe, pts[k].ts, pts[k].len))
-                        .collect(),
-                ))
-            })
-            .collect();
+        results.extend(window_chains(cp, &sc.pool, &sc.wins));
+        if sc.pool.capacity() > POOL_CAP * 2 {
+            sc.pool = Vec::with_capacity(POOL_CAP);
+        }
         for &(t, lo, r) in &sc.reqs {
             let Some((score, maxd, anchored, chain)) = &results[r as usize] else {
                 continue;
