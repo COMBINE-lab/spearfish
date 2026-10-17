@@ -769,7 +769,19 @@ impl<C: Chainer> Mapper<C> {
                     let tx: Vec<&[u8]> = todo.iter().map(|&k| texts[uniq[k]].as_slice()).collect();
                     let w0 = align::dp_work();
                     let xs = if mode == align::Mode::Prefix && tb.clip_ends {
-                        align::affine_extend_sorted(&read, &tx, sc, tb.band, tb.end_bonus, tb.xdrop, diag)
+                        // The band is laid out for the window the read end would get against a
+                        // transcript that doesn't end inside it.
+                        let window = read.len() + tb.pad as usize + read.len() / tb.pad_div as usize;
+                        align::affine_extend_sorted(
+                            &read,
+                            &tx,
+                            sc,
+                            tb.band,
+                            tb.end_bonus,
+                            tb.xdrop,
+                            diag,
+                            window,
+                        )
                     } else {
                         align::affine_sorted(&read, &tx, mode, sc, tb.band)
                     };

@@ -390,7 +390,11 @@ pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, b
 }
 
 /// [`affine_extend`] (or, with `diagonal`, [`affine_extend_diagonal`]) for each of `texts`,
-/// which must be sorted, sharing rows as [`affine_sorted`] does.
+/// which must be sorted, sharing rows as [`affine_sorted`] does. Without `diagonal`, the band is
+/// laid out for a text of at least `window` bases, as [`affine_extend_window`] does: a text cut
+/// short where its transcript ends gets the band of the full window, so a read whose far end
+/// doesn't align (a primer, an adapter) is placed as it would be against a longer transcript.
+#[allow(clippy::too_many_arguments)]
 pub fn affine_extend_sorted(
     pattern: &[u8],
     texts: &[&[u8]],
@@ -399,9 +403,10 @@ pub fn affine_extend_sorted(
     end_bonus: i32,
     xdrop: i32,
     diagonal: bool,
+    window: usize,
 ) -> Vec<i32> {
     let m = pattern.len();
-    let geom = |n: usize| if diagonal { m.min(n) } else { n };
+    let geom = |n: usize| if diagonal { m.min(n) } else { n.max(window) };
     affine_dp_sorted(pattern, texts, Mode::Prefix, sc, band, Some((xdrop, false)), geom)
         .into_iter()
         .map(|d| d.clip_best.max(d.score.saturating_add(end_bonus)))
@@ -1244,7 +1249,7 @@ mod tests {
             base in prop::collection::vec(0u8..4, 1..160),
             edits in prop::collection::vec((0usize..160, 0u8..4, 0u8..3), 0..12),
             variants in prop::collection::vec((0usize..160, prop::collection::vec(0u8..4, 0..40), 0usize..60), 1..8),
-            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8,
+            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8, window_extra in 0usize..40,
         ) {
             let mut p = base.clone();
             for (pos, b, kind) in edits {
@@ -1271,7 +1276,7 @@ mod tests {
                     prop_assert_eq!(got, want, "mode {:?}", mode);
                 }
                 for diag in [false, true] {
-                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag);
+                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag, 0);
                     let want: Vec<i32> = refs
                         .iter()
                         .map(|t| if diag {
@@ -1282,6 +1287,15 @@ mod tests {
                         .collect();
                     prop_assert_eq!(got, want, "diag {}", diag);
                 }
+                // A band laid out for a window at least as long as each text, as in
+                // affine_extend_window.
+                let w = refs.iter().map(|t| t.len()).max().unwrap_or(0) + window_extra;
+                let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, false, w);
+                let want: Vec<i32> = refs
+                    .iter()
+                    .map(|t| affine_extend_window(&p, t, w, &sc, band, bonus, xdrop).0)
+                    .collect();
+                prop_assert_eq!(got, want, "window {}", w);
             }
         }
 
