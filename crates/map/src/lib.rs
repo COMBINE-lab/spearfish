@@ -71,13 +71,18 @@ pub struct TieBreak {
     /// homopolymers at the read ends (e.g. a template-switch oligo's Gs) can't merge into the
     /// transcript's first or last run.
     pub raw_ends: bool,
-    /// Right read end: append this many A's to each candidate's window that reaches the
-    /// transcript's 3' end (the mRNA's poly(A) tail, absent from the reference), so a read's tail
-    /// aligns past the end of the transcript it came from (0: off). Raw read ends get the tail
-    /// only if the read shows one (a run of `TAIL_RUN` A's); in homopolymer-compressed space the
-    /// tail is a single A. Without it, an isoform that ends where the read's tail starts ties with
-    /// one that continues, since the clipped extension does not charge the unaligned remainder.
-    pub tail_a: u32,
+    /// Right read end: a read whose raw right end shows a poly(A) tail (a `tail_run`-base window
+    /// of A's with at most one other base) is aligned only up to the tail, so its A's can't
+    /// align into an isoform's A-rich continuation, and each candidate whose transcript ends
+    /// within `TAIL_TOL` (+ 1/10 of the read end) of the tail's start gains `tail_bonus` points:
+    /// the read's 3' end is the molecule's. Cleavage sites and annotated ends vary by a few
+    /// bases, so ends that close are not told apart (0: no bonus; the tail is still trimmed).
+    pub tail_bonus: i32,
+    /// Trim a detected poly(A) tail from the read's right end before aligning it.
+    pub tail_trim: bool,
+    /// Shortest poly(A) tail recognized: a window this long with at most one base not A,
+    /// followed by at most `TAIL_AFTER` read bases.
+    pub tail_run: usize,
 }
 
 impl Default for TieBreak {
@@ -102,7 +107,9 @@ impl Default for TieBreak {
             group_fallback: false,
             orient_clipped: true,
             raw_ends: true,
-            tail_a: 20,
+            tail_bonus: 10,
+            tail_trim: true,
+            tail_run: 15,
         }
     }
 }
@@ -880,44 +887,75 @@ impl<C: Chainer> Mapper<C> {
                 (h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
             })
             .collect();
+        // The read's poly(A) tail, searched for past the last block (raw positions from ql).
         let a_code = lcp_core::encode::CODE[b'A' as usize] & 3;
-        // Only a read that shows a poly(A) tail (a run of TAIL_RUN A's in its raw right end)
-        // gets the virtual tail; reads without one are scored as before.
-        let tail = |mut texts: Vec<Vec<u8>>, rest: &[u8]| {
-            let has_tail = rest.split(|&c| c != a_code).any(|run| run.len() >= TAIL_RUN);
-            if tb.tail_a > 0 && has_tail {
-                let a = a_code;
-                for (t, &(tx, _, hi)) in texts.iter_mut().zip(&spans) {
-                    if hi == self.idx.tx_plen()[tx as usize] {
-                        t.extend(std::iter::repeat_n(a, tb.tail_a as usize));
-                    }
-                }
-            }
+        // Whether each window's end (its length from the read end's start, in the tail's space)
+        // is where the tail starts: within the tolerance of its start, or further but only by
+        // annotated A's (an end that includes part of the tail) up to the run's end.
+        let ends_at_tail = |texts: &[Vec<u8>], cut: usize, run_end: usize| -> Vec<bool> {
+            let tol = TAIL_TOL + cut / 10;
             texts
+                .iter()
+                .map(|t| {
+                    let n = t.len();
+                    n.abs_diff(cut) <= tol
+                        || (n > cut
+                            && n <= run_end + tol
+                            && t[cut..].iter().filter(|&&c| c != a_code).count() * 10 <= n - cut)
+                })
+                .collect()
         };
-        match self.raw_texts(tb, raw, &spans) {
+        let tail = match raw {
+            Some(r) if tb.tail_trim || tb.tail_bonus > 0 => {
+                let (r0, r1) = (r.pos(ql), r.pos(last.query.end));
+                tail_start(&r.codes[r1..], a_code, tb.tail_run)
+                    .map(|(c, e)| (r, r0, r1 - r0 + c, r1 - r0 + e))
+            }
+            _ => None,
+        };
+        let ends = match self.raw_texts(tb, raw, &spans) {
             Some((r, texts)) => {
                 let rest = &r.codes[r.pos(ql)..];
-                add(tail(texts, rest), rest, align::Mode::Prefix, false)
+                let cut = tail.map_or(rest.len(), |(_, _, c, _)| c);
+                let run_end = tail.map_or(cut, |(_, _, _, e)| e);
+                let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
+                let read = if tb.tail_trim { &rest[..cut] } else { rest };
+                add(texts, read, align::Mode::Prefix, false);
+                at_end
             }
-            // In homopolymer-compressed space a poly(A) tail is one A (none if the
-            // transcript already ends in A), and the read's tail can't be told from one A.
-            None => add(
-                spans
+            None => {
+                let texts: Vec<Vec<u8>> = spans
                     .iter()
-                    .map(|&(t, lo, hi)| {
-                        let mut x = self.idx.tx_codes(t, lo, hi);
-                        if tb.tail_a > 0 && hi == self.idx.tx_plen()[t as usize] && x.last() != Some(&a_code)
-                        {
-                            x.push(a_code);
-                        }
-                        x
-                    })
-                    .collect(),
-                &codes[ql as usize..],
-                align::Mode::Prefix,
-                false,
-            ),
+                    .map(|&(t, lo, hi)| self.idx.tx_codes(t, lo, hi))
+                    .collect();
+                // The tail's start and run end in parsed space: the last parsed base starting at
+                // or before each.
+                let parsed = |x: usize, r: &RawRead| {
+                    let (mut lo, mut hi) = (ql, plen);
+                    while lo < hi {
+                        let mid = (lo + hi).div_ceil(2);
+                        if r.pos(mid) <= x { lo = mid } else { hi = mid - 1 }
+                    }
+                    (lo - ql) as usize
+                };
+                let cut = tail.map_or((plen - ql) as usize, |(r, r0, c, _)| parsed(r0 + c, r));
+                let run_end = tail.map_or(cut, |(r, r0, _, e)| parsed(r0 + e, r));
+                let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
+                let read = &codes[ql as usize..];
+                let read = if tb.tail_trim { &read[..cut] } else { read };
+                add(texts, read, align::Mode::Prefix, false);
+                at_end
+            }
+        };
+        // Candidates whose 3' end is where the read's tail starts gain the bonus.
+        if let Some(at_end) = ends
+            && tb.tail_bonus > 0
+        {
+            for ((c, &(tx, _, hi)), &ok) in cost.iter_mut().zip(&spans).zip(&at_end) {
+                if ok && hi == self.idx.tx_plen()[tx as usize] {
+                    *c -= i64::from(tb.tail_bonus);
+                }
+            }
         }
         let unit = if tb.affine.is_some() { tb.lambda } else { tb.kappa };
         Some((cost, unit))
@@ -1209,8 +1247,41 @@ impl<C: Chainer> Mapper<C> {
     }
 }
 
-/// Shortest run of A's in a read's raw right end taken as its poly(A) tail.
-const TAIL_RUN: usize = 10;
+/// Bases between a transcript's 3' end and a read's tail start treated as the same end.
+const TAIL_TOL: usize = 15;
+/// Most read bases after a poly(A) tail (adapter and the like).
+const TAIL_AFTER: usize = 80;
+
+/// The first poly(A) window of `run` bases in `rest` (raw codes): its first A, and the end of the A-run from
+/// there (the longest stretch ending in A with at most one other base per ten).
+fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
+    if rest.len() < run {
+        return None;
+    }
+    let mut other = rest[..run].iter().filter(|&&c| c != a).count();
+    for i in 0..=rest.len() - run {
+        if i > 0 {
+            other = other + usize::from(rest[i + run - 1] != a) - usize::from(rest[i - 1] != a);
+        }
+        if other <= 1 {
+            let s = i + rest[i..].iter().position(|&c| c == a).unwrap_or(0);
+            let (mut end, mut non) = (s, 0);
+            for (k, &c) in rest.iter().enumerate().skip(s) {
+                non += usize::from(c != a);
+                if c == a && non * 10 <= k + 1 - s {
+                    end = k + 1;
+                }
+            }
+            // A tail is followed only by adapter: an A-run with more of the read after it is
+            // transcript sequence (or internal priming), not the molecule's 3' end.
+            if rest.len() - end > TAIL_AFTER {
+                return None;
+            }
+            return Some((s, end));
+        }
+    }
+    None
+}
 
 /// Best score first; equal scores in the order of `tie_key(salt, tx)`, a per-read
 /// pseudo-random permutation of the transcripts.
@@ -1375,11 +1446,7 @@ mod segmented_tests {
             .collect();
         assert_eq!(gaps, vec![vec![], vec![], codes(b"AT"), vec![]]);
         let sc = align::Affine::ONT;
-        // The example's read ends carry no poly(A) tail.
-        let tb = TieBreak {
-            tail_a: 0,
-            ..Default::default()
-        };
+        let tb = TieBreak::default();
         let mut totals = vec![0; 4];
         for (i, h) in hits.iter().enumerate() {
             let left = m.idx.tx_codes(h.tx, 0, b[0].targets[i].start);
@@ -1420,21 +1487,35 @@ mod segmented_tests {
     }
 
     #[test]
-    fn poly_a_tail_prefers_the_isoform_ending_at_the_tail() {
+    fn tail_start_finds_the_first_poly_a_window() {
+        let a = codes(b"A")[0];
+        assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAAAAAAGT"), a, 15), Some((4, 19)));
+        // One base in a window may be a sequencing error.
+        assert_eq!(tail_start(&codes(b"CGAAAAAAACAAAAAAAGT"), a, 15), Some((2, 17)));
+        assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAGTCAAAA"), a, 15), None);
+    }
+
+    #[test]
+    fn poly_a_tail_is_trimmed_and_favours_the_isoform_ending_there() {
         // t1 continues past t0's 3' end; the read stops there and goes on into its tail.
-        let m = mapper(&[b"ACGTTGCC", b"ACGTTGCCTGCT"], false);
-        let q = b"ACGTTGCCAGT";
-        let hits = [hit(0, 10., &[(0, 0, 8)]), hit(1, 10., &[(0, 0, 8)])];
-        let cost = |tail_a| {
+        let body: &[u8] = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
+        let t1: Vec<u8> = [body, b"GCTCGTCGTCAGCTCGTCGATCGCT"].concat();
+        let m = mapper(&[body, &t1], true);
+        let q: Vec<u8> = [body, b"AAAAAAAAAAAAAAAAAAAAAAAA", b"GTCGCTCGTGCA"].concat();
+        let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &q);
+        let n = 30;
+        let hits = [hit(0, 10., &[(0, 0, n)]), hit(1, 10., &[(0, 0, n)])];
+        let cost = |tail_bonus| {
             let tb = TieBreak {
-                tail_a,
+                tail_bonus,
                 ..Default::default()
             };
-            m.segmented(&tb, &codes(q), None, &hits).unwrap().0
+            m.segmented(&tb, &codes(&seq), raw.as_ref(), &hits).unwrap().0
         };
-        let (off, on) = (cost(0), cost(20));
+        let (off, on) = (cost(0), cost(10));
         assert_eq!(off[0], off[1]);
-        assert!(on[0] < on[1]);
+        assert_eq!(on[0], off[0] - 10);
+        assert_eq!(on[1], off[1]);
     }
 
     #[test]

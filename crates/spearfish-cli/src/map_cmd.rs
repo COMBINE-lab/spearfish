@@ -140,10 +140,13 @@ pub struct Args {
     /// transcripts (default: the preset's; on except for drna).
     #[arg(long)]
     raw_ends: Option<bool>,
-    /// Tie-break: A's appended to transcript windows that reach the 3' end, standing for the
-    /// mRNA's poly(A) tail (0: off).
+    /// Tie-break: points for isoforms whose 3' end lies where the read's poly(A) tail starts
+    /// (within a few bases; 0: off).
     #[arg(long)]
-    tail_a: Option<u32>,
+    tail_bonus: Option<i32>,
+    /// Tie-break: align a read's poly(A) tail with its right end instead of trimming it.
+    #[arg(long)]
+    no_tail_trim: bool,
     /// Chain every anchor separately (no merging of collinear anchors within a unitig).
     #[arg(long)]
     no_merge: bool,
@@ -439,9 +442,10 @@ fn options(args: &Args) -> Result<MapOptions> {
         if let Some(r) = args.raw_ends {
             tb.raw_ends = r;
         }
-        if let Some(n) = args.tail_a {
-            tb.tail_a = n;
+        if let Some(n) = args.tail_bonus {
+            tb.tail_bonus = n;
         }
+        tb.tail_trim &= !args.no_tail_trim;
         if let Some(b) = args.tie_band {
             tb.band = b;
         }
