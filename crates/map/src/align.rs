@@ -999,8 +999,14 @@ fn run(
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
+        // The cfg must not cover the scalar branch: an attribute on an `if` removes its
+        // `else` arms too.
         #[cfg(target_arch = "x86_64")]
-        if start <= hi && avx512_rows() {
+        let fused = start <= hi && avx512_rows();
+        #[cfg(not(target_arch = "x86_64"))]
+        let fused = false;
+        #[cfg(target_arch = "x86_64")]
+        if fused {
             // SAFETY: AVX-512F/BW/VL are available (checked above).
             let m = unsafe {
                 row_avx512(
@@ -1015,7 +1021,8 @@ fn run(
                 )
             };
             row_max = row_max.max(m);
-        } else if start <= hi {
+        }
+        if !fused && start <= hi {
             // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
             // without horizontal gaps), from the previous row only.
             let w = hi + 1 - start;
