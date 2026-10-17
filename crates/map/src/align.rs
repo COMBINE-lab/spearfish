@@ -359,6 +359,99 @@ unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
     }
 }
 
+/// AVX-512 with byte masks, checked once.
+#[cfg(target_arch = "x86_64")]
+fn avx512_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    })
+}
+
+/// One DP row over `w` cells, the three passes of `run` fused per 16-lane block: diagonal and
+/// vertical moves, then horizontal gaps as an in-register prefix max carried across blocks,
+/// with no intermediate row written. `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
+/// F[i-1][start..=hi], `tx` the text bases of columns start..=hi; writes H and F of row i
+/// and returns the row's maximum. Same integer operations as the scalar passes, so the
+/// same results.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_avx512(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+) -> i32 {
+    use std::arch::x86_64::*;
+    let w = fu.len();
+    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    let neg = _mm512_set1_epi32(NEG);
+    let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
+    let (vmat, vmis) = (_mm512_set1_epi32(mat), _mm512_set1_epi32(-mis));
+    let vc = _mm512_set1_epi32(c as i32);
+    let three = _mm512_set1_epi32(3);
+    let last = _mm512_set1_epi32(15);
+    let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    // ext * k for the block's lanes, advanced by 16 * ext per block.
+    let mut ek = _mm512_mullo_epi32(lane, vext);
+    let step = _mm512_set1_epi32(16 * ext);
+    let mut cv = _mm512_set1_epi32(e);
+    let mut mx = neg;
+    let mut k = 0;
+    while k < w {
+        let n = (w - k).min(16);
+        let mask: __mmask16 = if n == 16 { !0 } else { (1u16 << n) - 1 };
+        // SAFETY: lanes below `n` are in bounds of every slice; the rest are masked off.
+        let (hd, hu, fv, t) = unsafe {
+            (
+                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k)),
+                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k + 1)),
+                _mm512_maskz_loadu_epi32(mask, fu.as_ptr().add(k)),
+                _mm_maskz_loadu_epi8(mask, tx.as_ptr().add(k).cast()),
+            )
+        };
+        let fj = _mm512_max_epi32(
+            _mm512_max_epi32(_mm512_sub_epi32(hu, vgo), _mm512_sub_epi32(fv, vext)),
+            neg,
+        );
+        let t = _mm512_and_si512(_mm512_cvtepu8_epi32(t), three);
+        let s = _mm512_mask_blend_epi32(_mm512_cmpeq_epi32_mask(t, vc), vmis, vmat);
+        let x = _mm512_max_epi32(_mm512_max_epi32(_mm512_add_epi32(hd, s), fj), neg);
+        // gs[k] = x - go + ext * (k + 1); lanes past the row are NEG (they come after every
+        // real lane, so they change no output).
+        let g = _mm512_mask_mov_epi32(
+            neg,
+            mask,
+            _mm512_add_epi32(_mm512_sub_epi32(x, vgo), _mm512_add_epi32(ek, vext)),
+        );
+        // Inclusive prefix max within the block, then the carry; exclusive by one lane.
+        let mut v = _mm512_max_epi32(g, _mm512_alignr_epi32::<15>(g, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<14>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<12>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
+        v = _mm512_max_epi32(v, cv);
+        let excl = _mm512_alignr_epi32::<15>(v, cv);
+        cv = _mm512_permutexvar_epi32(last, v);
+        let hv = _mm512_max_epi32(x, _mm512_sub_epi32(excl, ek));
+        // SAFETY: as for the loads.
+        unsafe {
+            _mm512_mask_storeu_epi32(nh.as_mut_ptr().add(k), mask, hv);
+            _mm512_mask_storeu_epi32(nf.as_mut_ptr().add(k), mask, fj);
+        }
+        mx = _mm512_mask_max_epi32(mx, mask, mx, hv);
+        ek = _mm512_add_epi32(ek, step);
+        k += 16;
+    }
+    _mm512_reduce_max_epi32(mx)
+}
+
 /// What one DP pass found.
 #[derive(Clone, Copy)]
 struct Dp {
@@ -673,7 +766,24 @@ fn run(
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
-        if start <= hi {
+        #[cfg(target_arch = "x86_64")]
+        if start <= hi && avx512_rows() {
+            let DpBuf { h, f, nh, nf, .. } = &mut *b;
+            // SAFETY: AVX-512F/BW/VL are available (checked above).
+            let m = unsafe {
+                row_avx512(
+                    &h[start - 1..=hi],
+                    &f[start..=hi],
+                    &text[start - 1..hi],
+                    &mut nh[start..=hi],
+                    &mut nf[start..=hi],
+                    c,
+                    (mat, mis, go, ext),
+                    e,
+                )
+            };
+            row_max = row_max.max(m);
+        } else if start <= hi {
             // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
             // without horizontal gaps), from the previous row only.
             let w = hi + 1 - start;
