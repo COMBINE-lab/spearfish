@@ -152,10 +152,109 @@ pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32
         }
         return out;
     }
+    #[cfg(target_arch = "aarch64")]
+    if pat.m > 0 {
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(INFIX_LANES) {
+            infix_lanes::<INFIX_LANES>(pat, batch, k, &mut out);
+        }
+        return out;
+    }
     texts
         .iter()
         .map(|t| distance_with(pat, t, Mode::Infix, k))
         .collect()
+}
+
+/// Lanes of [`infix_lanes`] on aarch64.
+#[cfg(target_arch = "aarch64")]
+const INFIX_LANES: usize = 4;
+
+/// [`infix_x8`] in scalar code, `L` texts in lockstep: the lanes' block steps are
+/// independent, so a wide core overlaps their carried horizontal deltas, the critical path
+/// of one [`distance_with`] call. Same band rules as `infix_x8`, so the same results. A lane
+/// past its text's end keeps stepping (on code 0) but no longer counts in the band or its
+/// best, so it changes no output.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    debug_assert!((1..=L).contains(&texts.len()) && pat.m > 0);
+    let m = pat.m;
+    let n_max = texts.iter().map(|t| t.len()).max().unwrap();
+    let kk = k.min((m + n_max) as u32) as i32;
+    let blocks = m.div_ceil(W);
+    let last_bit = (m - 1) % W;
+    let rows = |b: usize| if b + 1 == blocks { last_bit + 1 } else { W };
+    let bit = |b: usize| if b + 1 == blocks { last_bit } else { W - 1 };
+    // Text codes interleaved by lane: column j of lane l at L * j + l.
+    let mut tx = vec![0u8; L * n_max];
+    let mut lens = [0usize; L];
+    for (l, t) in texts.iter().enumerate() {
+        lens[l] = t.len();
+        for (j, &c) in t.iter().enumerate() {
+            tx[L * j + l] = c & 3;
+        }
+    }
+    let peq = &pat.peq;
+    let mut pv = vec![[u64::MAX; L]; blocks];
+    let mut mv = vec![[0u64; L]; blocks];
+    let mut score: Vec<[i32; L]> = (0..blocks).map(|b| [(b * W + rows(b)) as i32; L]).collect();
+    let kw = kk + W as i32;
+    let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
+    // Column 0: D[m][0] = m.
+    let mut best = [if last as usize + 1 == blocks && m as i32 <= kk {
+        m as i32
+    } else {
+        i32::MAX
+    }; L];
+    for (j, c) in tx.chunks_exact(L).enumerate() {
+        let c: [usize; L] = std::array::from_fn(|l| c[l] as usize);
+        let live: [bool; L] = std::array::from_fn(|l| j < lens[l]);
+        // Infix: the top row is free (horizontal delta 0).
+        let mut h = [0i32; L];
+        for b in 0..=last as usize {
+            let (p, mm, s, q, bt) = (&mut pv[b], &mut mv[b], &mut score[b], &peq[b], bit(b));
+            for l in 0..L {
+                h[l] = block(&mut p[l], &mut mm[l], q[c[l]], h[l], bt);
+                s[l] += h[l];
+            }
+        }
+        let lb = last as usize;
+        let mut added = false;
+        if lb + 1 < blocks {
+            let nb = lb + 1;
+            let top: [i32; L] = std::array::from_fn(|l| score[lb][l] - h[l]);
+            let want = (0..L).any(|l| live[l] && top[l] <= kk && ((peq[nb][c[l]] & 1) != 0 || h[l] < 0));
+            if want {
+                pv[nb] = [u64::MAX; L];
+                mv[nb] = [0; L];
+                for l in 0..L {
+                    let hn = block(&mut pv[nb][l], &mut mv[nb][l], peq[nb][c[l]], h[l], bit(nb));
+                    score[nb][l] = top[l] + rows(nb) as i32 + hn;
+                }
+                last += 1;
+                added = true;
+            }
+        }
+        if !added {
+            while last >= 0 && !(0..L).any(|l| live[l] && score[last as usize][l] < kw) {
+                last -= 1;
+            }
+            if last < 0 {
+                break;
+            }
+        }
+        if last as usize + 1 == blocks {
+            for l in 0..L {
+                if live[l] {
+                    best[l] = best[l].min(score[blocks - 1][l]);
+                }
+            }
+        }
+    }
+    for (l, t) in texts.iter().enumerate() {
+        let kl = k.min((m + t.len()) as u32) as i32;
+        out.push((best[l] <= kl).then_some(best[l] as u32));
+    }
 }
 
 /// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
@@ -1632,7 +1731,19 @@ mod tests {
             let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
             let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
             let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
-            prop_assert_eq!(infix_distances(&pat, &refs, k), want);
+            prop_assert_eq!(&infix_distances(&pat, &refs, k), &want);
+            // The lockstep lanes at any width (on every target, not only where they are used).
+            fn lanes<const L: usize>(pat: &Pattern, refs: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+                let mut out = Vec::new();
+                refs.chunks(L).for_each(|c| infix_lanes::<L>(pat, c, k, &mut out));
+                out
+            }
+            if !p.is_empty() {
+                prop_assert_eq!(&lanes::<1>(&pat, &refs, k), &want);
+                prop_assert_eq!(&lanes::<2>(&pat, &refs, k), &want);
+                prop_assert_eq!(&lanes::<4>(&pat, &refs, k), &want);
+                prop_assert_eq!(&lanes::<8>(&pat, &refs, k), &want);
+            }
         }
     }
 }
