@@ -674,6 +674,144 @@ unsafe fn row_avx512(
     _mm512_reduce_max_epi32(mx)
 }
 
+/// [`row_avx512`] in three passes, the reference the vector rows are tested against. `hpv`
+/// and `gsv` are scratch rows.
+#[inline(always)]
+#[allow(clippy::too_many_arguments, dead_code)]
+fn row_scalar(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+    hpv: &mut Vec<i32>,
+    gsv: &mut Vec<i32>,
+) -> i32 {
+    // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
+    // without horizontal gaps), from the previous row only.
+    let w = fu.len();
+    // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
+    // only adds outputs after every real one.
+    let wp = w.next_multiple_of(16);
+    if hpv.len() < wp {
+        hpv.resize(wp, NEG);
+        gsv.resize(wp, NEG);
+    }
+    let (hp, gs) = (&mut hpv[..], &mut gsv[..]);
+    gs[w..wp].fill(NEG);
+    let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
+    let gs = &mut gs_all[..w];
+    let hd = &hprev[..w]; // H[i-1][j-1]
+    let hu = &hprev[1..=w]; // H[i-1][j]
+    let (tx, nf) = (&tx[..w], &mut nf[..w]);
+    for k in 0..w {
+        let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
+        let s = if c == tx[k] & 3 { mat } else { -mis };
+        let x = (hd[k] + s).max(fj).max(NEG);
+        hp[k] = x;
+        gs[k] = x - go + ext * (k as i32 + 1);
+        nf[k] = fj;
+    }
+    // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
+    // - ext): opening from H = max(H', E) adds nothing. With g[k] =
+    // E[k] + ext*k this is a running max (pass 2: exclusive prefix
+    // maxima, one op per cell on the critical path); pass 3
+    // (vectorizes) takes H = max(H', E).
+    excl_prefix_max(gs_all, e);
+    let gs = &gs_all[..w];
+    let nh = &mut nh[..w];
+    let mut m = NEG;
+    for k in 0..w {
+        let v = hp[k].max(gs[k] - ext * k as i32);
+        nh[k] = v;
+        m = m.max(v);
+    }
+    m
+}
+
+/// [`row_avx512`] in 4-lane NEON blocks, the rest scalar: the horizontal-gap scan is two
+/// shift-and-max steps per block, and only the block maximum is carried, so the carried
+/// dependency is one max per four cells (the scalar scan's is one per cell, and its rows
+/// round-trip through memory between passes).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_neon(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+) -> i32 {
+    use std::arch::aarch64::*;
+    let w = fu.len();
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    let neg = vdupq_n_s32(NEG);
+    let (vgo, vext) = (vdupq_n_s32(go), vdupq_n_s32(ext));
+    let (vmat, vmis) = (vdupq_n_s32(mat), vdupq_n_s32(-mis));
+    let (vc, three) = (vdupq_n_u32(c as u32), vdupq_n_u32(3));
+    // ext * k for the block's lanes, advanced by 4 * ext per block.
+    let lane: [i32; 4] = [0, 1, 2, 3];
+    // SAFETY: `lane` holds four i32s.
+    let mut ek = vmulq_s32(unsafe { vld1q_s32(lane.as_ptr()) }, vext);
+    let step = vdupq_n_s32(4 * ext);
+    // max(e, gs[..k]) in every lane.
+    let mut cv = vdupq_n_s32(e);
+    let mut mx = neg;
+    let mut k = 0;
+    while k + 4 <= w {
+        // SAFETY: k + 4 <= w, and hprev holds w + 1 cells.
+        let (hd, hu, fv, t4) = unsafe {
+            (
+                vld1q_s32(hprev.as_ptr().add(k)),
+                vld1q_s32(hprev.as_ptr().add(k + 1)),
+                vld1q_s32(fu.as_ptr().add(k)),
+                tx.as_ptr().add(k).cast::<u32>().read_unaligned(),
+            )
+        };
+        let t = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(t4)))));
+        let t = vandq_u32(t, three);
+        let fj = vmaxq_s32(vmaxq_s32(vsubq_s32(hu, vgo), vsubq_s32(fv, vext)), neg);
+        let s = vbslq_s32(vceqq_u32(t, vc), vmat, vmis);
+        let x = vmaxq_s32(vmaxq_s32(vaddq_s32(hd, s), fj), neg);
+        // gs[k] = x - go + ext * (k + 1).
+        let g = vaddq_s32(vsubq_s32(x, vgo), vaddq_s32(ek, vext));
+        // Inclusive prefix max within the block; then the carry, exclusive by one lane.
+        let mut v = vmaxq_s32(g, vextq_s32::<3>(neg, g));
+        v = vmaxq_s32(v, vextq_s32::<2>(neg, v));
+        let excl = vextq_s32::<3>(cv, vmaxq_s32(v, cv));
+        cv = vmaxq_s32(cv, vdupq_laneq_s32::<3>(v));
+        let hv = vmaxq_s32(x, vsubq_s32(excl, ek));
+        // SAFETY: as for the loads.
+        unsafe {
+            vst1q_s32(nh.as_mut_ptr().add(k), hv);
+            vst1q_s32(nf.as_mut_ptr().add(k), fj);
+        }
+        mx = vmaxq_s32(mx, hv);
+        ek = vaddq_s32(ek, step);
+        k += 4;
+    }
+    let mut m = vmaxvq_s32(mx);
+    let mut g = vgetq_lane_s32::<0>(cv);
+    for k in k..w {
+        let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
+        let s = if c == tx[k] & 3 { mat } else { -mis };
+        let x = (hprev[k] + s).max(fj).max(NEG);
+        let v = x.max(g - ext * k as i32);
+        g = g.max(x - go + ext * (k as i32 + 1));
+        nh[k] = v;
+        nf[k] = fj;
+        m = m.max(v);
+    }
+    m
+}
+
 /// What one DP pass found.
 #[derive(Clone, Copy)]
 struct Dp {
@@ -999,71 +1137,25 @@ fn run(
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
-        // The cfg must not cover the scalar branch: an attribute on an `if` removes its
-        // `else` arms too.
-        #[cfg(target_arch = "x86_64")]
-        let fused = start <= hi && avx512_rows();
-        #[cfg(not(target_arch = "x86_64"))]
-        let fused = false;
-        #[cfg(target_arch = "x86_64")]
-        if fused {
-            // SAFETY: AVX-512F/BW/VL are available (checked above).
-            let m = unsafe {
-                row_avx512(
-                    &h[start - 1..=hi],
-                    &f[start..=hi],
-                    &text[start - 1..hi],
-                    &mut nh[start..=hi],
-                    &mut nf[start..=hi],
-                    c,
-                    (mat, mis, go, ext),
-                    e,
-                )
+        if start <= hi {
+            let (hd, fu, tx) = (&h[start - 1..=hi], &f[start..=hi], &text[start - 1..hi]);
+            let (nhr, nfr) = (&mut nh[start..=hi], &mut nf[start..=hi]);
+            let p = (mat, mis, go, ext);
+            #[cfg(target_arch = "x86_64")]
+            let m = if avx512_rows() {
+                // SAFETY: AVX-512F/BW/VL are available (checked above).
+                unsafe { row_avx512(hd, fu, tx, nhr, nfr, c, p, e) }
+            } else {
+                row_scalar(hd, fu, tx, nhr, nfr, c, p, e, hpv, gsv)
             };
-            row_max = row_max.max(m);
-        }
-        if !fused && start <= hi {
-            // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
-            // without horizontal gaps), from the previous row only.
-            let w = hi + 1 - start;
-            // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
-            // only adds outputs after every real one.
-            let wp = w.next_multiple_of(16);
-            if hpv.len() < wp {
-                hpv.resize(wp, NEG);
-                gsv.resize(wp, NEG);
-            }
-            let (hp, gs) = (&mut hpv[..], &mut gsv[..]);
-            gs[w..wp].fill(NEG);
-            let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
-            let gs = &mut gs_all[..w];
-            let hd = &h[start - 1..hi]; // H[i-1][j-1]
-            let hu = &h[start..=hi]; // H[i-1][j]
-            let fu = &f[start..=hi];
-            let tx = &text[start - 1..hi];
-            let nfr = &mut nf[start..=hi];
-            for k in 0..w {
-                let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
-                let s = if c == tx[k] & 3 { mat } else { -mis };
-                let x = (hd[k] + s).max(fj).max(NEG);
-                hp[k] = x;
-                gs[k] = x - go + ext * (k as i32 + 1);
-                nfr[k] = fj;
-            }
-            // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
-            // - ext): opening from H = max(H', E) adds nothing. With g[k] =
-            // E[k] + ext*k this is a running max (pass 2: exclusive prefix
-            // maxima, one op per cell on the critical path); pass 3
-            // (vectorizes) takes H = max(H', E).
-            excl_prefix_max(gs_all, e);
-            let gs = &gs_all[..w];
-            let nhr = &mut nh[start..=hi];
-            let mut m = NEG;
-            for k in 0..w {
-                let v = hp[k].max(gs[k] - ext * k as i32);
-                nhr[k] = v;
-                m = m.max(v);
-            }
+            #[cfg(target_arch = "aarch64")]
+            let m = {
+                let _ = (&hpv, &gsv);
+                // SAFETY: NEON is part of the aarch64 baseline.
+                unsafe { row_neon(hd, fu, tx, nhr, nfr, c, p, e) }
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let m = row_scalar(hd, fu, tx, nhr, nfr, c, p, e, hpv, gsv);
             row_max = row_max.max(m);
         }
         if cut != usize::MAX && lo <= cut {
@@ -1336,6 +1428,42 @@ mod tests {
             let mut got = xs.clone();
             excl_prefix_max(&mut got, init);
             prop_assert_eq!(got, want);
+        }
+
+        /// The vector DP rows equal the scalar passes, cell for cell, on rows of any width with
+        /// unreachable (NEG) cells and any scores.
+        #[test]
+        fn rows_match_scalar(
+            cells in prop::collection::vec(
+                (prop_oneof![Just(NEG), -3000i32..3000], prop_oneof![Just(NEG), -3000i32..3000], any::<u8>()),
+                0..70,
+            ),
+            h0 in prop_oneof![Just(NEG), -3000i32..3000],
+            e in prop_oneof![Just(NEG), -3000i32..3000],
+            c in 0u8..4, mat in 0i32..6, mis in 0i32..10, open in 0i32..12, ext in 0i32..6,
+        ) {
+            let w = cells.len();
+            let hprev: Vec<i32> = std::iter::once(h0).chain(cells.iter().map(|x| x.0)).collect();
+            let fu: Vec<i32> = cells.iter().map(|x| x.1).collect();
+            let tx: Vec<u8> = cells.iter().map(|x| x.2).collect();
+            let p = (mat, mis, open + ext, ext);
+            let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+            let m = row_scalar(&hprev, &fu, &tx, &mut nh, &mut nf, c, p, e, &mut Vec::new(), &mut Vec::new());
+            let want = (nh, nf, if w == 0 { NEG } else { m });
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+                // SAFETY: NEON is part of the aarch64 baseline.
+                let m = unsafe { row_neon(&hprev, &fu, &tx, &mut nh, &mut nf, c, p, e) };
+                prop_assert_eq!(&(nh, nf, m), &want);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if avx512_rows() {
+                let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+                // SAFETY: AVX-512F/BW/VL are available (checked above).
+                let m = unsafe { row_avx512(&hprev, &fu, &tx, &mut nh, &mut nf, c, p, e) };
+                prop_assert_eq!(&(nh, nf, m), &want);
+            }
         }
 
         /// Sorted texts sharing prefixes (isoform flanks) give the same scores through the
