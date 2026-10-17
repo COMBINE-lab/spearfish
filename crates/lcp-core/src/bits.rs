@@ -104,6 +104,33 @@ impl BitArena {
         self.cur_len = 0;
     }
 
+    /// A whole item of `width <= 64` bits (`v`'s low bits), with no item open.
+    #[inline]
+    pub(crate) fn push_item(&mut self, v: u64, width: u32) {
+        debug_assert!(width <= 64 && self.cur_len == 0 && self.cur_head.is_none());
+        self.head.push(v);
+        self.len.push(width);
+    }
+
+    /// A whole item of DCT values, the last value lowest, each [`value_width`] bits wide.
+    #[inline]
+    pub(crate) fn push_values(&mut self, vals: &[u64]) {
+        let (mut acc, mut nb) = (0u64, 0u32);
+        for &v in vals.iter().rev() {
+            let w = value_width(v);
+            if nb + w > 64 {
+                for &v in vals.iter().rev() {
+                    self.push_bits(v, value_width(v));
+                }
+                self.finish_item();
+                return;
+            }
+            acc |= v << nb;
+            nb += w;
+        }
+        self.push_item(acc, nb);
+    }
+
     /// Word `w` of item `i` (0 past its end).
     fn word(&self, i: usize, w: usize) -> u64 {
         if w == 0 {

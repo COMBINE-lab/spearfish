@@ -37,8 +37,7 @@ fn level1(c: &[u8], seed: u64, bits: &mut BitArena) -> u64 {
         for &b in c {
             x = (x << 2) | b as u64;
         }
-        bits.push_bits(x, 2 * c.len() as u32);
-        bits.finish_item();
+        bits.push_item(x, 2 * c.len() as u32);
         // A leading 1 marks the length: injective, and fmix64 is a bijection.
         fmix64((x | (1u64 << (2 * c.len()))) ^ seed)
     } else {
@@ -169,10 +168,7 @@ impl LcpParser {
                 });
                 // DCT replaced each core's start by that of the core `d` places to its left.
                 level.ctx_start.push(prev.ctx_start[lo - d]);
-                for &v in vals[lo..hi].iter().rev() {
-                    next_bits.push_bits(v, value_width(v));
-                }
-                next_bits.finish_item();
+                next_bits.push_values(&vals[lo..hi]);
             }
             levels.push(level);
             bits = next_bits;
@@ -218,11 +214,25 @@ impl LcpParser {
             cur.1.clear();
             cur.2.clear();
             sc.bits[0].clear();
-            for &(lo, hi) in &sc.spans {
-                cur.0.push(level1(&sc.codes[lo..hi], seed1, &mut sc.bits[0]));
-                cur.1.push(lo as u32);
-                cur.2.push(hi as u32);
+            // Bit strings feed the next level's DCT: none needed for the top level.
+            let bits = &mut sc.bits[0];
+            let codes = &sc.codes;
+            if k > 1 {
+                cur.0.extend(
+                    sc.spans
+                        .iter()
+                        .map(|&(lo, hi)| level1(&codes[lo..hi], seed1, bits)),
+                );
+            } else {
+                let mut none = BitArena::default();
+                cur.0.extend(sc.spans.iter().map(|&(lo, hi)| {
+                    let l = level1(&codes[lo..hi], seed1, &mut none);
+                    none.clear();
+                    l
+                }));
             }
+            cur.1.extend(sc.spans.iter().map(|s| s.0 as u32));
+            cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
             let mut ci = 0; // index of the current level's buffers
             for level in 2..=k {
                 let n = sc.lv[ci].0.len();
@@ -250,16 +260,20 @@ impl LcpParser {
                 let (ba, bb) = sc.bits.split_at_mut(1);
                 let nbits = if ci == 0 { &mut bb[0] } else { &mut ba[0] };
                 nbits.clear();
-                for &(lo, hi) in &sc.spans {
+                next.0.extend(sc.spans.iter().map(|&(lo, hi)| {
                     let s0 = prev.1[lo];
-                    next.0
-                        .push(label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed));
-                    next.1.push(s0);
-                    next.2.push(prev.2[lo..hi].iter().copied().max().unwrap());
-                    for &v in sc.vals[lo..hi].iter().rev() {
-                        nbits.push_bits(v, value_width(v));
+                    label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed)
+                }));
+                next.1.extend(sc.spans.iter().map(|&(lo, _)| prev.1[lo]));
+                next.2.extend(
+                    sc.spans
+                        .iter()
+                        .map(|&(lo, hi)| prev.2[lo..hi].iter().copied().max().unwrap()),
+                );
+                if level < k {
+                    for &(lo, hi) in &sc.spans {
+                        nbits.push_values(&sc.vals[lo..hi]);
                     }
-                    nbits.finish_item();
                 }
                 ci = ni;
             }
