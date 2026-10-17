@@ -430,14 +430,20 @@ impl Sym for u8 {
     fn has_simd() -> bool {
         #[cfg(target_arch = "x86_64")]
         return avx512();
-        #[cfg(not(target_arch = "x86_64"))]
+        // NEON is part of the aarch64 baseline.
+        #[cfg(target_arch = "aarch64")]
+        return true;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         false
     }
     unsafe fn masks(s: &[u8], blk: usize) -> (u64, u64) {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as the caller guarantees.
         return unsafe { masks_u8(s, blk) };
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as the caller guarantees.
+        return unsafe { masks_u8_neon(s, blk) };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = (s, blk);
             unreachable!()
@@ -479,6 +485,39 @@ unsafe fn masks_u8(s: &[u8], blk: usize) -> (u64, u64) {
         & _mm512_cmpge_epu8_mask(d, e);
     let run = _mm512_cmpneq_epu8_mask(b, c) & _mm512_cmpeq_epu8_mask(c, d);
     (lmin | lmax, run)
+}
+
+/// [`masks_u8`] in four 16-byte NEON blocks. NEON has no movemask: each compare result
+/// (0 or 0xff per byte) keeps its lane's bit within the byte's group of eight, and three
+/// rounds of pairwise byte sums pack the 64 lanes into one word, lane i at bit i.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn masks_u8_neon(s: &[u8], blk: usize) -> (u64, u64) {
+    use std::arch::aarch64::*;
+    let weights: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // SAFETY: 16 bytes.
+    let w = unsafe { vld1q_u8(weights.as_ptr()) };
+    let pack = |m: [uint8x16_t; 4]| {
+        let (a, b) = (vandq_u8(m[0], w), vandq_u8(m[1], w));
+        let (c, d) = (vandq_u8(m[2], w), vandq_u8(m[3], w));
+        let x = vpaddq_u8(vpaddq_u8(a, b), vpaddq_u8(c, d));
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(x, x)))
+    };
+    let (mut core, mut run) = ([vdupq_n_u8(0); 4], [vdupq_n_u8(0); 4]);
+    for q in 0..4 {
+        // SAFETY: s[blk - 1..blk + 67] is in bounds (caller); the last load ends there.
+        let ld = |o: usize| unsafe { vld1q_u8(s.as_ptr().add(blk + 16 * q + o - 1)) };
+        let (a, b, c, d, e) = (ld(0), ld(1), ld(2), ld(3), ld(4));
+        let lmin = vandq_u8(vcgtq_u8(b, c), vcltq_u8(c, d));
+        let lmax = vandq_u8(
+            vandq_u8(vcleq_u8(a, b), vcltq_u8(b, c)),
+            vandq_u8(vcgtq_u8(c, d), vcgeq_u8(d, e)),
+        );
+        core[q] = vorrq_u8(lmin, lmax);
+        // b != c and c == d.
+        run[q] = vbicq_u8(vceqq_u8(c, d), vceqq_u8(b, c));
+    }
+    (pack(core), pack(run))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -599,6 +638,24 @@ mod tests {
             let mut got = Vec::new();
             parse_spans(&b, 0, &mut got);
             proptest::prop_assert_eq!(got, want);
+        }
+
+        /// The vector masks equal the scalar scan's on whole blocks, over all byte values.
+        #[test]
+        fn masks_u8_equal_scalar(s in proptest::collection::vec(proptest::prelude::any::<u8>(), 68..300), at in 1usize..300) {
+            if !u8::has_simd() {
+                return Ok(());
+            }
+            let n = s.len();
+            let blk = 1 + at % (n - 67);
+            let (mut core, mut run) = (0u64, 0u64);
+            for i in blk..blk + 64 {
+                let (l, a, b, c, r) = (s[i - 1], s[i], s[i + 1], s[i + 2], s[i + 3]);
+                core |= ((((a > b) & (b < c)) | ((l <= a) & (a < b) & (b > c) & (c >= r))) as u64) << (i - blk);
+                run |= (((a != b) & (b == c)) as u64) << (i - blk);
+            }
+            // SAFETY: has_simd, and s[blk - 1..blk + 67] is in bounds.
+            proptest::prop_assert_eq!(unsafe { u8::masks(&s, blk) }, (core, run));
         }
     }
 
