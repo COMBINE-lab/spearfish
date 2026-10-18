@@ -12,7 +12,7 @@ use seeds::{BaseSeeder, Seed};
 use crate::anchor::{self, AnchorParams};
 use crate::chain::{ChainParams, Pt, TxHit, best_chains};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RescueParams {
     /// Seed scheme for rescue seeds (its highest level), applied to parsed sequences.
     pub spec: String,

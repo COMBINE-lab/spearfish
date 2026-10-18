@@ -12,7 +12,9 @@ use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct QuantParams {
-    /// Score denominator D in exp((s - s_max) / D).
+    /// Score denominator D in exp((s - s_max) / D). The default, 5, was oarfish's for
+    /// minimap2 alignment scores; `spearfish em` uses 2 and oarfish D = 1 for spearfish's
+    /// scores (`spearfish::SCORE_DENOM`).
     pub score_denom: f64,
     /// Keep transcripts scoring at least this fraction of the read's best score.
     pub min_frac: f64,

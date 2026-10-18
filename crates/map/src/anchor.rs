@@ -14,7 +14,7 @@ pub struct Anchor {
     pub weight: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnchorParams {
     /// Labels found in more genes than this are ignored for the read.
     pub h_max: usize,

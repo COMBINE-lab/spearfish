@@ -38,3 +38,31 @@ fn map_toy_reads() {
     let (_, _, seq) = &txs[0];
     assert!(drna.map(&revcomp(seq)).hits.iter().all(|h| !h.reverse));
 }
+
+/// The settings builder gives the same mapper as the preset's options, and records what it
+/// resolved to.
+#[test]
+fn builder_matches_presets() {
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let txs = read_transcripts(&fa).unwrap();
+    let index = Arc::new(
+        Index::build(txs.clone(), &IndexOptions::builder().scheme("lcp:K=3").build())
+            .unwrap()
+            .0,
+    );
+    assert!(index.manifest().is_some());
+    for p in Preset::ALL {
+        let a = spearfish::MapSettings::builder(p).mapper(index.clone()).unwrap();
+        let b = Mapper::new(index.clone(), &MapOptions::preset(p)).unwrap();
+        assert_eq!(a.options(), b.options());
+        for (_, _, seq) in &txs {
+            assert_eq!(a.map(seq), b.map(seq));
+        }
+    }
+    let m = spearfish::MapSettings::builder(Preset::Hifi)
+        .extend_ends(true)
+        .mapper(index.clone())
+        .unwrap();
+    assert!(m.options().params.ends.is_some());
+    assert_eq!(m.score_denom(), spearfish::SCORE_DENOM);
+}

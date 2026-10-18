@@ -22,7 +22,7 @@ use index::Index;
 
 use crate::anchor::Candidate;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChainParams {
     pub alpha: f32,
     pub beta: f32,

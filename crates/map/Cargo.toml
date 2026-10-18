@@ -13,6 +13,7 @@ seeds.workspace = true
 rustc-hash.workspace = true
 multiversion.workspace = true
 xxhash-rust.workspace = true
+serde.workspace = true
 
 
 [dev-dependencies]

@@ -21,7 +21,7 @@ pub use refine::RefineChainer;
 pub use rescue::{RescueParams, Rescuer};
 
 /// Targeted base-level tie-break among near-best transcripts.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TieBreak {
     /// Transcripts within max(margin_abs, margin_rel × best) of the best chain score form
     /// the tie set.
@@ -125,7 +125,7 @@ impl Default for TieBreak {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MapParams {
     pub anchor: AnchorParams,
     pub chain: ChainParams,
@@ -152,7 +152,7 @@ pub struct MapParams {
 /// ends, as minimap2 extends its chains. The anchors stop short of the read's ends by up to a
 /// seed spacing; where the read really starts and ends on the transcript is what positional
 /// models (truncation, 3' bias) need, and adapters or poly(A) tails are clipped by the X-drop.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Ends {
     pub sc: align::Affine,
     pub band: usize,
@@ -186,13 +186,27 @@ impl Default for Ends {
 }
 
 /// Which orientations of a read to map against the transcripts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Strands {
+    #[serde(rename = "both")]
     Both,
     /// The read as given (sense: direct RNA).
+    #[serde(rename = "fwd")]
     Forward,
     /// Only its reverse complement.
+    #[serde(rename = "rev")]
     Reverse,
+}
+
+impl Strands {
+    /// The name used on the command line and in output headers.
+    pub fn name(self) -> &'static str {
+        match self {
+            Strands::Both => "both",
+            Strands::Forward => "fwd",
+            Strands::Reverse => "rev",
+        }
+    }
 }
 
 impl Default for MapParams {
@@ -352,6 +366,7 @@ struct Strand {
 impl<C: Chainer> Mapper<C> {
     /// A mapper seeding exactly as the index was built.
     pub fn new(idx: Arc<Index>, chainer: C, p: MapParams) -> Result<Self> {
+        idx.check_compatible()?;
         let spec = idx.meta("spec").context("index lacks its seed spec")?;
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";
         let seeder = BaseSeeder::new(spec, hpc)?;

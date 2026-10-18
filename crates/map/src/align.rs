@@ -311,7 +311,7 @@ pub fn infix_distance(pattern: &[u8], text: &[u8]) -> u32 {
 
 /// Affine-gap scoring (maximized): `+mat` per match, `-mis` per mismatch, `-(open + ext·l)`
 /// per gap of length `l`. Defaults are minimap2's map-ont single-affine part.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Affine {
     pub mat: i32,
     pub mis: i32,
