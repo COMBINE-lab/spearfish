@@ -67,6 +67,9 @@
 - SIMD dispatch happens once per DP pass or parse call instead of per row or per 64-base
   block, and the whole LCP parse is compiled per level; a few percent fewer instructions at
   every level.
+- NEON kernels on aarch64 (Apple Silicon): the affine alignment rows, the batched edit
+  distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
+  scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
 
 ### Fixes

@@ -58,7 +58,7 @@ but they are in `crates/spearfish-cli/src`. Environment variables:
 
 | Variable | Effect |
 | --- | --- |
-| `SPEARFISH_SIMD=scalar\|avx2\|avx512` | Use at most this SIMD level (to test or time a lower one; higher than the CPU supports falls back with a warning). |
+| `SPEARFISH_SIMD=scalar\|avx2\|avx512\|neon` | Use at most this SIMD level (to test or time a lower one; a level the CPU lacks, such as an x86-64 one on arm64, falls back with a warning). |
 | `SPEARFISH_STATS=1` | Count internal events while mapping; printed at the end and stored in the run record. |
 | `REFINE_STATS=1` | Statistics of the experimental refine chainer. |
 | `SPEARFISH_GIT` | At build time: the revision to record when building outside a git checkout. |

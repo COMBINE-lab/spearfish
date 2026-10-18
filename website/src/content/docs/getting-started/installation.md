@@ -9,7 +9,8 @@ spearfish is written in Rust. Until the first release, it is installed from sour
 
 - Rust 1.89 or newer, installed with [rustup](https://rustup.rs).
 - Linux or macOS, on x86-64 or arm64 (Apple Silicon). The alignment and parsing kernels pick
-  AVX-512, AVX2 or scalar code at run time, and every choice gives exactly the same output.
+  AVX-512, AVX2 or scalar code at run time on x86-64, and NEON or scalar code on arm64, and
+  every choice gives exactly the same output.
 
 ## Build
 
@@ -34,8 +35,8 @@ spearfish doctor
 
 `doctor` prints the version and git revision, the target, the CPUs available and the SIMD
 kernels in use, then maps reads from a built-in toy transcriptome with every preset and checks
-the result against a reference. `SPEARFISH_SIMD=scalar|avx2|avx512` makes spearfish use at most
-that level, for example to compare speeds. With `--index transcripts.sfi` it also checks that an index
+the result against a reference. `SPEARFISH_SIMD=scalar|avx2|avx512|neon` makes spearfish use at
+most that level, for example to compare speeds. With `--index transcripts.sfi` it also checks that an index
 loads and suits this build. `--json` prints the same report as JSON, to attach to a bug report.
 
 The full test suite is `cargo test --workspace --release`.

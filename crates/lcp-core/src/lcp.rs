@@ -188,6 +188,9 @@ impl LcpParser {
             SimdLevel::Avx512 => unsafe { self.top_cores_avx512(seq, k, sc, out) },
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2 => unsafe { self.top_cores_avx2(seq, k, sc, out) },
+            // NEON is part of the aarch64 baseline: no entry point of its own.
+            #[cfg(target_arch = "aarch64")]
+            SimdLevel::Neon => self.top_cores_at(SimdLevel::Neon, seq, k, sc, out),
             _ => self.top_cores_at(SimdLevel::Scalar, seq, k, sc, out),
         }
     }
@@ -453,6 +456,16 @@ pub(crate) trait Sym: Ord + Copy {
     /// The CPU has AVX2, and `s[blk - 1..blk + 67]` is in bounds.
     #[cfg(target_arch = "x86_64")]
     unsafe fn masks_avx2(s: &[Self], blk: usize) -> (u64, u64);
+    /// Whether [`Sym::masks_neon`] has a kernel (else the NEON level scans these symbols in
+    /// the scalar loop).
+    #[cfg(target_arch = "aarch64")]
+    const NEON: bool;
+    /// [`Sym::masks_avx512`] with NEON.
+    ///
+    /// # Safety
+    /// [`Sym::NEON`], and `s[blk - 1..blk + 67]` is in bounds.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn masks_neon(s: &[Self], blk: usize) -> (u64, u64);
 }
 
 impl Sym for u8 {
@@ -467,6 +480,14 @@ impl Sym for u8 {
     unsafe fn masks_avx2(s: &[u8], blk: usize) -> (u64, u64) {
         // SAFETY: as the caller guarantees.
         unsafe { masks_u8_avx2(s, blk) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    const NEON: bool = true;
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn masks_neon(s: &[u8], blk: usize) -> (u64, u64) {
+        // SAFETY: as the caller guarantees (NEON is part of the aarch64 baseline).
+        unsafe { masks_u8_neon(s, blk) }
     }
 }
 
@@ -483,13 +504,22 @@ impl Sym for u64 {
         // SAFETY: as the caller guarantees.
         unsafe { masks_u64_avx2(s, blk) }
     }
+    // DCT values (level 2 and up) stay in the scalar loop on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    const NEON: bool = false;
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn masks_neon(_: &[u64], _: usize) -> (u64, u64) {
+        unreachable!()
+    }
 }
 
 /// How [`spans_core`] computes a whole block's masks: the scalar loop, or a level's kernel.
 trait Masks {
-    const SIMD: bool;
+    /// Whether the level has a kernel for symbols `T` (a constant per instance).
+    fn simd<T: Sym>() -> bool;
     /// # Safety
-    /// The CPU has the level's features, and `s[blk - 1..blk + 67]` is in bounds.
+    /// `Self::simd::<T>()`, the CPU has the level's features, and `s[blk - 1..blk + 67]` is in
+    /// bounds.
     unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64);
 }
 
@@ -500,7 +530,10 @@ struct Avx2Masks;
 
 #[cfg(target_arch = "x86_64")]
 impl Masks for Avx2Masks {
-    const SIMD: bool = true;
+    #[inline(always)]
+    fn simd<T: Sym>() -> bool {
+        true
+    }
     #[inline(always)]
     unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64) {
         // SAFETY: as the caller guarantees.
@@ -509,7 +542,10 @@ impl Masks for Avx2Masks {
 }
 
 impl Masks for ScalarMasks {
-    const SIMD: bool = false;
+    #[inline(always)]
+    fn simd<T: Sym>() -> bool {
+        false
+    }
     unsafe fn masks<T: Sym>(_: &[T], _: usize) -> (u64, u64) {
         unreachable!()
     }
@@ -520,11 +556,31 @@ struct Avx512Masks;
 
 #[cfg(target_arch = "x86_64")]
 impl Masks for Avx512Masks {
-    const SIMD: bool = true;
+    #[inline(always)]
+    fn simd<T: Sym>() -> bool {
+        true
+    }
     #[inline(always)]
     unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64) {
         // SAFETY: as the caller guarantees.
         unsafe { T::masks_avx512(s, blk) }
+    }
+}
+
+/// NEON kernels where [`Sym::NEON`] (base codes), else the scalar loop.
+#[cfg(target_arch = "aarch64")]
+struct NeonMasks;
+
+#[cfg(target_arch = "aarch64")]
+impl Masks for NeonMasks {
+    #[inline(always)]
+    fn simd<T: Sym>() -> bool {
+        T::NEON
+    }
+    #[inline(always)]
+    unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64) {
+        // SAFETY: as the caller guarantees.
+        unsafe { T::masks_neon(s, blk) }
     }
 }
 
@@ -632,6 +688,39 @@ unsafe fn masks_u64_avx2(s: &[u64], blk: usize) -> (u64, u64) {
     (core, run)
 }
 
+/// [`masks_u8`] in four 16-byte NEON blocks. NEON has no movemask: each compare result
+/// (0 or 0xff per byte) keeps its lane's bit within the byte's group of eight, and three
+/// rounds of pairwise byte sums pack the 64 lanes into one word, lane i at bit i.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn masks_u8_neon(s: &[u8], blk: usize) -> (u64, u64) {
+    use std::arch::aarch64::*;
+    let weights: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // SAFETY: 16 bytes.
+    let w = unsafe { vld1q_u8(weights.as_ptr()) };
+    let pack = |m: [uint8x16_t; 4]| {
+        let (a, b) = (vandq_u8(m[0], w), vandq_u8(m[1], w));
+        let (c, d) = (vandq_u8(m[2], w), vandq_u8(m[3], w));
+        let x = vpaddq_u8(vpaddq_u8(a, b), vpaddq_u8(c, d));
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(x, x)))
+    };
+    let (mut core, mut run) = ([vdupq_n_u8(0); 4], [vdupq_n_u8(0); 4]);
+    for q in 0..4 {
+        // SAFETY: s[blk - 1..blk + 67] is in bounds (caller); the last load ends there.
+        let ld = |o: usize| unsafe { vld1q_u8(s.as_ptr().add(blk + 16 * q + o - 1)) };
+        let (a, b, c, d, e) = (ld(0), ld(1), ld(2), ld(3), ld(4));
+        let lmin = vandq_u8(vcgtq_u8(b, c), vcltq_u8(c, d));
+        let lmax = vandq_u8(
+            vandq_u8(vcleq_u8(a, b), vcltq_u8(b, c)),
+            vandq_u8(vcgtq_u8(c, d), vcgeq_u8(d, e)),
+        );
+        core[q] = vorrq_u8(lmin, lmax);
+        // b != c and c == d.
+        run[q] = vbicq_u8(vceqq_u8(c, d), vceqq_u8(b, c));
+    }
+    (pack(core), pack(run))
+}
+
 /// [`parse_rules`] in two phases per block of 64 positions: a branch-free pass computes which
 /// positions start an LMIN/LMAX core or a run (RINT candidate) as bit masks, then a loop over
 /// the set bits emits the cores and the SSEQ gap fillers between them. Positions that start
@@ -650,6 +739,9 @@ pub(crate) fn parse_spans<T: Sym>(level: SimdLevel, s: &[T], add: usize, spans: 
         SimdLevel::Avx512 => unsafe { spans_avx512(s, add, spans) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { spans_avx2(s, add, spans) },
+        // NEON is part of the aarch64 baseline: no entry point of its own.
+        #[cfg(target_arch = "aarch64")]
+        SimdLevel::Neon => spans_core::<T, NeonMasks>(s, add, spans),
         _ => spans_core::<T, ScalarMasks>(s, add, spans),
     }
 }
@@ -684,7 +776,7 @@ fn spans_core<T: Sym, M: Masks>(s: &[T], add: usize, spans: &mut Vec<(usize, usi
         let end = (blk + 64).min(m);
         let (mut core, mut run) = (0u64, 0u64);
         // Whole interior blocks (every position has a symbol on each side) in SIMD.
-        let simd = if M::SIMD && blk > 0 && blk + 67 <= n {
+        let simd = if M::simd::<T>() && blk > 0 && blk + 67 <= n {
             // SAFETY: the CPU has the level's features (the caller's entry point is compiled
             // for them), and s[blk - 1..blk + 67] is in bounds.
             (core, run) = unsafe { M::masks(s, blk) };
@@ -739,6 +831,58 @@ mod tests {
         let mut v = Vec::new();
         parse_rules(&codes, |lo, hi| v.push((lo, hi)));
         v
+    }
+
+    /// The block masks by `level`'s kernel for `T`, called directly (`None` if the level scans
+    /// `T` in the scalar loop).
+    fn masks_at<T: Sym>(level: SimdLevel, s: &[T], blk: usize) -> Option<(u64, u64)> {
+        assert!(simd::detected().includes(level) && blk > 0 && blk + 67 <= s.len());
+        match level {
+            // SAFETY: the CPU supports the level (asserted above), and s[blk - 1..blk + 67] is
+            // in bounds.
+            #[cfg(target_arch = "x86_64")]
+            SimdLevel::Avx512 => Some(unsafe { T::masks_avx512(s, blk) }),
+            #[cfg(target_arch = "x86_64")]
+            SimdLevel::Avx2 => Some(unsafe { T::masks_avx2(s, blk) }),
+            #[cfg(target_arch = "aarch64")]
+            SimdLevel::Neon if T::NEON => Some(unsafe { T::masks_neon(s, blk) }),
+            _ => None,
+        }
+    }
+
+    /// The scalar scan's masks of the whole block `blk..blk + 64`.
+    fn masks_scalar<T: Sym>(s: &[T], blk: usize) -> (u64, u64) {
+        let (mut core, mut run) = (0u64, 0u64);
+        for i in blk..blk + 64 {
+            let (l, a, b, c, r) = (s[i - 1], s[i], s[i + 1], s[i + 2], s[i + 3]);
+            core |= ((((a > b) & (b < c)) | ((l <= a) & (a < b) & (b > c) & (c >= r))) as u64) << (i - blk);
+            run |= (((a != b) & (b == c)) as u64) << (i - blk);
+        }
+        (core, run)
+    }
+
+    proptest::proptest! {
+        /// Every level's vector masks equal the scalar scan's on whole blocks, over all byte
+        /// values and across the u64 range.
+        #[test]
+        fn masks_equal_scalar(
+            s in proptest::collection::vec(proptest::prelude::any::<u8>(), 68..300),
+            at in 1usize..300,
+            hi in proptest::collection::vec(proptest::sample::select(vec![0u64, 1, (1 << 63) - 1, 1 << 63, u64::MAX - 1, u64::MAX]), 300),
+        ) {
+            let n = s.len();
+            let blk = 1 + at % (n - 67);
+            // Wide symbols whose order the low byte decides only among equal high parts.
+            let w: Vec<u64> = s.iter().zip(&hi).map(|(&b, &h)| (h & !0xff) | b as u64).collect();
+            for level in crate::simd::supported() {
+                if let Some(got) = masks_at(level, &s, blk) {
+                    proptest::prop_assert_eq!(got, masks_scalar(&s, blk), "u8 at {}", level);
+                }
+                if let Some(got) = masks_at(level, &w, blk) {
+                    proptest::prop_assert_eq!(got, masks_scalar(&w, blk), "u64 at {}", level);
+                }
+            }
+        }
     }
 
     proptest::proptest! {

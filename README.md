@@ -31,7 +31,8 @@ spearfish doctor          # build, CPU, SIMD kernels, and a mapping self-test
 ```
 
 spearfish runs on Linux and macOS, x86-64 and arm64. Its alignment and parsing kernels pick
-AVX-512, AVX2 or scalar code at run time; every choice gives the same output.
+AVX-512, AVX2 or scalar code at run time on x86-64, and NEON or scalar code on arm64; every
+choice gives the same output.
 
 ## Use
 

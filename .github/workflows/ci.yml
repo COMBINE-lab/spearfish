@@ -44,6 +44,18 @@ jobs:
       - run: cargo test --workspace
       - run: cargo run --release -q -p spearfish-cli -- doctor
 
+  # The scalar level on Apple Silicon, forced: the NEON kernels (the default there) must agree
+  # with it.
+  simd-levels-aarch64:
+    runs-on: macos-15
+    env:
+      SPEARFISH_SIMD: scalar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - run: cargo run --release -q -p spearfish-cli -- doctor
+
   msrv:
     runs-on: ubuntu-latest
     steps:

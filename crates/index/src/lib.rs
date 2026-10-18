@@ -225,7 +225,7 @@ impl IndexData {
     }
 }
 
-/// A cache hint for the line holding `p` (no effect off x86-64; never faults).
+/// A cache hint for the line holding `p` (no effect off x86-64 and aarch64; never faults).
 #[inline(always)]
 pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
@@ -234,7 +234,12 @@ pub fn prefetch<T>(p: *const T) {
     unsafe {
         core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as on x86-64: `prfm` is a hint that reads nothing and cannot fault.
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = p;
 }
 
