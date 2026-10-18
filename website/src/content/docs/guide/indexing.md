@@ -19,21 +19,26 @@ transcripts belong together. There are three ways to tell it:
 - **A transcript-to-gene table**, `--t2g t2g.tsv`, with one `transcript gene` pair per line
   (whitespace-separated; further columns are ignored). Use this for Ensembl, RefSeq or any other
   annotation.
-- **Inferred from sequence**, `--infer-genes`, for transcriptomes without an annotation (other
+- **Inferred from sequence**, `--infer-genes`, for transcriptomes without gene IDs (other
   species, de novo assemblies). Transcripts that share a run of 12 consecutive seeds (about 300
   bases) are grouped, ignoring runs found in more than 64 transcripts, which are repeats; then
   short transcripts left on their own join the one group they share shorter runs (about 100
-  bases) with. On human GENCODE these groups give the same mapping accuracy as the annotated
-  genes. They merge gene families whose copies are near-identical, which reads cannot tell apart
-  either.
+  bases) with. The groups merge gene families whose copies are near-identical, which reads
+  cannot tell apart either.
+
+If your transcripts carry no gene IDs and you have no table, use `--infer-genes`: on human
+GENCODE, inferred groups do as well as the annotated genes. On simulated ONT reads (95%
+accuracy), 98.5% of reads rank their true transcript first and 99.3% keep it among the reported
+transcripts with either, and the index is the same size (1.3 GB).
 
 Without any of these, every transcript is its own gene and `spearfish index` prints a warning.
-Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB, and fewer reads are
-assigned to the right transcript (top-1 95.9% falls to 92.5% on simulated ONT reads), because the
-per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
+Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB, mapping takes more
+time and memory, and fewer reads are assigned to the right transcript (top-1 falls from 98.5% to
+97.2% on the same reads, and the true transcript is among those reported for 97.9% instead of
+99.3%), because the per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
 writes the grouping that was used.
 
-For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in about 6 seconds on
+For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in about 8 seconds on
 32 threads. Map against an index built from the same transcript FASTA you quantify against.
 
 ## What the index holds

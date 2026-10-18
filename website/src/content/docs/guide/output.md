@@ -57,8 +57,8 @@ With `--rad mappings.rad`, `spearfish map` also writes its mappings in the binar
 [RAD format](https://combine-lab.github.io/libradicl/) used by alevin-fry and piscem. The file
 holds one record per mapped read with all of its reported transcripts, in chunks that are each
 compressed (`--rad-codec`, LZ4 by default). Reads can be decoded in parallel, chunk by chunk.
-On 2.2 million PacBio reads (50.8 million hits) the TSV takes 5.7 GB, the RAD file 0.76 GB
-with LZ4 and 0.53 GB with zstd, and writing it does not slow mapping.
+On 2.2 million PacBio reads (50.6 million hits) the TSV takes 5.7 GB, the RAD file 0.76 GB
+with LZ4 and 0.54 GB with zstd, and writing it does not slow mapping.
 
 The record layout (`known_rad_type` `bulk_long_read`) does not depend on spearfish, so other
 long-read mappers can write it too:
