@@ -765,6 +765,69 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// The same with symbols across the whole unsigned range, where the vector kernels'
+        /// signed compares need the sign-bit flip, and with long runs of equal symbols.
+        #[test]
+        fn parse_spans_equal_rules_wide(
+            s in proptest::collection::vec(proptest::sample::select(vec![0u64, 1, 2, (1 << 63) - 1, 1 << 63, (1 << 63) + 1, u64::MAX - 1, u64::MAX]), 0..600),
+            run in 1usize..6,
+        ) {
+            let s: Vec<u64> = s.iter().flat_map(|&x| std::iter::repeat_n(x, if x & 1 == 0 { run } else { 1 })).collect();
+            let b: Vec<u8> = s.iter().map(|&x| (x >> 56) as u8 ^ (x as u8)).collect();
+            for level in crate::simd::supported() {
+                let mut want = Vec::new();
+                parse_rules(&s, |lo, hi| want.push((lo, hi)));
+                let mut got = Vec::new();
+                parse_spans(level, &s, 0, &mut got);
+                proptest::prop_assert_eq!(got, want, "u64 at {}", level);
+                let mut want = Vec::new();
+                parse_rules(&b, |lo, hi| want.push((lo, hi)));
+                let mut got = Vec::new();
+                parse_spans(level, &b, 0, &mut got);
+                proptest::prop_assert_eq!(got, want, "u8 at {}", level);
+            }
+        }
+    }
+
+    /// Isolated block-scan timings per SIMD level (`cargo test --release -p lcp-core --
+    /// --ignored --nocapture scan_timings`).
+    #[test]
+    #[ignore]
+    fn scan_timings() {
+        use std::hint::black_box;
+        let mut x = 5u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let n = 1 << 20;
+        let codes: Vec<u8> = (0..n).map(|_| (next() & 3) as u8).collect();
+        // Level-2 symbols (DCT values) are small integers.
+        let vals: Vec<u64> = (0..n).map(|_| next() % 13).collect();
+        let mut spans = Vec::with_capacity(2 * n);
+        for level in crate::simd::supported() {
+            let mut t8 = f64::INFINITY;
+            let mut t64 = f64::INFINITY;
+            for _ in 0..5 {
+                spans.clear();
+                let t = std::time::Instant::now();
+                parse_spans(level, black_box(&codes), 0, &mut spans);
+                t8 = t8.min(t.elapsed().as_nanos() as f64 / n as f64);
+                spans.clear();
+                let t = std::time::Instant::now();
+                parse_spans(level, black_box(&vals), 0, &mut spans);
+                t64 = t64.min(t.elapsed().as_nanos() as f64 / n as f64);
+            }
+            println!(
+                "parse_spans {:7}: u8 {t8:.3} ns/symbol, u64 {t64:.3} ns/symbol",
+                level.name()
+            );
+        }
+    }
+
     #[test]
     fn lmin_cores() {
         // A=0 C=1 G=2 T=3. "CAC" is a local minimum at A.

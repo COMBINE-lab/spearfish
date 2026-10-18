@@ -27,6 +27,16 @@ thread_local! {
     static FORCE_LEVEL: std::cell::Cell<Option<Level>> = const { std::cell::Cell::new(None) };
 }
 
+/// Runs `f` with the kernels on this thread at `level` (which the CPU must support).
+#[cfg(test)]
+pub(crate) fn at_level<R>(level: Level, f: impl FnOnce() -> R) -> R {
+    assert!(simd::detected().includes(level));
+    let old = FORCE_LEVEL.with(|x| x.replace(Some(level)));
+    let r = f();
+    FORCE_LEVEL.with(|x| x.set(old));
+    r
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Infix,
@@ -1586,6 +1596,59 @@ mod tests {
         best
     }
 
+    /// Runs `f` at every SIMD level this CPU supports, each forced explicitly.
+    fn each_level(mut f: impl FnMut(Level) -> Result<(), TestCaseError>) -> Result<(), TestCaseError> {
+        for l in simd::supported() {
+            at_level(l, || f(l))?;
+        }
+        Ok(())
+    }
+
+    /// One row by the row kernel of `level` (which the CPU must support), called directly.
+    #[allow(clippy::too_many_arguments)]
+    fn row_at(
+        level: Level,
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        scratch: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        assert!(simd::detected().includes(level));
+        match level {
+            // SAFETY: the CPU supports the level (asserted above).
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx512 => unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) },
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx2 => unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e) },
+            _ => row_scalar(hprev, fu, tx, nh, nf, c, sc, e, scratch),
+        }
+    }
+
+    /// One row through every row kernel this CPU supports: (level, H, F, max).
+    fn rows_at_each_level(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+    ) -> Vec<(Level, Vec<i32>, Vec<i32>, i32)> {
+        let w = fu.len();
+        let mut out = Vec::new();
+        for l in simd::supported() {
+            let (mut nh, mut nf) = (vec![7; w], vec![7; w]);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let m = row_at(l, hprev, fu, tx, &mut nh, &mut nf, c, sc, e, (&mut a, &mut b));
+            out.push((l, nh, nf, m));
+        }
+        out
+    }
+
     fn check(p: &[u8], t: &[u8], k: u32) -> Result<(), TestCaseError> {
         for mode in [Mode::Infix, Mode::Prefix, Mode::Global] {
             let want = naive(p, t, mode);
@@ -1737,21 +1800,41 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
 
-        /// The vectorized prefix maxima equal the scalar loop.
+        /// The scalar passes' prefix maxima equal the definition.
         #[test]
         fn prefix_max_matches_scalar(
             xs in prop::collection::vec(-100000i32..100000, 0..200), init in -100000i32..100000,
         ) {
-            let mut want = xs.clone();
-            let mut g = init;
-            for x in want.iter_mut() {
-                let next = g.max(*x);
-                *x = g;
-                g = next;
-            }
+            let want: Vec<i32> = (0..xs.len()).map(|k| xs[..k].iter().fold(init, |a, &x| a.max(x))).collect();
             let mut got = xs.clone();
             excl_prefix_max(&mut got, init);
             prop_assert_eq!(got, want);
+        }
+
+        /// Every row kernel computes the scalar passes' row exactly, on rows of every length
+        /// (whole vectors and partial tails), with cells and the entering gap down at and below
+        /// NEG (unreachable cells and column 0 next to them).
+        #[test]
+        fn row_kernels_match_scalar(
+            cells in prop::collection::vec((prop_oneof![-3000i32..3000, (NEG - 300)..(NEG + 300)], prop_oneof![-3000i32..3000, (NEG - 300)..(NEG + 300)]), 1..90),
+            tx in prop::collection::vec(any::<u8>(), 90),
+            c in 0u8..4,
+            sc in prop_oneof![Just((2, 4, 4, 2)), Just((1, 4, 6, 2)), (0i32..5, 0i32..9, 0i32..30, 0i32..6)],
+            e in prop_oneof![Just(NEG), (NEG - 300)..(NEG + 300), -3000i32..3000],
+        ) {
+            let hprev: Vec<i32> = cells.iter().map(|x| x.0).collect();
+            let w = hprev.len() - 1;
+            let fu: Vec<i32> = cells[1..].iter().map(|x| x.1).collect();
+            let (mat, mis, open, ext) = sc;
+            let sc = (mat, mis, open + ext, ext);
+            let all = rows_at_each_level(&hprev, &fu, &tx[..w], c, sc, e);
+            let want = &all[0];
+            prop_assert_eq!(want.0, Level::Scalar);
+            for got in &all[1..] {
+                prop_assert_eq!(&got.1, &want.1, "H at {}", got.0);
+                prop_assert_eq!(&got.2, &want.2, "F at {}", got.0);
+                prop_assert_eq!(got.3, want.3, "max at {}", got.0);
+            }
         }
 
         /// Sorted texts sharing prefixes (isoform flanks) give the same scores through the
@@ -1781,6 +1864,7 @@ mod tests {
             texts.sort();
             texts.dedup();
             let refs: Vec<&[u8]> = texts.iter().map(|t| t.as_slice()).collect();
+            each_level(|_| {
             for sc in [Affine::default(), Affine::HIFI] {
                 for mode in [Mode::Global, Mode::Prefix] {
                     let got = affine_sorted(&p, &refs, mode, &sc, band);
@@ -1821,6 +1905,8 @@ mod tests {
                 let whole = affine_extend_sorted(&p, &refs, &sc, band, bonus, i32::MAX, false, w);
                 prop_assert_eq!(both.iter().map(|x| x.0).collect::<Vec<_>>(), whole, "whole with cut");
             }
+            Ok(())
+            })?;
         }
 
         #[test]
@@ -1837,16 +1923,21 @@ mod tests {
                 match kind { 0 => p[i] = base, 1 => p.insert(i, base), _ => { p.remove(i); } }
             }
             let sc = Affine::default();
-            for mode in [Mode::Global, Mode::Prefix, Mode::Infix] {
-                let want = naive_affine(&p, &t, mode, &sc);
-                prop_assert_eq!(affine(&p, &t, mode, &sc, usize::MAX), want, "mode {:?}", mode);
-                // A band never improves the score, and a band covering everything is exact.
-                prop_assert!(affine(&p, &t, mode, &sc, 8) <= want);
-                prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
-            }
-            if p.len() <= 40 && t.len() <= 60 {
-                prop_assert_eq!(affine_extend(&p, &t[..t.len().min(60)], &sc, usize::MAX, 0, i32::MAX), naive_extend(&p, &t[..t.len().min(60)], &sc));
-            }
+            let wants: Vec<i32> = [Mode::Global, Mode::Prefix, Mode::Infix].iter().map(|&m| naive_affine(&p, &t, m, &sc)).collect();
+            let small = p.len() <= 40 && t.len() <= 60;
+            let want_ext = if small { naive_extend(&p, &t, &sc) } else { 0 };
+            each_level(|level| {
+                for (mode, &want) in [Mode::Global, Mode::Prefix, Mode::Infix].into_iter().zip(&wants) {
+                    prop_assert_eq!(affine(&p, &t, mode, &sc, usize::MAX), want, "mode {:?} at {}", mode, level);
+                    // A band never improves the score, and a band covering everything is exact.
+                    prop_assert!(affine(&p, &t, mode, &sc, 8) <= want);
+                    prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
+                }
+                if small {
+                    prop_assert_eq!(affine_extend(&p, &t, &sc, usize::MAX, 0, i32::MAX), want_ext, "at {}", level);
+                }
+                Ok(())
+            })?;
         }
 
         #[test]
@@ -1920,7 +2011,127 @@ mod tests {
             let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
             let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
             let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
-            prop_assert_eq!(infix_distances(&pat, &refs, k), want);
+            each_level(|level| {
+                prop_assert_eq!(infix_distances(&pat, &refs, k), want.clone(), "at {}", level);
+                Ok(())
+            })?;
+        }
+    }
+
+    /// Pseudo-random 2-bit codes, and a copy with about one edit in `div`.
+    fn rand_pair(n: usize, div: u64, seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut x = seed;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let t: Vec<u8> = (0..n).map(|_| (next() & 3) as u8).collect();
+        let mut p = Vec::with_capacity(n);
+        for &b in &t {
+            match next() % (3 * div) {
+                0 => p.push((b + 1) & 3),
+                1 => {}
+                2 => p.extend([b, (next() & 3) as u8]),
+                _ => p.push(b),
+            }
+        }
+        (p, t)
+    }
+
+    /// Times `f` (best of 5) in ns per `per` units.
+    fn time(per: f64, mut f: impl FnMut()) -> f64 {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                f();
+                t.elapsed().as_nanos() as f64 / per
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Isolated kernel timings per SIMD level (`cargo test --release -p map -- --ignored
+    /// --nocapture kernel_timings`).
+    #[test]
+    #[ignore]
+    fn kernel_timings() {
+        use std::hint::black_box;
+        // One DP row kernel, called directly on rows of a few widths.
+        for w in [24usize, 63, 129, 400] {
+            let (_, t) = rand_pair(w + 1, 10, w as u64);
+            let hprev: Vec<i32> = (0..=w as i32).map(|j| 3 * j - 200).collect();
+            let fu: Vec<i32> = (0..w as i32).map(|j| 2 * j - 300).collect();
+            let sc = (2, 4, 6, 2);
+            let reps = 2_000_000 / w;
+            for l in simd::supported() {
+                let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let ns = time((reps * w) as f64, || {
+                    for _ in 0..reps {
+                        let m = row_at(
+                            l,
+                            black_box(&hprev),
+                            &fu,
+                            &t[..w],
+                            &mut nh,
+                            &mut nf,
+                            1,
+                            sc,
+                            NEG,
+                            (&mut a, &mut b),
+                        );
+                        black_box(m);
+                    }
+                });
+                println!("row w={w:4} {:7}: {ns:.3} ns/cell", l.name());
+            }
+        }
+        // Whole banded extension DPs (the row loop around the kernel).
+        let (p, t) = rand_pair(3000, 12, 7);
+        for l in simd::supported() {
+            let ns = time(10.0, || {
+                at_level(l, || {
+                    for _ in 0..10 {
+                        black_box(affine_extend(black_box(&p), &t, &Affine::ONT, 64, 0, 400));
+                    }
+                })
+            });
+            println!(
+                "affine_extend 3 kb band 64 {:7}: {:.1} us/DP",
+                l.name(),
+                ns / 1000.0
+            );
+        }
+        // Batched infix distances: a 600-base pattern against 16 related 900-base texts.
+        let (p, base) = rand_pair(600, 15, 11);
+        let texts: Vec<Vec<u8>> = (0..16u64)
+            .map(|s| {
+                let mut t = rand_pair(150, 4, s + 100).1;
+                t.extend(
+                    rand_pair(600, 12, s + 200)
+                        .0
+                        .iter()
+                        .zip(&base)
+                        .map(|(&a, &b)| if s % 3 == 0 { a } else { b }),
+                );
+                t.extend(rand_pair(150, 4, s + 300).1);
+                t
+            })
+            .collect();
+        let refs: Vec<&[u8]> = texts.iter().map(|t| t.as_slice()).collect();
+        let pat = Pattern::new(&p);
+        for k in [60u32, u32::MAX] {
+            for l in simd::supported() {
+                let ns = time(20.0 * 16.0, || {
+                    at_level(l, || {
+                        for _ in 0..20 {
+                            black_box(infix_distances(&pat, black_box(&refs), k));
+                        }
+                    })
+                });
+                println!("infix k={k:10} {:7}: {:.1} us/text", l.name(), ns / 1000.0);
+            }
         }
     }
 }

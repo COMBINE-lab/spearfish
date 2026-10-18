@@ -806,15 +806,18 @@ mod best_chain_tests {
             pts.sort_unstable_by_key(|p| (p.qs, p.ts));
             let p = ChainParams { alpha, h, o_max: 30, g_max: 500, ..Default::default() };
             let want = best_chain_scalar(&p, &pts);
-            let got = best_chain(&p, &pts);
-            match (want, got) {
-                (None, None) => {}
-                (Some(w), Some(g)) => {
-                    prop_assert_eq!(w.0.to_bits(), g.0.to_bits());
-                    prop_assert_eq!(w.1, g.1);
-                    prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
+            // The vectorized DP at every SIMD level this CPU supports, each forced explicitly.
+            for level in lcp_core::simd::supported() {
+                let got = crate::align::at_level(level, || best_chain(&p, &pts));
+                match (&want, got) {
+                    (None, None) => {}
+                    (Some(w), Some(g)) => {
+                        prop_assert_eq!(w.0.to_bits(), g.0.to_bits(), "at {}", level);
+                        prop_assert_eq!(&w.1, &g.1, "at {}", level);
+                        prop_assert_eq!(w.2.to_bits(), g.2.to_bits(), "at {}", level);
+                    }
+                    (w, g) => prop_assert!(false, "{:?} vs {:?} at {}", w, g, level),
                 }
-                (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
             }
         }
 
@@ -856,17 +859,19 @@ mod best_chain_tests {
                 .collect();
             let p = ChainParams { h, o_max: 30, g_max: 500, ..Default::default() };
             let refs: Vec<&[Pt]> = lists.iter().map(|l| l.as_slice()).collect();
-            let got = best_chains(&p, &refs);
-            for (l, g) in lists.iter().zip(&got) {
-                let w = best_chain_scalar(&p, l);
-                match (w, g) {
-                    (None, None) => {}
-                    (Some(w), Some(g)) => {
-                        prop_assert_eq!(w.0.to_bits(), g.0.to_bits());
-                        prop_assert_eq!(&w.1, &g.1);
-                        prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
+            for level in lcp_core::simd::supported() {
+                let got = crate::align::at_level(level, || best_chains(&p, &refs));
+                for (l, g) in lists.iter().zip(&got) {
+                    let w = best_chain_scalar(&p, l);
+                    match (w, g) {
+                        (None, None) => {}
+                        (Some(w), Some(g)) => {
+                            prop_assert_eq!(w.0.to_bits(), g.0.to_bits(), "at {}", level);
+                            prop_assert_eq!(&w.1, &g.1, "at {}", level);
+                            prop_assert_eq!(w.2.to_bits(), g.2.to_bits(), "at {}", level);
+                        }
+                        (w, g) => prop_assert!(false, "{:?} vs {:?} at {}", w, g, level),
                     }
-                    (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
                 }
             }
         }
