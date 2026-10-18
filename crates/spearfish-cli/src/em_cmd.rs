@@ -1,4 +1,4 @@
-//! `spearfish quant`: EM quantification from a mapping TSV (`spearfish map` output, or
+//! `spearfish em`: spearfish's own EM quantification from a mapping TSV (`spearfish map` output, or
 //! another mapper's alignments converted to the same columns). Output: transcript, length,
 //! estimated reads.
 
@@ -17,8 +17,9 @@ pub struct Args {
     transcripts: PathBuf,
     /// Mapping TSV.
     mapping: PathBuf,
-    /// Score denominator D in exp((s - s_max) / D). 2 suits spearfish chain scores; use 5
-    /// (oarfish's default) for minimap2 alignment scores.
+    /// Score denominator D in exp((s - s_max) / D). This EM's default (2) is what the
+    /// mapper's ablations were evaluated with; oarfish uses D = 1 for spearfish's scores
+    /// (`spearfish::SCORE_DENOM`) and 3 for minimap2's.
     #[arg(long, default_value_t = 2.0)]
     score_denom: f64,
     /// Keep hits scoring at least this fraction of the read's best.
