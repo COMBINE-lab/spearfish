@@ -183,11 +183,40 @@ impl LcpParser {
     /// identical to `parse(seq, k).level(k)` but without building the hierarchy, reusing the
     /// buffers in `sc`.
     pub fn top_cores(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
+        match simd::active() {
+            #[cfg(target_arch = "x86_64")]
+            SimdLevel::Avx512 => unsafe { self.top_cores_avx512(seq, k, sc, out) },
+            #[cfg(target_arch = "x86_64")]
+            SimdLevel::Avx2 => unsafe { self.top_cores_avx2(seq, k, sc, out) },
+            _ => self.top_cores_at(SimdLevel::Scalar, seq, k, sc, out),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+    fn top_cores_avx512(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
+        self.top_cores_at(SimdLevel::Avx512, seq, k, sc, out)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+    fn top_cores_avx2(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
+        self.top_cores_at(SimdLevel::Avx2, seq, k, sc, out)
+    }
+
+    #[inline(always)]
+    fn top_cores_at(
+        &self,
+        simd: SimdLevel,
+        seq: &[u8],
+        k: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+    ) {
         if k == 0 {
             return;
         }
         let d = self.cfg.dct_iters as usize;
-        let simd = simd::active();
         let mut i = 0;
         while i < seq.len() {
             // Next maximal ACGT segment.
