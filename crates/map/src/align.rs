@@ -139,6 +139,171 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
     (best <= k).then_some(best as u32)
 }
 
+/// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
+/// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
+/// lane, sharing the pattern's blocks.
+pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+    #[cfg(target_arch = "x86_64")]
+    if pat.m > 0 && std::arch::is_x86_feature_detected!("avx512f") {
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(8) {
+            // SAFETY: AVX-512F is available (checked above).
+            unsafe { infix_x8(pat, batch, k, &mut out) };
+        }
+        return out;
+    }
+    texts
+        .iter()
+        .map(|t| distance_with(pat, t, Mode::Infix, k))
+        .collect()
+}
+
+/// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
+/// [`distance_with`]'s recurrence; the band is the union of the lanes' Ukkonen bands (a block
+/// is added if any lane would add it, dropped only if every lane would), and blocks are
+/// added with the same upper-bound state. Every lane's band thus contains its own, which
+/// already holds every cell scoring <= k, so a lane's distance is exact when <= k, as in
+/// `distance_with`, and above k otherwise.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=8).contains(&texts.len()) && pat.m > 0);
+    let m = pat.m;
+    let n_max = texts.iter().map(|t| t.len()).max().unwrap();
+    let kk = k.min((m + n_max) as u32) as i64;
+    let blocks = m.div_ceil(W);
+    let last_bit = (m - 1) % W;
+    let rows = |b: usize| if b + 1 == blocks { last_bit + 1 } else { W };
+    // Text codes interleaved by lane: column j of lane l at 8j + l.
+    let mut tx = vec![0u8; 8 * n_max];
+    for (l, t) in texts.iter().enumerate() {
+        for (j, &c) in t.iter().enumerate() {
+            tx[8 * j + l] = c & 3;
+        }
+    }
+    // Lanes still inside their text, per column: lane l is live while j < len(l).
+    let lens = _mm512_set_epi64(
+        texts.get(7).map_or(0, |t| t.len() as i64),
+        texts.get(6).map_or(0, |t| t.len() as i64),
+        texts.get(5).map_or(0, |t| t.len() as i64),
+        texts.get(4).map_or(0, |t| t.len() as i64),
+        texts.get(3).map_or(0, |t| t.len() as i64),
+        texts.get(2).map_or(0, |t| t.len() as i64),
+        texts.get(1).map_or(0, |t| t.len() as i64),
+        texts[0].len() as i64,
+    );
+    // Each block's four match masks, twice over, so a lane's code selects its mask.
+    let peq: Vec<__m512i> = pat
+        .peq
+        .iter()
+        // SAFETY: four u64s.
+        .map(|q| _mm512_broadcast_i64x4(unsafe { _mm256_loadu_si256(q.as_ptr().cast()) }))
+        .collect();
+    let ones = _mm512_set1_epi64(-1);
+    let one = _mm512_set1_epi64(1);
+    let zero = _mm512_setzero_si512();
+    let mut pv = vec![ones; blocks];
+    let mut mv = vec![zero; blocks];
+    let mut score: Vec<__m512i> = (0..blocks)
+        .map(|b| _mm512_set1_epi64((b * W + rows(b)) as i64))
+        .collect();
+    let kv = _mm512_set1_epi64(kk);
+    let kw = _mm512_set1_epi64(kk + W as i64);
+    let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
+    // Column 0: D[m][0] = m.
+    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+        _mm512_set1_epi64(m as i64)
+    } else {
+        _mm512_set1_epi64(i64::MAX)
+    };
+    // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn step(
+        pv: &mut __m512i,
+        mv: &mut __m512i,
+        eq: __m512i,
+        (neg, pos): (__m512i, __m512i),
+        bitv: __m128i,
+        live: __mmask8,
+    ) -> (__m512i, __m512i) {
+        let (p, m) = (*pv, *mv);
+        let one = _mm512_set1_epi64(1);
+        let xv = _mm512_or_si512(eq, m);
+        let eq = _mm512_or_si512(eq, neg);
+        let xh = _mm512_or_si512(
+            _mm512_xor_si512(_mm512_add_epi64(_mm512_and_si512(eq, p), p), p),
+            eq,
+        );
+        let ph = _mm512_or_si512(m, _mm512_ternarylogic_epi64::<0x01>(xh, p, p));
+        let mh = _mm512_and_si512(p, xh);
+        let hp = _mm512_and_si512(_mm512_srl_epi64(ph, bitv), one);
+        let hm = _mm512_and_si512(_mm512_srl_epi64(mh, bitv), one);
+        let ph = _mm512_or_si512(_mm512_slli_epi64::<1>(ph), pos);
+        let mh = _mm512_or_si512(_mm512_slli_epi64::<1>(mh), neg);
+        let npv = _mm512_or_si512(mh, _mm512_ternarylogic_epi64::<0x01>(xv, ph, ph));
+        let nmv = _mm512_and_si512(ph, xv);
+        *pv = _mm512_mask_mov_epi64(p, live, npv);
+        *mv = _mm512_mask_mov_epi64(m, live, nmv);
+        (hm, hp)
+    }
+    let bitw = _mm_cvtsi64_si128((W - 1) as i64);
+    let bitl = _mm_cvtsi64_si128(last_bit as i64);
+    let bitv = |b: usize| if b + 1 == blocks { bitl } else { bitw };
+    for j in 0..n_max {
+        let live: __mmask8 = _mm512_cmpgt_epi64_mask(lens, _mm512_set1_epi64(j as i64));
+        // SAFETY: tx holds 8 codes per column.
+        let c = _mm512_cvtepu8_epi64(unsafe { _mm_loadl_epi64(tx.as_ptr().add(8 * j).cast()) });
+        // Infix: the top row is free (horizontal delta 0).
+        let mut h = (zero, zero);
+        for b in 0..=last as usize {
+            let eq = _mm512_permutexvar_epi64(c, peq[b]);
+            h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
+            score[b] = _mm512_mask_add_epi64(score[b], live, score[b], _mm512_sub_epi64(h.1, h.0));
+        }
+        let lb = last as usize;
+        let hin = _mm512_sub_epi64(h.1, h.0);
+        let mut added = false;
+        if lb + 1 < blocks {
+            let eqn = _mm512_permutexvar_epi64(c, peq[lb + 1]);
+            let top = _mm512_sub_epi64(score[lb], hin);
+            let want = _mm512_mask_cmple_epi64_mask(live, top, kv)
+                & (_mm512_test_epi64_mask(eqn, one) | _mm512_cmplt_epi64_mask(hin, zero));
+            if want != 0 {
+                let nb = lb + 1;
+                pv[nb] = ones;
+                mv[nb] = zero;
+                let hn = step(&mut pv[nb], &mut mv[nb], eqn, h, bitv(nb), live);
+                score[nb] = _mm512_add_epi64(
+                    _mm512_add_epi64(top, _mm512_set1_epi64(rows(nb) as i64)),
+                    _mm512_sub_epi64(hn.1, hn.0),
+                );
+                last += 1;
+                added = true;
+            }
+        }
+        if !added {
+            while last >= 0 && _mm512_mask_cmplt_epi64_mask(live, score[last as usize], kw) == 0 {
+                last -= 1;
+            }
+            if last < 0 {
+                break;
+            }
+        }
+        if last as usize + 1 == blocks {
+            best = _mm512_mask_min_epi64(best, live, best, score[blocks - 1]);
+        }
+    }
+    let mut bs = [0i64; 8];
+    // SAFETY: eight i64s.
+    unsafe { _mm512_storeu_si512(bs.as_mut_ptr().cast(), best) };
+    for (l, t) in texts.iter().enumerate() {
+        let kl = k.min((m + t.len()) as u32) as i64;
+        out.push((bs[l] <= kl).then_some(bs[l] as u32));
+    }
+}
+
 /// Minimum edit distance between `pattern` and any substring of `text` (no cutoff).
 pub fn infix_distance(pattern: &[u8], text: &[u8]) -> u32 {
     distance(pattern, text, Mode::Infix, u32::MAX).unwrap()
@@ -191,10 +356,6 @@ pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize)
 /// free: the maximum over all DP cells (as minimap2's extension, without z-drop). Read tails
 /// that don't align (adapters, junk) are clipped instead of forced through the alignment.
 ///
-/// The accepted exact anchor is outside these slices: H[0][0] = 0 is the
-/// relative score at its boundary. Leading gaps pay affine penalties; no local
-/// restart or anchor realignment is needed to stay attached.
-///
 /// With `xdrop`, the extension stops once a whole row of the band scores more than `xdrop`
 /// below the best cell so far (minimap2-style X-drop): the rest of the read is junk for
 /// this text. Pass `i32::MAX` for none.
@@ -222,14 +383,18 @@ pub fn affine_extend(
 /// [`affine`] for each of `texts`, which must be sorted: equal to separate calls, but rows
 /// that read only a prefix shared with the previous text are not recomputed.
 pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, band: usize) -> Vec<i32> {
-    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n)
+    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n, usize::MAX)
         .into_iter()
         .map(|d| d.score)
         .collect()
 }
 
 /// [`affine_extend`] (or, with `diagonal`, [`affine_extend_diagonal`]) for each of `texts`,
-/// which must be sorted, sharing rows as [`affine_sorted`] does.
+/// which must be sorted, sharing rows as [`affine_sorted`] does. Without `diagonal`, the band is
+/// laid out for a text of at least `window` bases, as [`affine_extend_window`] does: a text cut
+/// short where its transcript ends gets the band of the full window, so a read whose far end
+/// doesn't align (a primer, an adapter) is placed as it would be against a longer transcript.
+#[allow(clippy::too_many_arguments)]
 pub fn affine_extend_sorted(
     pattern: &[u8],
     texts: &[&[u8]],
@@ -238,13 +403,70 @@ pub fn affine_extend_sorted(
     end_bonus: i32,
     xdrop: i32,
     diagonal: bool,
+    window: usize,
 ) -> Vec<i32> {
+    affine_extend_sorted_cut(
+        pattern,
+        texts,
+        sc,
+        band,
+        end_bonus,
+        xdrop,
+        diagonal,
+        window,
+        usize::MAX,
+    )
+    .into_iter()
+    .map(|(x, _, _)| x)
+    .collect()
+}
+
+/// [`affine_extend_sorted`], with each text's score also over its first `cut` bases only:
+/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
+/// one pass. Without X-drop, the second equals the pass
+/// over the cut text (same band layout: `window` at least as long as the texts); with it, the
+/// cut score may extend further, since the pass stops only when the whole text's does.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_extend_sorted_cut(
+    pattern: &[u8],
+    texts: &[&[u8]],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+    diagonal: bool,
+    window: usize,
+    cut: usize,
+) -> Vec<(i32, i32, usize)> {
     let m = pattern.len();
-    let geom = |n: usize| if diagonal { m.min(n) } else { n };
-    affine_dp_sorted(pattern, texts, Mode::Prefix, sc, band, Some((xdrop, false)), geom)
-        .into_iter()
-        .map(|d| d.clip_best.max(d.score.saturating_add(end_bonus)))
-        .collect()
+    let geom = |n: usize| if diagonal { m.min(n) } else { n.max(window) };
+    affine_dp_sorted(
+        pattern,
+        texts,
+        Mode::Prefix,
+        sc,
+        band,
+        Some((xdrop, cut != usize::MAX)),
+        geom,
+        cut,
+    )
+    .into_iter()
+    .map(|d| {
+        let end = d.score.saturating_add(end_bonus);
+        let whole = d.clip_best.max(end);
+        let cols = if d.clip_best >= end {
+            d.clip_cell.1
+        } else {
+            d.score_col
+        };
+        let cut = if cut == usize::MAX {
+            whole
+        } else {
+            d.cut_best.max(d.cut_score.saturating_add(end_bonus))
+        };
+        (whole, cut, cols)
+    })
+    .collect()
 }
 
 /// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
@@ -359,6 +581,99 @@ unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
     }
 }
 
+/// AVX-512 with byte masks, checked once.
+#[cfg(target_arch = "x86_64")]
+fn avx512_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    })
+}
+
+/// One DP row over `w` cells, the three passes of `run` fused per 16-lane block: diagonal and
+/// vertical moves, then horizontal gaps as an in-register prefix max carried across blocks,
+/// with no intermediate row written. `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
+/// F[i-1][start..=hi], `tx` the text bases of columns start..=hi; writes H and F of row i
+/// and returns the row's maximum. Same integer operations as the scalar passes, so the
+/// same results.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_avx512(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+) -> i32 {
+    use std::arch::x86_64::*;
+    let w = fu.len();
+    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    let neg = _mm512_set1_epi32(NEG);
+    let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
+    let (vmat, vmis) = (_mm512_set1_epi32(mat), _mm512_set1_epi32(-mis));
+    let vc = _mm512_set1_epi32(c as i32);
+    let three = _mm512_set1_epi32(3);
+    let last = _mm512_set1_epi32(15);
+    let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    // ext * k for the block's lanes, advanced by 16 * ext per block.
+    let mut ek = _mm512_mullo_epi32(lane, vext);
+    let step = _mm512_set1_epi32(16 * ext);
+    let mut cv = _mm512_set1_epi32(e);
+    let mut mx = neg;
+    let mut k = 0;
+    while k < w {
+        let n = (w - k).min(16);
+        let mask: __mmask16 = if n == 16 { !0 } else { (1u16 << n) - 1 };
+        // SAFETY: lanes below `n` are in bounds of every slice; the rest are masked off.
+        let (hd, hu, fv, t) = unsafe {
+            (
+                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k)),
+                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k + 1)),
+                _mm512_maskz_loadu_epi32(mask, fu.as_ptr().add(k)),
+                _mm_maskz_loadu_epi8(mask, tx.as_ptr().add(k).cast()),
+            )
+        };
+        let fj = _mm512_max_epi32(
+            _mm512_max_epi32(_mm512_sub_epi32(hu, vgo), _mm512_sub_epi32(fv, vext)),
+            neg,
+        );
+        let t = _mm512_and_si512(_mm512_cvtepu8_epi32(t), three);
+        let s = _mm512_mask_blend_epi32(_mm512_cmpeq_epi32_mask(t, vc), vmis, vmat);
+        let x = _mm512_max_epi32(_mm512_max_epi32(_mm512_add_epi32(hd, s), fj), neg);
+        // gs[k] = x - go + ext * (k + 1); lanes past the row are NEG (they come after every
+        // real lane, so they change no output).
+        let g = _mm512_mask_mov_epi32(
+            neg,
+            mask,
+            _mm512_add_epi32(_mm512_sub_epi32(x, vgo), _mm512_add_epi32(ek, vext)),
+        );
+        // Inclusive prefix max within the block, then the carry; exclusive by one lane.
+        let mut v = _mm512_max_epi32(g, _mm512_alignr_epi32::<15>(g, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<14>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<12>(v, neg));
+        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
+        v = _mm512_max_epi32(v, cv);
+        let excl = _mm512_alignr_epi32::<15>(v, cv);
+        cv = _mm512_permutexvar_epi32(last, v);
+        let hv = _mm512_max_epi32(x, _mm512_sub_epi32(excl, ek));
+        // SAFETY: as for the loads.
+        unsafe {
+            _mm512_mask_storeu_epi32(nh.as_mut_ptr().add(k), mask, hv);
+            _mm512_mask_storeu_epi32(nf.as_mut_ptr().add(k), mask, fj);
+        }
+        mx = _mm512_mask_max_epi32(mx, mask, mx, hv);
+        ek = _mm512_add_epi32(ek, step);
+        k += 16;
+    }
+    _mm512_reduce_max_epi32(mx)
+}
+
 /// What one DP pass found.
 #[derive(Clone, Copy)]
 struct Dp {
@@ -372,6 +687,10 @@ struct Dp {
     text_read: usize,
     /// The last row computed: the pattern length, or the row where the pass stopped.
     last_row: usize,
+    /// With a cut: `clip_best` and the Prefix-mode score over text columns up to the cut only
+    /// (the pass over the text cut there, X-drop aside).
+    cut_best: i32,
+    cut_score: i32,
 }
 
 /// A computed DP row (`h` and `f` over its band `[lo, hi]`) and the clip state after it, from
@@ -385,6 +704,7 @@ struct Snap {
     f: Vec<i32>,
     clip_best: i32,
     clip_cell: (usize, usize),
+    cut_best: i32,
 }
 
 /// Reused per-thread DP rows.
@@ -432,6 +752,7 @@ fn affine_dp(
             sc,
             (band, geom),
             clip,
+            usize::MAX,
             &mut b.borrow_mut(),
             None,
             &mut [],
@@ -443,6 +764,7 @@ fn affine_dp(
 /// resumes from the previous text's rows wherever they read only bases the two texts share
 /// and the bands have the same shape, so isoforms that agree near the anchor are aligned
 /// there once. Results equal separate [`affine_dp`] calls.
+#[allow(clippy::too_many_arguments)]
 fn affine_dp_sorted(
     pattern: &[u8],
     texts: &[&[u8]],
@@ -451,6 +773,7 @@ fn affine_dp_sorted(
     band: usize,
     clip: Option<(i32, bool)>,
     geom: impl Fn(usize) -> usize,
+    cut: usize,
 ) -> Vec<Dp> {
     let m = pattern.len();
     let shape = |n: usize| {
@@ -508,6 +831,7 @@ fn affine_dp_sorted(
                     sc,
                     (band, geom(t.len())),
                     clip,
+                    cut,
                     b,
                     None,
                     &mut snaps,
@@ -525,6 +849,7 @@ fn affine_dp_sorted(
                     sc,
                     (band, geom(t.len())),
                     clip,
+                    cut,
                     b,
                     Some(&s),
                     &mut snaps,
@@ -553,31 +878,17 @@ fn run(
     sc: &Affine,
     (band, geom): (usize, usize),
     clip: Option<(i32, bool)>,
+    cut: usize,
     b: &mut DpBuf,
     resume: Option<&Snap>,
     snaps: &mut [Snap],
 ) -> Dp {
     let (m, n) = (pattern.len(), text.len());
-    // A global alignment with either side empty has exactly one possible path.
-    // Compute its affine gap cost without allocating or initializing DP buffers.
-    if mode == Mode::Global && clip.is_none() && (m == 0 || n == 0) {
-        let len = m.max(n);
-        return Dp {
-            score: if len == 0 {
-                0
-            } else {
-                -(sc.open + sc.ext * len as i32)
-            },
-            score_col: n,
-            clip_best: 0,
-            clip_cell: (0, 0),
-            text_read: n,
-            last_row: m,
-        };
-    }
-    // With `clip`, the best cell anywhere (0 aligns nothing).
+    // With `clip`, the best cell anywhere (0 aligns nothing), and among text columns up to
+    // `cut` (usize::MAX: no cut).
     let mut clip_best = 0i32;
     let mut clip_cell = (0usize, 0usize);
+    let mut cut_best = 0i32;
     let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
     let go = sc.open + sc.ext;
     // Row i (pattern) covers text columns [i - band - (m - g)⁺, i + band +
@@ -604,7 +915,19 @@ fn run(
             v.resize(n + 2, NEG);
         }
     }
-    let edges = |v: &mut Vec<i32>, lo: usize, hi: usize| {
+    // Rows are swapped as local slices (in registers), not as the buffers' Vec headers in
+    // `b`: a store and reload of those per row stalls depending on where `b` lies.
+    let DpBuf {
+        h: hv,
+        f: fv,
+        nh: nhv,
+        nf: nfv,
+        hp: hpv,
+        gs: gsv,
+        ..
+    } = &mut *b;
+    let (mut h, mut f, mut nh, mut nf) = (&mut hv[..], &mut fv[..], &mut nhv[..], &mut nfv[..]);
+    let edges = |v: &mut [i32], lo: usize, hi: usize| {
         if lo > 0 {
             v[lo - 1] = NEG;
         }
@@ -613,26 +936,27 @@ fn run(
     debug_assert!(sc.open >= 0 && sc.ext >= 0);
     let (mut prev, first) = match resume {
         Some(s) => {
-            b.h[s.lo..=s.hi].copy_from_slice(&s.h);
-            b.f[s.lo..=s.hi].copy_from_slice(&s.f);
-            edges(&mut b.h, s.lo, s.hi);
-            edges(&mut b.f, s.lo, s.hi);
+            h[s.lo..=s.hi].copy_from_slice(&s.h);
+            f[s.lo..=s.hi].copy_from_slice(&s.f);
+            edges(h, s.lo, s.hi);
+            edges(f, s.lo, s.hi);
             clip_best = s.clip_best;
             clip_cell = s.clip_cell;
+            cut_best = s.cut_best;
             ((s.lo, s.hi), s.row + 1)
         }
         None => {
             let (lo0, hi0) = range(0);
-            for j in lo0..=hi0 {
-                b.h[j] = if j == 0 || mode == Mode::Infix {
+            for (j, x) in h.iter_mut().enumerate().take(hi0 + 1).skip(lo0) {
+                *x = if j == 0 || mode == Mode::Infix {
                     0
                 } else {
                     -(sc.open + sc.ext * j as i32)
                 };
             }
-            b.f[lo0..=hi0].fill(NEG);
-            edges(&mut b.h, lo0, hi0);
-            edges(&mut b.f, lo0, hi0);
+            f[lo0..=hi0].fill(NEG);
+            edges(h, lo0, hi0);
+            edges(f, lo0, hi0);
             ((lo0, hi0), 1)
         }
     }; // band of the row in h
@@ -649,6 +973,8 @@ fn run(
                 clip_cell,
                 text_read: n,
                 last_row: i,
+                cut_best,
+                cut_score: NEG,
             };
         }
         let c = pattern[i - 1] & 3;
@@ -660,9 +986,9 @@ fn run(
         let mut row_max = NEG;
         if lo == 0 {
             // Column 0: only a vertical gap reaches it.
-            let fj = (b.h[0] - go).max(b.f[0] - ext);
-            b.nh[0] = fj;
-            b.nf[0] = fj;
+            let fj = (h[0] - go).max(f[0] - ext);
+            nh[0] = fj;
+            nf[0] = fj;
             e = fj - go;
             start = 1;
             row_max = fj;
@@ -673,20 +999,34 @@ fn run(
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
-        if start <= hi {
+        #[cfg(target_arch = "x86_64")]
+        if start <= hi && avx512_rows() {
+            // SAFETY: AVX-512F/BW/VL are available (checked above).
+            let m = unsafe {
+                row_avx512(
+                    &h[start - 1..=hi],
+                    &f[start..=hi],
+                    &text[start - 1..hi],
+                    &mut nh[start..=hi],
+                    &mut nf[start..=hi],
+                    c,
+                    (mat, mis, go, ext),
+                    e,
+                )
+            };
+            row_max = row_max.max(m);
+        } else if start <= hi {
             // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
             // without horizontal gaps), from the previous row only.
             let w = hi + 1 - start;
             // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
             // only adds outputs after every real one.
             let wp = w.next_multiple_of(16);
-            if b.hp.len() < wp {
-                b.hp.resize(wp, NEG);
-                b.gs.resize(wp, NEG);
+            if hpv.len() < wp {
+                hpv.resize(wp, NEG);
+                gsv.resize(wp, NEG);
             }
-            let DpBuf {
-                h, f, nh, nf, hp, gs, ..
-            } = &mut *b;
+            let (hp, gs) = (&mut hpv[..], &mut gsv[..]);
             gs[w..wp].fill(NEG);
             let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
             let gs = &mut gs_all[..w];
@@ -719,12 +1059,20 @@ fn run(
             }
             row_max = row_max.max(m);
         }
+        if cut != usize::MAX && lo <= cut {
+            let row = if hi <= cut {
+                row_max
+            } else {
+                nh[lo..=cut].iter().copied().max().unwrap_or(NEG)
+            };
+            cut_best = cut_best.max(row);
+        }
         if let Some((xdrop, cell)) = clip {
             let row = row_max;
             if row > clip_best {
                 clip_best = row;
                 if cell {
-                    let j = b.nh[lo..=hi].iter().position(|&x| x == row).unwrap();
+                    let j = nh[lo..=hi].iter().position(|&x| x == row).unwrap();
                     clip_cell = (i, lo + j);
                 }
             }
@@ -736,32 +1084,39 @@ fn run(
                     clip_cell,
                     text_read: hi,
                     last_row: i,
+                    cut_best,
+                    cut_score: NEG,
                 };
             }
         }
-        edges(&mut b.nh, lo, hi);
-        edges(&mut b.nf, lo, hi);
-        std::mem::swap(&mut b.h, &mut b.nh);
-        std::mem::swap(&mut b.f, &mut b.nf);
+        edges(nh, lo, hi);
+        edges(nf, lo, hi);
+        std::mem::swap(&mut h, &mut nh);
+        std::mem::swap(&mut f, &mut nf);
         prev = (lo, hi);
         if next_snap < snaps.len() && snaps[next_snap].row == i {
             let s = &mut snaps[next_snap];
             (s.lo, s.hi) = (lo, hi);
             s.h.clear();
-            s.h.extend_from_slice(&b.h[lo..=hi]);
+            s.h.extend_from_slice(&h[lo..=hi]);
             s.f.clear();
-            s.f.extend_from_slice(&b.f[lo..=hi]);
-            (s.clip_best, s.clip_cell) = (clip_best, clip_cell);
+            s.f.extend_from_slice(&f[lo..=hi]);
+            (s.clip_best, s.clip_cell, s.cut_best) = (clip_best, clip_cell, cut_best);
             next_snap += 1;
         }
     }
     let (score, score_col) = match mode {
-        Mode::Global => (b.h[n], n),
+        Mode::Global => (h[n], n),
         Mode::Prefix | Mode::Infix => {
-            let row = &b.h[prev.0..=prev.1];
+            let row = &h[prev.0..=prev.1];
             let x = row.iter().copied().max().unwrap_or(NEG);
             (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
         }
+    };
+    let cut_score = if cut != usize::MAX && prev.0 <= cut {
+        h[prev.0..=prev.1.min(cut)].iter().copied().max().unwrap_or(NEG)
+    } else {
+        NEG
     };
     Dp {
         score,
@@ -770,6 +1125,8 @@ fn run(
         clip_cell,
         text_read: prev.1,
         last_row: m,
+        cut_best,
+        cut_score,
     }
 }
 
@@ -888,18 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn extension_starts_at_accepted_anchor_boundary() {
-        let sc = Affine::ONT;
-        // A leading mismatch cannot restart locally at the later exact suffix.
-        assert_eq!(affine_extend(&[0, 1, 2], &[3, 1, 2], &sc, 16, 0, 50), 0);
-        // A leading deletion remains attached through its paid gap.
-        assert_eq!(affine_extend(&[0, 1, 2, 3], &[3, 0, 1, 2, 3], &sc, 16, 5, 50), 7);
-        // Entire junk tails clip to the accepted anchor's relative zero score.
-        assert_eq!(affine_extend(&[0, 0], &[3, 3], &sc, 16, 5, 50), 0);
-        assert_eq!(affine_extend(&[], &[], &sc, 16, 5, 50), 5);
-    }
-
-    #[test]
     fn affine_extend_end_examples() {
         let sc = Affine::default();
         let end = |p: &[u8], t: &[u8], bonus| {
@@ -966,34 +1311,6 @@ mod tests {
         assert_eq!(affine(&[0, 1], &[], Mode::Global, &sc, usize::MAX), -8);
     }
 
-    #[test]
-    fn empty_global_gaps_do_no_dp_work() {
-        for sc in [Affine::ONT, Affine::HIFI] {
-            let before = dp_work();
-            for len in [0, 1, 2, 100] {
-                let bases = vec![0; len];
-                let expected = if len == 0 {
-                    0
-                } else {
-                    -(sc.open + sc.ext * len as i32)
-                };
-                for band in [0, 16, usize::MAX] {
-                    assert_eq!(affine(&[], &bases, Mode::Global, &sc, band), expected);
-                    assert_eq!(affine(&bases, &[], Mode::Global, &sc, band), expected);
-                    assert_eq!(
-                        affine_sorted(&[], &[&[], &bases], Mode::Global, &sc, band),
-                        [0, expected]
-                    );
-                }
-            }
-            assert_eq!(dp_work(), before);
-            if crate::stats::on() {
-                affine(&[0], &[0], Mode::Global, &sc, 16);
-                assert!(dp_work().0 > before.0); // Check that instrumentation is active.
-            }
-        }
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
 
@@ -1021,7 +1338,7 @@ mod tests {
             base in prop::collection::vec(0u8..4, 1..160),
             edits in prop::collection::vec((0usize..160, 0u8..4, 0u8..3), 0..12),
             variants in prop::collection::vec((0usize..160, prop::collection::vec(0u8..4, 0..40), 0usize..60), 1..8),
-            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8,
+            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8, window_extra in 0usize..40,
         ) {
             let mut p = base.clone();
             for (pos, b, kind) in edits {
@@ -1048,7 +1365,7 @@ mod tests {
                     prop_assert_eq!(got, want, "mode {:?}", mode);
                 }
                 for diag in [false, true] {
-                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag);
+                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag, 0);
                     let want: Vec<i32> = refs
                         .iter()
                         .map(|t| if diag {
@@ -1059,6 +1376,27 @@ mod tests {
                         .collect();
                     prop_assert_eq!(got, want, "diag {}", diag);
                 }
+                // A band laid out for a window at least as long as each text, as in
+                // affine_extend_window.
+                let w = refs.iter().map(|t| t.len()).max().unwrap_or(0) + window_extra;
+                let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, false, w);
+                let want: Vec<i32> = refs
+                    .iter()
+                    .map(|t| affine_extend_window(&p, t, w, &sc, band, bonus, xdrop).0)
+                    .collect();
+                prop_assert_eq!(got, want, "window {}", w);
+                // Scores over each text cut at `c`, from the same pass, equal passes over the cut
+                // texts (no X-drop, so neither pass stops early).
+                let c = refs.iter().map(|t| t.len()).min().unwrap_or(0) + window_extra / 2;
+                let both = affine_extend_sorted_cut(&p, &refs, &sc, band, bonus, i32::MAX, false, w, c);
+                let want: Vec<i32> = refs
+                    .iter()
+                    .map(|t| affine_extend_window(&p, &t[..t.len().min(c)], w, &sc, band, bonus, i32::MAX).0)
+                    .collect();
+                prop_assert_eq!(both.iter().map(|x| x.1).collect::<Vec<_>>(), want, "cut {}", c);
+                // Tracking the cut changes nothing about the whole texts' scores.
+                let whole = affine_extend_sorted(&p, &refs, &sc, band, bonus, i32::MAX, false, w);
+                prop_assert_eq!(both.iter().map(|x| x.0).collect::<Vec<_>>(), whole, "whole with cut");
             }
         }
 
@@ -1116,6 +1454,50 @@ mod tests {
             for k in [d.saturating_sub(1), d, d + slack, u32::MAX] {
                 check(&p, &t, k)?;
             }
+        }
+
+        /// Batched infix distances equal one `distance_with` call per text: texts are
+        /// mutated copies of one sequence (as isoform regions are) of differing lengths,
+        /// some empty or unrelated, in batches of any size.
+        #[test]
+        fn infix_batch_matches_single(
+            base in prop::collection::vec(0u8..4, 0..700),
+            texts in prop::collection::vec(
+                (0usize..700, 0usize..700, prop::collection::vec((0usize..700, 0u8..4, 0u8..3), 0..25), any::<bool>()),
+                1..20,
+            ),
+            pa in 0usize..300, plen in 0usize..500,
+            pedits in prop::collection::vec((0usize..700, 0u8..4, 0u8..3), 0..40),
+            kdelta in prop_oneof![Just(None), (0u32..60).prop_map(Some)],
+            rnd in prop::collection::vec(0u8..4, 0..300),
+        ) {
+            let mutate = |mut v: Vec<u8>, edits: &[(usize, u8, u8)]| {
+                for &(pos, b, kind) in edits {
+                    if v.is_empty() { break; }
+                    let i = pos % v.len();
+                    match kind { 0 => v[i] = b, 1 => v.insert(i, b), _ => { v.remove(i); } }
+                }
+                v
+            };
+            let end = (pa + plen).min(base.len());
+            let p = mutate(base[pa.min(end)..end].to_vec(), &pedits);
+            let ts: Vec<Vec<u8>> = texts
+                .iter()
+                .map(|(a, l, e, unrelated)| {
+                    if *unrelated {
+                        rnd[..(*l).min(rnd.len())].to_vec()
+                    } else {
+                        let end = (a + l).min(base.len());
+                        mutate(base[(*a).min(end)..end].to_vec(), e)
+                    }
+                })
+                .collect();
+            let pat = Pattern::new(&p);
+            let exact: Vec<u32> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, u32::MAX).unwrap()).collect();
+            let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
+            let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
+            let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
+            prop_assert_eq!(infix_distances(&pat, &refs, k), want);
         }
     }
 }

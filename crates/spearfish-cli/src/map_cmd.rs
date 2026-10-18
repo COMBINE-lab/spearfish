@@ -132,6 +132,10 @@ pub struct Args {
     /// aligning every hit's whole read (fewer whole-read alignments; default for hifi).
     #[arg(long)]
     tie_group: bool,
+    /// Tie-break: points a candidate must gain past the shortest annotated end at a read end
+    /// (its longer flank) for them to count (0: all count).
+    #[arg(long)]
+    flank_min: Option<i64>,
     /// Near-tied read orientations: compare by whole-read edit distance instead of clipped
     /// affine scores.
     #[arg(long)]
@@ -140,6 +144,13 @@ pub struct Args {
     /// transcripts (default: the preset's; on except for drna).
     #[arg(long)]
     raw_ends: Option<bool>,
+    /// Tie-break: points for isoforms whose 3' end lies where the read's poly(A) tail starts
+    /// (within a few bases; 0: off).
+    #[arg(long)]
+    tail_bonus: Option<i32>,
+    /// Tie-break: align a read's poly(A) tail with its right end instead of trimming it.
+    #[arg(long)]
+    no_tail_trim: bool,
     /// Chain every anchor separately (no merging of collinear anchors within a unitig).
     #[arg(long)]
     no_merge: bool,
@@ -388,8 +399,10 @@ fn rad_writer(path: &std::path::Path, args: &Args, mapper: &Mapper) -> Result<lo
             Preset::Hifi => "pac-bio-hifi",
         }
         .into(),
-        // spearfish weighs a hit scoring d below the best by exp(-d / 2).
-        score_denom: 2.0,
+        // A hit scoring d below the read's best is exp(-d) times as likely: the sharpest of
+        // the weightings tried with oarfish's EM on simulated reads and spike-ins (exp(-d / 2),
+        // used before, spread reads more evenly over near-ties).
+        score_denom: 1.0,
         ends_extended: opts.params.ends.is_some(),
         strands: match opts.params.strands {
             map::Strands::Both => "both",
@@ -429,10 +442,17 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
         tb.group_fallback |= args.tie_group;
+        if let Some(f) = args.flank_min {
+            tb.flank_min = f;
+        }
         tb.orient_clipped = !args.orient_edit;
         if let Some(r) = args.raw_ends {
             tb.raw_ends = r;
         }
+        if let Some(n) = args.tail_bonus {
+            tb.tail_bonus = n;
+        }
+        tb.tail_trim &= !args.no_tail_trim;
         if let Some(b) = args.tie_band {
             tb.band = b;
         }

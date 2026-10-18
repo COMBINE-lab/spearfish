@@ -10,7 +10,7 @@ use index::Index;
 use seeds::{BaseSeeder, Seed};
 
 use crate::anchor::{self, AnchorParams};
-use crate::chain::{ChainParams, Pt, TxHit, best_chain};
+use crate::chain::{ChainParams, Pt, TxHit, best_chains};
 
 #[derive(Clone, Debug)]
 pub struct RescueParams {
@@ -65,15 +65,55 @@ struct Scratch {
     /// Transcript -> (base anchors, min and max anchor diagonal ts - qs).
     per_tx: rustc_hash::FxHashMap<u32, (u32, i64, i64)>,
     txs: Vec<(u32, u32, i64, i64)>,
-    /// Window sequence (hash, length) -> index into `results`, per read orientation.
+    /// Window sequence (hash, length) -> distinct window index, per read orientation.
     seen: rustc_hash::FxHashMap<(u64, u32), u32>,
-    /// Per distinct window: its best chain, or None.
-    results: Vec<Option<WindowChain>>,
+    /// Points of all distinct windows, and each window's range in it.
+    pool: Vec<Pt>,
+    wins: Vec<(u32, u32)>,
+    /// Per (transcript, window start, distinct window), in visiting order.
+    reqs: Vec<(u32, u32, u32)>,
 }
 
 /// A rescue chain in one transcript window: (score, max discrepancy, anchored bases, chain
 /// as (qs, qe, ts relative to the window, len)).
 type WindowChain = (f32, f32, u32, Vec<(u32, u32, u32, u32)>);
+
+/// Rescue points chained per batch (320 kB of `Pt`s): a read whose windows hold more is
+/// chained in several batches rather than leaving a large pool on its thread.
+const POOL_CAP: usize = 1 << 14;
+
+/// Best chain of each window `wins` (ranges of `pool`), as [`WindowChain`]s.
+fn window_chains(cp: &ChainParams, pool: &[Pt], wins: &[(u32, u32)]) -> Vec<Option<WindowChain>> {
+    let lists: Vec<&[Pt]> = wins
+        .iter()
+        .map(|&(a, n)| &pool[a as usize..(a + n) as usize])
+        .collect();
+    best_chains(cp, &lists)
+        .into_iter()
+        .zip(&lists)
+        .map(|(res, pts)| {
+            let (score, chain, maxd) = res?;
+            let mut anchored = 0;
+            let mut to = 0;
+            for &k in &chain {
+                let from = pts[k].qs.max(to);
+                if pts[k].qe > from {
+                    anchored += pts[k].qe - from;
+                }
+                to = to.max(pts[k].qe);
+            }
+            Some((
+                score,
+                maxd,
+                anchored,
+                chain
+                    .iter()
+                    .map(|&k| (pts[k].qs, pts[k].qe, pts[k].ts, pts[k].len))
+                    .collect(),
+            ))
+        })
+        .collect()
+}
 
 thread_local! {
     static RESCUE: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
@@ -100,10 +140,9 @@ impl Rescuer {
         RESCUE.with(|sc| self.rescue_with(idx, seq, base, ap, cp, &mut sc.borrow_mut()))
     }
 
-    /// Best chain of the read's rescue seeds (`sc.read`, sorted by label) against one
-    /// transcript sequence: (score, max discrepancy, anchored bases, chain as (qs, qe, ts,
-    /// len)), or None.
-    fn best_in(&self, tseq: &[u8], cp: &ChainParams, sc: &mut Scratch) -> Option<WindowChain> {
+    /// Points of the read's rescue seeds (`sc.read`, sorted by label) against one transcript
+    /// window sequence, sorted by (qs, ts), appended to `sc.pool`.
+    fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
         self.seeder.seed_parsed_into(tseq, &mut sc.tx, &mut sc.tmp);
         sc.tx.sort_unstable_by_key(|s| (s.label, s.start));
         // Merge join on labels.
@@ -137,26 +176,7 @@ impl Rescuer {
             }
         }
         sc.pts.sort_unstable_by_key(|p| (p.qs, p.ts));
-        let (score, chain, maxd) = best_chain(cp, &sc.pts)?;
-        let pts = &sc.pts;
-        let mut anchored = 0;
-        let mut to = 0;
-        for &k in &chain {
-            let from = pts[k].qs.max(to);
-            if pts[k].qe > from {
-                anchored += pts[k].qe - from;
-            }
-            to = to.max(pts[k].qe);
-        }
-        Some((
-            score,
-            maxd,
-            anchored,
-            chain
-                .iter()
-                .map(|&k| (pts[k].qs, pts[k].qe, pts[k].ts, pts[k].len))
-                .collect(),
-        ))
+        sc.pool.extend_from_slice(&sc.pts);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -188,7 +208,12 @@ impl Rescuer {
         let mut hits = Vec::new();
         let plen = seq.len() as i64;
         sc.seen.clear();
-        sc.results.clear();
+        sc.pool.clear();
+        sc.wins.clear();
+        sc.reqs.clear();
+        // Window chains, computed in batches of at most POOL_CAP points so a read with many
+        // or long windows doesn't leave a large pool behind on its thread.
+        let mut results: Vec<Option<WindowChain>> = Vec::new();
         for c in &cands {
             // Transcripts of this gene that received base anchors, most anchors first, with
             // the range of their anchors' diagonals.
@@ -235,33 +260,47 @@ impl Rescuer {
                         crate::stats::add(&crate::stats::RESCUE_TX, 1);
                         crate::stats::add(&crate::stats::RESCUE_TX_BASES, (hi - lo) as u64);
                         let tseq = std::mem::take(&mut sc.tseq);
-                        let res = self.best_in(&tseq, cp, sc);
+                        let start = sc.pool.len() as u32;
+                        self.points_in(&tseq, sc);
                         sc.tseq = tseq;
-                        let r = sc.results.len() as u32;
-                        sc.results.push(res);
+                        let r = (results.len() + sc.wins.len()) as u32;
+                        sc.wins.push((start, sc.pool.len() as u32 - start));
                         sc.seen.insert(key, r);
+                        if sc.pool.len() >= POOL_CAP {
+                            results.extend(window_chains(cp, &sc.pool, &sc.wins));
+                            sc.pool.clear();
+                            sc.wins.clear();
+                        }
                         r
                     }
                 };
-                let Some((score, maxd, anchored, chain)) = &sc.results[r as usize] else {
-                    continue;
-                };
-                let (first, last) = (chain[0], chain[chain.len() - 1]);
-                hits.push(TxHit {
-                    tx: t,
-                    score: *score,
-                    qstart: first.0,
-                    qend: last.1,
-                    tstart: first.2 + lo,
-                    tend: last.2 + lo + last.3,
-                    anchors: chain.len() as u32,
-                    anchored: *anchored,
-                    max_discrepancy: *maxd,
-                    chain: chain.iter().map(|&(qs, _, ts, len)| (qs, ts + lo, len)).collect(),
-                    reverse: false,
-                    extended: false,
-                });
+                sc.reqs.push((t, lo, r));
             }
+        }
+        // Best chain per distinct window, isoform windows sharing their DP prefixes.
+        results.extend(window_chains(cp, &sc.pool, &sc.wins));
+        if sc.pool.capacity() > POOL_CAP * 2 {
+            sc.pool = Vec::with_capacity(POOL_CAP);
+        }
+        for &(t, lo, r) in &sc.reqs {
+            let Some((score, maxd, anchored, chain)) = &results[r as usize] else {
+                continue;
+            };
+            let (first, last) = (chain[0], chain[chain.len() - 1]);
+            hits.push(TxHit {
+                tx: t,
+                score: *score,
+                qstart: first.0,
+                qend: last.1,
+                tstart: first.2 + lo,
+                tend: last.2 + lo + last.3,
+                anchors: chain.len() as u32,
+                anchored: *anchored,
+                max_discrepancy: *maxd,
+                chain: chain.iter().map(|&(qs, _, ts, len)| (qs, ts + lo, len)).collect(),
+                reverse: false,
+                extended: false,
+            });
         }
         hits
     }

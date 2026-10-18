@@ -11,7 +11,7 @@
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::bits::{BitArena, dct_value, dct_value_words, value_width};
+use crate::bits::{BitArena, dct_value_words, value_width};
 use crate::encode::acgt_segments;
 use crate::{Core, Hierarchy, Level, Parser, ParserMeta};
 
@@ -37,8 +37,7 @@ fn level1(c: &[u8], seed: u64, bits: &mut BitArena) -> u64 {
         for &b in c {
             x = (x << 2) | b as u64;
         }
-        bits.push_bits(x, 2 * c.len() as u32);
-        bits.finish_item();
+        bits.push_item(x, 2 * c.len() as u32);
         // A leading 1 marks the length: injective, and fmix64 is a bijection.
         fmix64((x | (1u64 << (2 * c.len()))) ^ seed)
     } else {
@@ -169,10 +168,7 @@ impl LcpParser {
                 });
                 // DCT replaced each core's start by that of the core `d` places to its left.
                 level.ctx_start.push(prev.ctx_start[lo - d]);
-                for &v in vals[lo..hi].iter().rev() {
-                    next_bits.push_bits(v, value_width(v));
-                }
-                next_bits.finish_item();
+                next_bits.push_values(&vals[lo..hi]);
             }
             levels.push(level);
             bits = next_bits;
@@ -211,18 +207,32 @@ impl LcpParser {
             }
             // Level 1.
             sc.spans.clear();
-            parse_rules(&sc.codes, |lo, hi| sc.spans.push((lo, hi)));
+            parse_spans(&sc.codes, 0, &mut sc.spans);
             let seed1 = self.level_seed(1);
             let cur = &mut sc.lv[0];
             cur.0.clear();
             cur.1.clear();
             cur.2.clear();
             sc.bits[0].clear();
-            for &(lo, hi) in &sc.spans {
-                cur.0.push(level1(&sc.codes[lo..hi], seed1, &mut sc.bits[0]));
-                cur.1.push(lo as u32);
-                cur.2.push(hi as u32);
+            // Bit strings feed the next level's DCT: none needed for the top level.
+            let bits = &mut sc.bits[0];
+            let codes = &sc.codes;
+            if k > 1 {
+                cur.0.extend(
+                    sc.spans
+                        .iter()
+                        .map(|&(lo, hi)| level1(&codes[lo..hi], seed1, bits)),
+                );
+            } else {
+                let mut none = BitArena::default();
+                cur.0.extend(sc.spans.iter().map(|&(lo, hi)| {
+                    let l = level1(&codes[lo..hi], seed1, &mut none);
+                    none.clear();
+                    l
+                }));
             }
+            cur.1.extend(sc.spans.iter().map(|s| s.0 as u32));
+            cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
             let mut ci = 0; // index of the current level's buffers
             for level in 2..=k {
                 let n = sc.lv[ci].0.len();
@@ -236,7 +246,7 @@ impl LcpParser {
                 }
                 dct_into(&sc.bits[ci], d, &mut sc.vals);
                 sc.spans.clear();
-                parse_rules(&sc.vals[d..], |lo, hi| sc.spans.push((lo + d, hi + d)));
+                parse_spans(&sc.vals[d..], d, &mut sc.spans);
                 let seed = self.level_seed(level);
                 let (a, b) = sc.lv.split_at_mut(1);
                 let (prev, next) = if ci == 0 {
@@ -250,16 +260,20 @@ impl LcpParser {
                 let (ba, bb) = sc.bits.split_at_mut(1);
                 let nbits = if ci == 0 { &mut bb[0] } else { &mut ba[0] };
                 nbits.clear();
-                for &(lo, hi) in &sc.spans {
+                next.0.extend(sc.spans.iter().map(|&(lo, hi)| {
                     let s0 = prev.1[lo];
-                    next.0
-                        .push(label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed));
-                    next.1.push(s0);
-                    next.2.push(prev.2[lo..hi].iter().copied().max().unwrap());
-                    for &v in sc.vals[lo..hi].iter().rev() {
-                        nbits.push_bits(v, value_width(v));
+                    label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed)
+                }));
+                next.1.extend(sc.spans.iter().map(|&(lo, _)| prev.1[lo]));
+                next.2.extend(
+                    sc.spans
+                        .iter()
+                        .map(|&(lo, hi)| prev.2[lo..hi].iter().copied().max().unwrap()),
+                );
+                if level < k {
+                    for &(lo, hi) in &sc.spans {
+                        nbits.push_values(&sc.vals[lo..hi]);
                     }
-                    nbits.finish_item();
                 }
                 ci = ni;
             }
@@ -327,7 +341,7 @@ fn dct_into(bits: &BitArena, d: usize, vals: &mut Vec<u64>) {
     vals.clear();
     vals.resize(n, 0);
     for (i, v) in vals.iter_mut().enumerate().skip(1) {
-        *v = dct_value(bits.get(i - 1), bits.get(i));
+        *v = bits.dct(i);
     }
     for t in 1..d {
         // Iteration t compresses cores i > t against their left neighbour's previous value.
@@ -393,6 +407,163 @@ pub(crate) fn parse_rules<T: Ord>(s: &[T], mut emit: impl FnMut(usize, usize)) {
     }
 }
 
+/// Symbols [`parse_spans`] scans: with AVX-512, a block of 64 interior positions' LMIN/LMAX
+/// and run masks in a few vector compares.
+pub(crate) trait Sym: Ord + Copy {
+    fn has_simd() -> bool;
+    /// (core, run) masks of positions `blk..blk + 64`, as the scalar pass computes them.
+    ///
+    /// # Safety
+    /// [`Sym::has_simd`] returned true, and `s[blk - 1..blk + 67]` is in bounds.
+    unsafe fn masks(s: &[Self], blk: usize) -> (u64, u64);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx512() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw")
+    })
+}
+
+impl Sym for u8 {
+    fn has_simd() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return avx512();
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    }
+    unsafe fn masks(s: &[u8], blk: usize) -> (u64, u64) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as the caller guarantees.
+        return unsafe { masks_u8(s, blk) };
+        #[cfg(not(target_arch = "x86_64"))]
+        unreachable!()
+    }
+}
+
+impl Sym for u64 {
+    fn has_simd() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return avx512();
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    }
+    unsafe fn masks(s: &[u64], blk: usize) -> (u64, u64) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as the caller guarantees.
+        return unsafe { masks_u64(s, blk) };
+        #[cfg(not(target_arch = "x86_64"))]
+        unreachable!()
+    }
+}
+
+// Lanes hold positions i; vectors a..e load s[i - 1], s[i], ..., s[i + 3].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn masks_u8(s: &[u8], blk: usize) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    // SAFETY: s[blk - 1..blk + 67] is in bounds (caller).
+    let ld = |o: usize| unsafe { _mm512_loadu_si512(s.as_ptr().add(blk + o - 1).cast()) };
+    let (a, b, c, d, e) = (ld(0), ld(1), ld(2), ld(3), ld(4));
+    let lmin = _mm512_cmpgt_epu8_mask(b, c) & _mm512_cmplt_epu8_mask(c, d);
+    let lmax = _mm512_cmple_epu8_mask(a, b)
+        & _mm512_cmplt_epu8_mask(b, c)
+        & _mm512_cmpgt_epu8_mask(c, d)
+        & _mm512_cmpge_epu8_mask(d, e);
+    let run = _mm512_cmpneq_epu8_mask(b, c) & _mm512_cmpeq_epu8_mask(c, d);
+    (lmin | lmax, run)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn masks_u64(s: &[u64], blk: usize) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    let (mut core, mut run) = (0u64, 0u64);
+    for g in 0..8 {
+        // SAFETY: s[blk - 1..blk + 67] is in bounds (caller).
+        let ld = |o: usize| unsafe { _mm512_loadu_si512(s.as_ptr().add(blk + 8 * g + o - 1).cast()) };
+        let (a, b, c, d, e) = (ld(0), ld(1), ld(2), ld(3), ld(4));
+        let lmin = _mm512_cmpgt_epu64_mask(b, c) & _mm512_cmplt_epu64_mask(c, d);
+        let lmax = _mm512_cmple_epu64_mask(a, b)
+            & _mm512_cmplt_epu64_mask(b, c)
+            & _mm512_cmpgt_epu64_mask(c, d)
+            & _mm512_cmpge_epu64_mask(d, e);
+        let r = _mm512_cmpneq_epu64_mask(b, c) & _mm512_cmpeq_epu64_mask(c, d);
+        core |= ((lmin | lmax) as u64) << (8 * g);
+        run |= (r as u64) << (8 * g);
+    }
+    (core, run)
+}
+
+/// [`parse_rules`] in two phases per block of 64 positions: a branch-free pass computes which
+/// positions start an LMIN/LMAX core or a run (RINT candidate) as bit masks, then a loop over
+/// the set bits emits the cores and the SSEQ gap fillers between them. Positions that start
+/// nothing cost no branch. Appends `(lo + add, hi + add)` to `spans` in `parse_rules` order.
+pub(crate) fn parse_spans<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
+    let n = s.len();
+    if n < 3 {
+        return;
+    }
+    let m = n - 2;
+    // At most two spans per position.
+    spans.reserve(2 * n);
+    let base = spans.len();
+    let out = &mut spans.spare_capacity_mut()[..2 * n];
+    let mut cnt = 0;
+    let mut prev_end = usize::MAX;
+    let simd = T::has_simd();
+    let mut blk = 0;
+    while blk < m {
+        let end = (blk + 64).min(m);
+        let (mut core, mut run) = (0u64, 0u64);
+        // Whole interior blocks (every position has a symbol on each side) in SIMD.
+        let simd = if simd && blk > 0 && blk + 67 <= n {
+            // SAFETY: the CPU has the features `T::masks` needs (checked by `has_simd`), and
+            // s[blk - 1..blk + 67] is in bounds.
+            (core, run) = unsafe { T::masks(s, blk) };
+            true
+        } else {
+            false
+        };
+        for i in (blk..end).filter(|_| !simd) {
+            let (a, b, c) = (s[i], s[i + 1], s[i + 2]);
+            let (l, r) = (s[i.saturating_sub(1)], s[(i + 3).min(n - 1)]);
+            // LMIN, or LMAX (needs a symbol on each side); exclusive with each other and RINT.
+            let lmin = (a > b) & (b < c);
+            let lmax = (i > 0) & (i + 3 < n) & (l <= a) & (a < b) & (b > c) & (c >= r);
+            core |= ((lmin | lmax) as u64) << (i - blk);
+            run |= (((a != b) & (b == c)) as u64) << (i - blk);
+        }
+        let mut bits = core | run;
+        while bits != 0 {
+            let j = bits.trailing_zeros();
+            bits &= bits - 1;
+            let i = blk + j as usize;
+            let mut hi = i + 3;
+            if (run >> j) & 1 != 0 {
+                // RINT: the run of s[i + 1] must end before the end of `s`.
+                let mut t = i + 2;
+                while t < n && s[t - 1] == s[t] {
+                    t += 1;
+                }
+                if t == n {
+                    continue;
+                }
+                hi = t + 1;
+            }
+            out[cnt].write((prev_end.wrapping_sub(1).wrapping_add(add), i + 1 + add));
+            cnt += (prev_end < i) as usize;
+            out[cnt].write((i + add, hi + add));
+            cnt += 1;
+            prev_end = hi;
+        }
+        blk = end;
+    }
+    // SAFETY: the first `cnt` spare slots were written.
+    unsafe { spans.set_len(base + cnt) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +573,27 @@ mod tests {
         let mut v = Vec::new();
         parse_rules(&codes, |lo, hi| v.push((lo, hi)));
         v
+    }
+
+    proptest::proptest! {
+        /// The branch-free scan emits exactly what the rules do (small alphabets for runs).
+        #[test]
+        fn parse_spans_equal_rules(
+            s in proptest::collection::vec(0u64..4, 0..600),
+            add in 0usize..5,
+        ) {
+            let mut want = Vec::new();
+            parse_rules(&s, |lo, hi| want.push((lo + add, hi + add)));
+            let mut got = vec![(7, 7)];
+            parse_spans(&s, add, &mut got);
+            proptest::prop_assert_eq!(&got[1..], &want[..]);
+            let b: Vec<u8> = s.iter().map(|&x| (x as u8) >> 1).collect();
+            let mut want = Vec::new();
+            parse_rules(&b, |lo, hi| want.push((lo, hi)));
+            let mut got = Vec::new();
+            parse_spans(&b, 0, &mut got);
+            proptest::prop_assert_eq!(got, want);
+        }
     }
 
     #[test]

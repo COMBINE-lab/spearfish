@@ -98,6 +98,10 @@ impl MapOptions {
                 tb.affine_within = Some(4);
                 // No template-switch Gs at direct RNA read ends: raw ends cost 12% for nothing.
                 tb.raw_ends = false;
+                // Direct RNA reads end a few bases into their tail (basecalled poly(A) is short
+                // and noisy): a 10-base run marks it, where cDNA's longer tails need 15 to stay
+                // clear of A-runs near annotated 3' ends.
+                tb.tail_run = 10;
                 // Direct RNA spans extended to the read ends change no spike-in estimate under
                 // the default model and cost 31% more instructions. Positional models
                 // turn them back on.

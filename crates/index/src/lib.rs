@@ -218,7 +218,7 @@ impl IndexData {
 
 /// A cache hint for the line holding `p` (no effect off x86-64; never faults).
 #[inline(always)]
-fn prefetch<T>(p: *const T) {
+pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: prefetching is a hint: it reads nothing and cannot fault, whatever the address.
     #[allow(unused_unsafe)]
@@ -493,6 +493,19 @@ impl Index {
         Some(v)
     }
 
+    /// Whether the raw bases under parsed `[lo, hi)` of transcript `t` equal those under parsed
+    /// `[ulo, uhi)` of `u` (homopolymer run lengths included), compared on the packed sequence.
+    /// None if the index lacks either raw sequence.
+    pub fn tx_raw_eq(&self, t: u32, lo: u32, hi: u32, u: u32, ulo: u32, uhi: u32) -> Option<bool> {
+        let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
+        let (ua, ub) = (self.tx_raw_pos(u, ulo)?, self.tx_raw_pos(u, uhi)?);
+        if b - a != ub - ua {
+            return Some(false);
+        }
+        let ((tw, _), (uw, _)) = (self.raw_words(t)?, self.raw_words(u)?);
+        Some(packed_eq(tw, a, uw, ua, b - a))
+    }
+
     /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
     /// parsed length), if the index has its raw sequence.
     pub fn tx_raw_pos(&self, t: u32, p: u32) -> Option<u32> {
@@ -524,6 +537,21 @@ impl Index {
     pub fn nodes_of(&self, u: u32) -> &[u32] {
         let off = self.unitig_off();
         &self.unitig_nodes()[off[u as usize] as usize..off[u as usize + 1] as usize]
+    }
+
+    /// Ask the caches for the offsets [`Self::occurrences`] reads first.
+    #[inline]
+    pub fn prefetch_occ_off(&self, u: u32) {
+        prefetch(self.occ_off().as_ptr().wrapping_add(u as usize));
+    }
+
+    /// Ask the caches for the occurrence lists of `u` (reads the offsets, so call it after
+    /// [`Self::prefetch_occ_off`] has had time to land).
+    #[inline]
+    pub fn prefetch_occurrences(&self, u: u32) {
+        let o = self.occ_off()[u as usize] as usize;
+        prefetch(self.occ_tx().as_ptr().wrapping_add(o));
+        prefetch(self.occ_pos().as_ptr().wrapping_add(o));
     }
 
     /// Occurrences of unitig `u`: transcripts (sorted) and the position of its first seed.
