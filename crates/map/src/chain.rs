@@ -19,6 +19,7 @@
 //! - Chains are local: any anchor can start one with score `w`.
 
 use index::Index;
+use lcp_core::simd::Level;
 
 use crate::anchor::Candidate;
 
@@ -266,6 +267,7 @@ fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Ve
         h: 2 * p.h,
         ..p.clone()
     };
+    let level = crate::align::simd_level();
     // The list whose points and DP values the buffers hold.
     let mut prev: Option<&[Pt]> = None;
     let order = std::mem::take(&mut sc.order);
@@ -307,6 +309,7 @@ fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Ve
             sc.w[i] = x.w;
         }
         dp_beta0(
+            level,
             &wp,
             (
                 &sc.a[..n],
@@ -446,16 +449,68 @@ fn max_score(xs: &[f32]) -> f32 {
 type Soa<'a> = (&'a [u32], &'a [i32], &'a [i32], &'a [i32], &'a [i32], &'a [f32]);
 
 /// One transcript's forward DP with β = 0 over `lcp..n` (`f`, `back`, `disc` hold the shared
-/// prefix's values below `lcp`), compiled per target as a whole so the per-anchor work
-/// (predecessor scores, their maximum) stays in one vectorized loop without dispatch.
-#[multiversion::multiversion(targets(
-    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-    "x86_64+avx2+fma",
-    "x86_64+avx",
-    "aarch64+neon"
-))]
+/// prefix's values below `lcp`), at `level` (which the CPU must support): compiled per level as
+/// a whole so the per-anchor work (predecessor scores, their maximum) stays in one vectorized
+/// loop without dispatch. The arithmetic is the same at every level (no FMA contraction), so
+/// results are bit-identical.
 #[allow(clippy::too_many_arguments)]
 fn dp_beta0(
+    level: Level,
+    p: &ChainParams,
+    soa: Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    debug_assert!(lcp_core::simd::detected().includes(level));
+    match level {
+        // SAFETY: the CPU has the level's features (callers pass the active level).
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 => unsafe { dp_beta0_avx512(p, soa, f, back, disc, lcp, cs, cd) },
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 => unsafe { dp_beta0_avx2(p, soa, f, back, disc, lcp, cs, cd) },
+        _ => dp_beta0_core(p, soa, f, back, disc, lcp, cs, cd),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0_avx512(
+    p: &ChainParams,
+    soa: Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    dp_beta0_core(p, soa, f, back, disc, lcp, cs, cd)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0_avx2(
+    p: &ChainParams,
+    soa: Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    dp_beta0_core(p, soa, f, back, disc, lcp, cs, cd)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0_core(
     p: &ChainParams,
     (a, qs, qe, ts, te, w): Soa,
     f: &mut [f32],
@@ -513,6 +568,7 @@ impl Chainer for OracleChainer {
 
 impl OracleChainer {
     fn chain_with(&self, idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> Vec<TxHit> {
+        let level = crate::align::simd_level();
         let unitig = idx.node_unitig();
         let offset = idx.node_offset();
         // An anchor's transcript span equals its query span (exact core matches; merged
@@ -632,6 +688,7 @@ impl OracleChainer {
                     sc.cd.resize(n, 0.0);
                 }
                 dp_beta0(
+                    level,
                     p,
                     (&sc.a, &sc.qs, &sc.qe, &sc.ts, &sc.te, &sc.w),
                     &mut sc.f,

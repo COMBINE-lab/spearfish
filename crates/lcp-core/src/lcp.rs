@@ -13,6 +13,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::bits::{BitArena, dct_value_words, value_width};
 use crate::encode::acgt_segments;
+use crate::simd::{self, Level as SimdLevel};
 use crate::{Core, Hierarchy, Level, Parser, ParserMeta};
 
 /// Bumped whenever a change alters any parse or label.
@@ -186,6 +187,7 @@ impl LcpParser {
             return;
         }
         let d = self.cfg.dct_iters as usize;
+        let simd = simd::active();
         let mut i = 0;
         while i < seq.len() {
             // Next maximal ACGT segment.
@@ -207,7 +209,7 @@ impl LcpParser {
             }
             // Level 1.
             sc.spans.clear();
-            parse_spans(&sc.codes, 0, &mut sc.spans);
+            parse_spans(simd, &sc.codes, 0, &mut sc.spans);
             let seed1 = self.level_seed(1);
             let cur = &mut sc.lv[0];
             cur.0.clear();
@@ -246,7 +248,7 @@ impl LcpParser {
                 }
                 dct_into(&sc.bits[ci], d, &mut sc.vals);
                 sc.spans.clear();
-                parse_spans(&sc.vals[d..], d, &mut sc.spans);
+                parse_spans(simd, &sc.vals[d..], d, &mut sc.spans);
                 let seed = self.level_seed(level);
                 let (a, b) = sc.lv.split_at_mut(1);
                 let (prev, next) = if ci == 0 {
@@ -407,66 +409,69 @@ pub(crate) fn parse_rules<T: Ord>(s: &[T], mut emit: impl FnMut(usize, usize)) {
     }
 }
 
-/// Symbols [`parse_spans`] scans: with AVX-512, a block of 64 interior positions' LMIN/LMAX
-/// and run masks in a few vector compares.
+/// Symbols [`parse_spans`] scans, with their vector mask kernels: a block of 64 interior
+/// positions' LMIN/LMAX and run masks in a few vector compares.
 pub(crate) trait Sym: Ord + Copy {
-    fn has_simd() -> bool;
     /// (core, run) masks of positions `blk..blk + 64`, as the scalar pass computes them.
     ///
     /// # Safety
-    /// [`Sym::has_simd`] returned true, and `s[blk - 1..blk + 67]` is in bounds.
-    unsafe fn masks(s: &[Self], blk: usize) -> (u64, u64);
-}
-
-#[cfg(target_arch = "x86_64")]
-fn avx512() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw")
-    })
+    /// The CPU has AVX-512 F/BW, and `s[blk - 1..blk + 67]` is in bounds.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn masks_avx512(s: &[Self], blk: usize) -> (u64, u64);
 }
 
 impl Sym for u8 {
-    fn has_simd() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        return avx512();
-        #[cfg(not(target_arch = "x86_64"))]
-        false
-    }
-    unsafe fn masks(s: &[u8], blk: usize) -> (u64, u64) {
-        #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn masks_avx512(s: &[u8], blk: usize) -> (u64, u64) {
         // SAFETY: as the caller guarantees.
-        return unsafe { masks_u8(s, blk) };
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (s, blk);
-            unreachable!()
-        }
+        unsafe { masks_u8(s, blk) }
     }
 }
 
 impl Sym for u64 {
-    fn has_simd() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        return avx512();
-        #[cfg(not(target_arch = "x86_64"))]
-        false
-    }
-    unsafe fn masks(s: &[u64], blk: usize) -> (u64, u64) {
-        #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn masks_avx512(s: &[u64], blk: usize) -> (u64, u64) {
         // SAFETY: as the caller guarantees.
-        return unsafe { masks_u64(s, blk) };
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (s, blk);
-            unreachable!()
-        }
+        unsafe { masks_u64(s, blk) }
+    }
+}
+
+/// How [`spans_core`] computes a whole block's masks: the scalar loop, or a level's kernel.
+trait Masks {
+    const SIMD: bool;
+    /// # Safety
+    /// The CPU has the level's features, and `s[blk - 1..blk + 67]` is in bounds.
+    unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64);
+}
+
+struct ScalarMasks;
+
+impl Masks for ScalarMasks {
+    const SIMD: bool = false;
+    unsafe fn masks<T: Sym>(_: &[T], _: usize) -> (u64, u64) {
+        unreachable!()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Avx512Masks;
+
+#[cfg(target_arch = "x86_64")]
+impl Masks for Avx512Masks {
+    const SIMD: bool = true;
+    #[inline(always)]
+    unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64) {
+        // SAFETY: as the caller guarantees.
+        unsafe { T::masks_avx512(s, blk) }
     }
 }
 
 // Lanes hold positions i; vectors a..e load s[i - 1], s[i], ..., s[i + 3].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
 unsafe fn masks_u8(s: &[u8], blk: usize) -> (u64, u64) {
     use std::arch::x86_64::*;
     // SAFETY: s[blk - 1..blk + 67] is in bounds (caller).
@@ -483,6 +488,7 @@ unsafe fn masks_u8(s: &[u8], blk: usize) -> (u64, u64) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[inline]
 unsafe fn masks_u64(s: &[u64], blk: usize) -> (u64, u64) {
     use std::arch::x86_64::*;
     let (mut core, mut run) = (0u64, 0u64);
@@ -506,7 +512,38 @@ unsafe fn masks_u64(s: &[u64], blk: usize) -> (u64, u64) {
 /// positions start an LMIN/LMAX core or a run (RINT candidate) as bit masks, then a loop over
 /// the set bits emits the cores and the SSEQ gap fillers between them. Positions that start
 /// nothing cost no branch. Appends `(lo + add, hi + add)` to `spans` in `parse_rules` order.
-pub(crate) fn parse_spans<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
+///
+/// Runs at `level` (which the CPU must support): the whole scan is compiled once per level,
+/// so the block kernels inline into it.
+pub(crate) fn parse_spans<T: Sym>(level: SimdLevel, s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
+    assert!(
+        simd::detected().includes(level),
+        "SIMD level {level} not supported"
+    );
+    match level {
+        // SAFETY: the CPU has the level's features (asserted above).
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { spans_avx512(s, add, spans) },
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx2 => unsafe { spans_avx2(s, add, spans) },
+        _ => spans_core::<T, ScalarMasks>(s, add, spans),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn spans_avx512<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
+    spans_core::<T, Avx512Masks>(s, add, spans)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn spans_avx2<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
+    spans_core::<T, ScalarMasks>(s, add, spans)
+}
+
+#[inline(always)]
+fn spans_core<T: Sym, M: Masks>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
     let n = s.len();
     if n < 3 {
         return;
@@ -518,16 +555,15 @@ pub(crate) fn parse_spans<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, u
     let out = &mut spans.spare_capacity_mut()[..2 * n];
     let mut cnt = 0;
     let mut prev_end = usize::MAX;
-    let simd = T::has_simd();
     let mut blk = 0;
     while blk < m {
         let end = (blk + 64).min(m);
         let (mut core, mut run) = (0u64, 0u64);
         // Whole interior blocks (every position has a symbol on each side) in SIMD.
-        let simd = if simd && blk > 0 && blk + 67 <= n {
-            // SAFETY: the CPU has the features `T::masks` needs (checked by `has_simd`), and
-            // s[blk - 1..blk + 67] is in bounds.
-            (core, run) = unsafe { T::masks(s, blk) };
+        let simd = if M::SIMD && blk > 0 && blk + 67 <= n {
+            // SAFETY: the CPU has the level's features (the caller's entry point is compiled
+            // for them), and s[blk - 1..blk + 67] is in bounds.
+            (core, run) = unsafe { M::masks(s, blk) };
             true
         } else {
             false
@@ -588,17 +624,20 @@ mod tests {
             s in proptest::collection::vec(0u64..4, 0..600),
             add in 0usize..5,
         ) {
-            let mut want = Vec::new();
-            parse_rules(&s, |lo, hi| want.push((lo + add, hi + add)));
-            let mut got = vec![(7, 7)];
-            parse_spans(&s, add, &mut got);
-            proptest::prop_assert_eq!(&got[1..], &want[..]);
-            let b: Vec<u8> = s.iter().map(|&x| (x as u8) >> 1).collect();
-            let mut want = Vec::new();
-            parse_rules(&b, |lo, hi| want.push((lo, hi)));
-            let mut got = Vec::new();
-            parse_spans(&b, 0, &mut got);
-            proptest::prop_assert_eq!(got, want);
+            // Every level this CPU supports, each called explicitly.
+            for level in crate::simd::supported() {
+                let mut want = Vec::new();
+                parse_rules(&s, |lo, hi| want.push((lo + add, hi + add)));
+                let mut got = vec![(7, 7)];
+                parse_spans(level, &s, add, &mut got);
+                proptest::prop_assert_eq!(&got[1..], &want[..], "{}", level);
+                let b: Vec<u8> = s.iter().map(|&x| (x as u8) >> 1).collect();
+                let mut want = Vec::new();
+                parse_rules(&b, |lo, hi| want.push((lo, hi)));
+                let mut got = Vec::new();
+                parse_spans(level, &b, 0, &mut got);
+                proptest::prop_assert_eq!(got, want, "{}", level);
+            }
         }
     }
 

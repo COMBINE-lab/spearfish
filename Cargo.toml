@@ -30,7 +30,6 @@ rayon = "1.12"
 memmap2 = "0.9"
 bytemuck = "1.25"
 mimalloc = { version = "0.1", default-features = false }
-multiversion = "0.9"
 
 [profile.release]
 debug = 1

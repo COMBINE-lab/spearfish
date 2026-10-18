@@ -9,6 +9,24 @@
 //! (the band), and the result is `None` if the distance exceeds `k`. Cost
 //! O(⌈min(m, k)/64⌉ · n) word operations in practice, O(⌈m/64⌉ · n) at worst.
 
+use lcp_core::simd::{self, Level};
+
+/// The SIMD level the kernels here and in `chain` run at: [`simd::active`], resolved once per
+/// call (a DP, a batch) by the caller and passed down. Tests force a level on their thread.
+#[inline]
+pub(crate) fn simd_level() -> Level {
+    #[cfg(test)]
+    if let Some(l) = FORCE_LEVEL.with(|f| f.get()) {
+        return l;
+    }
+    simd::active()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_LEVEL: std::cell::Cell<Option<Level>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Infix,
@@ -143,19 +161,28 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
 /// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
 /// lane, sharing the pattern's blocks.
 pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
-    #[cfg(target_arch = "x86_64")]
-    if pat.m > 0 && std::arch::is_x86_feature_detected!("avx512f") {
-        let mut out = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(8) {
-            // SAFETY: AVX-512F is available (checked above).
-            unsafe { infix_x8(pat, batch, k, &mut out) };
+    match simd_level() {
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 if pat.m > 0 => {
+            let mut out = Vec::with_capacity(texts.len());
+            // SAFETY: the CPU has AVX-512 (the active level).
+            unsafe { infix_avx512(pat, texts, k, &mut out) };
+            out
         }
-        return out;
+        _ => texts
+            .iter()
+            .map(|t| distance_with(pat, t, Mode::Infix, k))
+            .collect(),
     }
-    texts
-        .iter()
-        .map(|t| distance_with(pat, t, Mode::Infix, k))
-        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn infix_avx512(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    for batch in texts.chunks(8) {
+        // SAFETY: AVX-512F is enabled here.
+        unsafe { infix_x8(pat, batch, k, out) };
+    }
 }
 
 /// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
@@ -166,6 +193,7 @@ pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32
 /// `distance_with`, and above k otherwise.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[inline]
 unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
     use std::arch::x86_64::*;
     debug_assert!((1..=8).contains(&texts.len()) && pat.m > 0);
@@ -531,16 +559,10 @@ pub fn affine_extend_window(
 }
 
 /// Exclusive prefix maxima of `xs` in place, starting from `init`: `xs[k]` becomes the
-/// maximum of `init` and `xs[..k]`. The scalar loop is one dependent max per element; with
-/// AVX-512 a 16-lane block is scanned in four shift-and-max steps and the block maximum carried.
-#[inline]
+/// maximum of `init` and `xs[..k]` (the scalar rows' horizontal-gap pass; the vector row
+/// kernels scan in registers instead).
+#[inline(always)]
 fn excl_prefix_max(xs: &mut [i32], init: i32) {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512f") {
-        // SAFETY: AVX-512F is available (checked above).
-        unsafe { excl_prefix_max_avx512(xs, init) };
-        return;
-    }
     let mut g = init;
     for x in xs.iter_mut() {
         let next = g.max(*x);
@@ -549,47 +571,64 @@ fn excl_prefix_max(xs: &mut [i32], init: i32) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
-    use std::arch::x86_64::*;
-    let neg = _mm512_set1_epi32(NEG);
-    let last = _mm512_set1_epi32(15);
-    // The running maximum, broadcast to every lane (kept in a register between blocks).
-    let mut cv = _mm512_set1_epi32(init);
-    let (blocks, rest) = xs.as_chunks_mut::<16>();
-    for c in blocks {
-        // SAFETY: `c` holds 16 i32s; unaligned loads and stores.
-        let mut v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
-        // Inclusive prefix max within the block: lane k takes the max of lanes <= k.
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<15>(v, neg));
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<14>(v, neg));
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<12>(v, neg));
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
-        v = _mm512_max_epi32(v, cv);
-        // Exclusive: shift up one lane, the carry entering lane 0.
-        let out = _mm512_alignr_epi32::<15>(v, cv);
-        unsafe { _mm512_storeu_si512(c.as_mut_ptr().cast(), out) };
-        // Lane 15 holds the block's (inclusive) maximum.
-        cv = _mm512_permutexvar_epi32(last, v);
-    }
-    let mut carry = _mm512_cvtsi512_si32(cv);
-    for x in rest {
-        let next = carry.max(*x);
-        *x = carry;
-        carry = next;
+/// A fused DP row kernel for `run_core` (see [`row_avx512`]); without one, it runs the
+/// scalar passes.
+trait Rows {
+    const FUSED: bool;
+    /// # Safety
+    /// The CPU has the kernel's features; the slices are as [`row_avx512`] takes them.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+    ) -> i32;
+}
+
+/// The scalar passes (autovectorized for the entry point's level).
+struct ScalarRows;
+
+impl Rows for ScalarRows {
+    const FUSED: bool = false;
+    unsafe fn row(
+        _: &[i32],
+        _: &[i32],
+        _: &[u8],
+        _: &mut [i32],
+        _: &mut [i32],
+        _: u8,
+        _: (i32, i32, i32, i32),
+        _: i32,
+    ) -> i32 {
+        unreachable!()
     }
 }
 
-/// AVX-512 with byte masks, checked once.
 #[cfg(target_arch = "x86_64")]
-fn avx512_rows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-    })
+struct Avx512Rows;
+
+#[cfg(target_arch = "x86_64")]
+impl Rows for Avx512Rows {
+    const FUSED: bool = true;
+    #[inline(always)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+    ) -> i32 {
+        // SAFETY: as the caller guarantees.
+        unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) }
+    }
 }
 
 /// One DP row over `w` cells, the three passes of `run` fused per 16-lane block: diagonal and
@@ -600,6 +639,7 @@ fn avx512_rows() -> bool {
 /// same results.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn row_avx512(
     hprev: &[i32],
@@ -744,8 +784,10 @@ fn affine_dp(
     clip: Option<(i32, bool)>,
     geom: usize,
 ) -> Dp {
+    let level = simd_level();
     DP_BUF.with(|b| {
         run(
+            level,
             pattern,
             text,
             mode,
@@ -801,6 +843,7 @@ fn affine_dp_sorted(
         })
         .collect();
     let mut want: Vec<usize> = resume.iter().copied().filter(|&r| r > 0).collect();
+    let level = simd_level();
     want.sort_unstable();
     want.dedup();
     DP_BUF.with(|b| {
@@ -825,6 +868,7 @@ fn affine_dp_sorted(
                 out[k - 1]
             } else if r == 0 {
                 run(
+                    level,
                     pattern,
                     t,
                     mode,
@@ -843,6 +887,7 @@ fn affine_dp_sorted(
                 let i = want.binary_search(&r).unwrap();
                 let s = std::mem::take(&mut snaps[i]);
                 let d = run(
+                    level,
                     pattern,
                     t,
                     mode,
@@ -864,14 +909,72 @@ fn affine_dp_sorted(
     })
 }
 
+/// One DP pass at `level` (which the CPU must support): the whole pass is compiled once per
+/// level, so the row kernel inlines into the row loop and nothing is dispatched per row.
 #[allow(clippy::too_many_arguments)]
-#[multiversion::multiversion(targets(
-    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-    "x86_64+avx2+fma",
-    "x86_64+avx",
-    "aarch64+neon"
-))]
 fn run(
+    level: Level,
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    bg: (usize, usize),
+    clip: Option<(i32, bool)>,
+    cut: usize,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    debug_assert!(simd::detected().includes(level));
+    match level {
+        // SAFETY: the CPU has the level's features (callers pass the active level).
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 => unsafe { run_avx512(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps) },
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 => unsafe { run_avx2(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps) },
+        _ => run_core::<ScalarRows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn run_avx512(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    bg: (usize, usize),
+    clip: Option<(i32, bool)>,
+    cut: usize,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    run_core::<Avx512Rows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn run_avx2(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    bg: (usize, usize),
+    clip: Option<(i32, bool)>,
+    cut: usize,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    run_core::<ScalarRows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn run_core<R: Rows>(
     pattern: &[u8],
     text: &[u8],
     mode: Mode,
@@ -961,6 +1064,7 @@ fn run(
         }
     }; // band of the row in h
     let mut next_snap = snaps.partition_point(|s| s.row < first);
+    let stats = crate::stats::on();
     for i in first..=m {
         let (lo, hi) = range(i);
         if lo > hi {
@@ -993,36 +1097,27 @@ fn run(
             start = 1;
             row_max = fj;
         }
-        if crate::stats::on() {
+        if stats {
             DP_WORK.with(|x| {
                 let (c, r) = x.get();
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
-        // The fused AVX-512 row where available. Off x86-64 the flag is false and the scalar
-        // passes below run (a `cfg` on the whole `if` chain would remove them too).
-        #[cfg(target_arch = "x86_64")]
-        let fused = start <= hi && avx512_rows();
-        #[cfg(not(target_arch = "x86_64"))]
-        let fused = false;
-        if fused {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // SAFETY: AVX-512F/BW/VL are available (checked above).
-                let m = unsafe {
-                    row_avx512(
-                        &h[start - 1..=hi],
-                        &f[start..=hi],
-                        &text[start - 1..hi],
-                        &mut nh[start..=hi],
-                        &mut nf[start..=hi],
-                        c,
-                        (mat, mis, go, ext),
-                        e,
-                    )
-                };
-                row_max = row_max.max(m);
-            }
+        if R::FUSED && start <= hi {
+            // SAFETY: the entry point is compiled for the kernel's features, which the CPU has.
+            let m = unsafe {
+                R::row(
+                    &h[start - 1..=hi],
+                    &f[start..=hi],
+                    &text[start - 1..hi],
+                    &mut nh[start..=hi],
+                    &mut nf[start..=hi],
+                    c,
+                    (mat, mis, go, ext),
+                    e,
+                )
+            };
+            row_max = row_max.max(m);
         } else if start <= hi {
             // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
             // without horizontal gaps), from the previous row only.
