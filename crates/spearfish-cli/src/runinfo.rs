@@ -103,7 +103,7 @@ pub struct IndexInfo {
 impl IndexInfo {
     pub fn of(path: &std::path::Path, idx: &spearfish::Index) -> Self {
         IndexInfo {
-            path: path.display().to_string(),
+            path: spearfish::provenance::absolute(path),
             index_id: idx.id(),
             spec: idx.raw().meta("spec").unwrap_or("").to_string(),
             transcripts: idx.n_transcripts(),

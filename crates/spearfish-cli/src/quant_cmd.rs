@@ -1,8 +1,10 @@
 //! `spearfish quant`: reads to transcript abundances, by mapping to a RAD file and
 //! quantifying it with oarfish (`oarfish -a`), which takes the score scale, preset and span
-//! settings from the file. Writes oarfish's outputs under the prefix, and the mapping's run
-//! record as `<prefix>.map.meta.json`.
+//! settings from the file. Writes oarfish's outputs under the prefix, the mapping's run record
+//! as `<prefix>.map.meta.json`, and oarfish's log as `<prefix>.oarfish.log` (on stderr with
+//! `-v`).
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -99,6 +101,15 @@ pub fn run(args: Args) -> Result<()> {
         cmd.arg("--quiet");
     }
     cmd.args(&args.oarfish_args);
+    // oarfish's log goes to a file unless -v asks for it on stderr; files get no colour codes.
+    let log_path = with_suffix(&args.output, ".oarfish.log");
+    let to_file = log::max_level() < log::LevelFilter::Debug;
+    if to_file {
+        cmd.stderr(std::fs::File::create(&log_path)?);
+    }
+    if to_file || !std::io::stderr().is_terminal() {
+        cmd.env("NO_COLOR", "1");
+    }
     log::debug!("running {cmd:?}");
     let status = cmd
         .status()
@@ -107,7 +118,14 @@ pub fn run(args: Args) -> Result<()> {
         let _ = std::fs::remove_file(&rad);
     }
     if !status.success() {
-        bail!("oarfish failed ({status})");
+        if to_file {
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: Vec<&str> = text.lines().rev().take(20).collect();
+            for l in tail.into_iter().rev() {
+                eprintln!("  oarfish: {l}");
+            }
+        }
+        bail!("oarfish failed ({status}); its log is {}", log_path.display());
     }
     log::info!(
         "quant: estimates in {}",

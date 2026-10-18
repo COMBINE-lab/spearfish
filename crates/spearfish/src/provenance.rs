@@ -40,7 +40,8 @@ impl BuildInfo {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputInfo {
-    /// Transcript FASTA as given (empty when built in memory).
+    /// Transcript FASTA, as an absolute path where it can be resolved (empty when built in
+    /// memory).
     pub path: String,
     /// Transcripts and genes.
     pub transcripts: usize,
@@ -73,6 +74,8 @@ pub struct IndexManifest {
     pub created_unix: u64,
     /// Command line, if built by the `spearfish` binary.
     pub command_line: Vec<String>,
+    /// Directory the command ran in (relative paths on the command line are relative to it).
+    pub working_directory: String,
     /// Build options.
     pub options: crate::IndexOptions,
     /// LCP parser version and hash seed the index was parsed with.
@@ -94,6 +97,7 @@ impl Default for IndexManifest {
             built_by: BuildInfo::current(),
             created_unix: 0,
             command_line: Vec::new(),
+            working_directory: String::new(),
             options: Default::default(),
             lcp_parser_version: lcp_core::LCP_PARSER_VERSION,
             lcp_seed: format!("{:#x}", lcp_core::LcpConfig::default().seed),
@@ -179,6 +183,15 @@ pub fn sidecar(index: &std::path::Path) -> std::path::PathBuf {
     let mut p = index.as_os_str().to_owned();
     p.push(".json");
     p.into()
+}
+
+/// `p` as an absolute path (canonical where it exists), for recording in provenance.
+pub fn absolute(p: &std::path::Path) -> String {
+    std::fs::canonicalize(p)
+        .or_else(|_| std::path::absolute(p))
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
 }
 
 /// xxh3-64 of a file's bytes, as 16 hex digits.

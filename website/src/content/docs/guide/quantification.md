@@ -15,7 +15,8 @@ spearfish quant transcripts.sfi reads.fastq.gz --preset ont -t 16 -o sample
 maps the reads to a RAD file and runs `oarfish -a` on it. oarfish takes the transcripts, the
 score scale, the preset and whether spans reach the read ends from the file, so no other options
 are needed. Its outputs are written under the prefix (`sample.quant`, `sample.meta_info.json`,
-...), and the mapping's run record as `sample.map.meta.json`. The RAD file is removed afterwards
+...), the mapping's run record as `sample.map.meta.json`, and oarfish's log as
+`sample.oarfish.log` (`-v` shows it on the terminal instead). The RAD file is removed afterwards
 unless `--keep-rad` is given.
 
 Mapping settings work as in `spearfish map`. Arguments after `--` go to oarfish:

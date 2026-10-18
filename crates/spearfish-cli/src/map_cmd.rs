@@ -598,12 +598,20 @@ pub fn execute(args: Job) -> Result<Counts> {
         c.bases as f64 / 1e6 / secs
     );
     if let Some(m) = &meta_path {
-        let show = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
+        // Absolute paths, so the record still names the files when read from elsewhere.
+        let abs = |p: &Path| {
+            if p.as_os_str() == "-" {
+                "-".to_string()
+            } else {
+                spearfish::provenance::absolute(p)
+            }
+        };
+        let show = |p: &Option<PathBuf>| p.as_deref().map(abs);
         let record = RunRecord {
             kind: "spearfish-map-run",
             invocation: &invocation,
             index: index_info,
-            reads: reads.display().to_string(),
+            reads: abs(&reads),
             outputs: Outputs {
                 tsv: show(&tsv_path),
                 paf: show(&args.paf),

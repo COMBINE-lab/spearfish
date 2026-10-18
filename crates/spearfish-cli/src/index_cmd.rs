@@ -91,7 +91,7 @@ pub fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let mut txs = spearfish::read_transcripts(&args.transcripts)?;
     let mut input = InputInfo {
-        path: args.transcripts.display().to_string(),
+        path: spearfish::provenance::absolute(&args.transcripts),
         genes_from: "fasta".into(),
         ..Default::default()
     };
@@ -101,7 +101,7 @@ pub fn run(args: Args) -> Result<()> {
             std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
         missing = spearfish::apply_t2g(&mut txs, &table);
         input.genes_from = "t2g".into();
-        input.t2g = Some((path.display().to_string(), file_xxh3(path)?));
+        input.t2g = Some((spearfish::provenance::absolute(path), file_xxh3(path)?));
     }
     if args.infer_genes.is_some() {
         input.genes_from = "inferred".into();
