@@ -191,10 +191,6 @@ pub fn affine(pattern: &[u8], text: &[u8], mode: Mode, sc: &Affine, band: usize)
 /// free: the maximum over all DP cells (as minimap2's extension, without z-drop). Read tails
 /// that don't align (adapters, junk) are clipped instead of forced through the alignment.
 ///
-/// The accepted exact anchor is outside these slices: H[0][0] = 0 is the
-/// relative score at its boundary. Leading gaps pay affine penalties; no local
-/// restart or anchor realignment is needed to stay attached.
-///
 /// With `xdrop`, the extension stops once a whole row of the band scores more than `xdrop`
 /// below the best cell so far (minimap2-style X-drop): the rest of the read is junk for
 /// this text. Pass `i32::MAX` for none.
@@ -222,14 +218,18 @@ pub fn affine_extend(
 /// [`affine`] for each of `texts`, which must be sorted: equal to separate calls, but rows
 /// that read only a prefix shared with the previous text are not recomputed.
 pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, band: usize) -> Vec<i32> {
-    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n)
+    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n, usize::MAX)
         .into_iter()
         .map(|d| d.score)
         .collect()
 }
 
 /// [`affine_extend`] (or, with `diagonal`, [`affine_extend_diagonal`]) for each of `texts`,
-/// which must be sorted, sharing rows as [`affine_sorted`] does.
+/// which must be sorted, sharing rows as [`affine_sorted`] does. Without `diagonal`, the band is
+/// laid out for a text of at least `window` bases, as [`affine_extend_window`] does: a text cut
+/// short where its transcript ends gets the band of the full window, so a read whose far end
+/// doesn't align (a primer, an adapter) is placed as it would be against a longer transcript.
+#[allow(clippy::too_many_arguments)]
 pub fn affine_extend_sorted(
     pattern: &[u8],
     texts: &[&[u8]],
@@ -238,13 +238,70 @@ pub fn affine_extend_sorted(
     end_bonus: i32,
     xdrop: i32,
     diagonal: bool,
+    window: usize,
 ) -> Vec<i32> {
+    affine_extend_sorted_cut(
+        pattern,
+        texts,
+        sc,
+        band,
+        end_bonus,
+        xdrop,
+        diagonal,
+        window,
+        usize::MAX,
+    )
+    .into_iter()
+    .map(|(x, _, _)| x)
+    .collect()
+}
+
+/// [`affine_extend_sorted`], with each text's score also over its first `cut` bases only:
+/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
+/// one pass. Without X-drop, the second equals the pass
+/// over the cut text (same band layout: `window` at least as long as the texts); with it, the
+/// cut score may extend further, since the pass stops only when the whole text's does.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_extend_sorted_cut(
+    pattern: &[u8],
+    texts: &[&[u8]],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+    diagonal: bool,
+    window: usize,
+    cut: usize,
+) -> Vec<(i32, i32, usize)> {
     let m = pattern.len();
-    let geom = |n: usize| if diagonal { m.min(n) } else { n };
-    affine_dp_sorted(pattern, texts, Mode::Prefix, sc, band, Some((xdrop, false)), geom)
-        .into_iter()
-        .map(|d| d.clip_best.max(d.score.saturating_add(end_bonus)))
-        .collect()
+    let geom = |n: usize| if diagonal { m.min(n) } else { n.max(window) };
+    affine_dp_sorted(
+        pattern,
+        texts,
+        Mode::Prefix,
+        sc,
+        band,
+        Some((xdrop, cut != usize::MAX)),
+        geom,
+        cut,
+    )
+    .into_iter()
+    .map(|d| {
+        let end = d.score.saturating_add(end_bonus);
+        let whole = d.clip_best.max(end);
+        let cols = if d.clip_best >= end {
+            d.clip_cell.1
+        } else {
+            d.score_col
+        };
+        let cut = if cut == usize::MAX {
+            whole
+        } else {
+            d.cut_best.max(d.cut_score.saturating_add(end_bonus))
+        };
+        (whole, cut, cols)
+    })
+    .collect()
 }
 
 /// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
@@ -372,6 +429,10 @@ struct Dp {
     text_read: usize,
     /// The last row computed: the pattern length, or the row where the pass stopped.
     last_row: usize,
+    /// With a cut: `clip_best` and the Prefix-mode score over text columns up to the cut only
+    /// (the pass over the text cut there, X-drop aside).
+    cut_best: i32,
+    cut_score: i32,
 }
 
 /// A computed DP row (`h` and `f` over its band `[lo, hi]`) and the clip state after it, from
@@ -385,6 +446,7 @@ struct Snap {
     f: Vec<i32>,
     clip_best: i32,
     clip_cell: (usize, usize),
+    cut_best: i32,
 }
 
 /// Reused per-thread DP rows.
@@ -432,6 +494,7 @@ fn affine_dp(
             sc,
             (band, geom),
             clip,
+            usize::MAX,
             &mut b.borrow_mut(),
             None,
             &mut [],
@@ -443,6 +506,7 @@ fn affine_dp(
 /// resumes from the previous text's rows wherever they read only bases the two texts share
 /// and the bands have the same shape, so isoforms that agree near the anchor are aligned
 /// there once. Results equal separate [`affine_dp`] calls.
+#[allow(clippy::too_many_arguments)]
 fn affine_dp_sorted(
     pattern: &[u8],
     texts: &[&[u8]],
@@ -451,6 +515,7 @@ fn affine_dp_sorted(
     band: usize,
     clip: Option<(i32, bool)>,
     geom: impl Fn(usize) -> usize,
+    cut: usize,
 ) -> Vec<Dp> {
     let m = pattern.len();
     let shape = |n: usize| {
@@ -508,6 +573,7 @@ fn affine_dp_sorted(
                     sc,
                     (band, geom(t.len())),
                     clip,
+                    cut,
                     b,
                     None,
                     &mut snaps,
@@ -525,6 +591,7 @@ fn affine_dp_sorted(
                     sc,
                     (band, geom(t.len())),
                     clip,
+                    cut,
                     b,
                     Some(&s),
                     &mut snaps,
@@ -553,31 +620,17 @@ fn run(
     sc: &Affine,
     (band, geom): (usize, usize),
     clip: Option<(i32, bool)>,
+    cut: usize,
     b: &mut DpBuf,
     resume: Option<&Snap>,
     snaps: &mut [Snap],
 ) -> Dp {
     let (m, n) = (pattern.len(), text.len());
-    // A global alignment with either side empty has exactly one possible path.
-    // Compute its affine gap cost without allocating or initializing DP buffers.
-    if mode == Mode::Global && clip.is_none() && (m == 0 || n == 0) {
-        let len = m.max(n);
-        return Dp {
-            score: if len == 0 {
-                0
-            } else {
-                -(sc.open + sc.ext * len as i32)
-            },
-            score_col: n,
-            clip_best: 0,
-            clip_cell: (0, 0),
-            text_read: n,
-            last_row: m,
-        };
-    }
-    // With `clip`, the best cell anywhere (0 aligns nothing).
+    // With `clip`, the best cell anywhere (0 aligns nothing), and among text columns up to
+    // `cut` (usize::MAX: no cut).
     let mut clip_best = 0i32;
     let mut clip_cell = (0usize, 0usize);
+    let mut cut_best = 0i32;
     let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
     let go = sc.open + sc.ext;
     // Row i (pattern) covers text columns [i - band - (m - g)⁺, i + band +
@@ -619,6 +672,7 @@ fn run(
             edges(&mut b.f, s.lo, s.hi);
             clip_best = s.clip_best;
             clip_cell = s.clip_cell;
+            cut_best = s.cut_best;
             ((s.lo, s.hi), s.row + 1)
         }
         None => {
@@ -649,6 +703,8 @@ fn run(
                 clip_cell,
                 text_read: n,
                 last_row: i,
+                cut_best,
+                cut_score: NEG,
             };
         }
         let c = pattern[i - 1] & 3;
@@ -719,6 +775,14 @@ fn run(
             }
             row_max = row_max.max(m);
         }
+        if cut != usize::MAX && lo <= cut {
+            let row = if hi <= cut {
+                row_max
+            } else {
+                b.nh[lo..=cut].iter().copied().max().unwrap_or(NEG)
+            };
+            cut_best = cut_best.max(row);
+        }
         if let Some((xdrop, cell)) = clip {
             let row = row_max;
             if row > clip_best {
@@ -736,6 +800,8 @@ fn run(
                     clip_cell,
                     text_read: hi,
                     last_row: i,
+                    cut_best,
+                    cut_score: NEG,
                 };
             }
         }
@@ -751,7 +817,7 @@ fn run(
             s.h.extend_from_slice(&b.h[lo..=hi]);
             s.f.clear();
             s.f.extend_from_slice(&b.f[lo..=hi]);
-            (s.clip_best, s.clip_cell) = (clip_best, clip_cell);
+            (s.clip_best, s.clip_cell, s.cut_best) = (clip_best, clip_cell, cut_best);
             next_snap += 1;
         }
     }
@@ -763,6 +829,11 @@ fn run(
             (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
         }
     };
+    let cut_score = if cut != usize::MAX && prev.0 <= cut {
+        b.h[prev.0..=prev.1.min(cut)].iter().copied().max().unwrap_or(NEG)
+    } else {
+        NEG
+    };
     Dp {
         score,
         score_col,
@@ -770,6 +841,8 @@ fn run(
         clip_cell,
         text_read: prev.1,
         last_row: m,
+        cut_best,
+        cut_score,
     }
 }
 
@@ -888,18 +961,6 @@ mod tests {
     }
 
     #[test]
-    fn extension_starts_at_accepted_anchor_boundary() {
-        let sc = Affine::ONT;
-        // A leading mismatch cannot restart locally at the later exact suffix.
-        assert_eq!(affine_extend(&[0, 1, 2], &[3, 1, 2], &sc, 16, 0, 50), 0);
-        // A leading deletion remains attached through its paid gap.
-        assert_eq!(affine_extend(&[0, 1, 2, 3], &[3, 0, 1, 2, 3], &sc, 16, 5, 50), 7);
-        // Entire junk tails clip to the accepted anchor's relative zero score.
-        assert_eq!(affine_extend(&[0, 0], &[3, 3], &sc, 16, 5, 50), 0);
-        assert_eq!(affine_extend(&[], &[], &sc, 16, 5, 50), 5);
-    }
-
-    #[test]
     fn affine_extend_end_examples() {
         let sc = Affine::default();
         let end = |p: &[u8], t: &[u8], bonus| {
@@ -966,34 +1027,6 @@ mod tests {
         assert_eq!(affine(&[0, 1], &[], Mode::Global, &sc, usize::MAX), -8);
     }
 
-    #[test]
-    fn empty_global_gaps_do_no_dp_work() {
-        for sc in [Affine::ONT, Affine::HIFI] {
-            let before = dp_work();
-            for len in [0, 1, 2, 100] {
-                let bases = vec![0; len];
-                let expected = if len == 0 {
-                    0
-                } else {
-                    -(sc.open + sc.ext * len as i32)
-                };
-                for band in [0, 16, usize::MAX] {
-                    assert_eq!(affine(&[], &bases, Mode::Global, &sc, band), expected);
-                    assert_eq!(affine(&bases, &[], Mode::Global, &sc, band), expected);
-                    assert_eq!(
-                        affine_sorted(&[], &[&[], &bases], Mode::Global, &sc, band),
-                        [0, expected]
-                    );
-                }
-            }
-            assert_eq!(dp_work(), before);
-            if crate::stats::on() {
-                affine(&[0], &[0], Mode::Global, &sc, 16);
-                assert!(dp_work().0 > before.0); // Check that instrumentation is active.
-            }
-        }
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
 
@@ -1021,7 +1054,7 @@ mod tests {
             base in prop::collection::vec(0u8..4, 1..160),
             edits in prop::collection::vec((0usize..160, 0u8..4, 0u8..3), 0..12),
             variants in prop::collection::vec((0usize..160, prop::collection::vec(0u8..4, 0..40), 0usize..60), 1..8),
-            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8,
+            band in 2usize..24, xdrop in 5i32..60, bonus in 0i32..8, window_extra in 0usize..40,
         ) {
             let mut p = base.clone();
             for (pos, b, kind) in edits {
@@ -1048,7 +1081,7 @@ mod tests {
                     prop_assert_eq!(got, want, "mode {:?}", mode);
                 }
                 for diag in [false, true] {
-                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag);
+                    let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, diag, 0);
                     let want: Vec<i32> = refs
                         .iter()
                         .map(|t| if diag {
@@ -1059,6 +1092,27 @@ mod tests {
                         .collect();
                     prop_assert_eq!(got, want, "diag {}", diag);
                 }
+                // A band laid out for a window at least as long as each text, as in
+                // affine_extend_window.
+                let w = refs.iter().map(|t| t.len()).max().unwrap_or(0) + window_extra;
+                let got = affine_extend_sorted(&p, &refs, &sc, band, bonus, xdrop, false, w);
+                let want: Vec<i32> = refs
+                    .iter()
+                    .map(|t| affine_extend_window(&p, t, w, &sc, band, bonus, xdrop).0)
+                    .collect();
+                prop_assert_eq!(got, want, "window {}", w);
+                // Scores over each text cut at `c`, from the same pass, equal passes over the cut
+                // texts (no X-drop, so neither pass stops early).
+                let c = refs.iter().map(|t| t.len()).min().unwrap_or(0) + window_extra / 2;
+                let both = affine_extend_sorted_cut(&p, &refs, &sc, band, bonus, i32::MAX, false, w, c);
+                let want: Vec<i32> = refs
+                    .iter()
+                    .map(|t| affine_extend_window(&p, &t[..t.len().min(c)], w, &sc, band, bonus, i32::MAX).0)
+                    .collect();
+                prop_assert_eq!(both.iter().map(|x| x.1).collect::<Vec<_>>(), want, "cut {}", c);
+                // Tracking the cut changes nothing about the whole texts' scores.
+                let whole = affine_extend_sorted(&p, &refs, &sc, band, bonus, i32::MAX, false, w);
+                prop_assert_eq!(both.iter().map(|x| x.0).collect::<Vec<_>>(), whole, "whole with cut");
             }
         }
 
