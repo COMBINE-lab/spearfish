@@ -159,7 +159,7 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
 
 /// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
 /// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
-/// lane, sharing the pattern's blocks.
+/// lane, sharing the pattern's blocks; with AVX2, up to four.
 pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
     match simd_level() {
         #[cfg(target_arch = "x86_64")]
@@ -167,6 +167,13 @@ pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32
             let mut out = Vec::with_capacity(texts.len());
             // SAFETY: the CPU has AVX-512 (the active level).
             unsafe { infix_avx512(pat, texts, k, &mut out) };
+            out
+        }
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 if pat.m > 0 => {
+            let mut out = Vec::with_capacity(texts.len());
+            // SAFETY: the CPU has AVX2 (the active level).
+            unsafe { infix_avx2(pat, texts, k, &mut out) };
             out
         }
         _ => texts
@@ -326,6 +333,165 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     let mut bs = [0i64; 8];
     // SAFETY: eight i64s.
     unsafe { _mm512_storeu_si512(bs.as_mut_ptr().cast(), best) };
+    for (l, t) in texts.iter().enumerate() {
+        let kl = k.min((m + t.len()) as u32) as i64;
+        out.push((bs[l] <= kl).then_some(bs[l] as u32));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn infix_avx2(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    for batch in texts.chunks(4) {
+        // SAFETY: AVX2 is enabled here.
+        unsafe { infix_x4(pat, batch, k, out) };
+    }
+}
+
+/// [`infix_x8`] for up to four texts in AVX2, one per 64-bit lane: the same recurrence and
+/// band union, with blends for the per-lane masked updates and vector compares for the mask
+/// tests. A lane's code selects its block mask through a dword permute.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=4).contains(&texts.len()) && pat.m > 0);
+    let m = pat.m;
+    let n_max = texts.iter().map(|t| t.len()).max().unwrap();
+    let kk = k.min((m + n_max) as u32) as i64;
+    let blocks = m.div_ceil(W);
+    let last_bit = (m - 1) % W;
+    let rows = |b: usize| if b + 1 == blocks { last_bit + 1 } else { W };
+    // Column j of lane l at 4j + l: the dword indices (2c, 2c + 1) of the lane's code c in a
+    // block's four masks (code 0 past the lane's text, whose lane is not updated there).
+    let mut tx = vec![1u64 << 32; 4 * n_max];
+    for (l, t) in texts.iter().enumerate() {
+        for (j, &c) in t.iter().enumerate() {
+            let c = (c & 3) as u64;
+            tx[4 * j + l] = (2 * c) | ((2 * c + 1) << 32);
+        }
+    }
+    let len = |l: usize| texts.get(l).map_or(0, |t| t.len() as i64);
+    // Lanes still inside their text, per column: lane l is live while j < len(l).
+    let lens = _mm256_set_epi64x(len(3), len(2), len(1), len(0));
+    // SAFETY: four u64s.
+    let peq: Vec<__m256i> = pat
+        .peq
+        .iter()
+        .map(|q| unsafe { _mm256_loadu_si256(q.as_ptr().cast()) })
+        .collect();
+    let ones = _mm256_set1_epi64x(-1);
+    let one = _mm256_set1_epi64x(1);
+    let zero = _mm256_setzero_si256();
+    let mut pv = vec![ones; blocks];
+    let mut mv = vec![zero; blocks];
+    let mut score: Vec<__m256i> = (0..blocks)
+        .map(|b| _mm256_set1_epi64x((b * W + rows(b)) as i64))
+        .collect();
+    let kv = _mm256_set1_epi64x(kk);
+    let kw = _mm256_set1_epi64x(kk + W as i64);
+    let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
+    // Column 0: D[m][0] = m.
+    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+        _mm256_set1_epi64x(m as i64)
+    } else {
+        _mm256_set1_epi64x(i64::MAX)
+    };
+    // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn step(
+        pv: &mut __m256i,
+        mv: &mut __m256i,
+        eq: __m256i,
+        (neg, pos): (__m256i, __m256i),
+        bitv: __m128i,
+        live: __m256i,
+    ) -> (__m256i, __m256i) {
+        let (p, m) = (*pv, *mv);
+        let one = _mm256_set1_epi64x(1);
+        let ones = _mm256_set1_epi64x(-1);
+        let xv = _mm256_or_si256(eq, m);
+        let eq = _mm256_or_si256(eq, neg);
+        let xh = _mm256_or_si256(
+            _mm256_xor_si256(_mm256_add_epi64(_mm256_and_si256(eq, p), p), p),
+            eq,
+        );
+        let ph = _mm256_or_si256(m, _mm256_xor_si256(_mm256_or_si256(xh, p), ones));
+        let mh = _mm256_and_si256(p, xh);
+        let hp = _mm256_and_si256(_mm256_srl_epi64(ph, bitv), one);
+        let hm = _mm256_and_si256(_mm256_srl_epi64(mh, bitv), one);
+        let ph = _mm256_or_si256(_mm256_slli_epi64::<1>(ph), pos);
+        let mh = _mm256_or_si256(_mm256_slli_epi64::<1>(mh), neg);
+        let npv = _mm256_or_si256(mh, _mm256_xor_si256(_mm256_or_si256(xv, ph), ones));
+        let nmv = _mm256_and_si256(ph, xv);
+        *pv = _mm256_blendv_epi8(p, npv, live);
+        *mv = _mm256_blendv_epi8(m, nmv, live);
+        (hm, hp)
+    }
+    let bitw = _mm_cvtsi64_si128((W - 1) as i64);
+    let bitl = _mm_cvtsi64_si128(last_bit as i64);
+    let bitv = |b: usize| if b + 1 == blocks { bitl } else { bitw };
+    for j in 0..n_max {
+        let live = _mm256_cmpgt_epi64(lens, _mm256_set1_epi64x(j as i64));
+        // SAFETY: tx holds 4 indices per column.
+        let idx = unsafe { _mm256_loadu_si256(tx.as_ptr().add(4 * j).cast()) };
+        // Infix: the top row is free (horizontal delta 0).
+        let mut h = (zero, zero);
+        for b in 0..=last as usize {
+            let eq = _mm256_permutevar8x32_epi32(peq[b], idx);
+            h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
+            score[b] = _mm256_add_epi64(score[b], _mm256_and_si256(_mm256_sub_epi64(h.1, h.0), live));
+        }
+        let lb = last as usize;
+        let hin = _mm256_sub_epi64(h.1, h.0);
+        let mut added = false;
+        if lb + 1 < blocks {
+            let eqn = _mm256_permutevar8x32_epi32(peq[lb + 1], idx);
+            let top = _mm256_sub_epi64(score[lb], hin);
+            // Live lanes with top <= k whose next block's top row can still be <= k.
+            let want = _mm256_and_si256(
+                _mm256_andnot_si256(_mm256_cmpgt_epi64(top, kv), live),
+                _mm256_or_si256(
+                    _mm256_cmpeq_epi64(_mm256_and_si256(eqn, one), one),
+                    _mm256_cmpgt_epi64(zero, hin),
+                ),
+            );
+            if _mm256_testz_si256(want, want) == 0 {
+                let nb = lb + 1;
+                pv[nb] = ones;
+                mv[nb] = zero;
+                let hn = step(&mut pv[nb], &mut mv[nb], eqn, h, bitv(nb), live);
+                score[nb] = _mm256_add_epi64(
+                    _mm256_add_epi64(top, _mm256_set1_epi64x(rows(nb) as i64)),
+                    _mm256_sub_epi64(hn.1, hn.0),
+                );
+                last += 1;
+                added = true;
+            }
+        }
+        if !added {
+            // Drop the bottom block while no live lane scores below k + W in it.
+            while last >= 0 && {
+                let below = _mm256_and_si256(live, _mm256_cmpgt_epi64(kw, score[last as usize]));
+                _mm256_testz_si256(below, below) != 0
+            } {
+                last -= 1;
+            }
+            if last < 0 {
+                break;
+            }
+        }
+        if last as usize + 1 == blocks {
+            let s = score[blocks - 1];
+            let lt = _mm256_and_si256(live, _mm256_cmpgt_epi64(best, s));
+            best = _mm256_blendv_epi8(best, s, lt);
+        }
+    }
+    let mut bs = [0i64; 4];
+    // SAFETY: four i64s.
+    unsafe { _mm256_storeu_si256(bs.as_mut_ptr().cast(), best) };
     for (l, t) in texts.iter().enumerate() {
         let kl = k.min((m + t.len()) as u32) as i64;
         out.push((bs[l] <= kl).then_some(bs[l] as u32));
