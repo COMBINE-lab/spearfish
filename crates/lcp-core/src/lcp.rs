@@ -418,6 +418,12 @@ pub(crate) trait Sym: Ord + Copy {
     /// The CPU has AVX-512 F/BW, and `s[blk - 1..blk + 67]` is in bounds.
     #[cfg(target_arch = "x86_64")]
     unsafe fn masks_avx512(s: &[Self], blk: usize) -> (u64, u64);
+    /// [`Sym::masks_avx512`] with AVX2.
+    ///
+    /// # Safety
+    /// The CPU has AVX2, and `s[blk - 1..blk + 67]` is in bounds.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn masks_avx2(s: &[Self], blk: usize) -> (u64, u64);
 }
 
 impl Sym for u8 {
@@ -427,6 +433,12 @@ impl Sym for u8 {
         // SAFETY: as the caller guarantees.
         unsafe { masks_u8(s, blk) }
     }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn masks_avx2(s: &[u8], blk: usize) -> (u64, u64) {
+        // SAFETY: as the caller guarantees.
+        unsafe { masks_u8_avx2(s, blk) }
+    }
 }
 
 impl Sym for u64 {
@@ -435,6 +447,12 @@ impl Sym for u64 {
     unsafe fn masks_avx512(s: &[u64], blk: usize) -> (u64, u64) {
         // SAFETY: as the caller guarantees.
         unsafe { masks_u64(s, blk) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn masks_avx2(s: &[u64], blk: usize) -> (u64, u64) {
+        // SAFETY: as the caller guarantees.
+        unsafe { masks_u64_avx2(s, blk) }
     }
 }
 
@@ -447,6 +465,19 @@ trait Masks {
 }
 
 struct ScalarMasks;
+
+#[cfg(target_arch = "x86_64")]
+struct Avx2Masks;
+
+#[cfg(target_arch = "x86_64")]
+impl Masks for Avx2Masks {
+    const SIMD: bool = true;
+    #[inline(always)]
+    unsafe fn masks<T: Sym>(s: &[T], blk: usize) -> (u64, u64) {
+        // SAFETY: as the caller guarantees.
+        unsafe { T::masks_avx2(s, blk) }
+    }
+}
 
 impl Masks for ScalarMasks {
     const SIMD: bool = false;
@@ -508,6 +539,70 @@ unsafe fn masks_u64(s: &[u64], blk: usize) -> (u64, u64) {
     (core, run)
 }
 
+// [`masks_u8`] in two 32-byte halves: unsigned compares are signed ones after flipping the
+// sign bits, and `movemask` gathers the lane bits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn masks_u8_avx2(s: &[u8], blk: usize) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    let bias = _mm256_set1_epi8(i8::MIN);
+    let half = |h: usize| {
+        // SAFETY: s[blk - 1..blk + 67] is in bounds (caller).
+        let ld = |o: usize| unsafe {
+            _mm256_xor_si256(
+                _mm256_loadu_si256(s.as_ptr().add(blk + 32 * h + o - 1).cast()),
+                bias,
+            )
+        };
+        let (a, b, c, d, e) = (ld(0), ld(1), ld(2), ld(3), ld(4));
+        let gt = |x, y| _mm256_cmpgt_epi8(x, y);
+        // LMIN: b > c < d. LMAX: a <= b < c > d >= e. Run: b != c == d.
+        let lmin = _mm256_and_si256(gt(b, c), gt(d, c));
+        let lmax = _mm256_andnot_si256(
+            gt(a, b),
+            _mm256_and_si256(gt(c, b), _mm256_andnot_si256(gt(e, d), gt(c, d))),
+        );
+        let run = _mm256_andnot_si256(_mm256_cmpeq_epi8(b, c), _mm256_cmpeq_epi8(c, d));
+        let bits = |v| _mm256_movemask_epi8(v) as u32 as u64;
+        (bits(_mm256_or_si256(lmin, lmax)), bits(run))
+    };
+    let ((c0, r0), (c1, r1)) = (half(0), half(1));
+    (c0 | (c1 << 32), r0 | (r1 << 32))
+}
+
+// [`masks_u64`] in sixteen groups of four 64-bit lanes, unsigned compares as for
+// [`masks_u8_avx2`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn masks_u64_avx2(s: &[u64], blk: usize) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    let bias = _mm256_set1_epi64x(i64::MIN);
+    let (mut core, mut run) = (0u64, 0u64);
+    for g in 0..16 {
+        // SAFETY: s[blk - 1..blk + 67] is in bounds (caller).
+        let ld = |o: usize| unsafe {
+            _mm256_xor_si256(
+                _mm256_loadu_si256(s.as_ptr().add(blk + 4 * g + o - 1).cast()),
+                bias,
+            )
+        };
+        let (a, b, c, d, e) = (ld(0), ld(1), ld(2), ld(3), ld(4));
+        let gt = |x, y| _mm256_cmpgt_epi64(x, y);
+        let lmin = _mm256_and_si256(gt(b, c), gt(d, c));
+        let lmax = _mm256_andnot_si256(
+            gt(a, b),
+            _mm256_and_si256(gt(c, b), _mm256_andnot_si256(gt(e, d), gt(c, d))),
+        );
+        let r = _mm256_andnot_si256(_mm256_cmpeq_epi64(b, c), _mm256_cmpeq_epi64(c, d));
+        let bits = |v| _mm256_movemask_pd(_mm256_castsi256_pd(v)) as u64;
+        core |= bits(_mm256_or_si256(lmin, lmax)) << (4 * g);
+        run |= bits(r) << (4 * g);
+    }
+    (core, run)
+}
+
 /// [`parse_rules`] in two phases per block of 64 positions: a branch-free pass computes which
 /// positions start an LMIN/LMAX core or a run (RINT candidate) as bit masks, then a loop over
 /// the set bits emits the cores and the SSEQ gap fillers between them. Positions that start
@@ -539,7 +634,7 @@ fn spans_avx512<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
 fn spans_avx2<T: Sym>(s: &[T], add: usize, spans: &mut Vec<(usize, usize)>) {
-    spans_core::<T, ScalarMasks>(s, add, spans)
+    spans_core::<T, Avx2Masks>(s, add, spans)
 }
 
 #[inline(always)]
