@@ -206,7 +206,7 @@ fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut
     } else {
         i32::MAX
     }; L];
-    for (j, c) in tx.chunks_exact(L).enumerate() {
+    for (j, c) in tx.as_chunks::<L>().0.iter().enumerate() {
         let c: [usize; L] = std::array::from_fn(|l| c[l] as usize);
         let live: [bool; L] = std::array::from_fn(|l| j < lens[l]);
         // Infix: the top row is free (horizontal delta 0).
