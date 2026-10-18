@@ -140,6 +140,8 @@ pub struct IndexData {
     pub tx_raw_ck: (Vec<u64>, Vec<u32>),
     pub tx_names: Vec<String>,
     pub gene_names: Vec<String>,
+    /// What built the index, as JSON (written as section `manifest`; the caller fills it in).
+    pub manifest: Option<String>,
 }
 
 /// 2-bit pack an ASCII sequence (non-ACGT as A), 32 bases per word, base i at bits
@@ -165,12 +167,16 @@ fn pool(strings: &[String]) -> (Vec<u64>, Vec<u8>) {
 }
 
 impl IndexData {
-    fn writer(&self) -> Writer {
+    /// The `meta` section's text.
+    pub fn meta_text(&self) -> String {
+        self.meta.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+    }
+
+    fn writer(&self) -> Writer<'_> {
         let mut w = Writer::default();
-        let meta: String = self.meta.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-        w.add("meta", meta.as_bytes());
+        w.add_owned("meta", self.meta_text().into_bytes());
         w.add("labels", &self.labels);
-        w.add("label_dir", &label_dir(&self.labels));
+        w.add_owned("label_dir", label_dir(&self.labels));
         w.add("node_unitig", &self.node_unitig);
         w.add("node_offset", &self.node_offset);
         w.add("node_len", &self.node_len);
@@ -198,11 +204,14 @@ impl IndexData {
             w.add("tx_raw_ck", &self.tx_raw_ck.1);
         }
         let (o, b) = pool(&self.tx_names);
-        w.add("tx_name_off", &o);
-        w.add("tx_names", &b);
+        w.add_owned("tx_name_off", o);
+        w.add_owned("tx_names", b);
         let (o, b) = pool(&self.gene_names);
-        w.add("gene_name_off", &o);
-        w.add("gene_names", &b);
+        w.add_owned("gene_name_off", o);
+        w.add_owned("gene_names", b);
+        if let Some(m) = &self.manifest {
+            w.add("manifest", m.as_bytes());
+        }
         w
     }
 
@@ -396,6 +405,60 @@ impl Index {
 
     pub fn meta(&self, key: &str) -> Option<&str> {
         self.meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// The `meta` section's text (`key=value` lines).
+    pub fn meta_text(&self) -> &str {
+        std::str::from_utf8(self.store.get::<u8>("meta").unwrap_or(&[])).unwrap_or("")
+    }
+
+    /// The manifest (JSON) recorded when the index was built, if any.
+    pub fn manifest(&self) -> Option<&str> {
+        let b = self.store.get::<u8>("manifest").ok()?;
+        std::str::from_utf8(b).ok()
+    }
+
+    /// The index holds raw (uncompressed) transcript sequence.
+    pub fn has_raw(&self) -> bool {
+        self.raw
+            .as_ref()
+            .is_some_and(|r| r.off.len > self.n_transcripts())
+    }
+
+    /// Check that this build parses sequence as the index was built: an index built with
+    /// another LCP parser version or hash seed loads, but would give wrong mappings.
+    pub fn check_compatible(&self) -> Result<()> {
+        let spec = self.meta("spec").unwrap_or("");
+        if !spec.starts_with("lcp") {
+            return Ok(());
+        }
+        if let Some(v) = self.meta("lcp_parser_version") {
+            let ours = lcp_core::LCP_PARSER_VERSION.to_string();
+            anyhow::ensure!(
+                v == ours,
+                "index built with LCP parser version {v}, this build parses with version {ours}; rebuild the index"
+            );
+        }
+        if let Some(seed) = self.meta("lcp_seed") {
+            let ours = format!("{:#x}", lcp_core::LcpConfig::default().seed);
+            anyhow::ensure!(
+                seed == ours,
+                "index built with LCP seed {seed}, this build uses {ours}; rebuild the index"
+            );
+        }
+        Ok(())
+    }
+
+    /// Every section's name, size in bytes and xxh3-64 checksum.
+    pub fn section_checksums(&self) -> Vec<(String, usize, u64)> {
+        self.store
+            .sizes()
+            .into_iter()
+            .map(|(name, len)| {
+                let h = xxhash_rust::xxh3::xxh3_64(self.store.get::<u8>(&name).unwrap_or(&[]));
+                (name, len, h)
+            })
+            .collect()
     }
 
     pub fn n_nodes(&self) -> usize {

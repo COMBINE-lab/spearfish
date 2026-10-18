@@ -4,6 +4,7 @@
 //! table of `(name: [u8; 24], offset: u64, len_bytes: u64)` entries, then each section's
 //! bytes at a 64-byte-aligned offset.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -17,21 +18,31 @@ pub const FORMAT_VERSION: u32 = 3;
 const NAME_LEN: usize = 24;
 const ALIGN: usize = 64;
 
-/// Sections to write, in order.
+/// Sections to write, in order. Sections borrow their data where they can, so writing an
+/// index to disk streams it without another copy.
 #[derive(Default)]
-pub struct Writer {
-    sections: Vec<(String, Vec<u8>)>,
+pub struct Writer<'a> {
+    sections: Vec<(String, Cow<'a, [u8]>)>,
 }
 
-impl Writer {
-    pub fn add<T: Pod>(&mut self, name: &str, data: &[T]) {
+impl<'a> Writer<'a> {
+    /// Add a section borrowing `data`.
+    pub fn add<T: Pod>(&mut self, name: &str, data: &'a [T]) {
         assert!(name.len() <= NAME_LEN, "section name too long: {name}");
         self.sections
-            .push((name.to_string(), bytemuck::cast_slice(data).to_vec()));
+            .push((name.to_string(), Cow::Borrowed(bytemuck::cast_slice(data))));
     }
 
-    /// Serialize to bytes (as written to disk).
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// Add a section owning its data.
+    pub fn add_owned<T: Pod>(&mut self, name: &str, data: Vec<T>) {
+        assert!(name.len() <= NAME_LEN, "section name too long: {name}");
+        let bytes = bytemuck::cast_slice(&data).to_vec();
+        self.sections.push((name.to_string(), Cow::Owned(bytes)));
+    }
+
+    /// The header (magic, version, section table) and each section's offset; the file is
+    /// `total` bytes.
+    fn layout(&self) -> (Vec<u8>, Vec<usize>, usize) {
         let header = 16 + self.sections.len() * (NAME_LEN + 16);
         let mut offsets = Vec::with_capacity(self.sections.len());
         let mut pos = header.next_multiple_of(ALIGN);
@@ -39,28 +50,55 @@ impl Writer {
             offsets.push(pos);
             pos = (pos + d.len()).next_multiple_of(ALIGN);
         }
-        let mut out = vec![0u8; pos];
-        out[..8].copy_from_slice(MAGIC);
-        out[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out[12..16].copy_from_slice(&(self.sections.len() as u32).to_le_bytes());
+        let mut h = vec![0u8; header];
+        h[..8].copy_from_slice(MAGIC);
+        h[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        h[12..16].copy_from_slice(&(self.sections.len() as u32).to_le_bytes());
         for (i, ((name, d), &off)) in self.sections.iter().zip(&offsets).enumerate() {
             let e = 16 + i * (NAME_LEN + 16);
-            out[e..e + name.len()].copy_from_slice(name.as_bytes());
-            out[e + NAME_LEN..e + NAME_LEN + 8].copy_from_slice(&(off as u64).to_le_bytes());
-            out[e + NAME_LEN + 8..e + NAME_LEN + 16].copy_from_slice(&(d.len() as u64).to_le_bytes());
+            h[e..e + name.len()].copy_from_slice(name.as_bytes());
+            h[e + NAME_LEN..e + NAME_LEN + 8].copy_from_slice(&(off as u64).to_le_bytes());
+            h[e + NAME_LEN + 8..e + NAME_LEN + 16].copy_from_slice(&(d.len() as u64).to_le_bytes());
+        }
+        (h, offsets, pos)
+    }
+
+    /// Serialize to bytes (as written to disk).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let (h, offsets, total) = self.layout();
+        let mut out = vec![0u8; total];
+        out[..h.len()].copy_from_slice(&h);
+        for ((_, d), &off) in self.sections.iter().zip(&offsets) {
             out[off..off + d.len()].copy_from_slice(d);
         }
         out
     }
 
+    /// Stream to `w`, as [`Writer::to_bytes`] lays the bytes out; returns bytes written.
+    pub fn write_to(&self, w: &mut impl Write) -> Result<u64> {
+        let (h, offsets, total) = self.layout();
+        w.write_all(&h)?;
+        let mut pos = h.len();
+        let zeros = [0u8; ALIGN];
+        for ((_, d), &off) in self.sections.iter().zip(&offsets) {
+            w.write_all(&zeros[..off - pos])?;
+            w.write_all(d)?;
+            pos = off + d.len();
+        }
+        w.write_all(&zeros[..total - pos])?;
+        Ok(total as u64)
+    }
+
+    /// Write to `path` (through a temporary file renamed into place); returns bytes written.
     pub fn write(&self, path: &Path) -> Result<u64> {
-        let bytes = self.to_bytes();
         let tmp = path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(&bytes)?;
+        let f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        let n = self.write_to(&mut w)?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
-        Ok(bytes.len() as u64)
+        Ok(n)
     }
 }
 
@@ -135,6 +173,11 @@ impl Store {
         bytemuck::try_cast_slice(bytes).map_err(|e| anyhow::anyhow!("section {name}: {e:?}"))
     }
 
+    /// Whether the container has section `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.sections.contains_key(name)
+    }
+
     /// Section sizes in bytes, by name.
     pub fn sizes(&self) -> Vec<(String, usize)> {
         let mut v: Vec<_> = self.sections.iter().map(|(k, &(_, l))| (k.clone(), l)).collect();
@@ -153,7 +196,14 @@ mod tests {
         w.add("a", &[1u64, 2, 3]);
         w.add("b", &[7u32, 8]);
         w.add("text", b"hello");
-        let s = Store::from_bytes(&w.to_bytes()).unwrap();
+        w.add_owned("owned", vec![9u32, 10, 11]);
+        let bytes = w.to_bytes();
+        let mut streamed = Vec::new();
+        assert_eq!(w.write_to(&mut streamed).unwrap(), bytes.len() as u64);
+        assert_eq!(streamed, bytes);
+        let s = Store::from_bytes(&bytes).unwrap();
+        assert_eq!(s.get::<u32>("owned").unwrap(), &[9, 10, 11]);
+        assert!(s.has("a") && !s.has("missing"));
         assert_eq!(s.get::<u64>("a").unwrap(), &[1, 2, 3]);
         assert_eq!(s.get::<u32>("b").unwrap(), &[7, 8]);
         assert_eq!(s.get::<u8>("text").unwrap(), b"hello");
