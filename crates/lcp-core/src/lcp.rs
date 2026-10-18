@@ -438,7 +438,10 @@ impl Sym for u8 {
         // SAFETY: as the caller guarantees.
         return unsafe { masks_u8(s, blk) };
         #[cfg(not(target_arch = "x86_64"))]
-        unreachable!()
+        {
+            let _ = (s, blk);
+            unreachable!()
+        }
     }
 }
 
@@ -454,7 +457,10 @@ impl Sym for u64 {
         // SAFETY: as the caller guarantees.
         return unsafe { masks_u64(s, blk) };
         #[cfg(not(target_arch = "x86_64"))]
-        unreachable!()
+        {
+            let _ = (s, blk);
+            unreachable!()
+        }
     }
 }
 

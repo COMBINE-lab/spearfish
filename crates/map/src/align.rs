@@ -999,22 +999,30 @@ fn run(
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
+        // The fused AVX-512 row where available. Off x86-64 the flag is false and the scalar
+        // passes below run (a `cfg` on the whole `if` chain would remove them too).
         #[cfg(target_arch = "x86_64")]
-        if start <= hi && avx512_rows() {
-            // SAFETY: AVX-512F/BW/VL are available (checked above).
-            let m = unsafe {
-                row_avx512(
-                    &h[start - 1..=hi],
-                    &f[start..=hi],
-                    &text[start - 1..hi],
-                    &mut nh[start..=hi],
-                    &mut nf[start..=hi],
-                    c,
-                    (mat, mis, go, ext),
-                    e,
-                )
-            };
-            row_max = row_max.max(m);
+        let fused = start <= hi && avx512_rows();
+        #[cfg(not(target_arch = "x86_64"))]
+        let fused = false;
+        if fused {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: AVX-512F/BW/VL are available (checked above).
+                let m = unsafe {
+                    row_avx512(
+                        &h[start - 1..=hi],
+                        &f[start..=hi],
+                        &text[start - 1..hi],
+                        &mut nh[start..=hi],
+                        &mut nf[start..=hi],
+                        c,
+                        (mat, mis, go, ext),
+                        e,
+                    )
+                };
+                row_max = row_max.max(m);
+            }
         } else if start <= hi {
             // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
             // without horizontal gaps), from the previous row only.
