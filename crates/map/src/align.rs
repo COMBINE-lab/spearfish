@@ -571,12 +571,12 @@ fn excl_prefix_max(xs: &mut [i32], init: i32) {
     }
 }
 
-/// A fused DP row kernel for `run_core` (see [`row_avx512`]); without one, it runs the
-/// scalar passes.
+/// A DP row kernel for `run_core`: [`row_scalar`], or a fused vector row.
 trait Rows {
-    const FUSED: bool;
+    /// Row `i` from row `i - 1`, as [`row_scalar`] computes it (the arguments are its).
+    ///
     /// # Safety
-    /// The CPU has the kernel's features; the slices are as [`row_avx512`] takes them.
+    /// The CPU has the kernel's features.
     #[allow(clippy::too_many_arguments)]
     unsafe fn row(
         hprev: &[i32],
@@ -587,34 +587,65 @@ trait Rows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        scratch: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32;
 }
 
-/// The scalar passes (autovectorized for the entry point's level).
+/// One DP row over `w` cells by three passes over the row (the first and last autovectorize
+/// for the entry point's level): `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
+/// F[i-1][start..=hi], `tx` the text bases of columns start..=hi, `c` the pattern base, `e`
+/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` and
+/// returns the row's maximum. `scratch` holds two rows of temporaries.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn row_scalar(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+    (hpv, gsv): (&mut Vec<i32>, &mut Vec<i32>),
+) -> i32 {
+    let w = fu.len();
+    if hpv.len() < w {
+        hpv.resize(w, NEG);
+        gsv.resize(w, NEG);
+    }
+    let (hp, gs) = (&mut hpv[..w], &mut gsv[..w]);
+    let hd = &hprev[..w]; // H[i-1][j-1]
+    let hu = &hprev[1..=w]; // H[i-1][j]
+    let (tx, nf, nh) = (&tx[..w], &mut nf[..w], &mut nh[..w]);
+    // Pass 1: vertical gaps and diagonal moves (H' = H without horizontal gaps), from the
+    // previous row only.
+    for k in 0..w {
+        let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
+        let s = if c == tx[k] & 3 { mat } else { -mis };
+        let x = (hd[k] + s).max(fj).max(NEG);
+        hp[k] = x;
+        gs[k] = x - go + ext * (k as i32 + 1);
+        nf[k] = fj;
+    }
+    // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1] - ext): opening from
+    // H = max(H', E) adds nothing. With g[k] = E[k] + ext*k this is a running max (pass 2:
+    // exclusive prefix maxima, one op per cell on the critical path); pass 3 takes
+    // H = max(H', E).
+    excl_prefix_max(gs, e);
+    let mut m = NEG;
+    for k in 0..w {
+        let v = hp[k].max(gs[k] - ext * k as i32);
+        nh[k] = v;
+        m = m.max(v);
+    }
+    m
+}
+
+/// The scalar passes.
 struct ScalarRows;
 
 impl Rows for ScalarRows {
-    const FUSED: bool = false;
-    unsafe fn row(
-        _: &[i32],
-        _: &[i32],
-        _: &[u8],
-        _: &mut [i32],
-        _: &mut [i32],
-        _: u8,
-        _: (i32, i32, i32, i32),
-        _: i32,
-    ) -> i32 {
-        unreachable!()
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-struct Avx512Rows;
-
-#[cfg(target_arch = "x86_64")]
-impl Rows for Avx512Rows {
-    const FUSED: bool = true;
     #[inline(always)]
     unsafe fn row(
         hprev: &[i32],
@@ -625,18 +656,37 @@ impl Rows for Avx512Rows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        scratch: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        row_scalar(hprev, fu, tx, nh, nf, c, sc, e, scratch)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Avx512Rows;
+
+#[cfg(target_arch = "x86_64")]
+impl Rows for Avx512Rows {
+    #[inline(always)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        _: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32 {
         // SAFETY: as the caller guarantees.
         unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) }
     }
 }
 
-/// One DP row over `w` cells, the three passes of `run` fused per 16-lane block: diagonal and
-/// vertical moves, then horizontal gaps as an in-register prefix max carried across blocks,
-/// with no intermediate row written. `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
-/// F[i-1][start..=hi], `tx` the text bases of columns start..=hi; writes H and F of row i
-/// and returns the row's maximum. Same integer operations as the scalar passes, so the
-/// same results.
+/// [`row_scalar`] with its three passes fused per 16-lane block: diagonal and vertical moves,
+/// then horizontal gaps as an in-register prefix max carried across blocks, with no
+/// intermediate row written. Same integer operations as the scalar passes, so the same results.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 #[inline]
@@ -712,6 +762,152 @@ unsafe fn row_avx512(
         k += 16;
     }
     _mm512_reduce_max_epi32(mx)
+}
+
+/// [`row_avx512`] in 8-lane AVX2 vectors. The horizontal-gap prefix max is a three-step
+/// shift-and-max scan within each vector (shifts cross the two 128-bit halves through a
+/// permute that also fills the low lanes with NEG), with the running maximum carried across
+/// vectors in a register. A row's last `w % 8` cells are covered by one more whole vector
+/// ending at the row's end, which recomputes the cells it shares with the previous vector
+/// from the maximum entering its first cell (no masked loads or stores: those of cells the
+/// previous row just stored stall on store forwarding, and masked stores are slow on some
+/// CPUs). Rows under 8 cells take the scalar steps.
+///
+/// Same results as the scalar passes: the integer operations per cell are theirs, and the scan
+/// differs from the exact prefix maximum only where both lie below NEG, where neither can win
+/// against the cell's diagonal/vertical score (which is at least NEG).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_avx2(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+) -> i32 {
+    use std::arch::x86_64::*;
+    let w = fu.len();
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    if w < 8 {
+        // The scalar steps (`row_scalar` without its row buffers).
+        let (mut m, mut carry) = (NEG, e);
+        for k in 0..w {
+            let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
+            let s = if c == tx[k] & 3 { mat } else { -mis };
+            let x = (hprev[k] + s).max(fj).max(NEG);
+            let v = x.max(carry - ext * k as i32);
+            carry = carry.max(x - go + ext * (k as i32 + 1));
+            nh[k] = v;
+            nf[k] = fj;
+            m = m.max(v);
+        }
+        return m;
+    }
+    let neg = _mm256_set1_epi32(NEG);
+    let (vgo, vext) = (_mm256_set1_epi32(go), _mm256_set1_epi32(ext));
+    let (vmat, vmis) = (_mm256_set1_epi32(mat), _mm256_set1_epi32(-mis));
+    let vc = _mm256_set1_epi32(c as i32);
+    let three = _mm256_set1_epi32(3);
+    let seven = _mm256_set1_epi32(7);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let lext = _mm256_mullo_epi32(lane, vext);
+    // [NEG x 4, v's low half]: `v` shifted up by four lanes, and the source of the lanes that
+    // cross into the high half when shifting by fewer.
+    let up4 = |v: __m256i| _mm256_permute2x128_si256::<0x02>(v, neg);
+    let mut mx = neg;
+    // Cells k..k + 8 with `cv` the maximum entering cell k (broadcast) and `ek` ext times
+    // each lane's cell index: stores H and F and returns the exclusive maxima entering each
+    // cell and the maximum after the last.
+    let mut cells = |k: usize, cv: __m256i, ek: __m256i| {
+        // SAFETY: k + 8 <= w, so cells k..k + 8 are in bounds of every slice (`hprev` has
+        // w + 1).
+        let (hd, hu, fv, t) = unsafe {
+            (
+                _mm256_loadu_si256(hprev.as_ptr().add(k).cast()),
+                _mm256_loadu_si256(hprev.as_ptr().add(k + 1).cast()),
+                _mm256_loadu_si256(fu.as_ptr().add(k).cast()),
+                _mm_loadl_epi64(tx.as_ptr().add(k).cast()),
+            )
+        };
+        let fj = _mm256_max_epi32(
+            _mm256_max_epi32(_mm256_sub_epi32(hu, vgo), _mm256_sub_epi32(fv, vext)),
+            neg,
+        );
+        let t = _mm256_and_si256(_mm256_cvtepu8_epi32(t), three);
+        let s = _mm256_blendv_epi8(vmis, vmat, _mm256_cmpeq_epi32(t, vc));
+        let x = _mm256_max_epi32(_mm256_max_epi32(_mm256_add_epi32(hd, s), fj), neg);
+        // gs[k] = x - go + ext * (k + 1).
+        let g = _mm256_add_epi32(_mm256_sub_epi32(x, vgo), _mm256_add_epi32(ek, vext));
+        // Inclusive prefix max within the vector: shifts by one, two, four lanes.
+        let v = _mm256_max_epi32(g, _mm256_alignr_epi8::<12>(g, up4(g)));
+        let v = _mm256_max_epi32(v, _mm256_alignr_epi8::<8>(v, up4(v)));
+        let v4 = up4(v);
+        let incl = _mm256_max_epi32(v, v4);
+        // Exclusive: shifted up one lane, with the carry. (`v4` stands in for `up4(incl)`:
+        // they differ only in lanes below NEG.)
+        let excl = _mm256_max_epi32(_mm256_alignr_epi8::<12>(incl, v4), cv);
+        let hv = _mm256_max_epi32(x, _mm256_sub_epi32(excl, ek));
+        // SAFETY: as for the loads.
+        unsafe {
+            _mm256_storeu_si256(nh.as_mut_ptr().add(k).cast(), hv);
+            _mm256_storeu_si256(nf.as_mut_ptr().add(k).cast(), fj);
+        }
+        mx = _mm256_max_epi32(mx, hv);
+        (
+            excl,
+            _mm256_max_epi32(cv, _mm256_permutevar8x32_epi32(incl, seven)),
+        )
+    };
+    let mut cv = _mm256_set1_epi32(e);
+    let mut excl = cv;
+    let mut ek = lext;
+    let step = _mm256_set1_epi32(8 * ext);
+    let mut k = 0;
+    while k + 8 <= w {
+        (excl, cv) = cells(k, cv, ek);
+        ek = _mm256_add_epi32(ek, step);
+        k += 8;
+    }
+    if k < w {
+        // The last vector, at w - 8: lane w - k of the previous one is the maximum entering
+        // its first cell.
+        let cv = _mm256_permutevar8x32_epi32(excl, _mm256_set1_epi32((w - k) as i32));
+        cells(
+            w - 8,
+            cv,
+            _mm256_add_epi32(lext, _mm256_set1_epi32(ext * (w - 8) as i32)),
+        );
+    }
+    let m = _mm_max_epi32(_mm256_castsi256_si128(mx), _mm256_extracti128_si256::<1>(mx));
+    let m = _mm_max_epi32(m, _mm_shuffle_epi32::<0b01_00_11_10>(m));
+    _mm_cvtsi128_si32(_mm_max_epi32(m, _mm_shuffle_epi32::<0b10_11_00_01>(m)))
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Avx2Rows;
+
+#[cfg(target_arch = "x86_64")]
+impl Rows for Avx2Rows {
+    #[inline(always)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        _: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        // SAFETY: as the caller guarantees.
+        unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e) }
+    }
 }
 
 /// What one DP pass found.
@@ -969,7 +1165,7 @@ fn run_avx2(
     resume: Option<&Snap>,
     snaps: &mut [Snap],
 ) -> Dp {
-    run_core::<ScalarRows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
+    run_core::<Avx2Rows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
 }
 
 #[inline(always)]
@@ -1103,7 +1299,7 @@ fn run_core<R: Rows>(
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
-        if R::FUSED && start <= hi {
+        if start <= hi {
             // SAFETY: the entry point is compiled for the kernel's features, which the CPU has.
             let m = unsafe {
                 R::row(
@@ -1115,51 +1311,9 @@ fn run_core<R: Rows>(
                     c,
                     (mat, mis, go, ext),
                     e,
+                    (hpv, gsv),
                 )
             };
-            row_max = row_max.max(m);
-        } else if start <= hi {
-            // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
-            // without horizontal gaps), from the previous row only.
-            let w = hi + 1 - start;
-            // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
-            // only adds outputs after every real one.
-            let wp = w.next_multiple_of(16);
-            if hpv.len() < wp {
-                hpv.resize(wp, NEG);
-                gsv.resize(wp, NEG);
-            }
-            let (hp, gs) = (&mut hpv[..], &mut gsv[..]);
-            gs[w..wp].fill(NEG);
-            let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
-            let gs = &mut gs_all[..w];
-            let hd = &h[start - 1..hi]; // H[i-1][j-1]
-            let hu = &h[start..=hi]; // H[i-1][j]
-            let fu = &f[start..=hi];
-            let tx = &text[start - 1..hi];
-            let nfr = &mut nf[start..=hi];
-            for k in 0..w {
-                let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
-                let s = if c == tx[k] & 3 { mat } else { -mis };
-                let x = (hd[k] + s).max(fj).max(NEG);
-                hp[k] = x;
-                gs[k] = x - go + ext * (k as i32 + 1);
-                nfr[k] = fj;
-            }
-            // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
-            // - ext): opening from H = max(H', E) adds nothing. With g[k] =
-            // E[k] + ext*k this is a running max (pass 2: exclusive prefix
-            // maxima, one op per cell on the critical path); pass 3
-            // (vectorizes) takes H = max(H', E).
-            excl_prefix_max(gs_all, e);
-            let gs = &gs_all[..w];
-            let nhr = &mut nh[start..=hi];
-            let mut m = NEG;
-            for k in 0..w {
-                let v = hp[k].max(gs[k] - ext * k as i32);
-                nhr[k] = v;
-                m = m.max(v);
-            }
             row_max = row_max.max(m);
         }
         if cut != usize::MAX && lo <= cut {
