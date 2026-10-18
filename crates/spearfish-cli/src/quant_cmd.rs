@@ -1,132 +1,135 @@
-//! `spearfish quant`: EM quantification from a mapping TSV (`spearfish map` output, or
-//! another mapper's alignments converted to the same columns). Output: transcript, length,
-//! estimated reads.
+//! `spearfish quant`: reads to transcript abundances, by mapping to a RAD file and
+//! quantifying it with oarfish (`oarfish -a`), which takes the score scale, preset and span
+//! settings from the file. Writes oarfish's outputs under the prefix, the mapping's run record
+//! as `<prefix>.map.meta.json`, and oarfish's log as `<prefix>.oarfish.log` (on stderr with
+//! `-v`).
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::process::Command;
 
-use anyhow::{Context, Result};
-use paraseq::{ReaderBuilder, Record};
-use quant::{EqBuilder, QuantParams, em};
+use anyhow::{Context, Result, bail};
+
+use crate::map_args::MapArgs;
+use crate::map_cmd::{Codec, Job, execute};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Transcript FASTA (names and lengths; GENCODE `tx|...` headers are cut at '|').
-    transcripts: PathBuf,
-    /// Mapping TSV.
-    mapping: PathBuf,
-    /// Score denominator D in exp((s - s_max) / D). 2 suits spearfish chain scores; use 5
-    /// (oarfish's default) for minimap2 alignment scores.
-    #[arg(long, default_value_t = 2.0)]
-    score_denom: f64,
-    /// Keep hits scoring at least this fraction of the read's best.
-    #[arg(long, default_value_t = 0.95)]
-    min_frac: f64,
-    /// Divide likelihoods by transcript length.
-    #[arg(long)]
-    length_norm: bool,
-    /// Also use reads flagged `low_coverage` (best chain spans < half the read).
-    #[arg(long)]
-    keep_low_coverage: bool,
-    /// EM: maximum iterations.
-    #[arg(long, default_value_t = 10_000)]
-    max_iter: usize,
-    /// EM: stop when the largest relative change (transcripts with >= 0.01 reads) is below
-    /// this.
-    #[arg(long, default_value_t = 1e-6)]
-    tol: f64,
-    /// Output TSV.
-    #[arg(short, long)]
+    /// Index built by `spearfish index`.
+    index: PathBuf,
+    /// Reads (FASTA/FASTQ, optionally compressed); `-` reads stdin.
+    reads: PathBuf,
+    /// Output prefix (oarfish writes <PREFIX>.quant, <PREFIX>.meta_info.json, ...).
+    #[arg(short, long, value_name = "PREFIX", help_heading = "Input and output")]
     output: PathBuf,
-    /// EM worker threads (0 = all cores).
-    #[arg(short, long, default_value_t = 0)]
+    /// Worker threads for mapping and quantification (0: every available CPU).
+    #[arg(short, long, default_value_t = 0, help_heading = "Input and output")]
     threads: usize,
+    /// The oarfish binary [default: $OARFISH, else `oarfish` on the PATH].
+    #[arg(long, value_name = "PATH", help_heading = "Input and output")]
+    oarfish: Option<PathBuf>,
+    /// Keep the intermediate RAD file (<PREFIX>.rad).
+    #[arg(long, help_heading = "Input and output")]
+    keep_rad: bool,
+    /// Further oarfish arguments, after `--` (e.g. `-- --model-truncation`).
+    #[arg(last = true, value_name = "OARFISH ARGS")]
+    oarfish_args: Vec<String>,
+    #[command(flatten)]
+    settings: MapArgs,
+}
+
+/// The oarfish to run, checked to read spearfish's RAD files.
+fn find_oarfish(given: Option<PathBuf>) -> Result<PathBuf> {
+    let bin = given
+        .or_else(|| std::env::var_os("OARFISH").map(PathBuf::from))
+        .unwrap_or_else(|| "oarfish".into());
+    let out = Command::new(&bin).arg("--help").output().with_context(|| {
+        format!(
+            "running {} (install oarfish, or give its path with --oarfish or $OARFISH)",
+            bin.display()
+        )
+    })?;
+    let help = String::from_utf8_lossy(&out.stdout);
+    if !help.contains("spearfish") {
+        bail!(
+            "{} cannot read spearfish's RAD files: an oarfish with the spearfish backend is needed",
+            bin.display()
+        );
+    }
+    let v = Command::new(&bin).arg("--version").output()?;
+    log::debug!(
+        "using {} ({})",
+        bin.display(),
+        String::from_utf8_lossy(&v.stdout).trim()
+    );
+    Ok(bin)
+}
+
+fn with_suffix(prefix: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut s = prefix.as_os_str().to_owned();
+    s.push(suffix);
+    s.into()
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let t0 = Instant::now();
-    let mut names: Vec<String> = Vec::new();
-    let mut lens: Vec<u32> = Vec::new();
-    let mut reader = ReaderBuilder::path(&args.transcripts).build()?;
-    let mut rset = reader.new_record_set();
-    while rset.fill(&mut reader)? {
-        for rec in rset.iter() {
-            let rec = rec?;
-            names.push(rec.id_str().split('|').next().unwrap().to_string());
-            lens.push(rec.seq().len() as u32);
-        }
+    let oarfish = find_oarfish(args.oarfish.clone())?;
+    if let Some(dir) = args.output.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
     }
-    let id: HashMap<&str, u32> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i as u32))
-        .collect();
-    let p = QuantParams {
-        score_denom: args.score_denom,
-        min_frac: args.min_frac,
-        length_norm: args.length_norm,
-        max_iter: args.max_iter,
-        tol: args.tol,
-    };
-    let mut b = EqBuilder::default();
-    let f =
-        std::fs::File::open(&args.mapping).with_context(|| format!("opening {}", args.mapping.display()))?;
-    let (mut cur, mut hits): (String, Vec<(u32, f64)>) = (String::new(), Vec::new());
-    let (mut unknown, mut unmapped, mut skipped) = (0u64, 0u64, 0u64);
-    let mut cur_low = false;
-    for line in BufReader::new(f).lines().skip(1) {
-        let line = line?;
-        let mut it = line.split('\t');
-        let read = it.next().unwrap_or("");
-        let tx = it.nth(3).unwrap_or("*");
-        let score: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
-        let flags = line.rsplit('\t').next().unwrap_or("");
-        let low = flags.split(',').any(|f| f == "low_coverage");
-        if read != cur {
-            if !hits.is_empty() {
-                b.add(&hits, &lens, &p);
-            } else if cur_low {
-                skipped += 1;
+    let threads = crate::runinfo::threads(args.threads);
+    let rad = with_suffix(&args.output, ".rad");
+    execute(Job {
+        index: args.index,
+        reads: args.reads,
+        threads,
+        output: None,
+        paf: None,
+        rad: Some(rad.clone()),
+        rad_codec: Codec::Lz4,
+        meta: Some(with_suffix(&args.output, ".map.meta.json")),
+        batch_size: 32,
+        settings: args.settings.settings(),
+    })?;
+    let mut cmd = Command::new(&oarfish);
+    cmd.arg("-a")
+        .arg(&rad)
+        .arg("-o")
+        .arg(&args.output)
+        .arg("-j")
+        .arg(threads.max(2).to_string());
+    if log::max_level() < log::LevelFilter::Info {
+        cmd.arg("--quiet");
+    }
+    cmd.args(&args.oarfish_args);
+    // oarfish's log goes to a file unless -v asks for it on stderr; files get no colour codes.
+    let log_path = with_suffix(&args.output, ".oarfish.log");
+    let to_file = log::max_level() < log::LevelFilter::Debug;
+    if to_file {
+        cmd.stderr(std::fs::File::create(&log_path)?);
+    }
+    if to_file || !std::io::stderr().is_terminal() {
+        cmd.env("NO_COLOR", "1");
+    }
+    log::debug!("running {cmd:?}");
+    let status = cmd
+        .status()
+        .with_context(|| format!("running {}", oarfish.display()))?;
+    if !args.keep_rad {
+        let _ = std::fs::remove_file(&rad);
+    }
+    if !status.success() {
+        if to_file {
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: Vec<&str> = text.lines().rev().take(20).collect();
+            for l in tail.into_iter().rev() {
+                eprintln!("  oarfish: {l}");
             }
-            hits.clear();
-            cur = read.to_string();
-            cur_low = false;
         }
-        if tx == "*" {
-            unmapped += 1;
-            continue;
-        }
-        if low && !args.keep_low_coverage {
-            cur_low = true;
-            continue;
-        }
-        match id.get(tx) {
-            Some(&t) => hits.push((t, score)),
-            None => unknown += 1,
-        }
+        bail!("oarfish failed ({status}); its log is {}", log_path.display());
     }
-    if !hits.is_empty() {
-        b.add(&hits, &lens, &p);
-    } else if cur_low {
-        skipped += 1;
-    }
-    let reads = b.reads;
-    let classes = b.finish();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build()?;
-    let (counts, iters) = pool.install(|| em(names.len(), &classes, &p));
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&args.output)?);
-    writeln!(out, "transcript\tlength\treads")?;
-    for ((n, l), c) in names.iter().zip(&lens).zip(&counts) {
-        writeln!(out, "{n}\t{l}\t{c:.4}")?;
-    }
-    eprintln!(
-        "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
-        classes.len(),
-        t0.elapsed().as_secs_f64()
+    log::info!(
+        "quant: estimates in {}",
+        with_suffix(&args.output, ".quant").display()
     );
     Ok(())
 }

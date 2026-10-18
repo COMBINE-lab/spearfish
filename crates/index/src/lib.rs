@@ -140,6 +140,8 @@ pub struct IndexData {
     pub tx_raw_ck: (Vec<u64>, Vec<u32>),
     pub tx_names: Vec<String>,
     pub gene_names: Vec<String>,
+    /// What built the index, as JSON (written as section `manifest`; the caller fills it in).
+    pub manifest: Option<String>,
 }
 
 /// 2-bit pack an ASCII sequence (non-ACGT as A), 32 bases per word, base i at bits
@@ -165,12 +167,16 @@ fn pool(strings: &[String]) -> (Vec<u64>, Vec<u8>) {
 }
 
 impl IndexData {
-    fn writer(&self) -> Writer {
+    /// The `meta` section's text.
+    pub fn meta_text(&self) -> String {
+        self.meta.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+    }
+
+    fn writer(&self) -> Writer<'_> {
         let mut w = Writer::default();
-        let meta: String = self.meta.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-        w.add("meta", meta.as_bytes());
+        w.add_owned("meta", self.meta_text().into_bytes());
         w.add("labels", &self.labels);
-        w.add("label_dir", &label_dir(&self.labels));
+        w.add_owned("label_dir", label_dir(&self.labels));
         w.add("node_unitig", &self.node_unitig);
         w.add("node_offset", &self.node_offset);
         w.add("node_len", &self.node_len);
@@ -198,11 +204,14 @@ impl IndexData {
             w.add("tx_raw_ck", &self.tx_raw_ck.1);
         }
         let (o, b) = pool(&self.tx_names);
-        w.add("tx_name_off", &o);
-        w.add("tx_names", &b);
+        w.add_owned("tx_name_off", o);
+        w.add_owned("tx_names", b);
         let (o, b) = pool(&self.gene_names);
-        w.add("gene_name_off", &o);
-        w.add("gene_names", &b);
+        w.add_owned("gene_name_off", o);
+        w.add_owned("gene_names", b);
+        if let Some(m) = &self.manifest {
+            w.add("manifest", m.as_bytes());
+        }
         w
     }
 
@@ -216,16 +225,21 @@ impl IndexData {
     }
 }
 
-/// A cache hint for the line holding `p` (no effect off x86-64; never faults).
+/// A cache hint for the line holding `p` (no effect off x86-64 and aarch64; never faults).
 #[inline(always)]
-fn prefetch<T>(p: *const T) {
+pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: prefetching is a hint: it reads nothing and cannot fault, whatever the address.
     #[allow(unused_unsafe)]
     unsafe {
         core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as on x86-64: `prfm` is a hint that reads nothing and cannot fault.
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = p;
 }
 
@@ -398,6 +412,60 @@ impl Index {
         self.meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
+    /// The `meta` section's text (`key=value` lines).
+    pub fn meta_text(&self) -> &str {
+        std::str::from_utf8(self.store.get::<u8>("meta").unwrap_or(&[])).unwrap_or("")
+    }
+
+    /// The manifest (JSON) recorded when the index was built, if any.
+    pub fn manifest(&self) -> Option<&str> {
+        let b = self.store.get::<u8>("manifest").ok()?;
+        std::str::from_utf8(b).ok()
+    }
+
+    /// The index holds raw (uncompressed) transcript sequence.
+    pub fn has_raw(&self) -> bool {
+        self.raw
+            .as_ref()
+            .is_some_and(|r| r.off.len > self.n_transcripts())
+    }
+
+    /// Check that this build parses sequence as the index was built: an index built with
+    /// another LCP parser version or hash seed loads, but would give wrong mappings.
+    pub fn check_compatible(&self) -> Result<()> {
+        let spec = self.meta("spec").unwrap_or("");
+        if !spec.starts_with("lcp") {
+            return Ok(());
+        }
+        if let Some(v) = self.meta("lcp_parser_version") {
+            let ours = lcp_core::LCP_PARSER_VERSION.to_string();
+            anyhow::ensure!(
+                v == ours,
+                "index built with LCP parser version {v}, this build parses with version {ours}; rebuild the index"
+            );
+        }
+        if let Some(seed) = self.meta("lcp_seed") {
+            let ours = format!("{:#x}", lcp_core::LcpConfig::default().seed);
+            anyhow::ensure!(
+                seed == ours,
+                "index built with LCP seed {seed}, this build uses {ours}; rebuild the index"
+            );
+        }
+        Ok(())
+    }
+
+    /// Every section's name, size in bytes and xxh3-64 checksum.
+    pub fn section_checksums(&self) -> Vec<(String, usize, u64)> {
+        self.store
+            .sizes()
+            .into_iter()
+            .map(|(name, len)| {
+                let h = xxhash_rust::xxh3::xxh3_64(self.store.get::<u8>(&name).unwrap_or(&[]));
+                (name, len, h)
+            })
+            .collect()
+    }
+
     pub fn n_nodes(&self) -> usize {
         self.labels().len()
     }
@@ -493,6 +561,19 @@ impl Index {
         Some(v)
     }
 
+    /// Whether the raw bases under parsed `[lo, hi)` of transcript `t` equal those under parsed
+    /// `[ulo, uhi)` of `u` (homopolymer run lengths included), compared on the packed sequence.
+    /// None if the index lacks either raw sequence.
+    pub fn tx_raw_eq(&self, t: u32, lo: u32, hi: u32, u: u32, ulo: u32, uhi: u32) -> Option<bool> {
+        let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
+        let (ua, ub) = (self.tx_raw_pos(u, ulo)?, self.tx_raw_pos(u, uhi)?);
+        if b - a != ub - ua {
+            return Some(false);
+        }
+        let ((tw, _), (uw, _)) = (self.raw_words(t)?, self.raw_words(u)?);
+        Some(packed_eq(tw, a, uw, ua, b - a))
+    }
+
     /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
     /// parsed length), if the index has its raw sequence.
     pub fn tx_raw_pos(&self, t: u32, p: u32) -> Option<u32> {
@@ -524,6 +605,21 @@ impl Index {
     pub fn nodes_of(&self, u: u32) -> &[u32] {
         let off = self.unitig_off();
         &self.unitig_nodes()[off[u as usize] as usize..off[u as usize + 1] as usize]
+    }
+
+    /// Ask the caches for the offsets [`Self::occurrences`] reads first.
+    #[inline]
+    pub fn prefetch_occ_off(&self, u: u32) {
+        prefetch(self.occ_off().as_ptr().wrapping_add(u as usize));
+    }
+
+    /// Ask the caches for the occurrence lists of `u` (reads the offsets, so call it after
+    /// [`Self::prefetch_occ_off`] has had time to land).
+    #[inline]
+    pub fn prefetch_occurrences(&self, u: u32) {
+        let o = self.occ_off()[u as usize] as usize;
+        prefetch(self.occ_tx().as_ptr().wrapping_add(o));
+        prefetch(self.occ_pos().as_ptr().wrapping_add(o));
     }
 
     /// Occurrences of unitig `u`: transcripts (sorted) and the position of its first seed.

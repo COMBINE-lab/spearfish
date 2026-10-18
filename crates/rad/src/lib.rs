@@ -469,6 +469,9 @@ pub struct Meta {
     pub ends_extended: bool,
     /// Which strands of the targets reads were mapped to: `both`, `fwd` or `rev`.
     pub strands: String,
+    /// An identifier of the index mapped against (spearfish: a hash of its inputs and build
+    /// parameters), or empty.
+    pub index_id: String,
 }
 
 /// Read counts, patched into the file when it is finished.
@@ -500,6 +503,7 @@ fn file_tags(meta: &Meta, ref_lengths: &[u32], codec: ChunkCodec) -> (TagSection
             ("score_denom", TagValue::F32(meta.score_denom)),
             ("ends_extended", TagValue::U8(meta.ends_extended as u8)),
             ("strands", s(&meta.strands)),
+            ("index_id", s(&meta.index_id)),
             ("num_reads", TagValue::U64(0)),
             ("num_mapped", TagValue::U64(0)),
             ("num_bases", TagValue::U64(0)),
@@ -688,6 +692,7 @@ impl Header {
                 },
                 ends_extended: int("ends_extended") != 0,
                 strands: string("strands"),
+                index_id: string("index_id"),
             },
             counts: Counts {
                 reads: int("num_reads"),
@@ -762,6 +767,7 @@ mod tests {
             score_denom: 2.0,
             ends_extended: true,
             strands: "both".into(),
+            index_id: "0123456789abcdef".into(),
             ..Default::default()
         };
         let w = RadWriter::create(&path, &refs, &meta, codec).unwrap();

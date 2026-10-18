@@ -3,6 +3,7 @@ name = "spearfish"
 description = "Fast long-read RNA-seq mapping to a transcriptome with locally consistent parsing (library)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -13,12 +14,18 @@ lcp-core.workspace = true
 map.workspace = true
 quant.workspace = true
 seeds.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bon.workspace = true
+log.workspace = true
+xxhash-rust.workspace = true
 paraseq = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 
 [features]
 default = ["fasta"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
-fasta = ["dep:paraseq"]
+fasta = ["dep:paraseq", "dep:flate2"]
 
 [dev-dependencies]
 lcp-core.workspace = true

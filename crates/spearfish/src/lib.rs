@@ -3,10 +3,10 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use spearfish::{Index, MapOptions, Mapper, Preset};
+//! use spearfish::{Index, MapSettings, Preset};
 //!
 //! let index = Arc::new(Index::build_from_fasta("transcripts.fa".as_ref(), &Default::default())?);
-//! let mapper = Mapper::new(index.clone(), &MapOptions::preset(Preset::Ont))?;
+//! let mapper = MapSettings::builder(Preset::Ont).mapper(index.clone())?;
 //! let read = mapper.map(b"ACGT...");
 //! for hit in &read.hits {
 //!     println!("{} {} {}", index.tx_name(hit.tx), hit.score, hit.reverse);
@@ -20,6 +20,16 @@
 //! (transcript coordinates fall back to scaling from compressed lengths for an index without
 //! raw sequence). Spans run from where the read's alignment starts to where it ends, extended
 //! past the outermost seeds (see [`Ends`]).
+//!
+//! Settings: [`MapSettings`] holds a [`Preset`] and the settings changed from it, and resolves
+//! to the complete [`MapOptions`] (see [`settings`]). Index construction takes
+//! [`IndexOptions`], also with a builder. Score differences between a read's hits convert to
+//! probabilities as `exp(-d / SCORE_DENOM)` ([`SCORE_DENOM`]).
+
+#![warn(missing_docs)]
+
+pub mod provenance;
+pub mod settings;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,17 +37,28 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use index::{BuildParams, Collapse, TxInput};
 use lcp_core::hpc::Hpc;
-use map::{AnyChainer, ChainParams, MapParams, OracleChainer, RefineChainer, Strands, TieBreak};
+use map::{AnyChainer, OracleChainer, RefineChainer};
+use serde::{Deserialize, Serialize};
 
-pub use index::BuildReport;
-pub use map::Ends;
+pub use index::{BuildReport, InferGenes};
 pub use map::align::Affine;
+pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands, TieBreak};
 pub use quant;
+pub use settings::{MapSettings, RescueWindow};
+
+/// Scale of score differences: a hit scoring `d` below its read's best is `exp(-d /
+/// SCORE_DENOM)` times as likely. spearfish's scores are on minimap2's alignment-score scale;
+/// D = 1 was the sharpest weighting tried with oarfish's EM on simulated reads and gave the
+/// most accurate estimates (minimap2 alignments do best with a wider D, e.g. oarfish's 3).
+/// RAD output records it, and oarfish's spearfish backend uses it.
+pub const SCORE_DENOM: f32 = 1.0;
 
 /// Read technology / protocol presets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Preset {
     /// ONT cDNA: both orientations, minimap2 map-ont scores.
+    #[default]
     Ont,
     /// ONT direct RNA: sense orientation only, cheaper tie-break.
     Drna,
@@ -57,24 +78,59 @@ impl std::str::FromStr for Preset {
     }
 }
 
-/// Which chainer to run (both give identical scores with an unbounded beam).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChainerKind {
-    /// Per-transcript DP with prefix sharing (fastest).
-    Oracle,
-    /// Multi-transcript state DP with lazy color refinement; `beam` bounds states per anchor.
-    Refine { beam: Option<usize> },
+impl Preset {
+    /// Every preset.
+    pub const ALL: [Preset; 3] = [Preset::Ont, Preset::Drna, Preset::Hifi];
+
+    /// The preset's name (as `--preset` takes it).
+    pub fn name(self) -> &'static str {
+        match self {
+            Preset::Ont => "ont",
+            Preset::Drna => "drna",
+            Preset::Hifi => "hifi",
+        }
+    }
+
+    /// The sequencing technology as oarfish's `--seq-tech` names it.
+    pub fn seq_tech(self) -> &'static str {
+        match self {
+            Preset::Ont => "ont-cdna",
+            Preset::Drna => "ont-drna",
+            Preset::Hifi => "pac-bio-hifi",
+        }
+    }
 }
 
-/// All mapping options. Start from [`MapOptions::preset`] and adjust fields.
-#[derive(Clone, Debug)]
+/// Which chainer to run (both give identical scores with an unbounded beam).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChainerKind {
+    /// Per-transcript DP with prefix sharing (fastest).
+    #[default]
+    Oracle,
+    /// Multi-transcript state DP with lazy color refinement; `beam` bounds states per anchor.
+    Refine {
+        /// States kept per anchor (`None`: unbounded, exact).
+        beam: Option<usize>,
+    },
+}
+
+/// The complete mapping options: every value a mapper runs with. [`MapSettings::resolve`]
+/// derives them from a preset and the settings changed; [`MapOptions::preset`] gives a
+/// preset's.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapOptions {
+    /// The preset these options started from.
+    pub preset: Preset,
+    /// Seeding, chaining, tie-break, rescue and reporting parameters.
     pub params: MapParams,
+    /// The chainer.
     pub chainer: ChainerKind,
 }
 
 impl MapOptions {
-    /// Turn on span extension (if the preset left it off), scored as the preset scores.
+    /// Turn on span extension (if it is off), scored as preset `p` scores. Prefer
+    /// [`MapOptions::set_extend_ends`], which uses the options' own preset.
     pub fn extend_ends(&mut self, p: Preset) {
         if self.params.ends.is_none() {
             let sc = match p {
@@ -88,6 +144,21 @@ impl MapOptions {
         }
     }
 
+    /// Turn span extension on (scored as the preset scores; kept as is if already on) or off.
+    pub fn set_extend_ends(&mut self, on: bool) {
+        if on {
+            self.extend_ends(self.preset);
+        } else {
+            self.params.ends = None;
+        }
+    }
+
+    /// The scale of score differences ([`SCORE_DENOM`]).
+    pub fn score_denom(&self) -> f32 {
+        SCORE_DENOM
+    }
+
+    /// A preset's options.
     pub fn preset(p: Preset) -> Self {
         let mut params = MapParams::default();
         let tb = params.tiebreak.as_mut().expect("tie-break on by default");
@@ -98,6 +169,10 @@ impl MapOptions {
                 tb.affine_within = Some(4);
                 // No template-switch Gs at direct RNA read ends: raw ends cost 12% for nothing.
                 tb.raw_ends = false;
+                // Direct RNA reads end a few bases into their tail (basecalled poly(A) is short
+                // and noisy): a 10-base run marks it, where cDNA's longer tails need 15 to stay
+                // clear of A-runs near annotated 3' ends.
+                tb.tail_run = 10;
                 // Direct RNA spans extended to the read ends change no spike-in estimate under
                 // the default model and cost 31% more instructions. Positional models
                 // turn them back on.
@@ -117,6 +192,7 @@ impl MapOptions {
             }
         }
         MapOptions {
+            preset: p,
             params,
             chainer: ChainerKind::Oracle,
         }
@@ -127,6 +203,7 @@ impl MapOptions {
         self.params.tiebreak.as_mut()
     }
 
+    /// Mutable access to the chaining parameters.
     pub fn chain_mut(&mut self) -> &mut ChainParams {
         &mut self.params.chain
     }
@@ -139,25 +216,84 @@ impl Default for MapOptions {
 }
 
 /// Index construction options.
-#[derive(Clone, Debug)]
+///
+/// ```
+/// let opts = spearfish::IndexOptions::builder().scheme("lcp:K=3").f_max(20).build();
+/// assert!(opts.hpc);
+/// ```
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, bon::Builder)]
 pub struct IndexOptions {
     /// Base seed scheme (its highest level is used), e.g. `lcp:K=3` or `minimizer:k=19,w=23`.
+    #[builder(into, default = "lcp:K=3".to_string())]
     pub scheme: String,
     /// Homopolymer-compress transcripts (and reads at mapping time).
+    #[builder(default = true)]
     pub hpc: bool,
     /// Mask unitigs whose color touches more than this many genes.
+    #[builder(default = 20)]
     pub f_max: u32,
     /// Graph nodes per (label, gene) (true) or per label (false).
+    #[builder(default = true)]
     pub per_gene: bool,
+    /// Group transcripts into genes from their sequence (for transcriptomes without gene
+    /// IDs) instead of using the given genes.
+    pub infer_genes: Option<InferGenesOptions>,
+    /// Build even if two different seed contents share a label (normally an error).
+    #[builder(default)]
+    pub allow_collisions: bool,
 }
 
 impl Default for IndexOptions {
     fn default() -> Self {
-        IndexOptions {
-            scheme: "lcp:K=3".into(),
-            hpc: true,
-            f_max: 20,
-            per_gene: true,
+        IndexOptions::builder().build()
+    }
+}
+
+/// Gene inference from shared sequence (see [`InferGenes`]): transcripts sharing a run of
+/// `span` consecutive seeds held by at most `max_tx` transcripts are grouped; then groups of
+/// at most `attach_max` transcripts join the one larger group they share runs of
+/// `attach_span` seeds with (0: no attach pass).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct InferGenesOptions {
+    /// Ignore runs held by more than this many transcripts (repeats).
+    #[builder(default = 64)]
+    pub max_tx: u32,
+    /// Consecutive seeds a shared run must span.
+    #[builder(default = 12)]
+    pub span: usize,
+    /// Attach pass: run length in seeds (0: off).
+    #[builder(default = 4)]
+    pub attach_span: usize,
+    /// Attach pass: largest group that may attach.
+    #[builder(default = 3)]
+    pub attach_max: usize,
+}
+
+impl Default for InferGenesOptions {
+    fn default() -> Self {
+        InferGenesOptions::builder().build()
+    }
+}
+
+impl IndexOptions {
+    /// The index crate's build parameters.
+    pub fn build_params(&self) -> BuildParams {
+        BuildParams {
+            spec: self.scheme.clone(),
+            hpc: self.hpc,
+            f_max: self.f_max,
+            allow_collisions: self.allow_collisions,
+            collapse: if self.per_gene {
+                Collapse::Gene
+            } else {
+                Collapse::Global
+            },
+            infer_genes: self.infer_genes.map(|g| InferGenes {
+                span: g.span,
+                max_tx: g.max_tx,
+                attach_span: g.attach_span,
+                attach_max: g.attach_max,
+            }),
         }
     }
 }
@@ -177,7 +313,7 @@ impl Index {
 
     /// Build an index in memory from transcripts given as (name, gene, sequence).
     pub fn build(txs: Vec<(String, String, Vec<u8>)>, opts: &IndexOptions) -> Result<(Self, BuildReport)> {
-        let (data, rep) = Self::build_data(txs, opts)?;
+        let (data, rep, _) = Self::build_data(txs, opts, Default::default(), Vec::new())?;
         Ok((
             Index {
                 inner: Arc::new(index::Index::from_bytes(&data.to_bytes())?),
@@ -186,37 +322,53 @@ impl Index {
         ))
     }
 
-    /// Build an index and write it to `path` (as `spearfish index`); returns bytes written.
+    /// Build an index and write it to `path`, with its manifest next to it as
+    /// `<path>.json`; returns bytes written.
     pub fn build_to_file(
         txs: Vec<(String, String, Vec<u8>)>,
         opts: &IndexOptions,
         path: &Path,
     ) -> Result<(u64, BuildReport)> {
-        let (data, rep) = Self::build_data(txs, opts)?;
-        Ok((data.write(path)?, rep))
+        let (n, rep, _) = Self::build_to_file_with(txs, opts, path, Default::default(), Vec::new())?;
+        Ok((n, rep))
+    }
+
+    /// [`Index::build_to_file`], recording where the input came from and the command line in
+    /// the manifest, which is also returned.
+    pub fn build_to_file_with(
+        txs: Vec<(String, String, Vec<u8>)>,
+        opts: &IndexOptions,
+        path: &Path,
+        input: provenance::InputInfo,
+        command_line: Vec<String>,
+    ) -> Result<(u64, BuildReport, provenance::IndexManifest)> {
+        let (data, rep, manifest) = Self::build_data(txs, opts, input, command_line)?;
+        let n = data.write(path)?;
+        std::fs::write(
+            provenance::sidecar(path),
+            serde_json::to_string_pretty(&manifest)? + "\n",
+        )?;
+        Ok((n, rep, manifest))
     }
 
     fn build_data(
         txs: Vec<(String, String, Vec<u8>)>,
         opts: &IndexOptions,
-    ) -> Result<(index::IndexData, BuildReport)> {
+        input: provenance::InputInfo,
+        command_line: Vec<String>,
+    ) -> Result<(index::IndexData, BuildReport, provenance::IndexManifest)> {
         let txs: Vec<TxInput> = txs
             .into_iter()
             .map(|(name, gene, seq)| TxInput { name, gene, seq })
             .collect();
-        let params = BuildParams {
-            spec: opts.scheme.clone(),
-            hpc: opts.hpc,
-            f_max: opts.f_max,
-            allow_collisions: false,
-            collapse: if opts.per_gene {
-                Collapse::Gene
-            } else {
-                Collapse::Global
-            },
-            infer_genes: None,
-        };
-        index::build(&txs, &params)
+        let (mut data, rep) = index::build(&txs, &opts.build_params())?;
+        let mut manifest = provenance::IndexManifest::new(&data, opts, &rep, input);
+        manifest.command_line = command_line;
+        manifest.working_directory = std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        data.manifest = Some(serde_json::to_string(&manifest)?);
+        Ok((data, rep, manifest))
     }
 
     /// Build an index in memory from a (optionally compressed) transcript FASTA. GENCODE
@@ -226,6 +378,7 @@ impl Index {
         Ok(Self::build(read_transcripts(path)?, opts)?.0)
     }
 
+    /// Number of transcripts.
     pub fn n_transcripts(&self) -> usize {
         self.inner.n_transcripts()
     }
@@ -244,6 +397,23 @@ impl Index {
     pub fn raw(&self) -> &index::Index {
         &self.inner
     }
+
+    /// The index holds raw (uncompressed) transcript sequence.
+    pub fn has_raw_sequence(&self) -> bool {
+        self.inner.has_raw()
+    }
+
+    /// What built the index and from what (see [`provenance::IndexManifest`]); `None` for
+    /// an index written before manifests were recorded.
+    pub fn manifest(&self) -> Option<provenance::IndexManifest> {
+        provenance::IndexManifest::of(&self.inner)
+    }
+
+    /// A short identifier of the index's contents: the hash of its input transcripts and
+    /// build parameters (stable across rebuilds with the same inputs).
+    pub fn id(&self) -> String {
+        provenance::index_id(&self.inner)
+    }
 }
 
 /// Name and gene from a FASTA ID: GENCODE-style `tx|gene|...`, else the ID (up to
@@ -261,7 +431,8 @@ pub fn name_and_gene(id: &str) -> (String, String) {
     (name, gene)
 }
 
-/// Read transcripts from a FASTA as (name, gene, sequence).
+/// Read transcripts from a (optionally compressed) FASTA as (name, gene, sequence), names
+/// and genes as [`name_and_gene`] splits the IDs.
 #[cfg(feature = "fasta")]
 pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     use paraseq::{ReaderBuilder, Record};
@@ -271,20 +442,32 @@ pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
             let rec = rec?;
-            let id = rec.id_str();
-            let mut f = id.split('|');
-            let name = f
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let gene = f.next().map_or_else(|| name.clone(), String::from);
+            let (name, gene) = name_and_gene(rec.id_str());
             txs.push((name, gene, rec.seq().into_owned()));
         }
     }
     Ok(txs)
+}
+
+/// Replace genes from a transcript-to-gene table: whitespace-separated `transcript gene` per
+/// line (further columns ignored). Returns how many transcripts the table lacks (they keep
+/// their genes).
+pub fn apply_t2g(txs: &mut [(String, String, Vec<u8>)], table: &str) -> usize {
+    let map: std::collections::HashMap<&str, &str> = table
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?, f.next()?))
+        })
+        .collect();
+    let mut missing = 0;
+    for (name, gene, _) in txs.iter_mut() {
+        match map.get(name.as_str()) {
+            Some(g) => *gene = g.to_string(),
+            None => missing += 1,
+        }
+    }
+    missing
 }
 
 /// One reported transcript for a read.
@@ -295,19 +478,22 @@ pub struct Hit {
     /// The read's reverse complement matched the transcript.
     pub reverse: bool,
     /// Chain score after the tie-break; higher is better. Differences are on minimap2's
-    /// alignment-score scale (λ = 1 per point); spearfish's EM uses exp(Δ / 2).
+    /// alignment-score scale; see [`SCORE_DENOM`] for converting them to probabilities.
     pub score: f32,
     /// Query span on the read's forward strand, raw bases.
     pub query_start: u32,
+    /// End of the query span (exclusive).
     pub query_end: u32,
     /// Transcript span, raw bases (exact if the index holds raw transcript sequence, else
     /// scaled from compressed coordinates).
     pub target_start: u32,
+    /// End of the transcript span (exclusive).
     pub target_end: u32,
-    /// Anchors in the chain, the read bases they cover (compressed), and the largest gap
-    /// discrepancy |Δq − ρΔt| between consecutive anchors.
+    /// Anchors in the chain.
     pub anchors: u32,
+    /// Read bases the anchors cover (compressed).
     pub anchored: u32,
+    /// Largest gap discrepancy |Δq − ρΔt| between consecutive anchors.
     pub max_discrepancy: f32,
     /// The span reaches the read's alignment ends; otherwise it runs from the first to the
     /// last anchor (hits scoring well below the best, or extension off).
@@ -319,6 +505,7 @@ pub struct Hit {
 pub struct MappedRead {
     /// Read length (raw bases).
     pub len: u32,
+    /// The reported hits, best first.
     pub hits: Vec<Hit>,
     /// The best chain spans less than half the read (spearfish quant skips such reads).
     pub low_coverage: bool,
@@ -331,10 +518,22 @@ pub struct Mapper {
     index: Arc<Index>,
     inner: map::Mapper<AnyChainer>,
     hpc: bool,
+    opts: MapOptions,
 }
 
 impl Mapper {
+    /// A mapper over `index` with the complete options `opts` (see also
+    /// [`MapSettings::mapper`]). Fails if the index can't serve the options.
     pub fn new(index: Arc<Index>, opts: &MapOptions) -> Result<Self> {
+        if let Some(tb) = &opts.params.tiebreak
+            && tb.raw_ends
+            && index.raw().meta("hpc") == Some("true")
+            && !index.has_raw_sequence()
+        {
+            log::warn!(
+                "raw read ends need an index with raw transcript sequence; aligning read ends in compressed bases"
+            );
+        }
         let chain = opts.params.chain.clone();
         let chainer = match opts.chainer {
             ChainerKind::Oracle => AnyChainer::Oracle(OracleChainer { p: chain }),
@@ -342,11 +541,27 @@ impl Mapper {
         };
         let inner = map::Mapper::new(index.inner.clone(), chainer, opts.params.clone())?;
         let hpc = inner.seeder.hpc;
-        Ok(Mapper { index, inner, hpc })
+        Ok(Mapper {
+            index,
+            inner,
+            hpc,
+            opts: opts.clone(),
+        })
     }
 
+    /// The index mapped against.
     pub fn index(&self) -> &Arc<Index> {
         &self.index
+    }
+
+    /// The options the mapper runs with.
+    pub fn options(&self) -> &MapOptions {
+        &self.opts
+    }
+
+    /// The scale of score differences ([`SCORE_DENOM`]).
+    pub fn score_denom(&self) -> f32 {
+        SCORE_DENOM
     }
 
     /// Map one read (ASCII bases; `U` is read as `T`).

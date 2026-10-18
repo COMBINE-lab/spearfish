@@ -189,6 +189,80 @@ fn index_and_stats_on_toy() {
     assert_eq!(get("hpc"), "true");
     assert_eq!(get("collapse"), "gene");
     assert_eq!(get("transcripts"), "6");
+    assert_eq!(get("compatible"), "yes");
+    assert!(get("built_by").starts_with("spearfish "));
+
+    // The manifest is stored in the index and written next to it, and names its inputs.
+    let side: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("toy_cli.sfi.json")).unwrap()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .args(["inspect", "--json", "--sections"])
+        .arg(&idx)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["manifest"], side);
+    assert_eq!(j["index_id"], side["index_id"]);
+    assert_eq!(side["input"]["transcripts"], 6);
+    assert_eq!(side["input"]["genes_from"], "fasta");
+    assert_eq!(side["options"]["scheme"], "lcp:K=3");
+    assert!(
+        j["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "manifest")
+    );
+}
+
+/// Commands around mapping: doctor, completions, man pages, parameter printing.
+#[test]
+fn utility_commands() {
+    let bin = env!("CARGO_BIN_EXE_spearfish");
+    let ok = |args: &[&str]| {
+        let o = Command::new(bin).args(args).output().unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stdout).unwrap()
+    };
+    let d: serde_json::Value = serde_json::from_str(&ok(&["doctor", "--json"])).unwrap();
+    for p in ["ont", "drna", "hifi"] {
+        assert_eq!(d["self_test"][p]["pass"], true, "{d}");
+    }
+    assert!(ok(&["completions", "bash"]).contains("spearfish"));
+    let man = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("man");
+    ok(&["man", "-q", "-o", man.to_str().unwrap()]);
+    for page in [
+        "spearfish.1",
+        "spearfish-map.1",
+        "spearfish-index.1",
+        "spearfish-quant.1",
+    ] {
+        assert!(man.join(page).exists(), "{page}");
+    }
+    let p: serde_json::Value = serde_json::from_str(&ok(&[
+        "map",
+        "--print-params",
+        "--preset",
+        "hifi",
+        "--extend-ends",
+    ]))
+    .unwrap();
+    assert_eq!(p["preset"], "hifi");
+    assert!(p["params"]["ends"].is_object());
+    assert!(p["params"]["rescue"].is_null());
+    let v = ok(&["--version"]);
+    assert!(v.starts_with("spearfish "), "{v}");
+    // Two outputs can't share stdout.
+    let o = Command::new(bin)
+        .args(["map", "x.sfi", "-", "-o", "-", "--paf", "-"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
 }
 
 #[test]
@@ -233,6 +307,8 @@ fn simulate_and_map_on_toy() {
         out_tsv.as_os_str(),
         "--rad".as_ref(),
         out_rad.as_os_str(),
+        "--paf".as_ref(),
+        dir.join("toy_map.paf").as_os_str(),
     ]);
     // Every read maps, its source transcript is among its top-scoring hits (truncated reads
     // can tie between isoforms), and each read's lines are contiguous (reads may appear in
@@ -281,7 +357,7 @@ fn simulate_and_map_on_toy() {
         .collect();
     let (h, mut r) = long_read_rad::open(&out_rad, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
     assert_eq!(h.meta.mapper, "spearfish");
-    assert_eq!(h.meta.score_denom, 2.0);
+    assert_eq!(h.meta.score_denom, 1.0);
     assert_eq!(h.counts.reads, 200);
     assert_eq!(h.counts.mapped, 200);
     assert_eq!(h.ref_names.len(), h.ref_lengths.len());
@@ -305,11 +381,41 @@ fn simulate_and_map_on_toy() {
     tsv_hits.sort();
     rad_hits.sort();
     assert_eq!(rad_hits, tsv_hits);
+
+    // PAF: one line per TSV hit (all reads map), with the same spans.
+    let paf = std::fs::read_to_string(dir.join("toy_map.paf")).unwrap();
+    let mut paf_hits: Vec<String> = paf
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            assert!(f.len() >= 12, "{l}");
+            let score: f32 = f
+                .iter()
+                .find_map(|x| x.strip_prefix("sc:f:"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            key(f[5], f[4], score, f[7].parse().unwrap(), f[8].parse().unwrap())
+        })
+        .collect();
+    paf_hits.sort();
+    assert_eq!(paf_hits, tsv_hits);
+
+    // The run record: the index, the settings, every parameter and the counts.
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("toy_map.tsv.meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["kind"], "spearfish-map-run");
+    assert_eq!(meta["stats"]["reads"], 200);
+    assert_eq!(meta["stats"]["mapped"], 200);
+    assert_eq!(meta["settings"]["preset"], "ont");
+    assert_eq!(meta["parameters"]["preset"], "ont");
+    assert_eq!(meta["index"]["index_id"].as_str().unwrap(), h.meta.index_id);
+    assert!(meta["index"]["manifest"]["built_by"]["version"].is_string());
 }
 
-/// `quant` skips reads flagged `low_coverage` whatever other flags the line carries.
+/// `em` skips reads flagged `low_coverage` whatever other flags the line carries.
 #[test]
-fn quant_skips_low_coverage_reads_with_other_flags() {
+fn em_skips_low_coverage_reads_with_other_flags() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let (map, out) = (dir.join("flags_map.tsv"), dir.join("flags_quant.tsv"));
     let head = "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n";
@@ -327,7 +433,7 @@ fn quant_skips_low_coverage_reads_with_other_flags() {
     std::fs::write(&map, tsv).unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
         .args([
-            "quant".as_ref(),
+            "em".as_ref(),
             toy().as_os_str(),
             map.as_os_str(),
             "-o".as_ref(),

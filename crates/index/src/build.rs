@@ -735,6 +735,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         },
         tx_names: txs.iter().map(|t| t.name.clone()).collect(),
         gene_names: gene_names.clone(),
+        manifest: None,
     };
     rep.tx_gene = data.tx_gene.clone();
     rep.gene_names = gene_names;

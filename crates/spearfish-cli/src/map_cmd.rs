@@ -1,187 +1,183 @@
 //! `spearfish map`: map long reads to the indexed transcriptome.
 //!
-//! Output TSV, one line per reported (read, transcript), best first. A read's lines are
-//! contiguous; reads appear in completion order, not input order. The strand is per line: a
-//! read whose orientations nearly tie (antisense transcripts) is reported on both.
-//! read, read_len, strand, rank, transcript, score, qstart, qend, tstart, tend, anchors,
-//! anchored, max_disc, flags. qstart/qend are raw read coordinates on the read's forward
-//! strand and tstart/tend raw transcript coordinates of the alignment, extended past the
-//! outermost anchors for hits within `--extend-within` of the best score (`--extend-ends`);
-//! other hits' spans run between their outermost anchors and carry the flag `anchor_span`.
-//! anchored counts compressed bases. Unmapped reads get one line with transcript `*`.
+//! Outputs, any combination (default: TSV on stdout):
 //!
-//! With `--rad`, the mappings are also written as a RAD file of `bulk_long_read` records (see
-//! the `long-read-rad` crate), one per mapped read, in chunks compressed per `--rad-codec`.
-//! oarfish quantifies these directly; the file's tags carry the preset, the score scale, and
-//! whether spans were extended to the read ends.
+//! - **TSV** (`-o`): one line per reported (read, transcript), best first. A read's lines are
+//!   contiguous; reads appear in completion order, not input order. The strand is per line: a
+//!   read whose orientations nearly tie (antisense transcripts) is reported on both. Columns:
+//!   read, read_len, strand, rank, transcript, score, qstart, qend, tstart, tend, anchors,
+//!   anchored, max_disc, flags. qstart/qend are raw read coordinates on the read's forward
+//!   strand and tstart/tend raw transcript coordinates of the alignment, extended past the
+//!   outermost anchors for hits within `--extend-within` of the best score (`--extend-ends`);
+//!   other hits' spans run between their outermost anchors and carry the flag `anchor_span`.
+//!   anchored counts compressed bases. Unmapped reads get one line with transcript `*`.
+//! - **PAF** (`--paf`): the same hits as PAF lines (no CIGAR; unmapped reads omitted; see
+//!   [`paf_line`]).
+//! - **RAD** (`--rad`): `bulk_long_read` records (see the `long-read-rad` crate), one per
+//!   mapped read, in chunks compressed per `--rad-codec`. oarfish quantifies these directly;
+//!   the file's tags carry the preset, the score scale, the index identifier, and whether
+//!   spans were extended to the read ends.
+//!
+//! Every run also writes a run record, `<first output>.meta.json` (or `--meta`): the build,
+//! command line, index and its manifest, the settings changed, every parameter used, and run
+//! statistics.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use paraseq::prelude::*;
 use paraseq::{ReaderBuilder, Record};
-use spearfish::{ChainerKind, Index, MapOptions, Mapper, Preset};
+use serde::Serialize;
+use spearfish::{Index, MapOptions, MapSettings, MappedRead, Mapper};
+
+use crate::map_args::MapArgs;
+use crate::runinfo::{self, IndexInfo, Invocation, Usage};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Codec {
+    Lz4,
+    Zstd,
+    None,
+}
 
 #[derive(clap::Args, Debug)]
+#[command(after_long_help = preset_table())]
 pub struct Args {
     /// Index built by `spearfish index`.
-    index: PathBuf,
-    /// Reads (FASTA/FASTQ, optionally compressed); `-` reads stdin.
-    reads: PathBuf,
-    /// Worker threads (0 = all cores).
-    #[arg(short, long, default_value_t = 0)]
+    #[arg(required_unless_present = "print_params")]
+    index: Option<PathBuf>,
+    /// Reads (FASTA/FASTQ, optionally gzip/bzip2/xz/zstd-compressed); `-` reads stdin.
+    #[arg(required_unless_present = "print_params")]
+    reads: Option<PathBuf>,
+    /// Worker threads (0: every available CPU).
+    #[arg(short, long, default_value_t = 0, help_heading = "Input and output")]
     threads: usize,
-    /// Output TSV (default stdout, unless `--rad` is given).
-    #[arg(short, long)]
+    /// TSV output (`-`: stdout; the default when no output is given).
+    #[arg(short, long, value_name = "FILE", help_heading = "Input and output")]
     output: Option<PathBuf>,
-    /// Write the mappings as a RAD file (`bulk_long_read` records, which oarfish reads).
-    #[arg(long)]
+    /// PAF output (`-`: stdout).
+    #[arg(long, value_name = "FILE", help_heading = "Input and output")]
+    paf: Option<PathBuf>,
+    /// RAD output (`bulk_long_read` records, which oarfish quantifies with `-a`).
+    #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     rad: Option<PathBuf>,
-    /// RAD chunk compression: `lz4`, `zstd` or `none`.
-    #[arg(long, default_value = "lz4")]
-    rad_codec: String,
-    /// Reads per work batch (smaller batches balance load better when read costs vary).
-    #[arg(long, default_value_t = 32)]
+    /// RAD chunk compression.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "lz4",
+        hide_short_help = true,
+        help_heading = "Input and output"
+    )]
+    rad_codec: Codec,
+    /// Run record (JSON) [default: <first output file>.meta.json; none if all output goes to
+    /// stdout].
+    #[arg(long, value_name = "FILE", help_heading = "Input and output")]
+    meta: Option<PathBuf>,
+    /// Print the complete parameters the settings resolve to (JSON) and exit.
+    #[arg(long, help_heading = "Input and output")]
+    print_params: bool,
+    /// Reads per work batch (smaller batches balance load when read costs vary).
+    #[arg(
+        long,
+        default_value_t = 32,
+        hide_short_help = true,
+        help_heading = "Input and output"
+    )]
     batch_size: usize,
-    /// Chaining: cost per base of gap discrepancy |Δq - ρΔt|.
-    #[arg(long, default_value_t = 1.5)]
-    alpha: f32,
-    /// Chaining: cost per log2 of gap length.
-    #[arg(long, default_value_t = 0.0)]
-    beta: f32,
-    /// Chaining: predecessor window (anchors).
-    #[arg(long, default_value_t = 50)]
-    window: usize,
-    /// Chainer: `oracle` (per-transcript DP with shared prefixes) or `refine` (multi-transcript
-    /// state DP with lazy color refinement). Both give identical scores with no beam.
-    #[arg(long, default_value = "oracle")]
-    chainer: String,
-    /// Refine chainer: keep at most this many states per anchor (default: unbounded, exact).
-    #[arg(long)]
-    beam: Option<usize>,
-    /// Disable the hierarchical rescue of low-coverage reads.
-    #[arg(long)]
-    no_rescue: bool,
-    /// Rescue seed scheme (applied to parsed read and candidate transcripts).
-    #[arg(long, default_value = "lcp:K=2")]
-    rescue_scheme: String,
-    /// Rescue: candidate genes per strand.
-    #[arg(long, default_value_t = 16)]
-    rescue_genes: usize,
-    /// Rescue: re-seed the other orientation only if its base-level best is within this
-    /// margin of the chosen one's (negative: never; default: always).
-    #[arg(long, allow_hyphen_values = true)]
-    rescue_other_margin: Option<f32>,
-    /// Rescue: window slack beyond the projected read, as PAD,DIV (PAD + read/DIV bases).
-    #[arg(long)]
-    rescue_window: Option<String>,
-    /// Rescue: candidate genes must score this fraction of the best gene's base score.
-    #[arg(long)]
-    rescue_alpha: Option<f32>,
-    /// Rescue: re-seed whole transcripts instead of the window the read can occupy.
-    #[arg(long)]
-    rescue_full: bool,
-    /// Rescue: transcripts per gene (those with the most base anchors).
-    #[arg(long, default_value_t = 128)]
-    rescue_tx: usize,
-    /// Disable the base-level tie-break among near-best transcripts.
-    #[arg(long)]
-    no_tiebreak: bool,
-    /// Tie-break: score charged per extra edit.
-    #[arg(long, default_value_t = 6.0)]
-    kappa: f32,
-    /// Tie-break: align whole reads instead of only where tied transcripts differ.
-    #[arg(long)]
-    whole_read_tiebreak: bool,
-    /// Tie-break: absolute score margin defining the tie set.
-    #[arg(long, default_value_t = 30.0)]
-    tie_margin: f32,
-    /// Read type: `ont` (cDNA, both orientations), `drna` (ONT direct RNA: sense
-    /// orientation only), or `hifi` (PacBio HiFi). Sets the tie-break's affine scores
-    /// (minimap2 map-ont / map-hifi) and the orientations mapped.
-    #[arg(long, default_value = "ont")]
-    preset: String,
-    /// Orientations to map, overriding the preset: `both`, `fwd` (as given) or `rev`.
-    #[arg(long)]
-    strands: Option<String>,
-    /// Tie-break: score segments by unit-cost edit distance instead of affine gaps.
-    #[arg(long)]
-    unit_tiebreak: bool,
-    /// Tie-break: affine-score only segment texts within this many edits of the best
-    /// (unit-cost prefilter); default from the preset (drna: 4, others: all).
-    #[arg(long)]
-    affine_within: Option<u32>,
-    /// Tie-break: transcript bases beyond the read's projected ends (plus 1/`tie_pad_div` of
-    /// the unanchored end).
-    /// Default 20 + 1/10.
-    #[arg(long)]
-    tie_pad: Option<u32>,
-    #[arg(long)]
-    tie_pad_div: Option<u32>,
-    /// Tie-break: force whole read ends through the alignment instead of clipping what
-    /// doesn't align (adapters, junk).
-    #[arg(long)]
-    no_tie_clip: bool,
-    /// Tie-break: bonus for aligning through to the read's end (minimap2's --end-bonus).
-    #[arg(long, default_value_t = 5)]
-    end_bonus: i32,
-    /// Tie-break: when tied hits share no anchor, group them by shared anchors instead of
-    /// aligning every hit's whole read (fewer whole-read alignments; default for hifi).
-    #[arg(long)]
-    tie_group: bool,
-    /// Near-tied read orientations: compare by whole-read edit distance instead of clipped
-    /// affine scores.
-    #[arg(long)]
-    orient_edit: bool,
-    /// Tie-break: align read ends in raw (uncompressed) space, needing an index with raw
-    /// transcripts (default: the preset's; on except for drna).
-    #[arg(long)]
-    raw_ends: Option<bool>,
-    /// Chain every anchor separately (no merging of collinear anchors within a unitig).
-    #[arg(long)]
-    no_merge: bool,
-    /// Extend reported spans past the outermost anchors to where the read's alignment ends
-    /// (default: the preset's; on for ont). Off: spans run from the first to the last
-    /// anchor.
-    #[arg(long)]
-    extend_ends: Option<bool>,
-    /// Extend only hits scoring within this fraction of the read's best.
-    #[arg(long, default_value_t = 0.05)]
-    extend_within: f32,
-    /// Tie-break: affine DP band (cells off the diagonals spanning each segment).
-    #[arg(long)]
-    tie_band: Option<usize>,
-    /// Tie-break: X-drop for read-end extensions (default: the preset's).
-    #[arg(long)]
-    xdrop: Option<i32>,
-    /// Tie-break: score charged per affine-score point below the best.
-    #[arg(long, default_value_t = 1.0)]
-    lambda: f32,
-    /// Tie-break: align at most this many near-best transcripts.
-    #[arg(long, default_value_t = 256)]
-    tie_cands: usize,
-    /// Candidate genes kept per read (best-scoring first).
-    #[arg(long, default_value_t = 8)]
-    f_keep: usize,
-    /// Also keep genes within this relative score of the last kept one (ties)...
-    #[arg(long, default_value_t = 0.01)]
-    f_tie: f32,
-    /// ...up to this many genes in total.
-    #[arg(long, default_value_t = 64)]
-    f_max: usize,
-    /// Ignore seed labels found in more than this many genes.
-    #[arg(long, default_value_t = 1000)]
-    h_max: usize,
-    /// Gene count at which a seed's weight reaches zero (specificity weighting; the
-    /// default effectively disables it).
-    #[arg(long, default_value_t = 1e9)]
-    g_max: f32,
-    /// Report transcripts within this fraction of the best score.
-    #[arg(long, default_value_t = 0.3)]
-    delta_rep: f32,
+    #[command(flatten)]
+    settings: MapArgs,
+}
+
+/// The settings that differ between presets, for `--help`.
+fn preset_table() -> String {
+    let opts: Vec<serde_json::Value> = spearfish::Preset::ALL
+        .iter()
+        .map(|&p| serde_json::to_value(MapOptions::preset(p)).unwrap())
+        .collect();
+    let mut rows = Vec::new();
+    fn walk(path: &str, vals: &[&serde_json::Value], rows: &mut Vec<(String, Vec<String>)>) {
+        if vals.iter().all(|v| v.is_object()) {
+            let mut keys: Vec<&String> = vals.iter().flat_map(|v| v.as_object().unwrap().keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                let sub: Vec<&serde_json::Value> = vals
+                    .iter()
+                    .map(|v| v.get(k).unwrap_or(&serde_json::Value::Null))
+                    .collect();
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                walk(&p, &sub, rows);
+            }
+        } else if vals.windows(2).any(|w| w[0] != w[1]) && path != "preset" {
+            let show = |v: &serde_json::Value| match v {
+                serde_json::Value::Null => "off".to_string(),
+                serde_json::Value::Object(_) => "on".to_string(),
+                v => v.to_string().trim_matches('"').to_string(),
+            };
+            rows.push((path.to_string(), vals.iter().map(|v| show(v)).collect()));
+        }
+    }
+    walk("", &opts.iter().collect::<Vec<_>>(), &mut rows);
+    let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let mut s = format!(
+        "Preset differences (all other defaults are shared):\n  {:w$}  ont  drna  hifi\n",
+        ""
+    );
+    for (k, v) in rows {
+        s += &format!("  {k:w$}  {}\n", v.join("  "));
+    }
+    s + "\n`spearfish map --print-params [--preset P] [settings]` prints every parameter."
+}
+
+/// Per-thread and total counts.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Counts {
+    pub reads: u64,
+    pub mapped: u64,
+    pub unmapped: u64,
+    /// Mapped reads with more than one reported hit.
+    pub multi_mapped: u64,
+    pub rescued: u64,
+    pub low_coverage: u64,
+    pub hits: u64,
+    pub bases: u64,
+}
+
+impl Counts {
+    fn add_read(&mut self, r: &MappedRead) {
+        self.reads += 1;
+        self.bases += r.len as u64;
+        if r.hits.is_empty() {
+            self.unmapped += 1;
+        } else {
+            self.mapped += 1;
+            self.multi_mapped += (r.hits.len() > 1) as u64;
+        }
+        self.rescued += r.rescued as u64;
+        self.low_coverage += r.low_coverage as u64;
+        self.hits += r.hits.len() as u64;
+    }
+
+    fn add(&mut self, o: &Counts) {
+        self.reads += o.reads;
+        self.mapped += o.mapped;
+        self.unmapped += o.unmapped;
+        self.multi_mapped += o.multi_mapped;
+        self.rescued += o.rescued;
+        self.low_coverage += o.low_coverage;
+        self.hits += o.hits;
+        self.bases += o.bases;
+    }
 }
 
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -189,23 +185,105 @@ type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 #[derive(Clone)]
 struct Processor {
     mapper: Arc<Mapper>,
-    buf: Vec<u8>,
-    out: Option<Out>,
+    tsv: Option<(Out, Vec<u8>)>,
+    paf: Option<(Out, Vec<u8>)>,
     rad: Option<long_read_rad::Sink>,
     rec: long_read_rad::ReadRecord,
-    stats: Arc<Mutex<(u64, u64, u64)>>,
-    local: (u64, u64, u64),
+    total: Arc<Mutex<Counts>>,
+    progress: Arc<AtomicU64>,
+    local: Counts,
+    batch_reads: u64,
+}
+
+/// TSV lines of one read.
+fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
+    if r.hits.is_empty() {
+        let _ = writeln!(
+            buf,
+            "{name}\t{}\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped",
+            r.len
+        );
+        return;
+    }
+    let read_flags = read_flags(r);
+    for (rank, h) in r.hits.iter().enumerate() {
+        let strand = if h.reverse { '-' } else { '+' };
+        let _ = writeln!(
+            buf,
+            "{name}\t{}\t{strand}\t{rank}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{}",
+            r.len,
+            idx.tx_name(h.tx),
+            h.score,
+            h.query_start,
+            h.query_end,
+            h.target_start,
+            h.target_end,
+            h.anchors,
+            h.anchored,
+            h.max_discrepancy,
+            hit_flags(read_flags, h.extended)
+        );
+    }
+}
+
+fn read_flags(r: &MappedRead) -> &'static str {
+    match (r.low_coverage, r.rescued) {
+        (true, true) => "rescued,low_coverage",
+        (true, false) => "low_coverage",
+        (false, true) => "rescued",
+        (false, false) => "-",
+    }
+}
+
+fn hit_flags(read_flags: &str, extended: bool) -> std::borrow::Cow<'_, str> {
+    match (extended, read_flags) {
+        (true, f) => f.into(),
+        (false, "-") => "anchor_span".into(),
+        (false, f) => format!("{f},anchor_span").into(),
+    }
+}
+
+/// PAF lines of one read (none if unmapped). Columns as minimap2 writes them without `-c`:
+/// residue matches are the read bases the hit's seeds cover (homopolymer-compressed), the
+/// block length the longer of the two spans, and the mapping quality 255 (not computed: tied
+/// isoforms are reported as hits instead). Tags: `tp:A` P for the best hit, S for the others;
+/// `AS:i` the score rounded; `sc:f` the score; `cm:i` anchors in the chain; `rk:i` the rank;
+/// `fl:Z` the TSV flags, when any.
+pub fn paf_line(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
+    let read_flags = read_flags(r);
+    for (rank, h) in r.hits.iter().enumerate() {
+        let strand = if h.reverse { '-' } else { '+' };
+        let block = (h.query_end - h.query_start).max(h.target_end - h.target_start);
+        let _ = write!(
+            buf,
+            "{name}\t{}\t{}\t{}\t{strand}\t{}\t{}\t{}\t{}\t{}\t{block}\t255\ttp:A:{}\tAS:i:{:.0}\tsc:f:{:.2}\tcm:i:{}\trk:i:{rank}",
+            r.len,
+            h.query_start,
+            h.query_end,
+            idx.tx_name(h.tx),
+            idx.tx_len(h.tx),
+            h.target_start,
+            h.target_end,
+            h.anchored.min(block),
+            if rank == 0 { 'P' } else { 'S' },
+            h.score,
+            h.score,
+            h.anchors,
+        );
+        let f = hit_flags(read_flags, h.extended);
+        if f != "-" {
+            let _ = write!(buf, "\tfl:Z:{f}");
+        }
+        buf.push(b'\n');
+    }
 }
 
 impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     fn process_record(&mut self, record: Rf) -> paraseq::Result<()> {
         let seq = record.seq();
         let r = self.mapper.map(&seq);
-        self.local.0 += 1;
-        self.local.2 += seq.len() as u64;
-        if !r.hits.is_empty() {
-            self.local.1 += 1;
-        }
+        self.local.add_read(&r);
+        self.batch_reads += 1;
         if let Some(rad) = &mut self.rad
             && !r.hits.is_empty()
         {
@@ -232,45 +310,16 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
             }
             rad.push(rec).map_err(std::io::Error::other)?;
         }
-        if self.out.is_none() {
+        if self.tsv.is_none() && self.paf.is_none() {
             return Ok(());
         }
         let name = record.id_str().split_whitespace().next().unwrap_or("");
-        if r.hits.is_empty() {
-            let _ = writeln!(
-                self.buf,
-                "{name}\t{}\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped",
-                r.len
-            );
-            return Ok(());
+        let idx = self.mapper.index();
+        if let Some((_, buf)) = &mut self.tsv {
+            tsv_lines(buf, name, &r, idx);
         }
-        let flags = match (r.low_coverage, r.rescued) {
-            (true, true) => "rescued,low_coverage",
-            (true, false) => "low_coverage",
-            (false, true) => "rescued",
-            (false, false) => "-",
-        };
-        for (rank, h) in r.hits.iter().enumerate() {
-            let strand = if h.reverse { '-' } else { '+' };
-            let flags = match (h.extended, flags) {
-                (true, f) => f.to_string(),
-                (false, "-") => "anchor_span".to_string(),
-                (false, f) => format!("{f},anchor_span"),
-            };
-            let _ = writeln!(
-                self.buf,
-                "{name}\t{}\t{strand}\t{rank}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{flags}",
-                r.len,
-                self.mapper.index().tx_name(h.tx),
-                h.score,
-                h.query_start,
-                h.query_end,
-                h.target_start,
-                h.target_end,
-                h.anchors,
-                h.anchored,
-                h.max_discrepancy
-            );
+        if let Some((_, buf)) = &mut self.paf {
+            paf_line(buf, name, &r, idx);
         }
         Ok(())
     }
@@ -278,10 +327,12 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     /// Write the batch's records. All mappings of a read are contiguous; reads appear in
     /// completion order, not input order.
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
-        if let Some(out) = &self.out {
-            out.lock().unwrap().write_all(&self.buf)?;
-            self.buf.clear();
+        for (out, buf) in [&mut self.tsv, &mut self.paf].into_iter().flatten() {
+            out.lock().unwrap().write_all(buf)?;
+            buf.clear();
         }
+        self.progress.fetch_add(self.batch_reads, Ordering::Relaxed);
+        self.batch_reads = 0;
         Ok(())
     }
 
@@ -289,209 +340,337 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         if let Some(rad) = &mut self.rad {
             rad.flush().map_err(std::io::Error::other)?;
         }
-        let mut s = self.stats.lock().unwrap();
-        s.0 += self.local.0;
-        s.1 += self.local.1;
-        s.2 += self.local.2;
-        self.local = (0, 0, 0);
+        self.total.lock().unwrap().add(&self.local);
+        self.local = Counts::default();
         Ok(())
     }
 }
 
-pub fn run(args: Args) -> Result<()> {
-    let t0 = Instant::now();
-    let idx = Arc::new(Index::open(&args.index)?);
-    let mapper = Arc::new(Mapper::new(idx, &options(&args)?)?);
-    let load = t0.elapsed().as_secs_f64();
-    let sink: Option<Box<dyn Write + Send>> = match (&args.output, &args.rad) {
-        (Some(p), _) => Some(Box::new(std::io::BufWriter::new(std::fs::File::create(p)?))),
-        (None, None) => Some(Box::new(std::io::BufWriter::new(std::io::stdout()))),
-        (None, Some(_)) => None,
+/// Open an output: a file, or stdout for `-`.
+fn sink(p: &Path) -> Result<Out> {
+    let w: Box<dyn Write + Send> = if p.as_os_str() == "-" {
+        Box::new(std::io::BufWriter::new(std::io::stdout()))
+    } else {
+        let f = std::fs::File::create(p).map_err(|e| anyhow::anyhow!("creating {}: {e}", p.display()))?;
+        Box::new(std::io::BufWriter::new(f))
     };
-    let out: Option<Out> = sink.map(|s| Arc::new(Mutex::new(s)));
-    if let Some(out) = &out {
-        out.lock().unwrap().write_all(
-            b"read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n",
-        )?;
+    Ok(Arc::new(Mutex::new(w)))
+}
+
+/// Draws `mapped N reads (R reads/s)` on stderr every second until dropped.
+struct Progress {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Progress {
+    fn start(count: Arc<AtomicU64>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = crate::logging::progress_enabled().then(|| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let mut drawn = false;
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let s = t0.elapsed().as_secs_f64();
+                    if s < 1.0 {
+                        continue;
+                    }
+                    let n = count.load(Ordering::Relaxed);
+                    eprint!("\r\x1b[2Kmapped {n} reads ({:.0} reads/s)", n as f64 / s);
+                    drawn = true;
+                }
+                if drawn {
+                    eprint!("\r\x1b[2K");
+                }
+            })
+        });
+        Progress { stop, handle }
     }
-    let rad = match &args.rad {
-        Some(p) => Some(rad_writer(p, &args, &mapper)?),
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Outputs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tsv: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paf: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rad: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RunStats {
+    #[serde(flatten)]
+    counts: Counts,
+    mean_read_length: f64,
+    mean_hits_per_mapped_read: f64,
+    index_load_seconds: f64,
+    mapping_seconds: f64,
+    wall_seconds: f64,
+    reads_per_second: f64,
+    mbp_per_second: f64,
+    #[serde(flatten)]
+    usage: Usage,
+    /// Internal counters (`SPEARFISH_STATS=1`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    internal: Vec<(String, u64)>,
+}
+
+/// The run record (`<output>.meta.json`).
+#[derive(Serialize)]
+struct RunRecord<'a> {
+    kind: &'static str,
+    #[serde(flatten)]
+    invocation: &'a Invocation,
+    index: IndexInfo,
+    reads: String,
+    outputs: Outputs,
+    /// The settings changed from the preset.
+    settings: &'a MapSettings,
+    /// Every parameter used.
+    parameters: &'a MapOptions,
+    score_denom: f32,
+    finished_unix: u64,
+    stats: RunStats,
+}
+
+/// One mapping run.
+pub struct Job {
+    pub index: PathBuf,
+    pub reads: PathBuf,
+    pub threads: usize,
+    pub output: Option<PathBuf>,
+    pub paf: Option<PathBuf>,
+    pub rad: Option<PathBuf>,
+    pub rad_codec: Codec,
+    pub meta: Option<PathBuf>,
+    pub batch_size: usize,
+    pub settings: MapSettings,
+}
+
+pub fn run(args: Args) -> Result<()> {
+    let settings = args.settings.settings();
+    if args.print_params {
+        println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
+        return Ok(());
+    }
+    execute(Job {
+        index: args.index.unwrap(),
+        reads: args.reads.unwrap(),
+        threads: args.threads,
+        output: args.output,
+        paf: args.paf,
+        rad: args.rad,
+        rad_codec: args.rad_codec,
+        meta: args.meta,
+        batch_size: args.batch_size,
+        settings,
+    })
+    .map(|_| ())
+}
+
+/// Run a mapping job; returns the read counts.
+pub fn execute(args: Job) -> Result<Counts> {
+    let settings = args.settings.clone();
+    let opts = settings.resolve()?;
+    let (index_path, reads) = (args.index.clone(), args.reads.clone());
+    let stdout_outputs = [&args.output, &args.paf]
+        .iter()
+        .filter(|o| o.as_ref().is_some_and(|p| p.as_os_str() == "-"))
+        .count();
+    if stdout_outputs > 1 {
+        bail!("only one output can go to stdout");
+    }
+    let tsv_path = match (&args.output, &args.paf, &args.rad) {
+        (None, None, None) => Some(PathBuf::from("-")),
+        (o, _, _) => o.clone(),
+    };
+    let meta_path = args.meta.clone().or_else(|| {
+        [&tsv_path, &args.paf, &args.rad]
+            .into_iter()
+            .flatten()
+            .find(|p| p.as_os_str() != "-")
+            .map(|p| {
+                let mut s = p.as_os_str().to_owned();
+                s.push(".meta.json");
+                PathBuf::from(s)
+            })
+    });
+    let threads = runinfo::threads(args.threads);
+    let invocation = Invocation::new(threads);
+
+    let input = Some(reads.clone()).filter(|p| p.as_os_str() != "-");
+    if let Some(p) = &input {
+        std::fs::metadata(p).with_context(|| format!("reads {}", p.display()))?;
+    }
+    let t0 = Instant::now();
+    let idx = Arc::new(Index::open(&index_path).with_context(|| format!("index {}", index_path.display()))?);
+    let mapper = Arc::new(Mapper::new(idx.clone(), &opts)?);
+    let load = t0.elapsed().as_secs_f64();
+    let index_info = IndexInfo::of(&index_path, &idx);
+    if index_info.manifest.is_none() {
+        log::debug!("the index has no manifest (built before manifests were recorded)");
+    }
+
+    let tsv = match &tsv_path {
+        Some(p) => {
+            let out = sink(p)?;
+            out.lock().unwrap().write_all(
+                b"read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n",
+            )?;
+            Some((out, Vec::new()))
+        }
         None => None,
     };
-    let stats = Arc::new(Mutex::new((0u64, 0u64, 0u64)));
+    let paf = match &args.paf {
+        Some(p) => Some((sink(p)?, Vec::new())),
+        None => None,
+    };
+    let rad = match &args.rad {
+        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings)?),
+        None => None,
+    };
+    let total = Arc::new(Mutex::new(Counts::default()));
+    let progress = Arc::new(AtomicU64::new(0));
     let mut proc = Processor {
         mapper,
-        buf: Vec::new(),
-        out: out.clone(),
+        tsv: tsv.clone(),
+        paf: paf.clone(),
         rad: rad.as_ref().map(|w| w.sink()),
         rec: long_read_rad::ReadRecord::default(),
-        stats: stats.clone(),
-        local: (0, 0, 0),
+        total: total.clone(),
+        progress: progress.clone(),
+        local: Counts::default(),
+        batch_reads: 0,
     };
-    let input = Some(args.reads.clone()).filter(|p| p.as_os_str() != "-");
     let reader = ReaderBuilder::optional_path(input)
         .batch_size(args.batch_size)
-        .build()?;
+        .build()
+        .with_context(|| format!("reading {}", reads.display()))?;
     let t1 = Instant::now();
-    reader.process_parallel(&mut proc, args.threads)?;
-    if let Some(out) = &out {
+    {
+        let _p = Progress::start(progress);
+        reader.process_parallel(&mut proc, threads)?;
+    }
+    for (out, _) in [&tsv, &paf].into_iter().flatten() {
         out.lock().unwrap().flush()?;
     }
     drop(proc);
     let secs = t1.elapsed().as_secs_f64();
-    if map::stats::on() {
-        for (k, v) in map::stats::snapshot() {
-            eprintln!("stats\t{k}\t{v}");
+    let internal = if map::stats::on() {
+        let v: Vec<(String, u64)> = map::stats::snapshot()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        for (k, v) in &v {
+            log::info!("stats\t{k}\t{v}");
         }
-    }
-    let (n, mapped, bases) = *stats.lock().unwrap();
+        v
+    } else {
+        Vec::new()
+    };
+    let c = *total.lock().unwrap();
     if let Some(w) = rad {
         w.finish(long_read_rad::Counts {
-            reads: n,
-            mapped,
-            bases,
+            reads: c.reads,
+            mapped: c.mapped,
+            bases: c.bases,
         })?;
     }
-    eprintln!(
-        "map: {n} reads ({:.1}% mapped), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",
-        100.0 * mapped as f64 / n.max(1) as f64,
-        bases as f64 / 1e6,
-        n as f64 / secs,
-        bases as f64 / 1e6 / secs
+    log::info!(
+        "map: {} reads ({:.1}% mapped, {:.1}% rescued), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",
+        c.reads,
+        100.0 * c.mapped as f64 / c.reads.max(1) as f64,
+        100.0 * c.rescued as f64 / c.reads.max(1) as f64,
+        c.bases as f64 / 1e6,
+        c.reads as f64 / secs,
+        c.bases as f64 / 1e6 / secs
     );
-    Ok(())
+    if let Some(m) = &meta_path {
+        // Absolute paths, so the record still names the files when read from elsewhere.
+        let abs = |p: &Path| {
+            if p.as_os_str() == "-" {
+                "-".to_string()
+            } else {
+                spearfish::provenance::absolute(p)
+            }
+        };
+        let show = |p: &Option<PathBuf>| p.as_deref().map(abs);
+        let record = RunRecord {
+            kind: "spearfish-map-run",
+            invocation: &invocation,
+            index: index_info,
+            reads: abs(&reads),
+            outputs: Outputs {
+                tsv: show(&tsv_path),
+                paf: show(&args.paf),
+                rad: show(&args.rad),
+            },
+            settings: &settings,
+            parameters: &opts,
+            score_denom: spearfish::SCORE_DENOM,
+            finished_unix: runinfo::unix_now(),
+            stats: RunStats {
+                counts: c,
+                mean_read_length: c.bases as f64 / c.reads.max(1) as f64,
+                mean_hits_per_mapped_read: c.hits as f64 / c.mapped.max(1) as f64,
+                index_load_seconds: load,
+                mapping_seconds: secs,
+                wall_seconds: t0.elapsed().as_secs_f64(),
+                reads_per_second: c.reads as f64 / secs,
+                mbp_per_second: c.bases as f64 / 1e6 / secs,
+                usage: Usage::now(),
+                internal,
+            },
+        };
+        runinfo::write_json(m, &record)?;
+    }
+    Ok(c)
 }
 
 /// A RAD writer over the index's transcripts, with the tags oarfish uses to read the scores
 /// and spans.
-fn rad_writer(path: &std::path::Path, args: &Args, mapper: &Mapper) -> Result<long_read_rad::RadWriter> {
-    let codec = match args.rad_codec.as_str() {
-        "lz4" => long_read_rad::ChunkCodec::Lz4,
-        "zstd" => long_read_rad::ChunkCodec::Zstd,
-        "none" => long_read_rad::ChunkCodec::None,
-        c => anyhow::bail!("unknown --rad-codec {c:?} (lz4, zstd, none)"),
+fn rad_writer(
+    path: &Path,
+    codec: Codec,
+    mapper: &Mapper,
+    settings: &MapSettings,
+) -> Result<long_read_rad::RadWriter> {
+    let codec = match codec {
+        Codec::Lz4 => long_read_rad::ChunkCodec::Lz4,
+        Codec::Zstd => long_read_rad::ChunkCodec::Zstd,
+        Codec::None => long_read_rad::ChunkCodec::None,
     };
     let idx = mapper.index();
     let refs: Vec<(&str, u32)> = (0..idx.n_transcripts() as u32)
         .map(|t| (idx.tx_name(t), idx.tx_len(t)))
         .collect();
-    let opts = options(args)?;
+    let opts = mapper.options();
     let meta = long_read_rad::Meta {
         mapper: "spearfish".into(),
-        mapper_version: env!("CARGO_PKG_VERSION").into(),
+        mapper_version: spearfish::provenance::BuildInfo::current().short(),
         cmdline: std::env::args().collect::<Vec<_>>().join(" "),
-        params: format!("{:?}", opts.params),
-        preset: args.preset.clone(),
-        seq_tech: match args.preset.parse::<Preset>()? {
-            Preset::Ont => "ont-cdna",
-            Preset::Drna => "ont-drna",
-            Preset::Hifi => "pac-bio-hifi",
-        }
-        .into(),
-        // spearfish weighs a hit scoring d below the best by exp(-d / 2).
-        score_denom: 2.0,
+        params: serde_json::to_string(&serde_json::json!({
+            "settings": settings,
+            "parameters": opts,
+        }))?,
+        preset: opts.preset.name().into(),
+        seq_tech: opts.preset.seq_tech().into(),
+        score_denom: mapper.score_denom(),
         ends_extended: opts.params.ends.is_some(),
-        strands: match opts.params.strands {
-            map::Strands::Both => "both",
-            map::Strands::Forward => "fwd",
-            map::Strands::Reverse => "rev",
-        }
-        .into(),
+        strands: opts.params.strands.name().into(),
+        index_id: idx.id(),
     };
     long_read_rad::RadWriter::create(path, &refs, &meta, codec)
-}
-
-/// Mapping options: the preset's, then any explicit flags.
-fn options(args: &Args) -> Result<MapOptions> {
-    let preset: Preset = args.preset.parse()?;
-    let mut o = MapOptions::preset(preset);
-    let p = &mut o.params;
-    p.chain.alpha = args.alpha;
-    p.chain.beta = args.beta;
-    p.chain.h = args.window;
-    if let Some(s) = &args.strands {
-        p.strands = match s.as_str() {
-            "both" => map::Strands::Both,
-            "fwd" => map::Strands::Forward,
-            "rev" => map::Strands::Reverse,
-            x => anyhow::bail!("unknown strands {x:?} (both, fwd, rev)"),
-        };
-    }
-    if args.no_tiebreak {
-        p.tiebreak = None;
-    } else if let Some(tb) = p.tiebreak.as_mut() {
-        tb.kappa = args.kappa;
-        tb.margin_abs = args.tie_margin;
-        if args.unit_tiebreak {
-            tb.affine = None;
-        }
-        tb.lambda = args.lambda;
-        tb.clip_ends = !args.no_tie_clip;
-        tb.end_bonus = args.end_bonus;
-        tb.group_fallback |= args.tie_group;
-        tb.orient_clipped = !args.orient_edit;
-        if let Some(r) = args.raw_ends {
-            tb.raw_ends = r;
-        }
-        if let Some(b) = args.tie_band {
-            tb.band = b;
-        }
-        if let Some(x) = args.xdrop {
-            tb.xdrop = x;
-        }
-        if let Some(x) = args.tie_pad {
-            tb.pad = x;
-        }
-        if let Some(x) = args.tie_pad_div {
-            tb.pad_div = x.max(1);
-        }
-        if args.affine_within.is_some() {
-            tb.affine_within = args.affine_within;
-        }
-        tb.max_cands = args.tie_cands;
-        tb.segmented = !args.whole_read_tiebreak;
-    }
-    p.anchor.f_keep = args.f_keep;
-    p.anchor.f_tie = args.f_tie;
-    p.anchor.f_max = args.f_max;
-    p.anchor.h_max = args.h_max;
-    p.anchor.g_max = args.g_max;
-    if args.no_rescue {
-        p.rescue = None;
-    } else if let Some(r) = p.rescue.as_mut() {
-        r.spec = args.rescue_scheme.clone();
-        r.max_genes = args.rescue_genes;
-        r.max_tx_per_gene = args.rescue_tx;
-        if args.rescue_full {
-            r.window = None;
-        }
-        if let Some(w) = &args.rescue_window {
-            let (a, b) = w
-                .split_once(',')
-                .ok_or_else(|| anyhow::anyhow!("--rescue-window PAD,DIV"))?;
-            r.window = Some((a.parse()?, b.parse()?));
-        }
-        if let Some(a) = args.rescue_alpha {
-            r.alpha = a;
-        }
-        if args.rescue_other_margin.is_some() {
-            r.other_margin = args.rescue_other_margin;
-        }
-    }
-    p.delta_rep = args.delta_rep;
-    p.merge_collinear = !args.no_merge;
-    match args.extend_ends {
-        Some(false) => o.params.ends = None,
-        Some(true) => o.extend_ends(preset),
-        None => {}
-    }
-    if let Some(e) = &mut o.params.ends {
-        e.within = args.extend_within;
-    }
-    o.chainer = match args.chainer.as_str() {
-        "oracle" => ChainerKind::Oracle,
-        "refine" => ChainerKind::Refine { beam: args.beam },
-        c => anyhow::bail!("unknown chainer {c:?} (oracle, refine)"),
-    };
-    Ok(o)
 }
