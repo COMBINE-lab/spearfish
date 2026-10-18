@@ -1,34 +1,43 @@
 ---
 title: Quantification
-description: Estimate transcript abundances from spearfish's output.
+description: Estimate transcript abundances from spearfish's mappings with oarfish.
 ---
 
-spearfish reports scored transcript sets; an EM turns them into abundances. There are two ways
-to run one.
+spearfish reports scored transcript sets; an EM turns them into abundances.
+[oarfish](https://github.com/COMBINE-lab/oarfish) does this, with coverage and positional models.
 
 ## spearfish quant
 
 ```sh
-spearfish quant transcripts.fa.gz reads.map.tsv -t 16 -o reads.quant.tsv
+spearfish quant transcripts.sfi reads.fastq.gz --preset ont -t 16 -o sample
 ```
 
-The transcript FASTA supplies names and lengths. The output lists each transcript's length and
-estimated number of reads. The EM groups reads with the same scored transcript set into
-equivalence classes and runs in parallel over them.
+maps the reads to a RAD file and runs `oarfish -a` on it. oarfish takes the transcripts, the
+score scale, the preset and whether spans reach the read ends from the file, so no other options
+are needed. Its outputs are written under the prefix (`sample.quant`, `sample.meta_info.json`,
+...), and the mapping's run record as `sample.map.meta.json`. The RAD file is removed afterwards
+unless `--keep-rad` is given.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--score-denom` | `2` | D in `exp((s - s_max) / D)`. Use 5, oarfish's default, for minimap2 alignment scores. |
-| `--min-frac` | `0.95` | Keep hits scoring at least this fraction of the read's best. |
-| `--keep-low-coverage` | off | Also use reads flagged `low_coverage`. |
-| `--length-norm` | off | Divide likelihoods by transcript length. Long-read protocols sequence about one read per molecule, so the default is off. |
+Mapping settings work as in `spearfish map`. Arguments after `--` go to oarfish:
 
-## With oarfish
+```sh
+spearfish quant transcripts.sfi reads.fastq.gz -o sample --extend-ends -- --model-truncation
+```
 
-[oarfish](https://github.com/COMBINE-lab/oarfish) is a long-read transcript quantifier with
-coverage and positional models. Two ways to use it with spearfish are in development and not
-yet part of a released oarfish: a mapping backend that maps reads in process and passes the
-scored sets to its EM, and reading a RAD file from `spearfish map --rad` with
-`oarfish -a mappings.rad`. The RAD file's tags tell oarfish the transcripts and the score scale,
-so no further options are needed. For oarfish's truncation model, map with
-`--extend-ends true` so that spans reach the read ends.
+oarfish's truncation model uses where reads start and end on transcripts, so map with
+`--extend-ends` for it (the `ont` preset already does).
+
+`spearfish quant` needs an oarfish build with spearfish support; give its path with
+`--oarfish` or `$OARFISH` if it is not on the `PATH`.
+
+## Step by step
+
+The same, in two steps:
+
+```sh
+spearfish map transcripts.sfi reads.fastq.gz --preset ont -t 16 --rad sample.rad
+oarfish -a sample.rad -o sample -j 16
+```
+
+oarfish can also map reads itself with spearfish (`oarfish --mapper spearfish`), building or
+opening a spearfish index in process.

@@ -1,5 +1,5 @@
 //! `spearfish index`: build the core-graph index from a transcript FASTA, and
-//! `spearfish index-stats`: report on a built index.
+//! `spearfish inspect`: report on a built index.
 
 use std::io::Write;
 use std::path::PathBuf;

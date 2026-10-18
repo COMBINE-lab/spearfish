@@ -6,6 +6,8 @@ exclude = ["data"]
 
 [workspace.package]
 edition = "2024"
+# Oldest Rust the workspace builds with (libradicl and paraseq need 1.89); CI checks it.
+rust-version = "1.89"
 version = "0.1.0"
 license = "BSD-3-Clause"
 publish = false

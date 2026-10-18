@@ -3,6 +3,7 @@ name = "spearfish"
 description = "Fast long-read RNA-seq mapping to a transcriptome with locally consistent parsing (library)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

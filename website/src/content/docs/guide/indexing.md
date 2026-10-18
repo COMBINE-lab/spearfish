@@ -46,20 +46,38 @@ For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in ab
 
 [Inside spearfish](/spearfish/concepts/inside/) explains why this structure is small.
 
+## What was built, and from what
+
+`spearfish index` writes a manifest into the index and next to it, as `transcripts.sfi.json`:
+the spearfish version and git revision, the command line, the build options, a checksum of the
+input transcripts (and of the `--t2g` table), where the genes came from (`fasta`, `t2g`,
+`inferred` or `none`) and the construction statistics. `spearfish inspect` shows it:
+
+```sh
+spearfish inspect transcripts.sfi           # key/value summary
+spearfish inspect transcripts.sfi --json    # everything, as JSON
+spearfish inspect transcripts.sfi --sections  # plus each section's size and checksum
+```
+
+The index's identifier (`index_id`) is a hash of its input transcripts and build parameters: a
+rebuild from the same inputs gets the same identifier. Mapping outputs record it, so a mapping
+can always be traced to the index it came from. If an index was built by a spearfish whose
+sequence parser differs from the running one, mapping stops and asks for a rebuild instead of
+giving wrong results.
+
 ## Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-t, --threads` | all cores | Worker threads. |
+| `-o, --output` | | Index file (the manifest goes to `<file>.json`). |
+| `-t, --threads` | all CPUs | Worker threads. |
 | `-s, --scheme` | `lcp:K=3` | Seed scheme. LCP level-3 cores are the default; minimizers (`minimizer:k=19,w=23`) give similar accuracy. |
-| `--hpc` | `true` | Homopolymer-compress transcripts, and reads at mapping time. |
+| `--no-hpc` | | Don't homopolymer-compress transcripts (and reads at mapping time). |
 | `--collapse` | `gene` | Collapse seeds per (label, gene) or globally (`global`, larger and slower). |
-| `--f-max` | `20` | Mask unitigs shared by more than this many genes (repeats). |
+| `--mask-genes` | `20` | Mask unitigs shared by more than this many genes (repeats). |
 | `--t2g` | | Transcript-to-gene table (see above). |
 | `--infer-genes [N]` | off (N = 64) | Infer genes from shared seed runs, ignoring runs in more than N transcripts. |
 | `--infer-span` | `12` | Consecutive seeds a shared run must span. |
 | `--infer-attach-span` | `4` | Shorter runs by which small groups attach to a larger one (0 = off). |
 | `--infer-attach-max` | `3` | Largest group, in transcripts, that may attach. |
 | `--write-t2g` | | Write the transcript-to-gene grouping used. |
-
-`spearfish index-stats` reports on a built index.

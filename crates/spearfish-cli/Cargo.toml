@@ -3,6 +3,7 @@ name = "spearfish-cli"
 description = "Command-line interface to spearfish (long-read RNA-seq mapping with locally consistent parsing)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
