@@ -132,6 +132,10 @@ pub struct Args {
     /// aligning every hit's whole read (fewer whole-read alignments; default for hifi).
     #[arg(long)]
     tie_group: bool,
+    /// Tie-break: points a candidate must gain past the shortest annotated end at a read end
+    /// (its longer flank) for them to count (0: all count).
+    #[arg(long)]
+    flank_min: Option<i64>,
     /// Near-tied read orientations: compare by whole-read edit distance instead of clipped
     /// affine scores.
     #[arg(long)]
@@ -438,6 +442,9 @@ fn options(args: &Args) -> Result<MapOptions> {
         tb.clip_ends = !args.no_tie_clip;
         tb.end_bonus = args.end_bonus;
         tb.group_fallback |= args.tie_group;
+        if let Some(f) = args.flank_min {
+            tb.flank_min = f;
+        }
         tb.orient_clipped = !args.orient_edit;
         if let Some(r) = args.raw_ends {
             tb.raw_ends = r;

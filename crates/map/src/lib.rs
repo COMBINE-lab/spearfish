@@ -54,8 +54,11 @@ pub struct TieBreak {
     /// With `clip_ends`: bonus for aligning through to the read's end.
     pub end_bonus: i32,
     /// When tied hits share no anchor, group them by shared anchors (segmented within groups,
-    /// whole read across group representatives) instead of aligning every hit's whole read.
+    /// group representatives placed by clipped alignments) instead of aligning every hit's
+    /// whole read.
     pub group_fallback: bool,
+    /// Whole-read distances cover only the read between the tied hits' outermost anchors.
+    pub whole_trim: bool,
     /// With `clip_ends`: stop extending a read end once a row falls this far below the best
     /// score so far (X-drop; `i32::MAX`: never).
     pub xdrop: i32,
@@ -80,6 +83,12 @@ pub struct TieBreak {
     pub tail_bonus: i32,
     /// Trim a detected poly(A) tail from the read's right end before aligning it.
     pub tail_trim: bool,
+    /// Read ends: points a candidate gains past the shortest annotated end among the windows
+    /// (by aligning read bases into its longer flank) count only from this many on, or from a
+    /// short nearly exact extension; less is what primers and adapters score against flanks by
+    /// chance (0: all count, the default: 10 raises top-1 on reads with primers but merges
+    /// isoforms whose ends differ by a few bases).
+    pub flank_min: i64,
     /// Shortest poly(A) tail recognized: a window this long with at most one base not A,
     /// followed by at most `TAIL_AFTER` read bases.
     pub tail_run: usize,
@@ -105,11 +114,13 @@ impl Default for TieBreak {
             xdrop: 50,
             end_diagonal: false,
             group_fallback: false,
+            whole_trim: true,
             orient_clipped: true,
             raw_ends: true,
             tail_bonus: 10,
             tail_trim: true,
             tail_run: 15,
+            flank_min: 0,
         }
     }
 }
@@ -506,15 +517,30 @@ impl<C: Chainer> Mapper<C> {
     /// Whole read against each candidate's covered transcript region (projected to the read
     /// ends, padded), infix mode.
     fn whole_read(&self, tb: &TieBreak, codes: &[u8], hits: &[TxHit]) -> Vec<u32> {
-        let plen = codes.len() as u32;
-        let texts: Vec<Vec<u8>> = hits.iter().map(|h| self.hit_region(tb, plen, h)).collect();
-        Self::banded(codes, &texts, align::Mode::Infix, tb.cap)
+        // Only the read between the outermost anchors of any hit: primers and adapters lie
+        // outside every hit's chain, and aligning them whole charges each hit for them unless
+        // its transcript has a flank there to absorb them.
+        let (lo, hi) = if tb.whole_trim {
+            (
+                hits.iter().map(|h| h.qstart).min().unwrap_or(0),
+                hits.iter().map(|h| h.qend).max().unwrap_or(codes.len() as u32),
+            )
+        } else {
+            (0, codes.len() as u32)
+        };
+        let texts: Vec<Vec<u8>> = hits.iter().map(|h| self.hit_region(tb, lo, hi, h)).collect();
+        Self::banded(
+            &codes[lo as usize..hi as usize],
+            &texts,
+            align::Mode::Infix,
+            tb.cap,
+        )
     }
 
-    /// A hit's transcript region projected to the read ends (read length `plen`), padded.
-    fn hit_region(&self, tb: &TieBreak, plen: u32, h: &TxHit) -> Vec<u8> {
+    /// A hit's transcript region projected to the ends of the read span `[lo, hi)`, padded.
+    fn hit_region(&self, tb: &TieBreak, lo: u32, hi: u32, h: &TxHit) -> Vec<u8> {
         let tlen = self.idx.tx_plen()[h.tx as usize];
-        let (left, right) = (h.qstart, plen - h.qend);
+        let (left, right) = (h.qstart - lo, hi - h.qend);
         let slack = |ext: u32| tb.pad + ext / tb.pad_div;
         let lo = h.tstart.saturating_sub(left + slack(left));
         let hi = (h.tend + right + slack(right)).min(tlen);
@@ -583,7 +609,7 @@ impl<C: Chainer> Mapper<C> {
 
     /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
     fn whole_read_k(&self, tb: &TieBreak, codes: &[u8], h: &TxHit, k: u32) -> u32 {
-        let text = self.hit_region(tb, codes.len() as u32, h);
+        let text = self.hit_region(tb, 0, codes.len() as u32, h);
         stats::add(&stats::MYERS_CALLS, 1);
         stats::add(
             &stats::MYERS_CELLS,
@@ -624,10 +650,21 @@ impl<C: Chainer> Mapper<C> {
         let blocks = shared_blocks(hits)?;
         let plen = codes.len() as u32;
         let mut cost = vec![0i64; hits.len()];
-        let mut add = |texts: Vec<Vec<u8>>, read: &[u8], mode: align::Mode, rev: bool| {
+        // Each candidate's cost for one segment, and with a `cut`, its cost against its text cut
+        // at that many bases from the segment's start and the text bases its best alignment
+        // covers, from the same pass (None if every candidate's text is the same: equal costs).
+        let seg = |texts: Vec<Vec<u8>>,
+                   read: &[u8],
+                   mode: align::Mode,
+                   rev: bool,
+                   cut: Option<usize>|
+         -> Option<(Vec<i64>, Vec<i64>, Vec<usize>)> {
             if texts.windows(2).all(|w| w[0] == w[1]) {
-                return; // same cost for every candidate
+                return None; // same cost for every candidate
             }
+            let mut delta = vec![0i64; texts.len()];
+            let mut delta_cut = vec![0i64; texts.len()];
+            let mut cols = vec![0usize; texts.len()];
             stats::add(&stats::TIEBREAK_SEGMENTS, 1);
             // An insertion-only global gap depends only on its length. Avoid
             // copying DP inputs, sorting distinct strings, and allocating DP rows.
@@ -636,12 +673,12 @@ impl<C: Chainer> Mapper<C> {
                 && tb.affine_within.is_none()
                 && let Some(sc) = &tb.affine
             {
-                for (c, text) in cost.iter_mut().zip(&texts) {
+                for (c, text) in delta.iter_mut().zip(&texts) {
                     if !text.is_empty() {
                         *c += i64::from(sc.open) + i64::from(sc.ext) * text.len() as i64;
                     }
                 }
-                return;
+                return Some((delta.clone(), delta, cols));
             }
             let (read, texts): (Vec<u8>, Vec<Vec<u8>>) = if rev {
                 (
@@ -688,6 +725,8 @@ impl<C: Chainer> Mapper<C> {
                         }
                     }
                     let mut score = vec![None::<i64>; uniq.len()];
+                    let mut score_cut = vec![None::<i64>; uniq.len()];
+                    let mut score_cols = vec![0usize; uniq.len()];
                     let mut best: Option<(u32, i64)> = None; // (unit distance, affine score)
                     // Distinct texts to score, in sorted order, so isoforms that agree near
                     // the anchor share the rows that read only those bases.
@@ -711,7 +750,7 @@ impl<C: Chainer> Mapper<C> {
                         // The band is laid out for the window the read end would get against a
                         // transcript that doesn't end inside it.
                         let window = read.len() + tb.pad as usize + read.len() / tb.pad_div as usize;
-                        align::affine_extend_sorted(
+                        align::affine_extend_sorted_cut(
                             &read,
                             &tx,
                             sc,
@@ -720,9 +759,13 @@ impl<C: Chainer> Mapper<C> {
                             tb.xdrop,
                             diag,
                             window,
+                            cut.unwrap_or(usize::MAX),
                         )
                     } else {
                         align::affine_sorted(&read, &tx, mode, sc, tb.band)
+                            .into_iter()
+                            .map(|x| (x, x, 0))
+                            .collect()
                     };
                     if stats::on() {
                         let w1 = align::dp_work();
@@ -734,16 +777,18 @@ impl<C: Chainer> Mapper<C> {
                         stats::add(c, w1.0 - w0.0);
                         stats::add(r, w1.1 - w0.1);
                     }
-                    for (&k, &x) in todo.iter().zip(&xs) {
+                    for (&k, &(x, xc, cc)) in todo.iter().zip(&xs) {
                         let x = i64::from(x);
                         score[k] = Some(x);
+                        score_cut[k] = Some(i64::from(xc));
+                        score_cols[k] = cc;
                         let du = unit.as_ref().map_or(0, |(d, _)| d[k]);
                         if best.is_none_or(|(bd, bx)| (du, -x) < (bd, -bx)) {
                             best = Some((du, x));
                         }
                     }
                     let per_edit = i64::from(sc.mat + sc.mis);
-                    for (i, c) in cost.iter_mut().enumerate() {
+                    for (i, c) in delta.iter_mut().enumerate() {
                         let k = rep[i];
                         let x = score[k].unwrap_or_else(|| {
                             let (bd, bx) = best.unwrap();
@@ -751,12 +796,55 @@ impl<C: Chainer> Mapper<C> {
                             bx - per_edit * i64::from(d - bd)
                         });
                         *c -= x;
+                        delta_cut[i] -= score_cut[k].unwrap_or(x);
+                        cols[i] = score_cols[k];
                     }
                 }
                 None => {
-                    for (c, x) in cost.iter_mut().zip(Self::banded(&read, &texts, mode, tb.cap)) {
+                    for (c, x) in delta.iter_mut().zip(Self::banded(&read, &texts, mode, tb.cap)) {
                         *c += i64::from(x);
                     }
+                    delta_cut.copy_from_slice(&delta);
+                }
+            }
+            Some((delta, delta_cut, cols))
+        };
+        // A read end against each candidate's window; `short` marks windows that stop at their
+        // transcript's end. Past the shortest such end the read has no counterpart in that
+        // candidate, and what a longer candidate gains there (read bases aligned by chance into
+        // its flank: primers, adapters) counts only if it reaches `flank_min` points.
+        let end = |texts: Vec<Vec<u8>>, read: &[u8], rev: bool, short: &[bool]| -> Option<Vec<i64>> {
+            let cut = texts
+                .iter()
+                .zip(short)
+                .filter(|&(_, &s)| s)
+                .map(|(t, _)| t.len())
+                .min();
+            let Some(cut) = cut.filter(|&c| tb.flank_min > 0 && texts.iter().any(|t| t.len() > c)) else {
+                return seg(texts, read, align::Mode::Prefix, rev, None).map(|(d, _, _)| d);
+            };
+            // The cut counts from the read end's start (a left-end window is aligned backwards,
+            // so it keeps the bases next to the block).
+            let long: Vec<bool> = texts.iter().map(|t| t.len() > cut).collect();
+            let (mut out, near, cols) = seg(texts, read, align::Mode::Prefix, rev, Some(cut))?;
+            // Gains past the cut count if they reach `flank_min`, or if they come from a short,
+            // nearly exact extension (at least 3/4 of a match per text base past the cut):
+            // isoforms whose ends differ by a few bases are told apart, a primer's chance
+            // matches against a long flank are not.
+            let mat = tb.affine.as_ref().map_or(1, |sc| i64::from(sc.mat));
+            for (((o, &n), &l), &c) in out.iter_mut().zip(&near).zip(&long).zip(&cols) {
+                let gain = n - *o;
+                let past = c.saturating_sub(cut) as i64;
+                if l && gain < tb.flank_min && !(past > 0 && 4 * gain >= 3 * mat * past) {
+                    *o = n;
+                }
+            }
+            Some(out)
+        };
+        let mut add = |d: Option<Vec<i64>>| {
+            if let Some(d) = d {
+                for (c, x) in cost.iter_mut().zip(d) {
+                    *c += x;
                 }
             }
         };
@@ -780,12 +868,14 @@ impl<C: Chainer> Mapper<C> {
                         .tx_codes(h.tx, left.targets[i].end, right.targets[i].start)
                 })
                 .collect();
-            add(
+            add(seg(
                 texts,
                 &codes[left.query.end as usize..right.query.start as usize],
                 align::Mode::Global,
                 false,
-            );
+                None,
+            )
+            .map(|(d, _, _)| d));
         }
         // Left end: read[0, q0) against transcript windows ending at each candidate's anchor.
         let first = &blocks[0];
@@ -802,18 +892,19 @@ impl<C: Chainer> Mapper<C> {
                     )
                 })
                 .collect();
-            match self.raw_texts(tb, raw, &spans) {
-                Some((r, texts)) => add(texts, &r.codes[..r.pos(q0)], align::Mode::Prefix, true),
-                None => add(
+            let short: Vec<bool> = spans.iter().map(|&(_, lo, _)| lo == 0).collect();
+            add(match self.raw_texts(tb, raw, &spans) {
+                Some((r, texts)) => end(texts, &r.codes[..r.pos(q0)], true, &short),
+                None => end(
                     spans
                         .iter()
                         .map(|&(t, lo, hi)| self.idx.tx_codes(t, lo, hi))
                         .collect(),
                     &codes[..q0 as usize],
-                    align::Mode::Prefix,
                     true,
+                    &short,
                 ),
-            }
+            });
         }
         // Right end: read[last block end, plen) against windows from each candidate's block end.
         // Blocks are exact in parsed space only: if the candidates' raw bases differ inside the
@@ -864,6 +955,10 @@ impl<C: Chainer> Mapper<C> {
             }
             _ => None,
         };
+        let short: Vec<bool> = spans
+            .iter()
+            .map(|&(tx, _, hi)| hi == self.idx.tx_plen()[tx as usize])
+            .collect();
         let ends = match self.raw_texts(tb, raw, &spans) {
             Some((r, texts)) => {
                 let rest = &r.codes[r.pos(ql)..];
@@ -871,7 +966,7 @@ impl<C: Chainer> Mapper<C> {
                 let run_end = tail.map_or(cut, |(_, _, _, e)| e);
                 let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
                 let read = if tb.tail_trim { &rest[..cut] } else { rest };
-                add(texts, read, align::Mode::Prefix, false);
+                add(end(texts, read, false, &short));
                 at_end
             }
             None => {
@@ -894,7 +989,7 @@ impl<C: Chainer> Mapper<C> {
                 let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
                 let read = &codes[ql as usize..];
                 let read = if tb.tail_trim { &read[..cut] } else { read };
-                add(texts, read, align::Mode::Prefix, false);
+                add(end(texts, read, false, &short));
                 at_end
             }
         };
@@ -1399,7 +1494,11 @@ mod segmented_tests {
             .collect();
         assert_eq!(gaps, vec![vec![], vec![], codes(b"AT"), vec![]]);
         let sc = align::Affine::ONT;
-        let tb = TieBreak::default();
+        // Per-segment alignments of the example, without the flank rule.
+        let tb = TieBreak {
+            flank_min: 0,
+            ..Default::default()
+        };
         let mut totals = vec![0; 4];
         for (i, h) in hits.iter().enumerate() {
             let left = m.idx.tx_codes(h.tx, 0, b[0].targets[i].start);
@@ -1472,6 +1571,41 @@ mod segmented_tests {
     }
 
     #[test]
+    fn chance_matches_in_a_longer_flank_do_not_separate_isoforms() {
+        // t1 has 30 bases of 5' flank that t0 lacks; a read starting with a primer aligns a
+        // few bases into it by chance, a read from t1 aligns all of it.
+        let body: &[u8] = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
+        let flank: &[u8] = b"GTCAGTACGTAGCTGATCGATGCTAGTCGA";
+        let t1: Vec<u8> = [flank, body].concat();
+        let m = mapper(&[body, &t1], false);
+        let primer: &[u8] = b"TTTCTGTTGGTGCTGATATTGCTGGG";
+        let cost = |read: &[u8], off: u32, flank_min| {
+            let hits = [hit(0, 10., &[(off, 0, 30)]), hit(1, 10., &[(off, 30, 30)])];
+            let tb = TieBreak {
+                flank_min,
+                ..Default::default()
+            };
+            m.segmented(&tb, &codes(read), None, &hits).unwrap().0
+        };
+        let primed: Vec<u8> = [primer, body].concat();
+        let c = cost(&primed, 26, 10);
+        assert_eq!(c[0], c[1]);
+        let from_t1: Vec<u8> = [flank, body].concat();
+        let c = cost(&from_t1, 30, 10);
+        assert!(c[1] < c[0]);
+        // Ends two bases apart: the short exact extension still counts.
+        let m = mapper(&[body, &[b"GT", body].concat()], false);
+        let hits = [hit(0, 10., &[(2, 0, 30)]), hit(1, 10., &[(2, 2, 30)])];
+        let tb = TieBreak {
+            flank_min: 10,
+            ..Default::default()
+        };
+        let read: Vec<u8> = [b"GT", body].concat();
+        let c = m.segmented(&tb, &codes(&read), None, &hits).unwrap().0;
+        assert!(c[1] < c[0]);
+    }
+
+    #[test]
     fn score_scaling_and_no_common_anchor_fallback() {
         let m = mapper(&[b"ACGTAC", b"ACAC"], false);
         let q = b"ACGTAC";
@@ -1534,7 +1668,10 @@ mod segmented_tests {
             (raw.pos(blocks[0].query.start), raw.pos(blocks[0].query.end)),
             (2, 7)
         );
-        let mut tb = TieBreak::default();
+        let mut tb = TieBreak {
+            flank_min: 0,
+            ..Default::default()
+        };
         let parsed = codes(&raw.hpc.seq);
         let costs = m.segmented(&tb, &parsed, Some(&raw), &hits).unwrap().0;
         // The block's raw bases differ (CCCGG vs CG), so the right end runs through it.

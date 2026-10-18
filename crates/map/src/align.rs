@@ -218,7 +218,7 @@ pub fn affine_extend(
 /// [`affine`] for each of `texts`, which must be sorted: equal to separate calls, but rows
 /// that read only a prefix shared with the previous text are not recomputed.
 pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, band: usize) -> Vec<i32> {
-    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n)
+    affine_dp_sorted(pattern, texts, mode, sc, band, None, |n| n, usize::MAX)
         .into_iter()
         .map(|d| d.score)
         .collect()
@@ -240,12 +240,68 @@ pub fn affine_extend_sorted(
     diagonal: bool,
     window: usize,
 ) -> Vec<i32> {
+    affine_extend_sorted_cut(
+        pattern,
+        texts,
+        sc,
+        band,
+        end_bonus,
+        xdrop,
+        diagonal,
+        window,
+        usize::MAX,
+    )
+    .into_iter()
+    .map(|(x, _, _)| x)
+    .collect()
+}
+
+/// [`affine_extend_sorted`], with each text's score also over its first `cut` bases only:
+/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
+/// one pass. Without X-drop, the second equals the pass
+/// over the cut text (same band layout: `window` at least as long as the texts); with it, the
+/// cut score may extend further, since the pass stops only when the whole text's does.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_extend_sorted_cut(
+    pattern: &[u8],
+    texts: &[&[u8]],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+    diagonal: bool,
+    window: usize,
+    cut: usize,
+) -> Vec<(i32, i32, usize)> {
     let m = pattern.len();
     let geom = |n: usize| if diagonal { m.min(n) } else { n.max(window) };
-    affine_dp_sorted(pattern, texts, Mode::Prefix, sc, band, Some((xdrop, false)), geom)
-        .into_iter()
-        .map(|d| d.clip_best.max(d.score.saturating_add(end_bonus)))
-        .collect()
+    affine_dp_sorted(
+        pattern,
+        texts,
+        Mode::Prefix,
+        sc,
+        band,
+        Some((xdrop, cut != usize::MAX)),
+        geom,
+        cut,
+    )
+    .into_iter()
+    .map(|d| {
+        let end = d.score.saturating_add(end_bonus);
+        let whole = d.clip_best.max(end);
+        let cols = if d.clip_best >= end {
+            d.clip_cell.1
+        } else {
+            d.score_col
+        };
+        let cut = if cut == usize::MAX {
+            whole
+        } else {
+            d.cut_best.max(d.cut_score.saturating_add(end_bonus))
+        };
+        (whole, cut, cols)
+    })
+    .collect()
 }
 
 /// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
@@ -373,6 +429,10 @@ struct Dp {
     text_read: usize,
     /// The last row computed: the pattern length, or the row where the pass stopped.
     last_row: usize,
+    /// With a cut: `clip_best` and the Prefix-mode score over text columns up to the cut only
+    /// (the pass over the text cut there, X-drop aside).
+    cut_best: i32,
+    cut_score: i32,
 }
 
 /// A computed DP row (`h` and `f` over its band `[lo, hi]`) and the clip state after it, from
@@ -386,6 +446,7 @@ struct Snap {
     f: Vec<i32>,
     clip_best: i32,
     clip_cell: (usize, usize),
+    cut_best: i32,
 }
 
 /// Reused per-thread DP rows.
@@ -433,6 +494,7 @@ fn affine_dp(
             sc,
             (band, geom),
             clip,
+            usize::MAX,
             &mut b.borrow_mut(),
             None,
             &mut [],
@@ -444,6 +506,7 @@ fn affine_dp(
 /// resumes from the previous text's rows wherever they read only bases the two texts share
 /// and the bands have the same shape, so isoforms that agree near the anchor are aligned
 /// there once. Results equal separate [`affine_dp`] calls.
+#[allow(clippy::too_many_arguments)]
 fn affine_dp_sorted(
     pattern: &[u8],
     texts: &[&[u8]],
@@ -452,6 +515,7 @@ fn affine_dp_sorted(
     band: usize,
     clip: Option<(i32, bool)>,
     geom: impl Fn(usize) -> usize,
+    cut: usize,
 ) -> Vec<Dp> {
     let m = pattern.len();
     let shape = |n: usize| {
@@ -509,6 +573,7 @@ fn affine_dp_sorted(
                     sc,
                     (band, geom(t.len())),
                     clip,
+                    cut,
                     b,
                     None,
                     &mut snaps,
@@ -526,6 +591,7 @@ fn affine_dp_sorted(
                     sc,
                     (band, geom(t.len())),
                     clip,
+                    cut,
                     b,
                     Some(&s),
                     &mut snaps,
@@ -554,14 +620,17 @@ fn run(
     sc: &Affine,
     (band, geom): (usize, usize),
     clip: Option<(i32, bool)>,
+    cut: usize,
     b: &mut DpBuf,
     resume: Option<&Snap>,
     snaps: &mut [Snap],
 ) -> Dp {
     let (m, n) = (pattern.len(), text.len());
-    // With `clip`, the best cell anywhere (0 aligns nothing).
+    // With `clip`, the best cell anywhere (0 aligns nothing), and among text columns up to
+    // `cut` (usize::MAX: no cut).
     let mut clip_best = 0i32;
     let mut clip_cell = (0usize, 0usize);
+    let mut cut_best = 0i32;
     let (mat, mis, ext) = (sc.mat, sc.mis, sc.ext);
     let go = sc.open + sc.ext;
     // Row i (pattern) covers text columns [i - band - (m - g)⁺, i + band +
@@ -603,6 +672,7 @@ fn run(
             edges(&mut b.f, s.lo, s.hi);
             clip_best = s.clip_best;
             clip_cell = s.clip_cell;
+            cut_best = s.cut_best;
             ((s.lo, s.hi), s.row + 1)
         }
         None => {
@@ -633,6 +703,8 @@ fn run(
                 clip_cell,
                 text_read: n,
                 last_row: i,
+                cut_best,
+                cut_score: NEG,
             };
         }
         let c = pattern[i - 1] & 3;
@@ -703,6 +775,14 @@ fn run(
             }
             row_max = row_max.max(m);
         }
+        if cut != usize::MAX && lo <= cut {
+            let row = if hi <= cut {
+                row_max
+            } else {
+                b.nh[lo..=cut].iter().copied().max().unwrap_or(NEG)
+            };
+            cut_best = cut_best.max(row);
+        }
         if let Some((xdrop, cell)) = clip {
             let row = row_max;
             if row > clip_best {
@@ -720,6 +800,8 @@ fn run(
                     clip_cell,
                     text_read: hi,
                     last_row: i,
+                    cut_best,
+                    cut_score: NEG,
                 };
             }
         }
@@ -735,7 +817,7 @@ fn run(
             s.h.extend_from_slice(&b.h[lo..=hi]);
             s.f.clear();
             s.f.extend_from_slice(&b.f[lo..=hi]);
-            (s.clip_best, s.clip_cell) = (clip_best, clip_cell);
+            (s.clip_best, s.clip_cell, s.cut_best) = (clip_best, clip_cell, cut_best);
             next_snap += 1;
         }
     }
@@ -747,6 +829,11 @@ fn run(
             (x, prev.0 + row.iter().position(|&y| y == x).unwrap_or(0))
         }
     };
+    let cut_score = if cut != usize::MAX && prev.0 <= cut {
+        b.h[prev.0..=prev.1.min(cut)].iter().copied().max().unwrap_or(NEG)
+    } else {
+        NEG
+    };
     Dp {
         score,
         score_col,
@@ -754,6 +841,8 @@ fn run(
         clip_cell,
         text_read: prev.1,
         last_row: m,
+        cut_best,
+        cut_score,
     }
 }
 
@@ -1012,6 +1101,18 @@ mod tests {
                     .map(|t| affine_extend_window(&p, t, w, &sc, band, bonus, xdrop).0)
                     .collect();
                 prop_assert_eq!(got, want, "window {}", w);
+                // Scores over each text cut at `c`, from the same pass, equal passes over the cut
+                // texts (no X-drop, so neither pass stops early).
+                let c = refs.iter().map(|t| t.len()).min().unwrap_or(0) + window_extra / 2;
+                let both = affine_extend_sorted_cut(&p, &refs, &sc, band, bonus, i32::MAX, false, w, c);
+                let want: Vec<i32> = refs
+                    .iter()
+                    .map(|t| affine_extend_window(&p, &t[..t.len().min(c)], w, &sc, band, bonus, i32::MAX).0)
+                    .collect();
+                prop_assert_eq!(both.iter().map(|x| x.1).collect::<Vec<_>>(), want, "cut {}", c);
+                // Tracking the cut changes nothing about the whole texts' scores.
+                let whole = affine_extend_sorted(&p, &refs, &sc, band, bonus, i32::MAX, false, w);
+                prop_assert_eq!(both.iter().map(|x| x.0).collect::<Vec<_>>(), whole, "whole with cut");
             }
         }
 
