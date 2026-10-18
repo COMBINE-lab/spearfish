@@ -34,7 +34,8 @@ spearfish doctor
 
 `doctor` prints the version and git revision, the target, the CPUs available and the SIMD
 kernels in use, then maps reads from a built-in toy transcriptome with every preset and checks
-the result against a reference. With `--index transcripts.sfi` it also checks that an index
+the result against a reference. `SPEARFISH_SIMD=scalar|avx2|avx512` makes spearfish use at most
+that level, for example to compare speeds. With `--index transcripts.sfi` it also checks that an index
 loads and suits this build. `--json` prints the same report as JSON, to attach to a bug report.
 
 The full test suite is `cargo test --workspace --release`.

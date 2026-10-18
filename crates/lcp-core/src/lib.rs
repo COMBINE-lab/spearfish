@@ -8,6 +8,7 @@ pub mod encode;
 pub mod hpc;
 mod lcp;
 pub mod locality;
+pub mod simd;
 
 pub use lcp::{LCP_PARSER_VERSION, LcpConfig, LcpParser, ParseScratch};
 

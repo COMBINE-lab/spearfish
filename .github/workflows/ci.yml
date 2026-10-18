@@ -28,6 +28,22 @@ jobs:
       - run: python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
       - run: cargo run --release -q -p spearfish-cli -- doctor
 
+  # The lower x86-64 SIMD levels, forced: the tests and the doctor self-test must agree with
+  # the default level's.
+  simd-levels:
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [scalar, avx2]
+    runs-on: ubuntu-latest
+    env:
+      SPEARFISH_SIMD: ${{ matrix.level }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - run: cargo run --release -q -p spearfish-cli -- doctor
+
   msrv:
     runs-on: ubuntu-latest
     steps:

@@ -60,6 +60,20 @@
   re-exported. The existing API (`MapOptions::preset`, `Mapper::new`, `Index::build`) is
   unchanged.
 
+### Performance
+
+- AVX2 kernels for the affine alignment rows, the batched edit distances and the LCP scan:
+  CPUs with AVX2 but not AVX-512 map 16 to 34% faster, close to AVX-512 speed.
+- SIMD dispatch happens once per DP pass or parse call instead of per row or per 64-base
+  block, and the whole LCP parse is compiled per level; a few percent fewer instructions at
+  every level.
+- `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+
+### Fixes
+
+- aarch64 (Apple Silicon, ARM Linux): the affine alignment rows were not computed at all,
+  because a configuration attribute removed the scalar code along with the x86 path.
+
 ### Other
 
 - gzip input decodes with zlib-rs.

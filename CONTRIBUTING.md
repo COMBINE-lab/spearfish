@@ -27,7 +27,10 @@ the output byte-identical. Checks, from cheapest:
   `spearfish inspect --sections` of indexes they build (the per-section checksums must agree).
 
 The SIMD kernels must agree exactly with the scalar code; each kernel's property test checks
-every level the machine supports against a scalar reference.
+every level the machine supports against a scalar reference, and CI also runs the tests and
+`spearfish doctor` with `SPEARFISH_SIMD` forcing each lower level. The levels live in
+`lcp_core::simd`; adding one (e.g. NEON) means a `Level` variant, its detection, and an arm in
+each kernel's dispatch.
 
 ## Adding a mapping setting
 
@@ -55,6 +58,7 @@ but they are in `crates/spearfish-cli/src`. Environment variables:
 
 | Variable | Effect |
 | --- | --- |
+| `SPEARFISH_SIMD=scalar\|avx2\|avx512` | Use at most this SIMD level (to test or time a lower one; higher than the CPU supports falls back with a warning). |
 | `SPEARFISH_STATS=1` | Count internal events while mapping; printed at the end and stored in the run record. |
 | `REFINE_STATS=1` | Statistics of the experimental refine chainer. |
 | `SPEARFISH_GIT` | At build time: the revision to record when building outside a git checkout. |

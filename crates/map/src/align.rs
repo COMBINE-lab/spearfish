@@ -9,6 +9,34 @@
 //! (the band), and the result is `None` if the distance exceeds `k`. Cost
 //! O(⌈min(m, k)/64⌉ · n) word operations in practice, O(⌈m/64⌉ · n) at worst.
 
+use lcp_core::simd::{self, Level};
+
+/// The SIMD level the kernels here and in `chain` run at: [`simd::active`], resolved once per
+/// call (a DP, a batch) by the caller and passed down. Tests force a level on their thread.
+#[inline]
+pub(crate) fn simd_level() -> Level {
+    #[cfg(test)]
+    if let Some(l) = FORCE_LEVEL.with(|f| f.get()) {
+        return l;
+    }
+    simd::active()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_LEVEL: std::cell::Cell<Option<Level>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the kernels on this thread at `level` (which the CPU must support).
+#[cfg(test)]
+pub(crate) fn at_level<R>(level: Level, f: impl FnOnce() -> R) -> R {
+    assert!(simd::detected().includes(level));
+    let old = FORCE_LEVEL.with(|x| x.replace(Some(level)));
+    let r = f();
+    FORCE_LEVEL.with(|x| x.set(old));
+    r
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Infix,
@@ -141,21 +169,37 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
 
 /// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
 /// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
-/// lane, sharing the pattern's blocks.
+/// lane, sharing the pattern's blocks; with AVX2, up to four.
 pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
-    #[cfg(target_arch = "x86_64")]
-    if pat.m > 0 && std::arch::is_x86_feature_detected!("avx512f") {
-        let mut out = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(8) {
-            // SAFETY: AVX-512F is available (checked above).
-            unsafe { infix_x8(pat, batch, k, &mut out) };
+    match simd_level() {
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 if pat.m > 0 => {
+            let mut out = Vec::with_capacity(texts.len());
+            // SAFETY: the CPU has AVX-512 (the active level).
+            unsafe { infix_avx512(pat, texts, k, &mut out) };
+            out
         }
-        return out;
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 if pat.m > 0 => {
+            let mut out = Vec::with_capacity(texts.len());
+            // SAFETY: the CPU has AVX2 (the active level).
+            unsafe { infix_avx2(pat, texts, k, &mut out) };
+            out
+        }
+        _ => texts
+            .iter()
+            .map(|t| distance_with(pat, t, Mode::Infix, k))
+            .collect(),
     }
-    texts
-        .iter()
-        .map(|t| distance_with(pat, t, Mode::Infix, k))
-        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn infix_avx512(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    for batch in texts.chunks(8) {
+        // SAFETY: AVX-512F is enabled here.
+        unsafe { infix_x8(pat, batch, k, out) };
+    }
 }
 
 /// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
@@ -166,6 +210,7 @@ pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32
 /// `distance_with`, and above k otherwise.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[inline]
 unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
     use std::arch::x86_64::*;
     debug_assert!((1..=8).contains(&texts.len()) && pat.m > 0);
@@ -298,6 +343,165 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     let mut bs = [0i64; 8];
     // SAFETY: eight i64s.
     unsafe { _mm512_storeu_si512(bs.as_mut_ptr().cast(), best) };
+    for (l, t) in texts.iter().enumerate() {
+        let kl = k.min((m + t.len()) as u32) as i64;
+        out.push((bs[l] <= kl).then_some(bs[l] as u32));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn infix_avx2(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    for batch in texts.chunks(4) {
+        // SAFETY: AVX2 is enabled here.
+        unsafe { infix_x4(pat, batch, k, out) };
+    }
+}
+
+/// [`infix_x8`] for up to four texts in AVX2, one per 64-bit lane: the same recurrence and
+/// band union, with blends for the per-lane masked updates and vector compares for the mask
+/// tests. A lane's code selects its block mask through a dword permute.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=4).contains(&texts.len()) && pat.m > 0);
+    let m = pat.m;
+    let n_max = texts.iter().map(|t| t.len()).max().unwrap();
+    let kk = k.min((m + n_max) as u32) as i64;
+    let blocks = m.div_ceil(W);
+    let last_bit = (m - 1) % W;
+    let rows = |b: usize| if b + 1 == blocks { last_bit + 1 } else { W };
+    // Column j of lane l at 4j + l: the dword indices (2c, 2c + 1) of the lane's code c in a
+    // block's four masks (code 0 past the lane's text, whose lane is not updated there).
+    let mut tx = vec![1u64 << 32; 4 * n_max];
+    for (l, t) in texts.iter().enumerate() {
+        for (j, &c) in t.iter().enumerate() {
+            let c = (c & 3) as u64;
+            tx[4 * j + l] = (2 * c) | ((2 * c + 1) << 32);
+        }
+    }
+    let len = |l: usize| texts.get(l).map_or(0, |t| t.len() as i64);
+    // Lanes still inside their text, per column: lane l is live while j < len(l).
+    let lens = _mm256_set_epi64x(len(3), len(2), len(1), len(0));
+    // SAFETY: four u64s.
+    let peq: Vec<__m256i> = pat
+        .peq
+        .iter()
+        .map(|q| unsafe { _mm256_loadu_si256(q.as_ptr().cast()) })
+        .collect();
+    let ones = _mm256_set1_epi64x(-1);
+    let one = _mm256_set1_epi64x(1);
+    let zero = _mm256_setzero_si256();
+    let mut pv = vec![ones; blocks];
+    let mut mv = vec![zero; blocks];
+    let mut score: Vec<__m256i> = (0..blocks)
+        .map(|b| _mm256_set1_epi64x((b * W + rows(b)) as i64))
+        .collect();
+    let kv = _mm256_set1_epi64x(kk);
+    let kw = _mm256_set1_epi64x(kk + W as i64);
+    let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
+    // Column 0: D[m][0] = m.
+    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+        _mm256_set1_epi64x(m as i64)
+    } else {
+        _mm256_set1_epi64x(i64::MAX)
+    };
+    // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn step(
+        pv: &mut __m256i,
+        mv: &mut __m256i,
+        eq: __m256i,
+        (neg, pos): (__m256i, __m256i),
+        bitv: __m128i,
+        live: __m256i,
+    ) -> (__m256i, __m256i) {
+        let (p, m) = (*pv, *mv);
+        let one = _mm256_set1_epi64x(1);
+        let ones = _mm256_set1_epi64x(-1);
+        let xv = _mm256_or_si256(eq, m);
+        let eq = _mm256_or_si256(eq, neg);
+        let xh = _mm256_or_si256(
+            _mm256_xor_si256(_mm256_add_epi64(_mm256_and_si256(eq, p), p), p),
+            eq,
+        );
+        let ph = _mm256_or_si256(m, _mm256_xor_si256(_mm256_or_si256(xh, p), ones));
+        let mh = _mm256_and_si256(p, xh);
+        let hp = _mm256_and_si256(_mm256_srl_epi64(ph, bitv), one);
+        let hm = _mm256_and_si256(_mm256_srl_epi64(mh, bitv), one);
+        let ph = _mm256_or_si256(_mm256_slli_epi64::<1>(ph), pos);
+        let mh = _mm256_or_si256(_mm256_slli_epi64::<1>(mh), neg);
+        let npv = _mm256_or_si256(mh, _mm256_xor_si256(_mm256_or_si256(xv, ph), ones));
+        let nmv = _mm256_and_si256(ph, xv);
+        *pv = _mm256_blendv_epi8(p, npv, live);
+        *mv = _mm256_blendv_epi8(m, nmv, live);
+        (hm, hp)
+    }
+    let bitw = _mm_cvtsi64_si128((W - 1) as i64);
+    let bitl = _mm_cvtsi64_si128(last_bit as i64);
+    let bitv = |b: usize| if b + 1 == blocks { bitl } else { bitw };
+    for j in 0..n_max {
+        let live = _mm256_cmpgt_epi64(lens, _mm256_set1_epi64x(j as i64));
+        // SAFETY: tx holds 4 indices per column.
+        let idx = unsafe { _mm256_loadu_si256(tx.as_ptr().add(4 * j).cast()) };
+        // Infix: the top row is free (horizontal delta 0).
+        let mut h = (zero, zero);
+        for b in 0..=last as usize {
+            let eq = _mm256_permutevar8x32_epi32(peq[b], idx);
+            h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
+            score[b] = _mm256_add_epi64(score[b], _mm256_and_si256(_mm256_sub_epi64(h.1, h.0), live));
+        }
+        let lb = last as usize;
+        let hin = _mm256_sub_epi64(h.1, h.0);
+        let mut added = false;
+        if lb + 1 < blocks {
+            let eqn = _mm256_permutevar8x32_epi32(peq[lb + 1], idx);
+            let top = _mm256_sub_epi64(score[lb], hin);
+            // Live lanes with top <= k whose next block's top row can still be <= k.
+            let want = _mm256_and_si256(
+                _mm256_andnot_si256(_mm256_cmpgt_epi64(top, kv), live),
+                _mm256_or_si256(
+                    _mm256_cmpeq_epi64(_mm256_and_si256(eqn, one), one),
+                    _mm256_cmpgt_epi64(zero, hin),
+                ),
+            );
+            if _mm256_testz_si256(want, want) == 0 {
+                let nb = lb + 1;
+                pv[nb] = ones;
+                mv[nb] = zero;
+                let hn = step(&mut pv[nb], &mut mv[nb], eqn, h, bitv(nb), live);
+                score[nb] = _mm256_add_epi64(
+                    _mm256_add_epi64(top, _mm256_set1_epi64x(rows(nb) as i64)),
+                    _mm256_sub_epi64(hn.1, hn.0),
+                );
+                last += 1;
+                added = true;
+            }
+        }
+        if !added {
+            // Drop the bottom block while no live lane scores below k + W in it.
+            while last >= 0 && {
+                let below = _mm256_and_si256(live, _mm256_cmpgt_epi64(kw, score[last as usize]));
+                _mm256_testz_si256(below, below) != 0
+            } {
+                last -= 1;
+            }
+            if last < 0 {
+                break;
+            }
+        }
+        if last as usize + 1 == blocks {
+            let s = score[blocks - 1];
+            let lt = _mm256_and_si256(live, _mm256_cmpgt_epi64(best, s));
+            best = _mm256_blendv_epi8(best, s, lt);
+        }
+    }
+    let mut bs = [0i64; 4];
+    // SAFETY: four i64s.
+    unsafe { _mm256_storeu_si256(bs.as_mut_ptr().cast(), best) };
     for (l, t) in texts.iter().enumerate() {
         let kl = k.min((m + t.len()) as u32) as i64;
         out.push((bs[l] <= kl).then_some(bs[l] as u32));
@@ -531,16 +735,10 @@ pub fn affine_extend_window(
 }
 
 /// Exclusive prefix maxima of `xs` in place, starting from `init`: `xs[k]` becomes the
-/// maximum of `init` and `xs[..k]`. The scalar loop is one dependent max per element; with
-/// AVX-512 a 16-lane block is scanned in four shift-and-max steps and the block maximum carried.
-#[inline]
+/// maximum of `init` and `xs[..k]` (the scalar rows' horizontal-gap pass; the vector row
+/// kernels scan in registers instead).
+#[inline(always)]
 fn excl_prefix_max(xs: &mut [i32], init: i32) {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512f") {
-        // SAFETY: AVX-512F is available (checked above).
-        unsafe { excl_prefix_max_avx512(xs, init) };
-        return;
-    }
     let mut g = init;
     for x in xs.iter_mut() {
         let next = g.max(*x);
@@ -549,57 +747,125 @@ fn excl_prefix_max(xs: &mut [i32], init: i32) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn excl_prefix_max_avx512(xs: &mut [i32], init: i32) {
-    use std::arch::x86_64::*;
-    let neg = _mm512_set1_epi32(NEG);
-    let last = _mm512_set1_epi32(15);
-    // The running maximum, broadcast to every lane (kept in a register between blocks).
-    let mut cv = _mm512_set1_epi32(init);
-    let (blocks, rest) = xs.as_chunks_mut::<16>();
-    for c in blocks {
-        // SAFETY: `c` holds 16 i32s; unaligned loads and stores.
-        let mut v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
-        // Inclusive prefix max within the block: lane k takes the max of lanes <= k.
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<15>(v, neg));
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<14>(v, neg));
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<12>(v, neg));
-        v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
-        v = _mm512_max_epi32(v, cv);
-        // Exclusive: shift up one lane, the carry entering lane 0.
-        let out = _mm512_alignr_epi32::<15>(v, cv);
-        unsafe { _mm512_storeu_si512(c.as_mut_ptr().cast(), out) };
-        // Lane 15 holds the block's (inclusive) maximum.
-        cv = _mm512_permutexvar_epi32(last, v);
+/// A DP row kernel for `run_core`: [`row_scalar`], or a fused vector row.
+trait Rows {
+    /// Row `i` from row `i - 1`, as [`row_scalar`] computes it (the arguments are its).
+    ///
+    /// # Safety
+    /// The CPU has the kernel's features.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        scratch: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32;
+}
+
+/// One DP row over `w` cells by three passes over the row (the first and last autovectorize
+/// for the entry point's level): `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
+/// F[i-1][start..=hi], `tx` the text bases of columns start..=hi, `c` the pattern base, `e`
+/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` and
+/// returns the row's maximum. `scratch` holds two rows of temporaries.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn row_scalar(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+    (hpv, gsv): (&mut Vec<i32>, &mut Vec<i32>),
+) -> i32 {
+    let w = fu.len();
+    if hpv.len() < w {
+        hpv.resize(w, NEG);
+        gsv.resize(w, NEG);
     }
-    let mut carry = _mm512_cvtsi512_si32(cv);
-    for x in rest {
-        let next = carry.max(*x);
-        *x = carry;
-        carry = next;
+    let (hp, gs) = (&mut hpv[..w], &mut gsv[..w]);
+    let hd = &hprev[..w]; // H[i-1][j-1]
+    let hu = &hprev[1..=w]; // H[i-1][j]
+    let (tx, nf, nh) = (&tx[..w], &mut nf[..w], &mut nh[..w]);
+    // Pass 1: vertical gaps and diagonal moves (H' = H without horizontal gaps), from the
+    // previous row only.
+    for k in 0..w {
+        let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
+        let s = if c == tx[k] & 3 { mat } else { -mis };
+        let x = (hd[k] + s).max(fj).max(NEG);
+        hp[k] = x;
+        gs[k] = x - go + ext * (k as i32 + 1);
+        nf[k] = fj;
+    }
+    // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1] - ext): opening from
+    // H = max(H', E) adds nothing. With g[k] = E[k] + ext*k this is a running max (pass 2:
+    // exclusive prefix maxima, one op per cell on the critical path); pass 3 takes
+    // H = max(H', E).
+    excl_prefix_max(gs, e);
+    let mut m = NEG;
+    for k in 0..w {
+        let v = hp[k].max(gs[k] - ext * k as i32);
+        nh[k] = v;
+        m = m.max(v);
+    }
+    m
+}
+
+/// The scalar passes.
+struct ScalarRows;
+
+impl Rows for ScalarRows {
+    #[inline(always)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        scratch: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        row_scalar(hprev, fu, tx, nh, nf, c, sc, e, scratch)
     }
 }
 
-/// AVX-512 with byte masks, checked once.
 #[cfg(target_arch = "x86_64")]
-fn avx512_rows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-    })
+struct Avx512Rows;
+
+#[cfg(target_arch = "x86_64")]
+impl Rows for Avx512Rows {
+    #[inline(always)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        _: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        // SAFETY: as the caller guarantees.
+        unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) }
+    }
 }
 
-/// One DP row over `w` cells, the three passes of `run` fused per 16-lane block: diagonal and
-/// vertical moves, then horizontal gaps as an in-register prefix max carried across blocks,
-/// with no intermediate row written. `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
-/// F[i-1][start..=hi], `tx` the text bases of columns start..=hi; writes H and F of row i
-/// and returns the row's maximum. Same integer operations as the scalar passes, so the
-/// same results.
+/// [`row_scalar`] with its three passes fused per 16-lane block: diagonal and vertical moves,
+/// then horizontal gaps as an in-register prefix max carried across blocks, with no
+/// intermediate row written. Same integer operations as the scalar passes, so the same results.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn row_avx512(
     hprev: &[i32],
@@ -674,6 +940,152 @@ unsafe fn row_avx512(
     _mm512_reduce_max_epi32(mx)
 }
 
+/// [`row_avx512`] in 8-lane AVX2 vectors. The horizontal-gap prefix max is a three-step
+/// shift-and-max scan within each vector (shifts cross the two 128-bit halves through a
+/// permute that also fills the low lanes with NEG), with the running maximum carried across
+/// vectors in a register. A row's last `w % 8` cells are covered by one more whole vector
+/// ending at the row's end, which recomputes the cells it shares with the previous vector
+/// from the maximum entering its first cell (no masked loads or stores: those of cells the
+/// previous row just stored stall on store forwarding, and masked stores are slow on some
+/// CPUs). Rows under 8 cells take the scalar steps.
+///
+/// Same results as the scalar passes: the integer operations per cell are theirs, and the scan
+/// differs from the exact prefix maximum only where both lie below NEG, where neither can win
+/// against the cell's diagonal/vertical score (which is at least NEG).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_avx2(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    e: i32,
+) -> i32 {
+    use std::arch::x86_64::*;
+    let w = fu.len();
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    if w < 8 {
+        // The scalar steps (`row_scalar` without its row buffers).
+        let (mut m, mut carry) = (NEG, e);
+        for k in 0..w {
+            let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
+            let s = if c == tx[k] & 3 { mat } else { -mis };
+            let x = (hprev[k] + s).max(fj).max(NEG);
+            let v = x.max(carry - ext * k as i32);
+            carry = carry.max(x - go + ext * (k as i32 + 1));
+            nh[k] = v;
+            nf[k] = fj;
+            m = m.max(v);
+        }
+        return m;
+    }
+    let neg = _mm256_set1_epi32(NEG);
+    let (vgo, vext) = (_mm256_set1_epi32(go), _mm256_set1_epi32(ext));
+    let (vmat, vmis) = (_mm256_set1_epi32(mat), _mm256_set1_epi32(-mis));
+    let vc = _mm256_set1_epi32(c as i32);
+    let three = _mm256_set1_epi32(3);
+    let seven = _mm256_set1_epi32(7);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let lext = _mm256_mullo_epi32(lane, vext);
+    // [NEG x 4, v's low half]: `v` shifted up by four lanes, and the source of the lanes that
+    // cross into the high half when shifting by fewer.
+    let up4 = |v: __m256i| _mm256_permute2x128_si256::<0x02>(v, neg);
+    let mut mx = neg;
+    // Cells k..k + 8 with `cv` the maximum entering cell k (broadcast) and `ek` ext times
+    // each lane's cell index: stores H and F and returns the exclusive maxima entering each
+    // cell and the maximum after the last.
+    let mut cells = |k: usize, cv: __m256i, ek: __m256i| {
+        // SAFETY: k + 8 <= w, so cells k..k + 8 are in bounds of every slice (`hprev` has
+        // w + 1).
+        let (hd, hu, fv, t) = unsafe {
+            (
+                _mm256_loadu_si256(hprev.as_ptr().add(k).cast()),
+                _mm256_loadu_si256(hprev.as_ptr().add(k + 1).cast()),
+                _mm256_loadu_si256(fu.as_ptr().add(k).cast()),
+                _mm_loadl_epi64(tx.as_ptr().add(k).cast()),
+            )
+        };
+        let fj = _mm256_max_epi32(
+            _mm256_max_epi32(_mm256_sub_epi32(hu, vgo), _mm256_sub_epi32(fv, vext)),
+            neg,
+        );
+        let t = _mm256_and_si256(_mm256_cvtepu8_epi32(t), three);
+        let s = _mm256_blendv_epi8(vmis, vmat, _mm256_cmpeq_epi32(t, vc));
+        let x = _mm256_max_epi32(_mm256_max_epi32(_mm256_add_epi32(hd, s), fj), neg);
+        // gs[k] = x - go + ext * (k + 1).
+        let g = _mm256_add_epi32(_mm256_sub_epi32(x, vgo), _mm256_add_epi32(ek, vext));
+        // Inclusive prefix max within the vector: shifts by one, two, four lanes.
+        let v = _mm256_max_epi32(g, _mm256_alignr_epi8::<12>(g, up4(g)));
+        let v = _mm256_max_epi32(v, _mm256_alignr_epi8::<8>(v, up4(v)));
+        let v4 = up4(v);
+        let incl = _mm256_max_epi32(v, v4);
+        // Exclusive: shifted up one lane, with the carry. (`v4` stands in for `up4(incl)`:
+        // they differ only in lanes below NEG.)
+        let excl = _mm256_max_epi32(_mm256_alignr_epi8::<12>(incl, v4), cv);
+        let hv = _mm256_max_epi32(x, _mm256_sub_epi32(excl, ek));
+        // SAFETY: as for the loads.
+        unsafe {
+            _mm256_storeu_si256(nh.as_mut_ptr().add(k).cast(), hv);
+            _mm256_storeu_si256(nf.as_mut_ptr().add(k).cast(), fj);
+        }
+        mx = _mm256_max_epi32(mx, hv);
+        (
+            excl,
+            _mm256_max_epi32(cv, _mm256_permutevar8x32_epi32(incl, seven)),
+        )
+    };
+    let mut cv = _mm256_set1_epi32(e);
+    let mut excl = cv;
+    let mut ek = lext;
+    let step = _mm256_set1_epi32(8 * ext);
+    let mut k = 0;
+    while k + 8 <= w {
+        (excl, cv) = cells(k, cv, ek);
+        ek = _mm256_add_epi32(ek, step);
+        k += 8;
+    }
+    if k < w {
+        // The last vector, at w - 8: lane w - k of the previous one is the maximum entering
+        // its first cell.
+        let cv = _mm256_permutevar8x32_epi32(excl, _mm256_set1_epi32((w - k) as i32));
+        cells(
+            w - 8,
+            cv,
+            _mm256_add_epi32(lext, _mm256_set1_epi32(ext * (w - 8) as i32)),
+        );
+    }
+    let m = _mm_max_epi32(_mm256_castsi256_si128(mx), _mm256_extracti128_si256::<1>(mx));
+    let m = _mm_max_epi32(m, _mm_shuffle_epi32::<0b01_00_11_10>(m));
+    _mm_cvtsi128_si32(_mm_max_epi32(m, _mm_shuffle_epi32::<0b10_11_00_01>(m)))
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Avx2Rows;
+
+#[cfg(target_arch = "x86_64")]
+impl Rows for Avx2Rows {
+    #[inline(always)]
+    unsafe fn row(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        _: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        // SAFETY: as the caller guarantees.
+        unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e) }
+    }
+}
+
 /// What one DP pass found.
 #[derive(Clone, Copy)]
 struct Dp {
@@ -744,8 +1156,10 @@ fn affine_dp(
     clip: Option<(i32, bool)>,
     geom: usize,
 ) -> Dp {
+    let level = simd_level();
     DP_BUF.with(|b| {
         run(
+            level,
             pattern,
             text,
             mode,
@@ -801,6 +1215,7 @@ fn affine_dp_sorted(
         })
         .collect();
     let mut want: Vec<usize> = resume.iter().copied().filter(|&r| r > 0).collect();
+    let level = simd_level();
     want.sort_unstable();
     want.dedup();
     DP_BUF.with(|b| {
@@ -825,6 +1240,7 @@ fn affine_dp_sorted(
                 out[k - 1]
             } else if r == 0 {
                 run(
+                    level,
                     pattern,
                     t,
                     mode,
@@ -843,6 +1259,7 @@ fn affine_dp_sorted(
                 let i = want.binary_search(&r).unwrap();
                 let s = std::mem::take(&mut snaps[i]);
                 let d = run(
+                    level,
                     pattern,
                     t,
                     mode,
@@ -864,14 +1281,72 @@ fn affine_dp_sorted(
     })
 }
 
+/// One DP pass at `level` (which the CPU must support): the whole pass is compiled once per
+/// level, so the row kernel inlines into the row loop and nothing is dispatched per row.
 #[allow(clippy::too_many_arguments)]
-#[multiversion::multiversion(targets(
-    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-    "x86_64+avx2+fma",
-    "x86_64+avx",
-    "aarch64+neon"
-))]
 fn run(
+    level: Level,
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    bg: (usize, usize),
+    clip: Option<(i32, bool)>,
+    cut: usize,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    debug_assert!(simd::detected().includes(level));
+    match level {
+        // SAFETY: the CPU has the level's features (callers pass the active level).
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 => unsafe { run_avx512(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps) },
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 => unsafe { run_avx2(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps) },
+        _ => run_core::<ScalarRows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn run_avx512(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    bg: (usize, usize),
+    clip: Option<(i32, bool)>,
+    cut: usize,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    run_core::<Avx512Rows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn run_avx2(
+    pattern: &[u8],
+    text: &[u8],
+    mode: Mode,
+    sc: &Affine,
+    bg: (usize, usize),
+    clip: Option<(i32, bool)>,
+    cut: usize,
+    b: &mut DpBuf,
+    resume: Option<&Snap>,
+    snaps: &mut [Snap],
+) -> Dp {
+    run_core::<Avx2Rows>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn run_core<R: Rows>(
     pattern: &[u8],
     text: &[u8],
     mode: Mode,
@@ -961,6 +1436,7 @@ fn run(
         }
     }; // band of the row in h
     let mut next_snap = snaps.partition_point(|s| s.row < first);
+    let stats = crate::stats::on();
     for i in first..=m {
         let (lo, hi) = range(i);
         if lo > hi {
@@ -993,17 +1469,16 @@ fn run(
             start = 1;
             row_max = fj;
         }
-        if crate::stats::on() {
+        if stats {
             DP_WORK.with(|x| {
                 let (c, r) = x.get();
                 x.set((c + (hi + 1 - lo) as u64, r + 1));
             });
         }
-        #[cfg(target_arch = "x86_64")]
-        if start <= hi && avx512_rows() {
-            // SAFETY: AVX-512F/BW/VL are available (checked above).
+        if start <= hi {
+            // SAFETY: the entry point is compiled for the kernel's features, which the CPU has.
             let m = unsafe {
-                row_avx512(
+                R::row(
                     &h[start - 1..=hi],
                     &f[start..=hi],
                     &text[start - 1..hi],
@@ -1012,51 +1487,9 @@ fn run(
                     c,
                     (mat, mis, go, ext),
                     e,
+                    (hpv, gsv),
                 )
             };
-            row_max = row_max.max(m);
-        } else if start <= hi {
-            // Pass 1 (vectorizes): vertical gaps and diagonal moves (H' = H
-            // without horizontal gaps), from the previous row only.
-            let w = hi + 1 - start;
-            // The scan runs over whole 16-lane blocks: `gs` is padded with sentinels, which
-            // only adds outputs after every real one.
-            let wp = w.next_multiple_of(16);
-            if hpv.len() < wp {
-                hpv.resize(wp, NEG);
-                gsv.resize(wp, NEG);
-            }
-            let (hp, gs) = (&mut hpv[..], &mut gsv[..]);
-            gs[w..wp].fill(NEG);
-            let (hp, gs_all) = (&mut hp[..w], &mut gs[..wp]);
-            let gs = &mut gs_all[..w];
-            let hd = &h[start - 1..hi]; // H[i-1][j-1]
-            let hu = &h[start..=hi]; // H[i-1][j]
-            let fu = &f[start..=hi];
-            let tx = &text[start - 1..hi];
-            let nfr = &mut nf[start..=hi];
-            for k in 0..w {
-                let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
-                let s = if c == tx[k] & 3 { mat } else { -mis };
-                let x = (hd[k] + s).max(fj).max(NEG);
-                hp[k] = x;
-                gs[k] = x - go + ext * (k as i32 + 1);
-                nfr[k] = fj;
-            }
-            // Horizontal gaps. With open >= 0, E[k] = max(H'[k-1] - go, E[k-1]
-            // - ext): opening from H = max(H', E) adds nothing. With g[k] =
-            // E[k] + ext*k this is a running max (pass 2: exclusive prefix
-            // maxima, one op per cell on the critical path); pass 3
-            // (vectorizes) takes H = max(H', E).
-            excl_prefix_max(gs_all, e);
-            let gs = &gs_all[..w];
-            let nhr = &mut nh[start..=hi];
-            let mut m = NEG;
-            for k in 0..w {
-                let v = hp[k].max(gs[k] - ext * k as i32);
-                nhr[k] = v;
-                m = m.max(v);
-            }
             row_max = row_max.max(m);
         }
         if cut != usize::MAX && lo <= cut {
@@ -1161,6 +1594,59 @@ mod tests {
             prev = cur;
         }
         best
+    }
+
+    /// Runs `f` at every SIMD level this CPU supports, each forced explicitly.
+    fn each_level(mut f: impl FnMut(Level) -> Result<(), TestCaseError>) -> Result<(), TestCaseError> {
+        for l in simd::supported() {
+            at_level(l, || f(l))?;
+        }
+        Ok(())
+    }
+
+    /// One row by the row kernel of `level` (which the CPU must support), called directly.
+    #[allow(clippy::too_many_arguments)]
+    fn row_at(
+        level: Level,
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        nh: &mut [i32],
+        nf: &mut [i32],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+        scratch: (&mut Vec<i32>, &mut Vec<i32>),
+    ) -> i32 {
+        assert!(simd::detected().includes(level));
+        match level {
+            // SAFETY: the CPU supports the level (asserted above).
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx512 => unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) },
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx2 => unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e) },
+            _ => row_scalar(hprev, fu, tx, nh, nf, c, sc, e, scratch),
+        }
+    }
+
+    /// One row through every row kernel this CPU supports: (level, H, F, max).
+    fn rows_at_each_level(
+        hprev: &[i32],
+        fu: &[i32],
+        tx: &[u8],
+        c: u8,
+        sc: (i32, i32, i32, i32),
+        e: i32,
+    ) -> Vec<(Level, Vec<i32>, Vec<i32>, i32)> {
+        let w = fu.len();
+        let mut out = Vec::new();
+        for l in simd::supported() {
+            let (mut nh, mut nf) = (vec![7; w], vec![7; w]);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let m = row_at(l, hprev, fu, tx, &mut nh, &mut nf, c, sc, e, (&mut a, &mut b));
+            out.push((l, nh, nf, m));
+        }
+        out
     }
 
     fn check(p: &[u8], t: &[u8], k: u32) -> Result<(), TestCaseError> {
@@ -1314,21 +1800,41 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(600))]
 
-        /// The vectorized prefix maxima equal the scalar loop.
+        /// The scalar passes' prefix maxima equal the definition.
         #[test]
         fn prefix_max_matches_scalar(
             xs in prop::collection::vec(-100000i32..100000, 0..200), init in -100000i32..100000,
         ) {
-            let mut want = xs.clone();
-            let mut g = init;
-            for x in want.iter_mut() {
-                let next = g.max(*x);
-                *x = g;
-                g = next;
-            }
+            let want: Vec<i32> = (0..xs.len()).map(|k| xs[..k].iter().fold(init, |a, &x| a.max(x))).collect();
             let mut got = xs.clone();
             excl_prefix_max(&mut got, init);
             prop_assert_eq!(got, want);
+        }
+
+        /// Every row kernel computes the scalar passes' row exactly, on rows of every length
+        /// (whole vectors and partial tails), with cells and the entering gap down at and below
+        /// NEG (unreachable cells and column 0 next to them).
+        #[test]
+        fn row_kernels_match_scalar(
+            cells in prop::collection::vec((prop_oneof![-3000i32..3000, (NEG - 300)..(NEG + 300)], prop_oneof![-3000i32..3000, (NEG - 300)..(NEG + 300)]), 1..90),
+            tx in prop::collection::vec(any::<u8>(), 90),
+            c in 0u8..4,
+            sc in prop_oneof![Just((2, 4, 4, 2)), Just((1, 4, 6, 2)), (0i32..5, 0i32..9, 0i32..30, 0i32..6)],
+            e in prop_oneof![Just(NEG), (NEG - 300)..(NEG + 300), -3000i32..3000],
+        ) {
+            let hprev: Vec<i32> = cells.iter().map(|x| x.0).collect();
+            let w = hprev.len() - 1;
+            let fu: Vec<i32> = cells[1..].iter().map(|x| x.1).collect();
+            let (mat, mis, open, ext) = sc;
+            let sc = (mat, mis, open + ext, ext);
+            let all = rows_at_each_level(&hprev, &fu, &tx[..w], c, sc, e);
+            let want = &all[0];
+            prop_assert_eq!(want.0, Level::Scalar);
+            for got in &all[1..] {
+                prop_assert_eq!(&got.1, &want.1, "H at {}", got.0);
+                prop_assert_eq!(&got.2, &want.2, "F at {}", got.0);
+                prop_assert_eq!(got.3, want.3, "max at {}", got.0);
+            }
         }
 
         /// Sorted texts sharing prefixes (isoform flanks) give the same scores through the
@@ -1358,6 +1864,7 @@ mod tests {
             texts.sort();
             texts.dedup();
             let refs: Vec<&[u8]> = texts.iter().map(|t| t.as_slice()).collect();
+            each_level(|_| {
             for sc in [Affine::default(), Affine::HIFI] {
                 for mode in [Mode::Global, Mode::Prefix] {
                     let got = affine_sorted(&p, &refs, mode, &sc, band);
@@ -1398,6 +1905,8 @@ mod tests {
                 let whole = affine_extend_sorted(&p, &refs, &sc, band, bonus, i32::MAX, false, w);
                 prop_assert_eq!(both.iter().map(|x| x.0).collect::<Vec<_>>(), whole, "whole with cut");
             }
+            Ok(())
+            })?;
         }
 
         #[test]
@@ -1414,16 +1923,21 @@ mod tests {
                 match kind { 0 => p[i] = base, 1 => p.insert(i, base), _ => { p.remove(i); } }
             }
             let sc = Affine::default();
-            for mode in [Mode::Global, Mode::Prefix, Mode::Infix] {
-                let want = naive_affine(&p, &t, mode, &sc);
-                prop_assert_eq!(affine(&p, &t, mode, &sc, usize::MAX), want, "mode {:?}", mode);
-                // A band never improves the score, and a band covering everything is exact.
-                prop_assert!(affine(&p, &t, mode, &sc, 8) <= want);
-                prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
-            }
-            if p.len() <= 40 && t.len() <= 60 {
-                prop_assert_eq!(affine_extend(&p, &t[..t.len().min(60)], &sc, usize::MAX, 0, i32::MAX), naive_extend(&p, &t[..t.len().min(60)], &sc));
-            }
+            let wants: Vec<i32> = [Mode::Global, Mode::Prefix, Mode::Infix].iter().map(|&m| naive_affine(&p, &t, m, &sc)).collect();
+            let small = p.len() <= 40 && t.len() <= 60;
+            let want_ext = if small { naive_extend(&p, &t, &sc) } else { 0 };
+            each_level(|level| {
+                for (mode, &want) in [Mode::Global, Mode::Prefix, Mode::Infix].into_iter().zip(&wants) {
+                    prop_assert_eq!(affine(&p, &t, mode, &sc, usize::MAX), want, "mode {:?} at {}", mode, level);
+                    // A band never improves the score, and a band covering everything is exact.
+                    prop_assert!(affine(&p, &t, mode, &sc, 8) <= want);
+                    prop_assert_eq!(affine(&p, &t, mode, &sc, 400), want);
+                }
+                if small {
+                    prop_assert_eq!(affine_extend(&p, &t, &sc, usize::MAX, 0, i32::MAX), want_ext, "at {}", level);
+                }
+                Ok(())
+            })?;
         }
 
         #[test]
@@ -1497,7 +2011,127 @@ mod tests {
             let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
             let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
             let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
-            prop_assert_eq!(infix_distances(&pat, &refs, k), want);
+            each_level(|level| {
+                prop_assert_eq!(infix_distances(&pat, &refs, k), want.clone(), "at {}", level);
+                Ok(())
+            })?;
+        }
+    }
+
+    /// Pseudo-random 2-bit codes, and a copy with about one edit in `div`.
+    fn rand_pair(n: usize, div: u64, seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut x = seed;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let t: Vec<u8> = (0..n).map(|_| (next() & 3) as u8).collect();
+        let mut p = Vec::with_capacity(n);
+        for &b in &t {
+            match next() % (3 * div) {
+                0 => p.push((b + 1) & 3),
+                1 => {}
+                2 => p.extend([b, (next() & 3) as u8]),
+                _ => p.push(b),
+            }
+        }
+        (p, t)
+    }
+
+    /// Times `f` (best of 5) in ns per `per` units.
+    fn time(per: f64, mut f: impl FnMut()) -> f64 {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                f();
+                t.elapsed().as_nanos() as f64 / per
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Isolated kernel timings per SIMD level (`cargo test --release -p map -- --ignored
+    /// --nocapture kernel_timings`).
+    #[test]
+    #[ignore]
+    fn kernel_timings() {
+        use std::hint::black_box;
+        // One DP row kernel, called directly on rows of a few widths.
+        for w in [24usize, 63, 129, 400] {
+            let (_, t) = rand_pair(w + 1, 10, w as u64);
+            let hprev: Vec<i32> = (0..=w as i32).map(|j| 3 * j - 200).collect();
+            let fu: Vec<i32> = (0..w as i32).map(|j| 2 * j - 300).collect();
+            let sc = (2, 4, 6, 2);
+            let reps = 2_000_000 / w;
+            for l in simd::supported() {
+                let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let ns = time((reps * w) as f64, || {
+                    for _ in 0..reps {
+                        let m = row_at(
+                            l,
+                            black_box(&hprev),
+                            &fu,
+                            &t[..w],
+                            &mut nh,
+                            &mut nf,
+                            1,
+                            sc,
+                            NEG,
+                            (&mut a, &mut b),
+                        );
+                        black_box(m);
+                    }
+                });
+                println!("row w={w:4} {:7}: {ns:.3} ns/cell", l.name());
+            }
+        }
+        // Whole banded extension DPs (the row loop around the kernel).
+        let (p, t) = rand_pair(3000, 12, 7);
+        for l in simd::supported() {
+            let ns = time(10.0, || {
+                at_level(l, || {
+                    for _ in 0..10 {
+                        black_box(affine_extend(black_box(&p), &t, &Affine::ONT, 64, 0, 400));
+                    }
+                })
+            });
+            println!(
+                "affine_extend 3 kb band 64 {:7}: {:.1} us/DP",
+                l.name(),
+                ns / 1000.0
+            );
+        }
+        // Batched infix distances: a 600-base pattern against 16 related 900-base texts.
+        let (p, base) = rand_pair(600, 15, 11);
+        let texts: Vec<Vec<u8>> = (0..16u64)
+            .map(|s| {
+                let mut t = rand_pair(150, 4, s + 100).1;
+                t.extend(
+                    rand_pair(600, 12, s + 200)
+                        .0
+                        .iter()
+                        .zip(&base)
+                        .map(|(&a, &b)| if s % 3 == 0 { a } else { b }),
+                );
+                t.extend(rand_pair(150, 4, s + 300).1);
+                t
+            })
+            .collect();
+        let refs: Vec<&[u8]> = texts.iter().map(|t| t.as_slice()).collect();
+        let pat = Pattern::new(&p);
+        for k in [60u32, u32::MAX] {
+            for l in simd::supported() {
+                let ns = time(20.0 * 16.0, || {
+                    at_level(l, || {
+                        for _ in 0..20 {
+                            black_box(infix_distances(&pat, black_box(&refs), k));
+                        }
+                    })
+                });
+                println!("infix k={k:10} {:7}: {:.1} us/text", l.name(), ns / 1000.0);
+            }
         }
     }
 }

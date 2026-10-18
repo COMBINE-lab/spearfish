@@ -19,6 +19,7 @@
 //! - Chains are local: any anchor can start one with score `w`.
 
 use index::Index;
+use lcp_core::simd::Level;
 
 use crate::anchor::Candidate;
 
@@ -266,6 +267,7 @@ fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Ve
         h: 2 * p.h,
         ..p.clone()
     };
+    let level = crate::align::simd_level();
     // The list whose points and DP values the buffers hold.
     let mut prev: Option<&[Pt]> = None;
     let order = std::mem::take(&mut sc.order);
@@ -307,6 +309,7 @@ fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Ve
             sc.w[i] = x.w;
         }
         dp_beta0(
+            level,
             &wp,
             (
                 &sc.a[..n],
@@ -446,16 +449,68 @@ fn max_score(xs: &[f32]) -> f32 {
 type Soa<'a> = (&'a [u32], &'a [i32], &'a [i32], &'a [i32], &'a [i32], &'a [f32]);
 
 /// One transcript's forward DP with β = 0 over `lcp..n` (`f`, `back`, `disc` hold the shared
-/// prefix's values below `lcp`), compiled per target as a whole so the per-anchor work
-/// (predecessor scores, their maximum) stays in one vectorized loop without dispatch.
-#[multiversion::multiversion(targets(
-    "x86_64+avx512f+avx512bw+avx512vl+avx2+fma",
-    "x86_64+avx2+fma",
-    "x86_64+avx",
-    "aarch64+neon"
-))]
+/// prefix's values below `lcp`), at `level` (which the CPU must support): compiled per level as
+/// a whole so the per-anchor work (predecessor scores, their maximum) stays in one vectorized
+/// loop without dispatch. The arithmetic is the same at every level (no FMA contraction), so
+/// results are bit-identical.
 #[allow(clippy::too_many_arguments)]
 fn dp_beta0(
+    level: Level,
+    p: &ChainParams,
+    soa: Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    debug_assert!(lcp_core::simd::detected().includes(level));
+    match level {
+        // SAFETY: the CPU has the level's features (callers pass the active level).
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 => unsafe { dp_beta0_avx512(p, soa, f, back, disc, lcp, cs, cd) },
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 => unsafe { dp_beta0_avx2(p, soa, f, back, disc, lcp, cs, cd) },
+        _ => dp_beta0_core(p, soa, f, back, disc, lcp, cs, cd),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0_avx512(
+    p: &ChainParams,
+    soa: Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    dp_beta0_core(p, soa, f, back, disc, lcp, cs, cd)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0_avx2(
+    p: &ChainParams,
+    soa: Soa,
+    f: &mut [f32],
+    back: &mut [u32],
+    disc: &mut [f32],
+    lcp: usize,
+    cs: &mut [f32],
+    cd: &mut [f32],
+) {
+    dp_beta0_core(p, soa, f, back, disc, lcp, cs, cd)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn dp_beta0_core(
     p: &ChainParams,
     (a, qs, qe, ts, te, w): Soa,
     f: &mut [f32],
@@ -513,6 +568,7 @@ impl Chainer for OracleChainer {
 
 impl OracleChainer {
     fn chain_with(&self, idx: &Index, cand: &Candidate, sc: &mut DpScratch) -> Vec<TxHit> {
+        let level = crate::align::simd_level();
         let unitig = idx.node_unitig();
         let offset = idx.node_offset();
         // An anchor's transcript span equals its query span (exact core matches; merged
@@ -632,6 +688,7 @@ impl OracleChainer {
                     sc.cd.resize(n, 0.0);
                 }
                 dp_beta0(
+                    level,
                     p,
                     (&sc.a, &sc.qs, &sc.qe, &sc.ts, &sc.te, &sc.w),
                     &mut sc.f,
@@ -749,15 +806,18 @@ mod best_chain_tests {
             pts.sort_unstable_by_key(|p| (p.qs, p.ts));
             let p = ChainParams { alpha, h, o_max: 30, g_max: 500, ..Default::default() };
             let want = best_chain_scalar(&p, &pts);
-            let got = best_chain(&p, &pts);
-            match (want, got) {
-                (None, None) => {}
-                (Some(w), Some(g)) => {
-                    prop_assert_eq!(w.0.to_bits(), g.0.to_bits());
-                    prop_assert_eq!(w.1, g.1);
-                    prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
+            // The vectorized DP at every SIMD level this CPU supports, each forced explicitly.
+            for level in lcp_core::simd::supported() {
+                let got = crate::align::at_level(level, || best_chain(&p, &pts));
+                match (&want, got) {
+                    (None, None) => {}
+                    (Some(w), Some(g)) => {
+                        prop_assert_eq!(w.0.to_bits(), g.0.to_bits(), "at {}", level);
+                        prop_assert_eq!(&w.1, &g.1, "at {}", level);
+                        prop_assert_eq!(w.2.to_bits(), g.2.to_bits(), "at {}", level);
+                    }
+                    (w, g) => prop_assert!(false, "{:?} vs {:?} at {}", w, g, level),
                 }
-                (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
             }
         }
 
@@ -799,17 +859,19 @@ mod best_chain_tests {
                 .collect();
             let p = ChainParams { h, o_max: 30, g_max: 500, ..Default::default() };
             let refs: Vec<&[Pt]> = lists.iter().map(|l| l.as_slice()).collect();
-            let got = best_chains(&p, &refs);
-            for (l, g) in lists.iter().zip(&got) {
-                let w = best_chain_scalar(&p, l);
-                match (w, g) {
-                    (None, None) => {}
-                    (Some(w), Some(g)) => {
-                        prop_assert_eq!(w.0.to_bits(), g.0.to_bits());
-                        prop_assert_eq!(&w.1, &g.1);
-                        prop_assert_eq!(w.2.to_bits(), g.2.to_bits());
+            for level in lcp_core::simd::supported() {
+                let got = crate::align::at_level(level, || best_chains(&p, &refs));
+                for (l, g) in lists.iter().zip(&got) {
+                    let w = best_chain_scalar(&p, l);
+                    match (w, g) {
+                        (None, None) => {}
+                        (Some(w), Some(g)) => {
+                            prop_assert_eq!(w.0.to_bits(), g.0.to_bits(), "at {}", level);
+                            prop_assert_eq!(&w.1, &g.1, "at {}", level);
+                            prop_assert_eq!(w.2.to_bits(), g.2.to_bits(), "at {}", level);
+                        }
+                        (w, g) => prop_assert!(false, "{:?} vs {:?} at {}", w, g, level),
                     }
-                    (w, g) => prop_assert!(false, "{:?} vs {:?}", w, g),
                 }
             }
         }

@@ -1,7 +1,8 @@
 //! `spearfish doctor`: report the build and the machine, run a self-test, and optionally check
 //! an index.
 //!
-//! The self-test builds an index of the toy transcripts in memory and maps reads made from
+//! The self-test runs at the SIMD level in use (`SPEARFISH_SIMD=scalar|avx2|avx512` lowers
+//! it). It builds an index of the toy transcripts in memory and maps reads made from
 //! them (forward, reverse-complemented, and with substitutions) with every preset. The
 //! output's digest must match the reference: the SIMD kernels this machine selects compute
 //! exactly what the scalar code does, so any difference is a bug.
@@ -109,6 +110,7 @@ pub fn run(args: Args) -> Result<()> {
         "arch": std::env::consts::ARCH,
         "cpus_available": crate::runinfo::available_cpus(),
         "simd": spearfish::provenance::simd_level(),
+        "simd_detected": spearfish::provenance::simd_detected(),
         "score_denom": spearfish::SCORE_DENOM,
     });
     let mut ok = true;
@@ -150,7 +152,11 @@ pub fn run(args: Args) -> Result<()> {
         println!("spearfish {}", build.short());
         println!("target      {} ({})", build.target, build.profile);
         println!("cpus        {}", report["cpus_available"]);
-        println!("simd        {}", report["simd"].as_str().unwrap_or(""));
+        println!(
+            "simd        {} (CPU supports {})",
+            report["simd"].as_str().unwrap_or(""),
+            report["simd_detected"].as_str().unwrap_or("")
+        );
         for (p, t) in report["self_test"].as_object().unwrap() {
             let pass = t["pass"].as_bool() == Some(true);
             println!(

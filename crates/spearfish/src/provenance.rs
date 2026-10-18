@@ -197,17 +197,12 @@ pub fn file_xxh3(path: &std::path::Path) -> std::io::Result<String> {
     Ok(format!("{:016x}", h.digest()))
 }
 
-/// The SIMD kernels this process runs, as a short name.
+/// The SIMD kernels this process runs, as a short name (`SPEARFISH_SIMD` can lower it).
 pub fn simd_level() -> &'static str {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512bw") && std::arch::is_x86_feature_detected!("avx512vl")
-        {
-            return "avx512";
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return "avx2";
-        }
-    }
-    "scalar"
+    lcp_core::simd::active().name()
+}
+
+/// The most capable SIMD kernels this CPU supports.
+pub fn simd_detected() -> &'static str {
+    lcp_core::simd::detected().name()
 }
