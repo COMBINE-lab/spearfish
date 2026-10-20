@@ -83,8 +83,8 @@ record, and records carry no read names.
 ## Run records
 
 Every `spearfish map` run writes a JSON record next to its first output file
-(`reads.tsv.meta.json`; `--meta FILE` to choose; none if everything goes to standard output and
-`--meta` is not given). It holds:
+(`reads.tsv.meta.json`; `--meta FILE` to choose; none if `--meta` is not given and no output is a
+regular file, as when everything goes to standard output or `/dev/null`). It holds:
 
 - `spearfish`: version, git revision, target and build profile; `simd`: the kernels used;
 - `command_line`, `working_directory`, start and finish times, threads and CPUs available;
