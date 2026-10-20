@@ -402,54 +402,94 @@ impl<'a> Plan<'a> {
     }
 
     fn run(&mut self, j: usize, tb: &TieBreak) -> i64 {
-        if let Some(score) = self.jobs[j].score {
-            return score;
-        }
-        let job = &self.jobs[j];
-        let ctx = &self.contexts[job.context];
-        let sc = tb.affine.as_ref().unwrap();
-        let mut text = if job.text.is_empty() {
-            Vec::new()
-        } else {
-            job.text.decode()
+        self.run_batch(&[j], tb);
+        self.jobs[j].score.unwrap()
+    }
+
+    /// Score the jobs `js` of one context that have no score yet, in one pass of the sorted
+    /// kernels: texts sorted, so rows that read only a prefix shared with the previous text
+    /// are not recomputed (equal to separate calls).
+    fn run_batch(&mut self, js: &[usize], tb: &TieBreak) {
+        let js: Vec<usize> = js
+            .iter()
+            .copied()
+            .filter(|&j| self.jobs[j].score.is_none())
+            .collect();
+        let Some(&j0) = js.first() else {
+            return;
         };
-        if ctx.reverse {
-            text.reverse();
-        }
+        let ctx = &self.contexts[self.jobs[j0].context];
+        debug_assert!(js.iter().all(|&j| self.jobs[j].context == self.jobs[j0].context));
+        let sc = tb.affine.as_ref().unwrap();
+        let texts: Vec<Vec<u8>> = js
+            .iter()
+            .map(|&j| {
+                let t = &self.jobs[j].text;
+                let mut v = if t.is_empty() { Vec::new() } else { t.decode() };
+                if ctx.reverse {
+                    v.reverse();
+                }
+                v
+            })
+            .collect();
         #[cfg(test)]
         {
-            self.decoded += usize::from(!job.text.is_empty());
-            self.evaluated.push(j);
+            self.decoded += js.iter().filter(|&&j| !self.jobs[j].text.is_empty()).count();
+            self.evaluated.extend(&js);
         }
-        stats::add(&stats::AFFINE_CALLS, 1);
-        stats::add(&stats::AFFINE_TEXT_BASES, text.len() as u64);
-        stats::add(&stats::AFFINE_TEXT_NEW_BASES, text.len() as u64);
-        let cells = job.work(ctx, tb).min(u64::MAX as u128) as u64;
-        stats::add(&stats::AFFINE_CELLS, cells);
-        if ctx.mode == align::Mode::Prefix {
-            stats::add(&stats::AFFINE_END_CELLS, cells);
+        let mut order: Vec<usize> = (0..js.len()).collect();
+        order.sort_unstable_by(|&a, &b| texts[a].cmp(&texts[b]));
+        let prefix_mode = ctx.mode == align::Mode::Prefix;
+        let diag = prefix_mode && tb.clip_ends && tb.end_diagonal;
+        if stats::on() {
+            // As the original evaluator counts: text bases, those outside the common prefix
+            // with the previous text in sorted order, and the banded cells per text.
+            let m = ctx.read.len() as u64;
+            let mut prev: Option<&Vec<u8>> = None;
+            for &k in &order {
+                let t = &texts[k];
+                let l = prev.map_or(0, |p| t.iter().zip(p).take_while(|(a, b)| a == b).count());
+                let n = t.len() as u64;
+                let drift = if diag && n >= m { 0 } else { m.abs_diff(n) };
+                let width = (tb.band as u64)
+                    .saturating_mul(2)
+                    .saturating_add(drift)
+                    .saturating_add(1);
+                let cells = m.saturating_mul(width.min(n + 1));
+                stats::add(&stats::AFFINE_CALLS, 1);
+                stats::add(&stats::AFFINE_TEXT_BASES, n);
+                stats::add(&stats::AFFINE_TEXT_NEW_BASES, (t.len() - l) as u64);
+                stats::add(&stats::AFFINE_CELLS, cells);
+                if prefix_mode {
+                    stats::add(&stats::AFFINE_END_CELLS, cells);
+                }
+                prev = Some(t);
+            }
         }
+        let tx: Vec<&[u8]> = order.iter().map(|&k| texts[k].as_slice()).collect();
         let w0 = align::dp_work();
-        let (x, near, cols) = if ctx.mode == align::Mode::Prefix && tb.clip_ends {
+        let xs: Vec<(i32, i32, usize)> = if prefix_mode && tb.clip_ends {
             let window = ctx.read.len() + tb.pad as usize + ctx.read.len() / tb.pad_div as usize;
             align::affine_extend_sorted_cut(
                 &ctx.read,
-                &[&text],
+                &tx,
                 sc,
                 tb.band,
                 tb.end_bonus,
                 tb.xdrop,
-                tb.end_diagonal,
+                diag,
                 window,
                 ctx.cut.unwrap_or(usize::MAX),
-            )[0]
+            )
         } else {
-            let x = align::affine_sorted(&ctx.read, &[&text], ctx.mode, sc, tb.band)[0];
-            (x, x, 0)
+            align::affine_sorted(&ctx.read, &tx, ctx.mode, sc, tb.band)
+                .into_iter()
+                .map(|x| (x, x, 0))
+                .collect()
         };
         if stats::on() {
             let w1 = align::dp_work();
-            let (c, r) = if ctx.mode == align::Mode::Prefix {
+            let (c, r) = if prefix_mode {
                 (&stats::DP_TBEND_CELLS, &stats::DP_TBEND_ROWS)
             } else {
                 (&stats::DP_SEG_CELLS, &stats::DP_SEG_ROWS)
@@ -457,21 +497,45 @@ impl<'a> Plan<'a> {
             stats::add(c, w1.0 - w0.0);
             stats::add(r, w1.1 - w0.1);
         }
-        let mut score = i64::from(x);
-        if let Some(cut) = ctx.cut {
-            let gain = score - i64::from(near);
-            let past = cols.saturating_sub(cut) as i64;
-            if text.len() > cut
-                && gain < tb.flank_min
-                && !(past > 0 && 4 * gain >= 3 * i64::from(sc.mat) * past)
-            {
-                score = i64::from(near);
+        let cut = ctx.cut;
+        for (&k, &(x, near, cols)) in order.iter().zip(&xs) {
+            let mut score = i64::from(x);
+            if let Some(cut) = cut {
+                let gain = score - i64::from(near);
+                let past = cols.saturating_sub(cut) as i64;
+                if texts[k].len() > cut
+                    && gain < tb.flank_min
+                    && !(past > 0 && 4 * gain >= 3 * i64::from(sc.mat) * past)
+                {
+                    score = i64::from(near);
+                }
             }
+            self.jobs[js[k]].score = Some(score);
         }
-        self.jobs[j].score = Some(score);
-        score
     }
 
+    /// Candidate `i`'s score, once all its jobs are scored.
+    fn total(&self, i: usize) -> Option<i64> {
+        self.required[i]
+            .iter()
+            .try_fold(-self.cost[i], |sum, &j| Some(sum + self.jobs[j].score?))
+    }
+
+    /// An upper bound on candidate `i`'s score: scored jobs as they are, the rest at their
+    /// bound. None (no pruning) if a sum would overflow.
+    fn upper_bound(&self, i: usize, tb: &TieBreak) -> Option<i64> {
+        self.required[i].iter().try_fold(-self.cost[i], |sum, &j| {
+            let job = &self.jobs[j];
+            sum.checked_add(job.score.or_else(|| job.upper(&self.contexts[job.context], tb))?)
+        })
+    }
+
+    /// Costs (negated scores) of every candidate, or None for one certified (by `filter`) to
+    /// fall below the reporting floor. Every candidate has one job per context (uniform
+    /// segments have none); contexts are scored cheapest first, each context's texts still
+    /// needed in one sorted batch, so isoforms that agree near the anchor share DP rows. With a
+    /// filter, the candidate with the best chain score is aligned first (one text per
+    /// context): its score is the reference that certifies the others before each batch.
     pub(super) fn evaluate(
         &mut self,
         tb: &TieBreak,
@@ -480,51 +544,62 @@ impl<'a> Plan<'a> {
     ) -> Vec<Option<i64>> {
         // Input order is already read-salted. Strict improvement preserves that order
         // among equal original chain scores; scores are never changed during evaluation.
-        let first = (0..hits.len())
+        let n = hits.len();
+        let first = (0..n)
             .reduce(|a, b| if hits[b].score > hits[a].score { b } else { a })
             .unwrap();
+        #[cfg(test)]
+        self.candidates.push(first);
+        let work = |p: &Self, j: usize| {
+            let job = &p.jobs[j];
+            if job.score.is_some() {
+                0
+            } else {
+                job.work(&p.contexts[job.context], tb)
+            }
+        };
         let mut reference = None;
-        let mut costs = vec![None; hits.len()];
-        for i in std::iter::once(first).chain((0..hits.len()).filter(|&i| i != first)) {
-            #[cfg(test)]
-            self.candidates.push(i);
-            let mut todo: Vec<usize> = self.required[i]
-                .iter()
-                .copied()
-                .filter(|&j| self.jobs[j].score.is_none())
-                .collect();
-            todo.sort_by_key(|&j| (self.jobs[j].work(&self.contexts[self.jobs[j].context], tb), j));
-            let mut next = todo.into_iter();
-            loop {
-                // Include all cached scores immediately, even those computed for another
-                // candidate, and known annotation bonuses. Checked sums decline to prune.
-                let upper = self.required[i].iter().try_fold(-self.cost[i], |sum, &j| {
-                    let job = &self.jobs[j];
-                    sum.checked_add(job.score.or_else(|| job.upper(&self.contexts[job.context], tb))?)
-                });
-                if let (Some(f), Some(r), Some(u)) = (filter, reference, upper)
-                    && f.rejects(r, u)
-                {
-                    break;
-                }
-                match next.next() {
-                    Some(j) => {
-                        self.run(j, tb);
+        if filter.is_some() {
+            let mut own: Vec<usize> = self.required[first].clone();
+            own.sort_by_key(|&j| (work(self, j), j));
+            for j in own {
+                self.run(j, tb);
+            }
+            reference = self.total(first);
+        }
+        let mut alive = vec![true; n];
+        let mut order: Vec<usize> = (0..self.contexts.len()).collect();
+        let ctx_work: Vec<u128> = order
+            .iter()
+            .map(|&c| (0..n).map(|i| self.required[i][c]).map(|j| work(self, j)).sum())
+            .collect();
+        order.sort_by_key(|&c| (ctx_work[c], c));
+        for c in order {
+            if let (Some(f), Some(r)) = (filter, reference) {
+                for i in 0..n {
+                    if alive[i] && self.upper_bound(i, tb).is_some_and(|u| f.rejects(r, u)) {
+                        alive[i] = false;
                     }
-                    None => {
-                        let score = -self.cost[i]
-                            + self.required[i]
-                                .iter()
-                                .map(|&j| self.jobs[j].score.unwrap())
-                                .sum::<i64>();
-                        costs[i] = Some(-score);
-                        reference = Some(reference.map_or(score, |r: i64| r.max(score)));
-                        break;
+                }
+            }
+            let mut js: Vec<usize> = (0..n)
+                .filter(|&i| alive[i])
+                .map(|i| self.required[i][c])
+                .collect();
+            js.sort_unstable();
+            js.dedup();
+            self.run_batch(&js, tb);
+            if filter.is_some() {
+                for i in (0..n).filter(|&i| alive[i]) {
+                    if let Some(s) = self.total(i) {
+                        reference = Some(reference.map_or(s, |r: i64| r.max(s)));
                     }
                 }
             }
         }
-        costs
+        (0..n)
+            .map(|i| alive[i].then(|| -self.total(i).unwrap()))
+            .collect()
     }
 }
 
@@ -583,16 +658,14 @@ mod tests {
         let hits: Vec<_> = (0..4).map(|t| hit(t, 100. - t as f32, &[(0, 0, 1)])).collect();
         let got = p.evaluate(&tb, &hits, filter(100., 0.1));
         assert_eq!(got, [Some(-52), None, Some(-46), None]);
-        assert_eq!(
-            p.evaluated,
-            [
-                required[0][1],
-                required[0][0],
-                required[1][1],
-                required[2][0],
-                required[3][1]
-            ]
-        );
+        // The reference candidate's jobs first, cheap before expensive; then the cheap context's
+        // remaining texts in one batch; then the expensive context's, for survivors only.
+        assert_eq!(p.evaluated[..2], [required[0][1], required[0][0]]);
+        let mut rest = p.evaluated[2..].to_vec();
+        rest.sort_unstable();
+        let mut want = vec![required[1][1], required[2][0], required[3][1]];
+        want.sort_unstable();
+        assert_eq!(rest, want);
         // Candidate 1's skipped expensive job was still needed by surviving candidate 2.
         assert_eq!(required[1][0], required[2][0]);
         assert!(p.jobs[required[3][0]].score.is_none());
@@ -635,9 +708,10 @@ mod tests {
         );
         let hits: Vec<_> = (0..3).map(|t| hit(t, 100. - t as f32, &[(0, 0, 1)])).collect();
         let got = p.evaluate(&tb, &hits, filter(100., 0.));
-        assert_eq!(got, [Some(68), Some(-16), None]);
-        // After candidate 1 improves R from -68 to 16, candidate 2's bound is 14.
-        assert!(p.jobs[p.required[2][0]].score.is_none());
+        // Candidate 1 improves R from -68 to 16, after which candidate 2's bound (14) would be
+        // rejected; its texts were already scored in the same batches as candidate 1's, so it
+        // is kept with its exact cost (below the floor; the retain step drops it).
+        assert_eq!(got, [Some(68), Some(-16), Some(106)]);
     }
 
     #[test]
@@ -659,7 +733,7 @@ mod tests {
             None,
         );
         p.evaluate(&tb, &hits, None);
-        assert_eq!(p.candidates, [1, 0, 2]);
+        assert_eq!(p.candidates, [1]);
         for h in &mut hits {
             h.score = 10.;
         }
