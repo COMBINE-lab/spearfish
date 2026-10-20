@@ -72,11 +72,13 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
             .collect();
         let n = idx.tx_plen()[t];
         assert_eq!(idx.tx_codes(t as u32, 0, n), codes);
+        assert_eq!(idx.tx_range(t as u32, 0, n, false).unwrap().decode(), codes);
     }
     // HPC: raw windows of parsed spans decode to the raw sequence's whole runs.
     for (t, tx) in txs.iter().enumerate() {
         let Some(h) = seeder.parsed(&tx.seq) else {
             assert_eq!(idx.tx_raw_codes(t as u32, 0, 0), None);
+            assert!(idx.tx_range(t as u32, 0, 0, true).is_none());
             continue;
         };
         let n = idx.tx_plen()[t];
@@ -94,6 +96,9 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
             (1.min(n), n),
         ] {
             let (a, b) = h.to_raw(lo, hi);
+            let range = idx.tx_range(t as u32, lo, hi, true).unwrap();
+            assert_eq!(range.len(), (b - a) as usize);
+            assert_eq!(range.decode(), &raw[a as usize..b as usize]);
             assert_eq!(
                 idx.tx_raw_codes(t as u32, lo, hi).as_deref(),
                 Some(&raw[a as usize..b as usize]),

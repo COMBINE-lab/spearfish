@@ -6,6 +6,7 @@ pub mod anchor;
 pub mod chain;
 pub mod refine;
 pub mod rescue;
+mod segmented;
 pub mod stats;
 
 use std::sync::Arc;
@@ -253,6 +254,8 @@ pub struct Mapper<C: Chainer> {
     rescuer: Option<Rescuer>,
     /// [`anchor::node_families`] of `idx`.
     node_fam: Vec<u32>,
+    #[cfg(test)]
+    reference_tiebreak: bool,
 }
 
 /// One orientation of a read: hits (sorted), the parsed sequence and its base seeds.
@@ -373,6 +376,8 @@ impl<C: Chainer> Mapper<C> {
         let rescuer = p.rescue.clone().map(|r| Rescuer::new(&idx, r)).transpose()?;
         let node_fam = anchor::node_families(&idx);
         Ok(Mapper {
+            #[cfg(test)]
+            reference_tiebreak: false,
             node_fam,
             idx,
             seeder,
@@ -385,6 +390,8 @@ impl<C: Chainer> Mapper<C> {
     /// Re-rank the near-tie set of `hits` (sorted, best first) by edit distance between the
     /// parsed read `seq` and each transcript. Returns the tie-set size. `salt` orders equal
     /// scores (see [`sort_hits`]).
+    /// `prune` is false when orientation reconciliation can still shift the reporting floor.
+    #[allow(clippy::too_many_arguments)]
     fn tiebreak(
         &self,
         tb: &TieBreak,
@@ -392,6 +399,7 @@ impl<C: Chainer> Mapper<C> {
         raw: Option<&RawRead>,
         hits: &mut [TxHit],
         salt: u64,
+        prune: bool,
     ) -> u32 {
         let Some(best) = hits.first().map(|h| h.score) else {
             return 0;
@@ -413,15 +421,29 @@ impl<C: Chainer> Mapper<C> {
             .collect();
         // Costs (edits, or negated affine scores) and the score charged per unit.
         let seg = if tb.segmented {
-            self.segmented(tb, &codes, raw, &hits[..n])
+            if let Some(mut plan) = self.affine_plan(tb, &codes, raw, &hits[..n]) {
+                let filter = prune.then_some(segmented::Retention {
+                    baseline: best,
+                    delta: self.p.delta_rep,
+                    lambda: tb.lambda,
+                });
+                Some((plan.evaluate(tb, &hits[..n], filter), tb.lambda))
+            } else {
+                self.segmented_reference(tb, &codes, raw, &hits[..n])
+                    .map(|(cost, unit)| (cost.into_iter().map(Some).collect(), unit))
+            }
         } else {
             None
         };
         // Alignment deficit relative to the tie set's best alignment, per hit.
         let penalty: Vec<f32> = match seg {
             Some((cost, unit)) => {
-                let cmin = *cost.iter().min().unwrap();
-                cost.iter().map(|&c| unit * (c - cmin) as f32).collect()
+                let cmin = *cost.iter().flatten().min().unwrap();
+                // Missing costs are certified below the final reporting floor. Keep their
+                // slots (and the original tie-set metadata) until the normal retain step.
+                cost.iter()
+                    .map(|&c| c.map_or(f32::INFINITY, |c| unit * (c - cmin) as f32))
+                    .collect()
             }
             None => {
                 stats::add(&stats::TIEBREAK_WHOLE_READ, 1);
@@ -723,6 +745,26 @@ impl<C: Chainer> Mapper<C> {
         raw: Option<&RawRead>,
         hits: &[TxHit],
     ) -> Option<(Vec<i64>, f32)> {
+        if let Some(mut plan) = self.affine_plan(tb, codes, raw, hits) {
+            let costs = plan
+                .evaluate(tb, hits, None)
+                .into_iter()
+                .map(Option::unwrap)
+                .collect();
+            Some((costs, tb.lambda))
+        } else {
+            self.segmented_reference(tb, codes, raw, hits)
+        }
+    }
+
+    // Original evaluator: differential oracle and fallback for unsupported scoring paths.
+    fn segmented_reference(
+        &self,
+        tb: &TieBreak,
+        codes: &[u8],
+        raw: Option<&RawRead>,
+        hits: &[TxHit],
+    ) -> Option<(Vec<i64>, f32)> {
         let blocks = shared_blocks(hits)?;
         let plen = codes.len() as u32;
         let mut cost = vec![0i64; hits.len()];
@@ -814,7 +856,11 @@ impl<C: Chainer> Mapper<C> {
                         let (m, n) = (read.len() as u64, texts[uniq[k]].len() as u64);
                         stats::add(&stats::AFFINE_CALLS, 1);
                         let drift = if diag && n >= m { 0 } else { m.abs_diff(n) };
-                        let cells = m * (2 * tb.band as u64 + drift + 1).min(n + 1);
+                        let width = (tb.band as u64)
+                            .saturating_mul(2)
+                            .saturating_add(drift)
+                            .saturating_add(1);
+                        let cells = m.saturating_mul(width.min(n + 1));
                         stats::add(&stats::AFFINE_CELLS, cells);
                         if mode == align::Mode::Prefix {
                             stats::add(&stats::AFFINE_END_CELLS, cells);
@@ -1277,13 +1323,14 @@ impl<C: Chainer> Mapper<C> {
             let margin = |s: f32| tb.margin_abs.max(tb.margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
-            tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits, salt);
+            tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits, salt, !both);
             if both {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
-                tiebreak_size += self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits, salt);
+                tiebreak_size +=
+                    self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits, salt, false);
                 let codes = |s: &[u8]| -> Vec<u8> {
                     s.iter()
                         .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
@@ -1428,11 +1475,11 @@ fn tie_key(salt: u64, tx: u32) -> u64 {
 mod segmented_tests {
     use super::*;
 
-    fn hit(tx: u32, score: f32, chain: &[(u32, u32, u32)]) -> TxHit {
+    pub(super) fn hit(tx: u32, score: f32, chain: &[(u32, u32, u32)]) -> TxHit {
         chain::hit_from_path(tx, score, 0.0, chain.iter().map(|&(q, t, l)| (q, q + l, t, l)))
     }
 
-    fn mapper(texts: &[&[u8]], hpc: bool) -> Mapper<OracleChainer> {
+    pub(super) fn mapper(texts: &[&[u8]], hpc: bool) -> Mapper<OracleChainer> {
         let txs: Vec<_> = texts
             .iter()
             .enumerate()
@@ -1464,7 +1511,7 @@ mod segmented_tests {
         .unwrap()
     }
 
-    fn codes(s: &[u8]) -> Vec<u8> {
+    pub(super) fn codes(s: &[u8]) -> Vec<u8> {
         s.iter()
             .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
             .collect()
@@ -1605,7 +1652,7 @@ mod segmented_tests {
             m.segmented(&tb, &codes(q), None, &hits).unwrap().0,
             [-28, -21, -13, -13]
         );
-        assert_eq!(m.tiebreak(&tb, q, None, &mut hits, 0), 4);
+        assert_eq!(m.tiebreak(&tb, q, None, &mut hits, 0, false), 4);
         assert_eq!(
             hits.iter().map(|h| h.score).collect::<Vec<_>>(),
             [15., 8., 0., 0.]
@@ -1691,7 +1738,7 @@ mod segmented_tests {
             lambda: 0.5,
             ..Default::default()
         };
-        m.tiebreak(&tb, q, None, &mut hits, 0);
+        m.tiebreak(&tb, q, None, &mut hits, 0, false);
         // Scores become the tie set's best chain score minus each deficit.
         assert_eq!((hits[0].score, hits[1].score), (15., 9.));
         let m = mapper(&[q, q], false);
@@ -1702,7 +1749,7 @@ mod segmented_tests {
                 ..Default::default()
             };
             assert!(m.segmented(&tb, &codes(q), None, &hits).is_none());
-            m.tiebreak(&tb, q, None, &mut hits, 0);
+            m.tiebreak(&tb, q, None, &mut hits, 0, false);
             assert_eq!((hits[0].score, hits[1].score), (15., 15.));
         }
     }
