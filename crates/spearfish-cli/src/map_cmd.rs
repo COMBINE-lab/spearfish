@@ -75,8 +75,8 @@ pub struct Args {
         help_heading = "Input and output"
     )]
     rad_codec: Codec,
-    /// Run record (JSON) [default: <first output file>.meta.json; none if all output goes to
-    /// stdout].
+    /// Run record (JSON) [default: <first output file>.meta.json; none if no output is a regular
+    /// file, e.g. all go to stdout or /dev/null].
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     meta: Option<PathBuf>,
     /// Print the complete parameters the settings resolve to (JSON) and exit.
@@ -427,6 +427,13 @@ struct RunStats {
     internal: Vec<(String, u64)>,
 }
 
+/// Whether `p` names a regular file to write (or one to be created), so a run record can sit
+/// next to it: not `-` (stdout), and not a device, pipe or other special file such as
+/// `/dev/null`.
+fn is_file_output(p: &Path) -> bool {
+    p.as_os_str() != "-" && std::fs::metadata(p).map_or(true, |m| m.is_file())
+}
+
 /// The run record (`<output>.meta.json`).
 #[derive(Serialize)]
 struct RunRecord<'a> {
@@ -500,7 +507,7 @@ pub fn execute(args: Job) -> Result<Counts> {
         [&tsv_path, &args.paf, &args.rad]
             .into_iter()
             .flatten()
-            .find(|p| p.as_os_str() != "-")
+            .find(|p| is_file_output(p))
             .map(|p| {
                 let mut s = p.as_os_str().to_owned();
                 s.push(".meta.json");

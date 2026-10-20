@@ -411,6 +411,31 @@ fn simulate_and_map_on_toy() {
     assert_eq!(meta["parameters"]["preset"], "ont");
     assert_eq!(meta["index"]["index_id"].as_str().unwrap(), h.meta.index_id);
     assert!(meta["index"]["manifest"]["built_by"]["version"].is_string());
+
+    // Output to a device: no run record beside it; the first regular output file gets it.
+    #[cfg(unix)]
+    {
+        let null = std::ffi::OsStr::new("/dev/null");
+        let reads_fa = dir.join("toy_reads.fa");
+        run(&[
+            "map".as_ref(),
+            idx.as_os_str(),
+            reads_fa.as_os_str(),
+            "-o".as_ref(),
+            null,
+        ]);
+        let paf = dir.join("toy_null.paf");
+        run(&[
+            "map".as_ref(),
+            idx.as_os_str(),
+            reads_fa.as_os_str(),
+            "-o".as_ref(),
+            null,
+            "--paf".as_ref(),
+            paf.as_os_str(),
+        ]);
+        assert!(dir.join("toy_null.paf.meta.json").is_file());
+    }
 }
 
 /// `em` skips reads flagged `low_coverage` whatever other flags the line carries.

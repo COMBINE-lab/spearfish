@@ -74,6 +74,10 @@
 
 ### Fixes
 
+- `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
+  end trying to write `/dev/null.meta.json`: the run record goes next to the first output that
+  is a regular file, and is skipped if there is none and `--meta` is not given.
+
 - aarch64 (Apple Silicon, ARM Linux): the affine alignment rows were not computed at all,
   because a configuration attribute removed the scalar code along with the x86 path.
 
