@@ -694,6 +694,21 @@ impl<C: Chainer> Mapper<C> {
         align::distance(codes, &text, align::Mode::Infix, k).unwrap_or(k.saturating_add(1))
     }
 
+    /// [`Self::raw_texts`], as packed ranges of the index (nothing decoded).
+    fn raw_ranges<'a, 'r>(
+        &'a self,
+        tb: &TieBreak,
+        raw: Option<&'r RawRead>,
+        spans: &[(u32, u32, u32)],
+    ) -> Option<(&'r RawRead, Vec<index::PackedRange<'a>>)> {
+        let r = raw.filter(|_| tb.raw_ends)?;
+        let texts = spans
+            .iter()
+            .map(|&(t, lo, hi)| self.idx.tx_range(t, lo, hi, true))
+            .collect::<Option<Vec<_>>>()?;
+        Some((r, texts))
+    }
+
     /// Raw transcript texts for parsed spans `(transcript, lo, hi)`, if raw read ends are on
     /// and the index has every transcript's raw sequence.
     fn raw_texts<'r>(
@@ -729,13 +744,13 @@ impl<C: Chainer> Mapper<C> {
         // Each candidate's cost for one segment, and with a `cut`, its cost against its text cut
         // at that many bases from the segment's start and the text bases its best alignment
         // covers, from the same pass (None if every candidate's text is the same: equal costs).
-        let seg = |texts: Vec<Vec<u8>>,
+        let seg = |texts: Vec<index::PackedRange<'_>>,
                    read: &[u8],
                    mode: align::Mode,
                    rev: bool,
                    cut: Option<usize>|
          -> Option<(Vec<i64>, Vec<i64>, Vec<usize>)> {
-            if texts.windows(2).all(|w| w[0] == w[1]) {
+            if texts.windows(2).all(|w| w[0].sequence_eq(&w[1])) {
                 return None; // same cost for every candidate
             }
             let mut delta = vec![0i64; texts.len()];
@@ -756,33 +771,49 @@ impl<C: Chainer> Mapper<C> {
                 }
                 return Some((delta.clone(), delta, cols));
             }
-            let (read, texts): (Vec<u8>, Vec<Vec<u8>>) = if rev {
-                (
-                    read.iter().rev().copied().collect(),
-                    texts.into_iter().map(|t| t.into_iter().rev().collect()).collect(),
-                )
+            // Tied isoforms often share a segment's sequence: compare the packed texts and
+            // decode each distinct one once (`rep0`: each candidate's distinct text).
+            let mut distinct: Vec<index::PackedRange<'_>> = Vec::new();
+            let rep0: Vec<usize> = texts
+                .iter()
+                .map(|t| {
+                    distinct.iter().position(|d| d.sequence_eq(t)).unwrap_or_else(|| {
+                        distinct.push(*t);
+                        distinct.len() - 1
+                    })
+                })
+                .collect();
+            let decoded: Vec<Vec<u8>> = distinct
+                .iter()
+                .map(|t| {
+                    let mut v = if t.is_empty() { Vec::new() } else { t.decode() };
+                    if rev {
+                        v.reverse();
+                    }
+                    v
+                })
+                .collect();
+            let read: Vec<u8> = if rev {
+                read.iter().rev().copied().collect()
             } else {
-                (read.to_vec(), texts)
+                read.to_vec()
             };
             match &tb.affine {
                 Some(sc) => {
-                    // Tied isoforms often share a segment's sequence: score each distinct text
-                    // once. With `affine_within`, a capped unit-cost (Myers) pass comes first
-                    // and only texts within that many edits of the best get an affine score;
-                    // the rest are charged one mismatch (mat + mis) per extra edit.
-                    let mut order: Vec<usize> = (0..texts.len()).collect();
-                    order.sort_unstable_by(|&a, &b| texts[a].cmp(&texts[b]));
-                    let mut uniq: Vec<usize> = Vec::with_capacity(order.len());
-                    let mut rep = vec![0usize; texts.len()];
-                    for &i in &order {
-                        if uniq.last().is_none_or(|&u| texts[u] != texts[i]) {
-                            uniq.push(i);
-                        }
-                        rep[i] = uniq.len() - 1;
+                    // Each distinct text is scored once, in sorted order (`rep`: each
+                    // candidate's place in it). With `affine_within`, a capped unit-cost (Myers)
+                    // pass comes first and only texts within that many edits of the best get an
+                    // affine score; the rest are charged one mismatch (mat + mis) per extra edit.
+                    let mut uniq: Vec<usize> = (0..decoded.len()).collect();
+                    uniq.sort_unstable_by(|&a, &b| decoded[a].cmp(&decoded[b]));
+                    let mut place = vec![0usize; decoded.len()];
+                    for (k, &u) in uniq.iter().enumerate() {
+                        place[u] = k;
                     }
+                    let rep: Vec<usize> = rep0.iter().map(|&d| place[d]).collect();
                     let unit = match tb.affine_within {
                         Some(w) if uniq.len() > 1 => {
-                            let ut: Vec<Vec<u8>> = uniq.iter().map(|&u| texts[u].clone()).collect();
+                            let ut: Vec<Vec<u8>> = uniq.iter().map(|&u| decoded[u].clone()).collect();
                             Some((Self::banded(&read, &ut, mode, w), w))
                         }
                         _ => None,
@@ -793,7 +824,7 @@ impl<C: Chainer> Mapper<C> {
                         // distinct text in sorted order (what prefix sharing would compute).
                         let mut prev: Option<&Vec<u8>> = None;
                         for &u in &uniq {
-                            let t = &texts[u];
+                            let t = &decoded[u];
                             let l = prev.map_or(0, |p| t.iter().zip(p).take_while(|(a, b)| a == b).count());
                             stats::add(&stats::AFFINE_TEXT_BASES, t.len() as u64);
                             stats::add(&stats::AFFINE_TEXT_NEW_BASES, (t.len() - l) as u64);
@@ -811,7 +842,7 @@ impl<C: Chainer> Mapper<C> {
                         .collect();
                     let diag = mode == align::Mode::Prefix && tb.clip_ends && tb.end_diagonal;
                     for &k in &todo {
-                        let (m, n) = (read.len() as u64, texts[uniq[k]].len() as u64);
+                        let (m, n) = (read.len() as u64, decoded[uniq[k]].len() as u64);
                         stats::add(&stats::AFFINE_CALLS, 1);
                         let drift = if diag && n >= m { 0 } else { m.abs_diff(n) };
                         let cells = m * (2 * tb.band as u64 + drift + 1).min(n + 1);
@@ -820,7 +851,7 @@ impl<C: Chainer> Mapper<C> {
                             stats::add(&stats::AFFINE_END_CELLS, cells);
                         }
                     }
-                    let tx: Vec<&[u8]> = todo.iter().map(|&k| texts[uniq[k]].as_slice()).collect();
+                    let tx: Vec<&[u8]> = todo.iter().map(|&k| decoded[uniq[k]].as_slice()).collect();
                     let w0 = align::dp_work();
                     let xs = if mode == align::Mode::Prefix && tb.clip_ends {
                         // The band is laid out for the window the read end would get against a
@@ -877,6 +908,7 @@ impl<C: Chainer> Mapper<C> {
                     }
                 }
                 None => {
+                    let texts: Vec<Vec<u8>> = rep0.iter().map(|&d| decoded[d].clone()).collect();
                     for (c, x) in delta.iter_mut().zip(Self::banded(&read, &texts, mode, tb.cap)) {
                         *c += i64::from(x);
                     }
@@ -889,7 +921,11 @@ impl<C: Chainer> Mapper<C> {
         // transcript's end. Past the shortest such end the read has no counterpart in that
         // candidate, and what a longer candidate gains there (read bases aligned by chance into
         // its flank: primers, adapters) counts only if it reaches `flank_min` points.
-        let end = |texts: Vec<Vec<u8>>, read: &[u8], rev: bool, short: &[bool]| -> Option<Vec<i64>> {
+        let end = |texts: Vec<index::PackedRange<'_>>,
+                   read: &[u8],
+                   rev: bool,
+                   short: &[bool]|
+         -> Option<Vec<i64>> {
             let cut = texts
                 .iter()
                 .zip(short)
@@ -941,7 +977,8 @@ impl<C: Chainer> Mapper<C> {
                 .enumerate()
                 .map(|(i, h)| {
                     self.idx
-                        .tx_codes(h.tx, left.targets[i].end, right.targets[i].start)
+                        .tx_range(h.tx, left.targets[i].end, right.targets[i].start, false)
+                        .unwrap()
                 })
                 .collect();
             add(seg(
@@ -969,12 +1006,12 @@ impl<C: Chainer> Mapper<C> {
                 })
                 .collect();
             let short: Vec<bool> = spans.iter().map(|&(_, lo, _)| lo == 0).collect();
-            add(match self.raw_texts(tb, raw, &spans) {
+            add(match self.raw_ranges(tb, raw, &spans) {
                 Some((r, texts)) => end(texts, &r.codes[..r.pos(q0)], true, &short),
                 None => end(
                     spans
                         .iter()
-                        .map(|&(t, lo, hi)| self.idx.tx_codes(t, lo, hi))
+                        .map(|&(t, lo, hi)| self.idx.tx_range(t, lo, hi, false).unwrap())
                         .collect(),
                     &codes[..q0 as usize],
                     true,
@@ -1010,16 +1047,14 @@ impl<C: Chainer> Mapper<C> {
         // Whether each window's end (its length from the read end's start, in the tail's space)
         // is where the tail starts: within the tolerance of its start, or further but only by
         // annotated A's (an end that includes part of the tail) up to the run's end.
-        let ends_at_tail = |texts: &[Vec<u8>], cut: usize, run_end: usize| -> Vec<bool> {
+        let ends_at_tail = |texts: &[index::PackedRange<'_>], cut: usize, run_end: usize| -> Vec<bool> {
             let tol = TAIL_TOL + cut / 10;
             texts
                 .iter()
                 .map(|t| {
                     let n = t.len();
                     n.abs_diff(cut) <= tol
-                        || (n > cut
-                            && n <= run_end + tol
-                            && t[cut..].iter().filter(|&&c| c != a_code).count() * 10 <= n - cut)
+                        || (n > cut && n <= run_end + tol && t.count_other(cut, a_code) * 10 <= n - cut)
                 })
                 .collect()
         };
@@ -1035,7 +1070,7 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .map(|&(tx, _, hi)| hi == self.idx.tx_plen()[tx as usize])
             .collect();
-        let ends = match self.raw_texts(tb, raw, &spans) {
+        let ends = match self.raw_ranges(tb, raw, &spans) {
             Some((r, texts)) => {
                 let rest = &r.codes[r.pos(ql)..];
                 let cut = tail.map_or(rest.len(), |(_, _, c, _)| c);
@@ -1046,9 +1081,9 @@ impl<C: Chainer> Mapper<C> {
                 at_end
             }
             None => {
-                let texts: Vec<Vec<u8>> = spans
+                let texts: Vec<index::PackedRange<'_>> = spans
                     .iter()
-                    .map(|&(t, lo, hi)| self.idx.tx_codes(t, lo, hi))
+                    .map(|&(t, lo, hi)| self.idx.tx_range(t, lo, hi, false).unwrap())
                     .collect();
                 // The tail's start and run end in parsed space: the last parsed base starting at
                 // or before each.

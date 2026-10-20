@@ -75,6 +75,44 @@ fn packed_eq(a: &[u64], alo: u32, b: &[u64], blo: u32, len: u32) -> bool {
     r == 0 || (word_at(a, alo + k) ^ word_at(b, blo + k)) & ((1u64 << (2 * r)) - 1) == 0
 }
 
+/// A borrowed interval in an existing packed transcript, in parsed or raw space.
+/// Constructed by [`Index::tx_range`]; raw intervals cover complete HPC runs.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedRange<'a> {
+    words: &'a [u64],
+    lo: u32,
+    hi: u32,
+}
+
+impl PackedRange<'_> {
+    pub fn len(&self) -> usize {
+        (self.hi - self.lo) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lo == self.hi
+    }
+
+    /// Exact sequence equality, including unaligned starts and partial final words.
+    pub fn sequence_eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && packed_eq(self.words, self.lo, other.words, other.lo, self.hi - self.lo)
+    }
+
+    pub fn decode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        decode_into(self.words, self.lo, self.hi, [0, 1, 2, 3], &mut out);
+        out
+    }
+
+    /// Count non-`code` bases in a suffix without allocating a decoded sequence.
+    pub fn count_other(&self, from: usize, code: u8) -> usize {
+        assert!(from <= self.len());
+        (self.lo + from as u32..self.hi)
+            .filter(|&p| (self.words[(p / 32) as usize] >> (2 * (p % 32))) & 3 != u64::from(code))
+            .count()
+    }
+}
+
 /// The `q`-th position after `r` (q >= 1) where the base differs from the one before it, in
 /// 2-bit packed `words` of `rlen` bases, or `rlen` if there are fewer: where `q` runs after the
 /// run starting at `r` end. Changes are found a word at a time (XOR with the shifted word).
@@ -530,6 +568,25 @@ impl Index {
         v
     }
 
+    /// Borrow a packed reference interval without copying its bases. Coordinates are
+    /// parsed coordinates even when `raw` is true; conversion uses the run checkpoints.
+    /// Returns None for a raw interval if that transcript has no stored raw sequence.
+    pub fn tx_range(&self, t: u32, lo: u32, hi: u32, raw: bool) -> Option<PackedRange<'_>> {
+        if raw {
+            Some(PackedRange {
+                words: self.raw_words(t)?.0,
+                lo: self.tx_raw_pos(t, lo)?,
+                hi: self.tx_raw_pos(t, hi)?,
+            })
+        } else {
+            Some(PackedRange {
+                words: &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..],
+                lo,
+                hi,
+            })
+        }
+    }
+
     /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes or (if
     /// `ascii`) as ACGT.
     pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>, ascii: bool) {
@@ -687,6 +744,40 @@ mod packed_tests {
     }
 
     proptest! {
+        #[test]
+        fn borrowed_ranges_match_decoded_slices(
+            bases in prop::collection::vec(0u8..4, 0..300),
+            other in prop::collection::vec(0u8..4, 0..300),
+            a in 0usize..300, b in 0usize..300, len in 0usize..300,
+        ) {
+            let (a, b) = (a.min(bases.len()), b.min(other.len()));
+            let (an, bn) = (len.min(bases.len() - a), len.min(other.len() - b));
+            let (w, v) = (pack(&bases), pack(&other));
+            let x = PackedRange { words: &w, lo: a as u32, hi: (a + an) as u32 };
+            let y = PackedRange { words: &v, lo: b as u32, hi: (b + bn) as u32 };
+            prop_assert_eq!(x.sequence_eq(&y), bases[a..a+an] == other[b..b+bn]);
+            prop_assert_eq!(x.decode(), &bases[a..a+an]);
+            prop_assert_eq!(x.count_other(an / 2, 0), bases[a+an/2..a+an].iter().filter(|&&c| c != 0).count());
+        }
+
+        #[test]
+        fn relocated_ranges_at_all_word_offsets(
+            bases in prop::collection::vec(0u8..4, 0..100),
+        ) {
+            for a in 0..32 {
+                for b in 0..32 {
+                    let (mut x, mut y) = (vec![3; a], vec![1; b]);
+                    x.extend(&bases); y.extend(&bases);
+                    // Different padding must not enter the comparison's last partial word.
+                    x.push(2); y.push(0);
+                    let (w, v) = (pack(&x), pack(&y));
+                    let x = PackedRange { words: &w, lo: a as u32, hi: (a+bases.len()) as u32 };
+                    let y = PackedRange { words: &v, lo: b as u32, hi: (b+bases.len()) as u32 };
+                    prop_assert!(x.sequence_eq(&y));
+                }
+            }
+        }
+
         /// Word-at-a-time decoding and run skipping equal the base-at-a-time loops.
         #[test]
         fn packed_ops_match_scalar(
