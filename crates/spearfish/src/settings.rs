@@ -215,6 +215,9 @@ pub struct MapSettings {
     /// Points for isoforms whose 3' end lies where the read's poly(A) tail starts (0: off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_bonus: Option<i32>,
+    /// Near-tied read orientations: points for the one whose read ends in a poly(A) tail (0: off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_tail: Option<i32>,
 
     // Rescue.
     /// Re-seed reads that map poorly at a lower LCP level within their candidate genes.
@@ -304,6 +307,7 @@ impl MapSettings {
         "tail_trim",
         "tail_run",
         "tail_bonus",
+        "orient_tail",
         "rescue",
         "rescue_scheme",
         "rescue_genes",
@@ -347,6 +351,7 @@ impl MapSettings {
             tail_trim,
             tail_run,
             tail_bonus,
+            orient_tail,
             end_diagonal
         );
         v
@@ -442,6 +447,7 @@ impl MapSettings {
             set!(self.tail_trim => tb.tail_trim);
             set!(self.tail_run => tb.tail_run);
             set!(self.tail_bonus => tb.tail_bonus);
+            set!(self.orient_tail => tb.orient_tail);
             ensure!(tb.pad_div >= 1, "pad_div must be at least 1");
             ensure!(tb.max_cands >= 1, "tie_cands must be at least 1");
             ensure!(tb.tail_run >= 2, "tail_run must be at least 2");
@@ -619,6 +625,7 @@ mod tests {
             tail_trim: _,
             tail_run: _,
             tail_bonus: _,
+            orient_tail: _,
             rescue: _,
             rescue_scheme: _,
             rescue_genes: _,
@@ -677,6 +684,7 @@ mod tests {
                 stringify!(tail_trim),
                 stringify!(tail_run),
                 stringify!(tail_bonus),
+                stringify!(orient_tail),
                 stringify!(rescue),
                 stringify!(rescue_scheme),
                 stringify!(rescue_genes),

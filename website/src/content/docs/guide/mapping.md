@@ -36,7 +36,9 @@ setting.
 
 With every preset, a poly(A) tail at a read's 3′ end is found (a run of A's with at most one
 other base) and trimmed before the read end is aligned, and isoforms whose annotated 3′ end lies
-where the tail starts gain a few points (`--tail-bonus`).
+where the tail starts gain a few points (`--tail-bonus`). When a read's two orientations align
+almost equally well (sequence shared antisense, as with antisense isoforms or a pseudogene inside
+another gene), the orientation that ends in the poly(A) tail is preferred (`--orient-tail`).
 
 ## Changing settings
 

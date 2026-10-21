@@ -327,6 +327,10 @@ pub struct MapArgs {
     /// Points for isoforms ending where the read's poly(A) tail starts (0: off) [default: 10].
     #[arg(long, hide_short_help = true, help_heading = "Read ends")]
     pub tail_bonus: Option<i32>,
+    /// Near-tied read orientations: points for the one whose read ends in a poly(A) tail (0: off)
+    /// [default: 30].
+    #[arg(long, hide_short_help = true, help_heading = "Read ends")]
+    pub orient_tail: Option<i32>,
 
     // Rescue.
     /// Rescue seed scheme [default: lcp:K=2].
@@ -420,6 +424,7 @@ impl MapArgs {
             .maybe_tail_trim(onoff!(self.tail_trim / no_tail_trim))
             .maybe_tail_run(self.tail_run)
             .maybe_tail_bonus(self.tail_bonus)
+            .maybe_orient_tail(self.orient_tail)
             .maybe_rescue(onoff!(self.rescue / no_rescue))
             .maybe_rescue_scheme(self.rescue_scheme.clone())
             .maybe_rescue_genes(self.rescue_genes)
@@ -546,6 +551,7 @@ mod tests {
             "--no-tail-trim",
             "--tail-run=12",
             "--tail-bonus=0",
+            "--orient-tail=0",
             "--rescue",
             "--rescue-scheme=lcp:K=2",
             "--rescue-genes=8",
