@@ -74,6 +74,19 @@
 
 ### Fixes
 
+- Near-tied read orientations and tied hits without a shared anchor are compared by a clipped
+  alignment that scored the read between the outermost anchors in compressed bases and the read
+  ends in raw ones, so whichever hit left more of the read to its ends gained. With raw read
+  ends the whole read is now scored in raw bases. Reads from transcripts whose sequence lies
+  inside another gene's (pseudogenes in a host's intron, often antisense) picked the wrong gene
+  half as often: on the simulated sets, top-1 99.16% -> 99.37% (HiFi) and 98.51% -> 98.67%
+  (ONT), reads with a best hit in the wrong gene 0.30% -> 0.09% and 0.40% -> 0.23%.
+- `--orient-tail` (default 30 points): of two near-tied read orientations, the one whose raw
+  read ends in a poly(A) tail is preferred. Where sequence is shared antisense (SIRV antisense
+  isoforms, nested pseudogenes) both orientations align equally well, and the tail is the
+  evidence of strand: on ONT PCR-cDNA SIRV reads, top hits on the strand opposite the read's
+  tail fell from 6,144 to 2,159. Mapping cost is unchanged (instructions within ±0.5%).
+
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that
   is a regular file, and is skipped if there is none and `--meta` is not given.

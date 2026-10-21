@@ -92,6 +92,11 @@ pub struct TieBreak {
     /// Shortest poly(A) tail recognized: a window this long with at most one base not A,
     /// followed by at most `TAIL_AFTER` read bases.
     pub tail_run: usize,
+    /// Near-tied read orientations: points for the orientation whose raw read ends in a poly(A)
+    /// tail (the molecule's 3' end) over one that doesn't. Where a transcript's sequence lies
+    /// antisense inside another's (antisense isoforms, a pseudogene in a host gene's intron),
+    /// both orientations align equally well and the tail is the evidence of strand (0: off).
+    pub orient_tail: i32,
 }
 
 impl Default for TieBreak {
@@ -120,6 +125,7 @@ impl Default for TieBreak {
             tail_bonus: 10,
             tail_trim: true,
             tail_run: 15,
+            orient_tail: 30,
             flank_min: 0,
         }
     }
@@ -624,7 +630,11 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Affine score of the read against one hit with both read ends clipped: the chained span
-    /// aligned globally, each read end extended from it into the padded transcript flank.
+    /// aligned globally, each read end extended from it into the padded transcript flank. With
+    /// raw read ends the span is aligned in raw space too: hits compared by this score (read
+    /// orientations, anchor groups) have different outermost anchors, and a score that counts
+    /// part of the read in parsed bases and part in raw ones would favor whichever hit leaves
+    /// more of the read to its raw ends.
     fn clipped(
         &self,
         tb: &TieBreak,
@@ -638,13 +648,22 @@ impl<C: Chainer> Mapper<C> {
         let slack = |ext: u32| tb.pad + ext / tb.pad_div;
         let (qs, qe) = (h.qstart as usize, h.qend as usize);
         let w0 = align::dp_work();
-        let mid = align::affine(
-            &codes[qs..qe],
-            &self.idx.tx_codes(h.tx, h.tstart, h.tend),
-            align::Mode::Global,
-            sc,
-            tb.band,
-        );
+        let mid = match self.raw_texts(tb, raw, &[(h.tx, h.tstart, h.tend)]) {
+            Some((r, mut t)) => align::affine(
+                &r.codes[r.pos(h.qstart)..r.pos(h.qend)],
+                &t.pop().unwrap(),
+                align::Mode::Global,
+                sc,
+                tb.band,
+            ),
+            None => align::affine(
+                &codes[qs..qe],
+                &self.idx.tx_codes(h.tx, h.tstart, h.tend),
+                align::Mode::Global,
+                sc,
+                tb.band,
+            ),
+        };
         let w1 = align::dp_work();
         let left = if qs > 0 {
             let span = [(
@@ -1348,11 +1367,20 @@ impl<C: Chainer> Mapper<C> {
                         (i64::from(da), i64::from(db), tb.kappa)
                     }
                 };
-                if cb < ca {
+                // This orientation's lead over the other, in score points: alignment, then the
+                // poly(A) tail where one orientation shows it and the other doesn't.
+                let mut lead = unit * (cb - ca) as f32;
+                if tb.orient_tail > 0 {
+                    let tailed = |r: Option<&RawRead>| r.is_some_and(|r| ends_in_tail(&r.codes, tb.tail_run));
+                    lead += tb.orient_tail as f32
+                        * (f32::from(u8::from(tailed(st.raw.as_ref())))
+                            - f32::from(u8::from(tailed(other.raw.as_ref()))));
+                }
+                if lead < 0.0 {
                     std::mem::swap(&mut st, &mut other);
                     reverse = !reverse;
                 }
-                let target = st.hits[0].score - unit * ca.abs_diff(cb) as f32;
+                let target = st.hits[0].score - lead.abs();
                 let shift = target - other.hits[0].score;
                 for h in &mut other.hits {
                     h.score += shift;
@@ -1408,6 +1436,15 @@ impl<C: Chainer> Mapper<C> {
 const TAIL_TOL: usize = 15;
 /// Most read bases after a poly(A) tail (adapter and the like).
 const TAIL_AFTER: usize = 80;
+/// Raw read bases searched for a poly(A) tail when comparing read orientations.
+const TAIL_WINDOW: usize = 200;
+
+/// Whether a raw read (2-bit codes) ends in a poly(A) tail: a `run`-base window of A's within its
+/// last `TAIL_WINDOW` bases, followed by at most `TAIL_AFTER` bases.
+fn ends_in_tail(codes: &[u8], run: usize) -> bool {
+    let a = lcp_core::encode::CODE[b'A' as usize] & 3;
+    tail_start(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run).is_some()
+}
 
 /// The first poly(A) window of `run` bases in `rest` (raw codes): its first A, and the end of the A-run from
 /// there (the longest stretch ending in A with at most one other base per ten).
@@ -1654,6 +1691,20 @@ mod segmented_tests {
         // One base in a window may be a sequencing error.
         assert_eq!(tail_start(&codes(b"CGAAAAAAACAAAAAAAGT"), a, 15), Some((2, 17)));
         assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAGTCAAAA"), a, 15), None);
+    }
+
+    #[test]
+    fn only_a_poly_a_near_the_read_end_marks_its_orientation() {
+        let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT".repeat(10);
+        let tail = [b"A".repeat(20), b"GTACTCTGCGTTGATACCACTGCTT".to_vec()].concat();
+        assert!(ends_in_tail(&codes(&[&body[..], &tail].concat()), 15));
+        // A tail at the read's start is the other orientation's 3' end.
+        assert!(!ends_in_tail(&codes(&[&tail[..], &body].concat()), 15));
+        // An A-run with more than `TAIL_AFTER` read bases after it is transcript sequence.
+        assert!(!ends_in_tail(
+            &codes(&[&body[..], &tail, &body[..100]].concat()),
+            15
+        ));
     }
 
     #[test]
