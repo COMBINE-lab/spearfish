@@ -18,6 +18,11 @@ pub struct RescueParams {
     pub spec: String,
     /// Candidate genes per strand (best base-level score first).
     pub max_genes: usize,
+    /// Reads shorter than this (parsed bases) get proportionally more candidate genes, up to
+    /// `GENES_LEN_CAP` × `max_genes`: re-seeding a gene costs work in proportion to the read's
+    /// length, and a short read's few base anchors rank its true gene among many genes that
+    /// share one common label with it (0: `max_genes` for every read).
+    pub genes_len: u32,
     /// Skip transcripts longer than this (parsed bases).
     pub max_tx_len: u32,
     /// Per gene, re-seed at most this many transcripts: those with the most base anchors.
@@ -40,12 +45,27 @@ impl Default for RescueParams {
         RescueParams {
             spec: "lcp:K=2".into(),
             max_genes: 16,
+            genes_len: 350,
             max_tx_len: 50_000,
             max_tx_per_gene: 128,
             window: Some((10, 50)),
             other_margin: Some(30.0),
             alpha: 0.5,
         }
+    }
+}
+
+/// Most candidate genes a short read gets, as a multiple of `max_genes` (see `genes_len`).
+pub const GENES_LEN_CAP: usize = 4;
+
+impl RescueParams {
+    /// Candidate genes for a read of `plen` parsed bases.
+    pub fn max_genes_for(&self, plen: usize) -> usize {
+        if self.genes_len == 0 {
+            return self.max_genes;
+        }
+        (self.max_genes * self.genes_len as usize / plen.max(1))
+            .clamp(self.max_genes, GENES_LEN_CAP * self.max_genes)
     }
 }
 
@@ -190,9 +210,10 @@ impl Rescuer {
         sc: &mut Scratch,
     ) -> Vec<TxHit> {
         let anchors = anchor::anchors(idx, base, ap);
+        let genes = self.p.max_genes_for(seq.len());
         let all = AnchorParams {
-            f_keep: self.p.max_genes,
-            f_max: self.p.max_genes,
+            f_keep: genes,
+            f_max: genes,
             alpha_fam: self.p.alpha,
             ..ap.clone()
         };
@@ -303,5 +324,24 @@ impl Rescuer {
             });
         }
         hits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_reads_get_more_candidate_genes_up_to_the_cap() {
+        let p = RescueParams {
+            genes_len: 500,
+            ..RescueParams::default()
+        };
+        assert_eq!(p.max_genes_for(2000), p.max_genes);
+        assert_eq!(p.max_genes_for(500), p.max_genes);
+        assert_eq!(p.max_genes_for(250), 2 * p.max_genes);
+        assert_eq!(p.max_genes_for(10), GENES_LEN_CAP * p.max_genes);
+        let off = RescueParams { genes_len: 0, ..p };
+        assert_eq!(off.max_genes_for(10), off.max_genes);
     }
 }

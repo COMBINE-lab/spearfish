@@ -86,6 +86,21 @@
   isoforms, nested pseudogenes) both orientations align equally well, and the tail is the
   evidence of strand: on ONT PCR-cDNA SIRV reads, top hits on the strand opposite the read's
   tail fell from 6,144 to 2,159. Mapping cost is unchanged (instructions within ±0.5%).
+- `--orient-margin-rel` (default 0.35): both read orientations go to the tie-break when the
+  weaker one's chain scores within 35% of the stronger one's. Before, only `--tie-margin`
+  points of slack applied, so an orientation that happened to seed fewer level-3 cores (LCP
+  parses the two strands differently) was dropped before the alignment could compare them.
+  Only the orientation test widens; ties within one orientation are unchanged.
+- `--rescue-genes-len` (default 350 compressed bases): rescue keeps candidate genes in
+  proportion to `350 / read length`, between 1 and 4 times `--max-genes`. A short read
+  (pseudogenes and small RNAs are often under 500 nt) seeds few level-3 cores, and its true
+  gene was often not among the first `--max-genes` candidates. `0` turns this off.
+- Together, on the simulated ONT 95% set, top-1 98.67% -> 98.72% (pseudogene 98.17% -> 98.42%,
+  other biotypes 97.62% -> 97.99%), reads with a best hit in the wrong gene 0.23% -> 0.19%; on
+  ONT 90%, 95.95% -> 96.05% (pseudogene 94.64% -> 95.07%, other 91.99% -> 93.05%); on HiFi,
+  99.37% -> 99.38% (pseudogene 99.17% -> 99.27%). Real-data spike-in accuracy is unchanged
+  within ±0.001 Spearman. Mapping cost rises 0.4-1.8% in instructions (largest on ONT cDNA)
+  and at most 1.5% in wall time.
 
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that
