@@ -97,6 +97,12 @@ pub struct TieBreak {
     /// antisense inside another's (antisense isoforms, a pseudogene in a host gene's intron),
     /// both orientations align equally well and the tail is the evidence of strand (0: off).
     pub orient_tail: i32,
+    /// Both read orientations are tie-broken when the other's best chain scores within
+    /// max(`margin_abs`, this × best) of the chosen one's. Wider than `margin_rel`: LCP parsing
+    /// is not strand-symmetric, so the two orientations of a read draw different seeds, and
+    /// where transcripts share sequence antisense the true orientation's chain can trail by
+    /// seed luck alone. Only the orientation test uses it, not the tie sets within one.
+    pub orient_margin_rel: f32,
 }
 
 impl Default for TieBreak {
@@ -126,6 +132,7 @@ impl Default for TieBreak {
             tail_trim: true,
             tail_run: 15,
             orient_tail: 30,
+            orient_margin_rel: 0.35,
             flank_min: 0,
         }
     }
@@ -1328,7 +1335,7 @@ impl<C: Chainer> Mapper<C> {
         let mut tiebreak_size = 0;
         let mut both = false;
         if let Some(tb) = &self.p.tiebreak {
-            let margin = |s: f32| tb.margin_abs.max(tb.margin_rel * s.abs());
+            let margin = |s: f32| tb.margin_abs.max(tb.orient_margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
             tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits, salt);

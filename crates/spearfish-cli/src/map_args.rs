@@ -331,6 +331,10 @@ pub struct MapArgs {
     /// [default: 30].
     #[arg(long, hide_short_help = true, help_heading = "Read ends")]
     pub orient_tail: Option<i32>,
+    /// Tie-break both read orientations when the other's best chain is within this fraction
+    /// of the best (or the tie margin) [default: 0.35].
+    #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Tie-break")]
+    pub orient_margin_rel: Option<f32>,
 
     // Rescue.
     /// Rescue seed scheme [default: lcp:K=2].
@@ -339,6 +343,10 @@ pub struct MapArgs {
     /// Rescue candidate genes per strand [default: 16].
     #[arg(long, hide_short_help = true, help_heading = "Rescue")]
     pub rescue_genes: Option<usize>,
+    /// Reads shorter than this (parsed bases) get proportionally more candidate genes, up to 4×
+    /// (0: off) [default: 350].
+    #[arg(long, value_name = "LEN", hide_short_help = true, help_heading = "Rescue")]
+    pub rescue_genes_len: Option<u32>,
     /// Transcripts re-seeded per gene, those with the most anchors [default: 128].
     #[arg(long, hide_short_help = true, help_heading = "Rescue")]
     pub rescue_tx: Option<usize>,
@@ -425,9 +433,11 @@ impl MapArgs {
             .maybe_tail_run(self.tail_run)
             .maybe_tail_bonus(self.tail_bonus)
             .maybe_orient_tail(self.orient_tail)
+            .maybe_orient_margin_rel(self.orient_margin_rel)
             .maybe_rescue(onoff!(self.rescue / no_rescue))
             .maybe_rescue_scheme(self.rescue_scheme.clone())
             .maybe_rescue_genes(self.rescue_genes)
+            .maybe_rescue_genes_len(self.rescue_genes_len)
             .maybe_rescue_tx(self.rescue_tx)
             .maybe_rescue_alpha(self.rescue_alpha)
             .maybe_rescue_window(self.rescue_window)
@@ -552,9 +562,11 @@ mod tests {
             "--tail-run=12",
             "--tail-bonus=0",
             "--orient-tail=0",
+            "--orient-margin-rel=0.2",
             "--rescue",
             "--rescue-scheme=lcp:K=2",
             "--rescue-genes=8",
+            "--rescue-genes-len=0",
             "--rescue-tx=64",
             "--rescue-alpha=0.4",
             "--rescue-window=full",

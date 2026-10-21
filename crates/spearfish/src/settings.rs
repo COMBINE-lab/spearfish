@@ -218,6 +218,9 @@ pub struct MapSettings {
     /// Near-tied read orientations: points for the one whose read ends in a poly(A) tail (0: off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_tail: Option<i32>,
+    /// Relative margin within which both read orientations are tie-broken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_margin_rel: Option<f32>,
 
     // Rescue.
     /// Re-seed reads that map poorly at a lower LCP level within their candidate genes.
@@ -229,6 +232,9 @@ pub struct MapSettings {
     /// Rescue candidate genes per strand.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_genes: Option<usize>,
+    /// Rescue: reads shorter than this (parsed bases) get proportionally more candidate genes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_genes_len: Option<u32>,
     /// Rescue: transcripts re-seeded per gene (those with the most anchors).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_tx: Option<usize>,
@@ -308,9 +314,11 @@ impl MapSettings {
         "tail_run",
         "tail_bonus",
         "orient_tail",
+        "orient_margin_rel",
         "rescue",
         "rescue_scheme",
         "rescue_genes",
+        "rescue_genes_len",
         "rescue_tx",
         "rescue_alpha",
         "rescue_window",
@@ -352,6 +360,7 @@ impl MapSettings {
             tail_run,
             tail_bonus,
             orient_tail,
+            orient_margin_rel,
             end_diagonal
         );
         v
@@ -365,6 +374,7 @@ impl MapSettings {
         chk!(
             rescue_scheme,
             rescue_genes,
+            rescue_genes_len,
             rescue_tx,
             rescue_alpha,
             rescue_window,
@@ -448,9 +458,14 @@ impl MapSettings {
             set!(self.tail_run => tb.tail_run);
             set!(self.tail_bonus => tb.tail_bonus);
             set!(self.orient_tail => tb.orient_tail);
+            set!(self.orient_margin_rel => tb.orient_margin_rel);
             ensure!(tb.pad_div >= 1, "pad_div must be at least 1");
             ensure!(tb.max_cands >= 1, "tie_cands must be at least 1");
             ensure!(tb.tail_run >= 2, "tail_run must be at least 2");
+            ensure!(
+                tb.orient_margin_rel >= 0.0,
+                "orient_margin_rel must be non-negative"
+            );
         } else {
             let unused = self.tiebreak_only();
             if !unused.is_empty() {
@@ -466,6 +481,7 @@ impl MapSettings {
         if let Some(r) = o.params.rescue.as_mut() {
             set!(self.rescue_scheme => r.spec);
             set!(self.rescue_genes => r.max_genes);
+            set!(self.rescue_genes_len => r.genes_len);
             set!(self.rescue_tx => r.max_tx_per_gene);
             set!(self.rescue_alpha => r.alpha);
             set!(self.rescue_max_tx_len => r.max_tx_len);
@@ -626,9 +642,11 @@ mod tests {
             tail_run: _,
             tail_bonus: _,
             orient_tail: _,
+            orient_margin_rel: _,
             rescue: _,
             rescue_scheme: _,
             rescue_genes: _,
+            rescue_genes_len: _,
             rescue_tx: _,
             rescue_alpha: _,
             rescue_window: _,
@@ -685,9 +703,11 @@ mod tests {
                 stringify!(tail_run),
                 stringify!(tail_bonus),
                 stringify!(orient_tail),
+                stringify!(orient_margin_rel),
                 stringify!(rescue),
                 stringify!(rescue_scheme),
                 stringify!(rescue_genes),
+                stringify!(rescue_genes_len),
                 stringify!(rescue_tx),
                 stringify!(rescue_alpha),
                 stringify!(rescue_window),

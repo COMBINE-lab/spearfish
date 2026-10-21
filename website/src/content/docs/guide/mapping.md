@@ -39,6 +39,9 @@ other base) and trimmed before the read end is aligned, and isoforms whose annot
 where the tail starts gain a few points (`--tail-bonus`). When a read's two orientations align
 almost equally well (sequence shared antisense, as with antisense isoforms or a pseudogene inside
 another gene), the orientation that ends in the poly(A) tail is preferred (`--orient-tail`).
+LCP parsing is not strand-symmetric, so a read's two orientations draw different seeds; both are
+compared whenever the other orientation's best chain scores within 35% of the chosen one's
+(`--orient-margin-rel`).
 
 ## Changing settings
 
@@ -63,7 +66,7 @@ Settings you may want to change:
 | `--extend-ends`, `--no-extend-ends` | preset | Extend each reported span past its outermost anchors to where the read's alignment ends. Needed by models that use read positions, such as oarfish's truncation model. |
 | `--extend-within` | `0.05` | Extend only hits within this fraction of the best score. |
 | `--strands` | preset | Orientations mapped: `both`, `fwd` or `rev`. |
-| `--rescue`, `--no-rescue` | preset | Re-seed reads whose best chain covers less than half the read at a lower LCP level. |
+| `--rescue`, `--no-rescue` | preset | Re-seed reads whose best chain covers less than half the read at a lower LCP level. Reads shorter than `--rescue-genes-len` (350 compressed bases) re-seed proportionally more candidate genes. |
 | `--tail-trim`, `--no-tail-trim` | on | Trim poly(A) tails before aligning read ends. |
 | `--tail-run` | preset | Shortest poly(A) tail recognized. |
 | `--clip-ends`, `--no-clip-ends` | on | Clip read ends that don't align (adapters, primers). |
