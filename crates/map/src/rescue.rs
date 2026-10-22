@@ -90,7 +90,8 @@ struct Scratch {
     tx: Vec<Seed>,
     tmp: Vec<(u64, u32, u32)>,
     tseq: Vec<u8>,
-    pts: Vec<Pt>,
+    /// One window's points as (seed index in `read` << 32 | window start).
+    keys: Vec<u64>,
     /// Transcript -> (base anchors, min and max anchor diagonal ts - qs).
     per_tx: rustc_hash::FxHashMap<u32, (u32, i64, i64)>,
     txs: Vec<(u32, u32, i64, i64)>,
@@ -190,25 +191,29 @@ impl Rescuer {
     /// distinct starts on either side, so (qs, ts) is unique and fixes the order.
     fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
         self.seeder.seed_parsed_into(tseq, &mut sc.tx, &mut sc.tmp);
-        // Hash join on labels: each window seed probes the read's label table.
-        sc.pts.clear();
+        // Hash join on labels: each window seed probes the read's label table. A point is
+        // packed as its read seed's index and its window start: read seeds are in start order,
+        // so sorting the keys sorts the points by (qs, ts), and the rest comes from the seed.
+        sc.keys.clear();
         for x in &sc.tx {
             let mut i = sc.read_at.get(&x.label).copied().unwrap_or(u32::MAX);
             while i != u32::MAX {
-                let r = sc.read[i as usize];
-                let len = r.end - r.start;
-                sc.pts.push(Pt {
-                    qs: r.start,
-                    qe: r.end,
-                    ts: x.start,
-                    len,
-                    w: len as f32,
-                });
+                sc.keys.push((u64::from(i) << 32) | u64::from(x.start));
                 i = sc.read_next[i as usize];
             }
         }
-        sc.pts.sort_unstable_by_key(|p| (p.qs, p.ts));
-        sc.pool.extend_from_slice(&sc.pts);
+        sc.keys.sort_unstable();
+        sc.pool.extend(sc.keys.iter().map(|&k| {
+            let r = sc.read[(k >> 32) as usize];
+            let len = r.end - r.start;
+            Pt {
+                qs: r.start,
+                qe: r.end,
+                ts: k as u32,
+                len,
+                w: len as f32,
+            }
+        }));
     }
 
     #[allow(clippy::too_many_arguments)]
