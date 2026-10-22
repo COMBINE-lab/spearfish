@@ -225,10 +225,10 @@ impl Processor {
 
 impl<Rf: Record> ParallelProcessor<Rf> for Processor {
     fn process_record(&mut self, record: Rf) -> paraseq::Result<()> {
-        // GENCODE headers are `tx|gene|...`; otherwise each sequence is its own gene.
-        let id = record.id();
-        let gene_field = id.split(|&b| b == b'|').nth(1).unwrap_or(id);
-        let gene = xxhash_rust::xxh3::xxh3_64(gene_field);
+        // Genes as the index takes them: GENCODE headers are `tx|gene|...`; otherwise each
+        // sequence is its own gene.
+        let (_, gene) = spearfish::name_and_gene(&String::from_utf8_lossy(record.id()));
+        let gene = xxhash_rust::xxh3::xxh3_64(gene.as_bytes());
         self.add(&record.seq(), gene, record.index());
         Ok(())
     }
@@ -335,5 +335,6 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
+    out.flush()?;
     Ok(())
 }

@@ -67,7 +67,8 @@ pub struct Args {
     /// PAF output (`-`: stdout).
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     paf: Option<PathBuf>,
-    /// RAD output (`bulk_long_read` records, which oarfish quantifies with `-a`).
+    /// RAD output, a file and not `-` (`bulk_long_read` records, which oarfish quantifies with
+    /// `-a`).
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     rad: Option<PathBuf>,
     /// RAD chunk compression.
@@ -317,7 +318,9 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         if self.tsv.is_none() && self.paf.is_none() {
             return Ok(());
         }
-        let name = record.id_str().split_whitespace().next().unwrap_or("");
+        // Lossy: a header that is not UTF-8 gets U+FFFD instead of failing the run.
+        let id = String::from_utf8_lossy(record.id());
+        let name = id.split_whitespace().next().unwrap_or("");
         let idx = self.mapper.index();
         if let Some((_, buf)) = &mut self.tsv {
             tsv_lines(buf, name, &r, idx);
@@ -503,6 +506,11 @@ pub fn execute(args: Job) -> Result<Counts> {
     if stdout_outputs > 1 {
         bail!("only one output can go to stdout");
     }
+    if args.rad.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+        bail!(
+            "RAD output needs a file (its read counts are written when it is finished); `-` (stdout) is not supported"
+        );
+    }
     let tsv_path = match (&args.output, &args.paf, &args.rad) {
         (None, None, None) => Some(PathBuf::from("-")),
         (o, _, _) => o.clone(),
@@ -545,7 +553,7 @@ pub fn execute(args: Job) -> Result<Counts> {
         None => None,
     };
     let rad = match &args.rad {
-        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings)?),
+        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings, &invocation)?),
         None => None,
     };
     let total = Arc::new(Mutex::new(Counts::default()));
@@ -653,6 +661,7 @@ fn rad_writer(
     codec: Codec,
     mapper: &Mapper,
     settings: &MapSettings,
+    invocation: &Invocation,
 ) -> Result<long_read_rad::RadWriter> {
     let codec = match codec {
         Codec::Lz4 => long_read_rad::ChunkCodec::Lz4,
@@ -667,7 +676,7 @@ fn rad_writer(
     let meta = long_read_rad::Meta {
         mapper: "spearfish".into(),
         mapper_version: spearfish::provenance::BuildInfo::current().short(),
-        cmdline: std::env::args().collect::<Vec<_>>().join(" "),
+        cmdline: invocation.command_line.join(" "),
         params: serde_json::to_string(&serde_json::json!({
             "settings": settings,
             "parameters": opts,

@@ -156,8 +156,9 @@ pub fn run(args: Args) -> Result<()> {
         None => None,
     };
     let t = Instant::now();
-    let (bytes, rep, manifest) = pool
-        .install(|| Index::build_to_file_with(txs, &opts, &args.output, input, std::env::args().collect()))?;
+    let (bytes, rep, manifest) = pool.install(|| {
+        Index::build_to_file_with(txs, &opts, &args.output, input, crate::runinfo::command_line())
+    })?;
     let build_write_s = t.elapsed().as_secs_f64();
     if let Some(w) = &mut t2g_out {
         for (t, g) in names.iter().zip(&rep.tx_gene) {
