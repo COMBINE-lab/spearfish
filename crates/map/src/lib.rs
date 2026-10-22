@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use index::Index;
-use lcp_core::encode::revcomp;
+use lcp_core::encode::{codes, revcomp};
 use seeds::BaseSeeder;
 
 pub use anchor::{Anchor, AnchorParams, Candidate};
@@ -423,10 +423,7 @@ impl<C: Chainer> Mapper<C> {
         }
         stats::add(&stats::TIEBREAK_CALLS, 1);
         stats::add(&stats::TIEBREAK_TIED, n as u64);
-        let codes: Vec<u8> = seq
-            .iter()
-            .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
-            .collect();
+        let codes = codes(seq);
         // Costs (edits, or negated affine scores) and the score charged per unit.
         let seg = if tb.segmented {
             self.segmented(tb, &codes, raw, &hits[..n])
@@ -1183,10 +1180,7 @@ impl<C: Chainer> Mapper<C> {
         match seeder.parsed(raw) {
             Some(h) if acgt() => {
                 let rc = h.revcomp_acgt();
-                let codes: Vec<u8> = raw
-                    .iter()
-                    .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
-                    .collect();
+                let codes = codes(raw);
                 let rcodes = codes.iter().rev().map(|&c| 3 - c).collect();
                 let done = |mut h: lcp_core::hpc::Hpc, codes| {
                     let seq = std::mem::take(&mut h.seq);
@@ -1203,10 +1197,7 @@ impl<C: Chainer> Mapper<C> {
         match seeder.parsed(raw) {
             Some(mut h) => {
                 let seq = std::mem::take(&mut h.seq);
-                let codes = raw
-                    .iter()
-                    .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
-                    .collect();
+                let codes = codes(raw);
                 (seq, Some(RawRead { codes, hpc: h }))
             }
             None => (raw.to_vec(), None),
@@ -1359,11 +1350,6 @@ impl<C: Chainer> Mapper<C> {
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
                 tiebreak_size += self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits, salt);
-                let codes = |s: &[u8]| -> Vec<u8> {
-                    s.iter()
-                        .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
-                        .collect()
-                };
                 // Costs of the two best hits and the score charged per unit.
                 let (ca, cb, unit) = match &tb.affine {
                     Some(sc) if tb.orient_clipped => (
@@ -1424,11 +1410,6 @@ impl<C: Chainer> Mapper<C> {
             hits.retain(|h| h.score >= floor);
         }
         if let Some(e) = &self.p.ends {
-            let codes = |s: &[u8]| -> Vec<u8> {
-                s.iter()
-                    .map(|&c| lcp_core::encode::CODE[c as usize] & 3)
-                    .collect()
-            };
             let this = codes(&st.seq);
             let that = if both { codes(&other.seq) } else { Vec::new() };
             let mut seen = rustc_hash::FxHashMap::default();
@@ -1575,12 +1556,6 @@ mod segmented_tests {
             MapParams::default(),
         )
         .unwrap()
-    }
-
-    fn codes(s: &[u8]) -> Vec<u8> {
-        s.iter()
-            .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
-            .collect()
     }
 
     #[test]

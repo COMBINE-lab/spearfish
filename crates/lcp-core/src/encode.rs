@@ -24,6 +24,11 @@ const fn build_table() -> [u8; 256] {
 
 pub static CODE: [u8; 256] = build_table();
 
+/// 2-bit codes of an ASCII sequence; bytes other than A/C/G/T/U (either case) map to 3, as T.
+pub fn codes(seq: &[u8]) -> Vec<u8> {
+    seq.iter().map(|&b| CODE[b as usize] & 3).collect()
+}
+
 /// Reverse complement of an ASCII nucleotide sequence. Non-ACGT bytes map to `N`.
 pub fn revcomp(seq: &[u8]) -> Vec<u8> {
     seq.iter()
