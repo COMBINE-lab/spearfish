@@ -222,6 +222,7 @@ impl Default for MapOptions {
 /// assert!(opts.hpc);
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct IndexOptions {
     /// Base seed scheme (its highest level is used), e.g. `lcp:K=3` or `minimizer:k=19,w=23`.
     #[builder(into, default = "lcp:K=3".to_string())]
@@ -254,6 +255,7 @@ impl Default for IndexOptions {
 /// at most `attach_max` transcripts join the one larger group they share runs of
 /// `attach_span` seeds with (0: no attach pass).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct InferGenesOptions {
     /// Ignore runs held by more than this many transcripts (repeats).
     #[builder(default = 64)]
@@ -404,7 +406,7 @@ impl Index {
     }
 
     /// What built the index and from what (see [`provenance::IndexManifest`]); `None` for
-    /// an index written before manifests were recorded.
+    /// an index written before manifests were recorded, or whose manifest can't be read.
     pub fn manifest(&self) -> Option<provenance::IndexManifest> {
         provenance::IndexManifest::of(&self.inner)
     }
