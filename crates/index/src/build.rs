@@ -502,8 +502,11 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         Some((u, d)) => !(u != v && succ[u as usize] == enc(v, d)),
         None => true,
     };
-    let acyclic = (0..n as u32).filter(|&v| is_head(v)).count();
+    let mut heads: Vec<u32> = Vec::new();
     for (v, &e) in pred.iter().enumerate() {
+        if is_head(v as u32) {
+            heads.push(v as u32);
+        }
         match e {
             START => rep.heads_start += 1,
             MULTI => rep.heads_multi_pred += 1,
@@ -521,36 +524,43 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     let mut unitig_off: Vec<u64> = vec![0];
     let mut unitig_nodes: Vec<u32> = Vec::with_capacity(n);
     let mut unitig_span: Vec<u32> = Vec::new();
-    let mut walk = |start: u32, node_unitig: &mut Vec<u32>, cyclic: bool| {
-        let u = unitig_span.len() as u32;
+    // The chain of (node, offset) from `start` (a cycle stops before returning to it).
+    let chain = |start: u32, cyclic: bool| {
         let (mut cur, mut delta) = (start, 0u32);
-        loop {
-            node_unitig[cur as usize] = u;
-            node_offset[cur as usize] = delta;
-            unitig_nodes.push(cur);
-            match cont(cur) {
-                Some((next, d)) if !(cyclic && next == start) => {
-                    cur = next;
-                    delta += d;
-                }
-                _ => break,
-            }
+        let mut c = vec![(cur, delta)];
+        while let Some((next, d)) = cont(cur).filter(|&(next, _)| !(cyclic && next == start)) {
+            cur = next;
+            delta += d;
+            c.push((cur, delta));
         }
-        unitig_span.push(delta + node_len[cur as usize]);
+        c
+    };
+    let mut add = |c: &[(u32, u32)], node_unitig: &mut Vec<u32>| {
+        let u = unitig_span.len() as u32;
+        for &(w, d) in c {
+            node_unitig[w as usize] = u;
+            node_offset[w as usize] = d;
+            unitig_nodes.push(w);
+        }
+        let &(last, d) = c.last().unwrap();
+        unitig_span.push(d + node_len[last as usize]);
         unitig_off.push(unitig_nodes.len() as u64);
     };
-    for v in 0..n as u32 {
-        if is_head(v) {
-            walk(v, &mut node_unitig, false);
-        }
+    // Chains from heads only read pred and succ, so follow them in parallel (the walks are
+    // latency-bound pointer chasing), then number them in head order.
+    let chains: Vec<Vec<(u32, u32)>> = heads.par_iter().map(|&h| chain(h, false)).collect();
+    for c in &chains {
+        add(c, &mut node_unitig);
     }
+    drop(chains);
+    // What is left are pure cycles: cut each at its first node.
     for v in 0..n as u32 {
         if node_unitig[v as usize] == u32::MAX {
-            walk(v, &mut node_unitig, true);
+            add(&chain(v, true), &mut node_unitig);
         }
     }
     rep.unitigs = unitig_span.len();
-    rep.cyclic_unitigs = rep.unitigs - acyclic;
+    rep.cyclic_unitigs = rep.unitigs - heads.len();
     let mut lens: Vec<usize> = unitig_off.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
     lens.sort_unstable_by(|a, b| b.cmp(a));
     let half = lens.iter().sum::<usize>() / 2;
