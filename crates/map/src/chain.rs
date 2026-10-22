@@ -2,11 +2,11 @@
 //!
 //! `OracleChainer` runs one DP per candidate transcript. Transcripts are visited in order of
 //! their placement lists (shifted to the first placement), and each DP resumes where its list
-//! diverges from the previous transcript's: identical prefixes give identical DP values, so
-//! this is exact and shares the work of isoforms that agree over a read's anchors. It defines
-//! the scores the multi-transcript refinement chainer (M6, `RefineChainer`) must reproduce
-//! exactly with an unbounded beam (Theorem 2), so the window, validity rule, gain and cost here
-//! are the specification:
+//! diverges from the previous transcript's (an equal list reuses its chain): identical prefixes
+//! give identical DP values, so this is exact and shares the work of isoforms that agree over a
+//! read's anchors. It defines the scores the multi-transcript refinement chainer (M6,
+//! `RefineChainer`) must reproduce exactly with an unbounded beam (Theorem 2), so the window,
+//! validity rule, gain and cost here are the specification:
 //!
 //! - Anchors of a candidate are indexed in their family order (sorted by query start);
 //!   anchor `i'` may extend a chain ending at anchor `i` only if `i' - h <= i < i'`.
@@ -926,7 +926,7 @@ impl OracleChainer {
                 u.len().cmp(&v.len())
             });
         }
-        let mut hits = Vec::with_capacity(used);
+        let mut hits: Vec<TxHit> = Vec::with_capacity(used);
         let mut prev: Option<usize> = None;
         for oi in 0..used {
             let bi = sc.order[oi] as usize;
@@ -936,14 +936,33 @@ impl OracleChainer {
             // Target positions are stored relative to the first placement (plus a bias that
             // keeps them positive); transitions only use their differences.
             let base = el[0].ts as i64 - REL_BIAS;
-            let lcp = prev.map_or(0, |pb| {
+            // The common prefix with the previous transcript's list, that list's length, and
+            // the offset between their target positions.
+            let (lcp, pn, shift) = prev.map_or((0, 0, 0), |pb| {
                 let pe = &sc.buckets[pb];
                 let pbase = pe[0].ts as i64 - REL_BIAS;
-                el.iter()
+                let lcp = el
+                    .iter()
                     .zip(pe)
                     .take_while(|(x, y)| x.a == y.a && x.ts as i64 - base == y.ts as i64 - pbase)
-                    .count()
+                    .count();
+                (lcp, pe.len(), base - pbase)
             });
+            if lcp == n && pn == n {
+                // The previous transcript's list (isoforms that agree over the read): the DP
+                // values and the buffers stay, and the hit is its chain shifted by the offset.
+                let sh = |ts: u32| (ts as i64 + shift) as u32;
+                let mut h = hits.last().unwrap().clone();
+                h.tx = t;
+                (h.tstart, h.tend) = (sh(h.tstart), sh(h.tend));
+                for c in &mut h.chain {
+                    c.1 = sh(c.1);
+                }
+                hits.push(h);
+                prev = Some(bi);
+                sc.buckets[bi] = el;
+                continue;
+            }
             sc.a.truncate(lcp);
             sc.qs.truncate(lcp);
             sc.qe.truncate(lcp);
