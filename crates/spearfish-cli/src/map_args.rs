@@ -167,7 +167,7 @@ pub struct MapArgs {
         help_heading = "Candidate genes"
     )]
     pub min_gene_frac: Option<f32>,
-    /// Cap on a seed's span in the gene score [default: 100].
+    /// Cap on a seed's span in its weight (gene scores and chaining) [default: 100].
     #[arg(long, hide_short_help = true, help_heading = "Candidate genes")]
     pub seed_span_cap: Option<u32>,
     #[arg(long, alias = "g-max", hide = true)]

@@ -103,7 +103,7 @@ pub struct MapSettings {
     /// Keep genes scoring at least this fraction of the best gene.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_gene_frac: Option<f32>,
-    /// Cap on a seed's span in the gene score.
+    /// Cap on a seed's span in its weight (gene scores and chaining).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_span_cap: Option<u32>,
     /// Experimental: gene count at which a seed's weight reaches zero.

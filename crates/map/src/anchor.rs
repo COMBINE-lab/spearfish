@@ -11,6 +11,8 @@ pub struct Anchor {
     pub qs: u32,
     pub qe: u32,
     pub node: u32,
+    /// `min(span, s_max) * max(0, 1 - ln g / ln g_max)` for a label held by `g` genes: what the
+    /// anchor counts for in gene scores, merging and chaining (rescue seeds count their span).
     pub weight: f32,
 }
 
@@ -18,9 +20,10 @@ pub struct Anchor {
 pub struct AnchorParams {
     /// Labels found in more genes than this are ignored for the read.
     pub h_max: usize,
-    /// Span cap in the anchor weight.
+    /// Span cap in the anchor weight (gene scores and chaining).
     pub s_max: u32,
-    /// Gene count at which an anchor's weight reaches zero.
+    /// Gene count at which an anchor's weight reaches zero; seeds in fewer genes are
+    /// down-weighted by the log of their gene count relative to this.
     pub g_max: f32,
     /// Keep genes scoring at least this fraction of the best.
     pub alpha_fam: f32,
@@ -36,8 +39,9 @@ impl Default for AnchorParams {
         AnchorParams {
             h_max: 1000,
             s_max: 100,
-            // Effectively off: at genome scale, down-weighting multi-gene seeds hid the true
-            // locus of reads from multi-copy and repeat-rich genes.
+            // Mild, not off: a seed whose label is in g genes keeps 1 - log10(g)/9 of its capped
+            // span (0.97 at 2 genes, 0.67 at h_max). Stronger down-weighting of multi-gene seeds
+            // hid the true locus of reads from multi-copy and repeat-rich genes at genome scale.
             g_max: 1e9,
             alpha_fam: 0.5,
             f_keep: 8,
