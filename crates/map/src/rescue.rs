@@ -6,9 +6,9 @@
 //! score (those scoring at least `alpha` times the best gene, at most
 //! [`RescueParams::max_genes_for`] of them) and, in each, the `max_tx_per_gene` transcripts
 //! with the most base anchors, skipping those longer than `max_tx_len`. With `window` set,
-//! only the part of each transcript the read can occupy is re-seeded, and identical windows
-//! are seeded once per read. Transcript sequences come from the index (parsed, 2-bit), so no
-//! extra index is needed.
+//! only the part of each transcript the read can occupy is re-seeded; identical windows (or
+//! whole transcripts) are seeded once per read orientation. Transcript sequences come from the
+//! index (parsed, 2-bit), so no extra index is needed.
 
 use index::Index;
 use seeds::{BaseSeeder, Seed};
@@ -33,8 +33,8 @@ pub struct RescueParams {
     pub max_tx_per_gene: usize,
     /// Re-seed only the window of each transcript the read can occupy (projected from its
     /// base anchors, padded by `pad` + 1/`pad_div` of the read), and compute each distinct
-    /// window sequence once per read (isoforms usually agree around the read). `None`:
-    /// whole transcripts.
+    /// window sequence once per read orientation (isoforms usually agree around the read).
+    /// `None`: whole transcripts.
     pub window: Option<(u32, u32)>,
     /// Re-seed the other read orientation only if its base-level best score is within this
     /// margin of the chosen orientation's (None: always).
