@@ -373,10 +373,18 @@ fn shared_blocks(hits: &[TxHit]) -> Option<Vec<SharedBlock>> {
 struct Strand {
     hits: Vec<TxHit>,
     seq: Vec<u8>,
+    /// `seq` as 2-bit codes, made on first use ([`strand_codes`]).
+    codes: std::cell::OnceCell<Vec<u8>>,
     raw: Option<RawRead>,
     seeds: Vec<seeds::Seed>,
     anchors: u32,
     candidates: u32,
+}
+
+/// A strand's `codes`, made from its `seq` on first use (a function of the two fields rather
+/// than a method, so the strand's hits can be borrowed mutably meanwhile).
+fn strand_codes<'a>(codes: &'a std::cell::OnceCell<Vec<u8>>, seq: &[u8]) -> &'a [u8] {
+    codes.get_or_init(|| lcp_core::encode::codes(seq))
 }
 
 impl<C: Chainer> Mapper<C> {
@@ -399,12 +407,12 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Re-rank the near-tie set of `hits` (sorted, best first) by edit distance between the
-    /// parsed read `seq` and each transcript. Returns the tie-set size. `salt` orders equal
-    /// scores (see [`sort_hits`]).
-    fn tiebreak(
+    /// parsed read (`codes` gives its 2-bit codes, asked for only if there is a tie) and each
+    /// transcript. Returns the tie-set size. `salt` orders equal scores (see [`sort_hits`]).
+    fn tiebreak<'c>(
         &self,
         tb: &TieBreak,
-        seq: &[u8],
+        codes: impl FnOnce() -> &'c [u8],
         raw: Option<&RawRead>,
         hits: &mut [TxHit],
         salt: u64,
@@ -423,10 +431,10 @@ impl<C: Chainer> Mapper<C> {
         }
         stats::add(&stats::TIEBREAK_CALLS, 1);
         stats::add(&stats::TIEBREAK_TIED, n as u64);
-        let codes = codes(seq);
+        let codes = codes();
         // Costs (edits, or negated affine scores) and the score charged per unit.
         let seg = if tb.segmented {
-            self.segmented(tb, &codes, raw, &hits[..n])
+            self.segmented(tb, codes, raw, &hits[..n])
         } else {
             None
         };
@@ -439,9 +447,9 @@ impl<C: Chainer> Mapper<C> {
             None => {
                 stats::add(&stats::TIEBREAK_WHOLE_READ, 1);
                 if tb.segmented && tb.group_fallback {
-                    self.grouped(tb, &codes, raw, &hits[..n])
+                    self.grouped(tb, codes, raw, &hits[..n])
                 } else {
-                    let d = self.whole_read(tb, &codes, &hits[..n]);
+                    let d = self.whole_read(tb, codes, &hits[..n]);
                     let dmin = *d.iter().min().unwrap();
                     d.iter().map(|&x| tb.kappa * (x - dmin) as f32).collect()
                 }
@@ -1165,6 +1173,7 @@ impl<C: Chainer> Mapper<C> {
         Strand {
             hits,
             seq,
+            codes: Default::default(),
             raw: raw_read,
             seeds,
             anchors: n_anchors,
@@ -1278,6 +1287,7 @@ impl<C: Chainer> Mapper<C> {
         let skip = |p: (Vec<u8>, Option<RawRead>)| Strand {
             hits: Vec::new(),
             seq: p.0,
+            codes: Default::default(),
             raw: p.1,
             seeds: Vec::new(),
             anchors: 0,
@@ -1343,34 +1353,29 @@ impl<C: Chainer> Mapper<C> {
             let margin = |s: f32| tb.margin_abs.max(tb.orient_margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
-            tiebreak_size = self.tiebreak(tb, &st.seq, st.raw.as_ref(), &mut st.hits, salt);
+            let codes = || strand_codes(&st.codes, &st.seq);
+            tiebreak_size = self.tiebreak(tb, codes, st.raw.as_ref(), &mut st.hits, salt);
             if both {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
-                tiebreak_size += self.tiebreak(tb, &other.seq, other.raw.as_ref(), &mut other.hits, salt);
+                let codes = || strand_codes(&other.codes, &other.seq);
+                tiebreak_size += self.tiebreak(tb, codes, other.raw.as_ref(), &mut other.hits, salt);
+                let (qa, qb) = (
+                    strand_codes(&st.codes, &st.seq),
+                    strand_codes(&other.codes, &other.seq),
+                );
                 // Costs of the two best hits and the score charged per unit.
                 let (ca, cb, unit) = match &tb.affine {
                     Some(sc) if tb.orient_clipped => (
-                        -i64::from(self.clipped(tb, sc, &codes(&st.seq), st.raw.as_ref(), &st.hits[0])),
-                        -i64::from(self.clipped(
-                            tb,
-                            sc,
-                            &codes(&other.seq),
-                            other.raw.as_ref(),
-                            &other.hits[0],
-                        )),
+                        -i64::from(self.clipped(tb, sc, qa, st.raw.as_ref(), &st.hits[0])),
+                        -i64::from(self.clipped(tb, sc, qb, other.raw.as_ref(), &other.hits[0])),
                         tb.lambda,
                     ),
                     _ => {
-                        let da = self.whole_read(tb, &codes(&st.seq), &st.hits[..1])[0];
-                        let db = self.whole_read_k(
-                            tb,
-                            &codes(&other.seq),
-                            &other.hits[0],
-                            da.saturating_add(tb.cap),
-                        );
+                        let da = self.whole_read(tb, qa, &st.hits[..1])[0];
+                        let db = self.whole_read_k(tb, qb, &other.hits[0], da.saturating_add(tb.cap));
                         (i64::from(da), i64::from(db), tb.kappa)
                     }
                 };
@@ -1410,12 +1415,15 @@ impl<C: Chainer> Mapper<C> {
             hits.retain(|h| h.score >= floor);
         }
         if let Some(e) = &self.p.ends {
-            let this = codes(&st.seq);
-            let that = if both { codes(&other.seq) } else { Vec::new() };
             let mut seen = rustc_hash::FxHashMap::default();
             let floor = hits.first().map_or(0.0, |t| t.score - e.within * t.score.abs());
             for h in hits.iter_mut().filter(|h| h.score >= floor) {
-                let c = if h.reverse == reverse { &this } else { &that };
+                // The other orientation's hits are reported only if both were tie-broken.
+                let c = if h.reverse == reverse {
+                    strand_codes(&st.codes, &st.seq)
+                } else {
+                    strand_codes(&other.codes, &other.seq)
+                };
                 self.extend_ends(e, c, h, &mut seen);
                 h.extended = true;
             }
@@ -1693,7 +1701,8 @@ mod segmented_tests {
             m.segmented(&tb, &codes(q), None, &hits).unwrap().0,
             [-28, -21, -13, -13]
         );
-        assert_eq!(m.tiebreak(&tb, q, None, &mut hits, 0), 4);
+        let c = codes(q);
+        assert_eq!(m.tiebreak(&tb, || &c, None, &mut hits, 0), 4);
         assert_eq!(
             hits.iter().map(|h| h.score).collect::<Vec<_>>(),
             [15., 8., 0., 0.]
@@ -1785,6 +1794,7 @@ mod segmented_tests {
     fn score_scaling_and_no_common_anchor_fallback() {
         let m = mapper(&[b"ACGTAC", b"ACAC"], false);
         let q = b"ACGTAC";
+        let c = codes(q);
         let mut hits = [
             hit(0, 15., &[(0, 0, 2), (4, 4, 2)]),
             hit(1, 12., &[(0, 0, 2), (4, 2, 2)]),
@@ -1793,7 +1803,7 @@ mod segmented_tests {
             lambda: 0.5,
             ..Default::default()
         };
-        m.tiebreak(&tb, q, None, &mut hits, 0);
+        m.tiebreak(&tb, || &c, None, &mut hits, 0);
         // Scores become the tie set's best chain score minus each deficit.
         assert_eq!((hits[0].score, hits[1].score), (15., 9.));
         let m = mapper(&[q, q], false);
@@ -1803,8 +1813,8 @@ mod segmented_tests {
                 group_fallback: grouped,
                 ..Default::default()
             };
-            assert!(m.segmented(&tb, &codes(q), None, &hits).is_none());
-            m.tiebreak(&tb, q, None, &mut hits, 0);
+            assert!(m.segmented(&tb, &c, None, &hits).is_none());
+            m.tiebreak(&tb, || &c, None, &mut hits, 0);
             assert_eq!((hits[0].score, hits[1].score), (15., 15.));
         }
     }
