@@ -75,6 +75,27 @@ pub struct Args {
     allow_collisions: bool,
 }
 
+impl Args {
+    /// The library options these arguments select.
+    fn options(&self) -> IndexOptions {
+        IndexOptions::builder()
+            .scheme(self.scheme.clone())
+            .hpc(!self.no_hpc)
+            .f_max(self.mask_genes)
+            .per_gene(self.collapse == CollapseArg::Gene)
+            .allow_collisions(self.allow_collisions)
+            .maybe_infer_genes(self.infer_genes.map(|max_tx| {
+                InferGenesOptions::builder()
+                    .max_tx(max_tx)
+                    .span(self.infer_span)
+                    .attach_span(self.infer_attach_span)
+                    .attach_max(self.infer_attach_max)
+                    .build()
+            }))
+            .build()
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct InspectArgs {
     /// Index built by `spearfish index`.
@@ -109,21 +130,7 @@ pub fn run(args: Args) -> Result<()> {
         input.genes_from = "none".into();
     }
     let read_s = t0.elapsed().as_secs_f64();
-    let opts = IndexOptions::builder()
-        .scheme(args.scheme.clone())
-        .hpc(!args.no_hpc)
-        .f_max(args.mask_genes)
-        .per_gene(args.collapse == CollapseArg::Gene)
-        .allow_collisions(args.allow_collisions)
-        .maybe_infer_genes(args.infer_genes.map(|max_tx| {
-            InferGenesOptions::builder()
-                .max_tx(max_tx)
-                .span(args.infer_span)
-                .attach_span(args.infer_attach_span)
-                .attach_max(args.infer_attach_max)
-                .build()
-        }))
-        .build();
+    let opts = args.options();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(crate::runinfo::threads(args.threads))
         .build()?;
@@ -302,4 +309,34 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        a: Args,
+    }
+
+    fn options(extra: &[&str]) -> IndexOptions {
+        Cli::try_parse_from(["x", "tx.fa", "-o", "o"].into_iter().chain(extra.iter().copied()))
+            .unwrap()
+            .a
+            .options()
+    }
+
+    /// `spearfish index` without options builds what `Index::build` builds with the library's
+    /// defaults (as doctor and library callers do).
+    #[test]
+    fn cli_defaults_are_library_defaults() {
+        assert_eq!(options(&[]), IndexOptions::default());
+        assert_eq!(
+            options(&["--infer-genes"]).infer_genes,
+            Some(InferGenesOptions::default())
+        );
+    }
 }
