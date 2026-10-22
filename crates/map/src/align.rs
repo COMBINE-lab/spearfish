@@ -870,8 +870,9 @@ trait Rows {
 /// One DP row over `w` cells by three passes over the row (the first and last autovectorize
 /// for the entry point's level): `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
 /// F[i-1][start..=hi], `tx` the text bases of columns start..=hi, `c` the pattern base, `e`
-/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` and
-/// returns the row's maximum. `scratch` holds two rows of temporaries.
+/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` (`w + 1`
+/// cells: the last gets NEG, the band's right sentinel) and returns the row's maximum. `scratch`
+/// holds two rows of temporaries.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn row_scalar(
@@ -893,6 +894,8 @@ fn row_scalar(
     let (hp, gs) = (&mut hpv[..w], &mut gsv[..w]);
     let hd = &hprev[..w]; // H[i-1][j-1]
     let hu = &hprev[1..=w]; // H[i-1][j]
+    // The band's right sentinel.
+    (nh[w], nf[w]) = (NEG, NEG);
     let (tx, nf, nh) = (&tx[..w], &mut nf[..w], &mut nh[..w]);
     // Pass 1: vertical gaps and diagonal moves (H' = H without horizontal gaps), from the
     // previous row only.
@@ -963,6 +966,8 @@ impl Rows for Avx512Rows {
 /// [`row_scalar`] with its three passes fused per 16-lane block: diagonal and vertical moves,
 /// then horizontal gaps as an in-register prefix max carried across blocks, with no
 /// intermediate row written. Same integer operations as the scalar passes, so the same results.
+/// As in [`row_avx2`], whole vectors only: a row's last `w % 16` cells are covered by one more
+/// vector ending at the row's end (rows under 16 cells take one masked block).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 #[inline]
@@ -979,7 +984,8 @@ unsafe fn row_avx512(
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
-    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    (nh[w], nf[w]) = (NEG, NEG);
     let neg = _mm512_set1_epi32(NEG);
     let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
     let (vmat, vmis) = (_mm512_set1_epi32(mat), _mm512_set1_epi32(-mis));
@@ -987,23 +993,30 @@ unsafe fn row_avx512(
     let three = _mm512_set1_epi32(3);
     let last = _mm512_set1_epi32(15);
     let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    // ext * k for the block's lanes, advanced by 16 * ext per block.
-    let mut ek = _mm512_mullo_epi32(lane, vext);
-    let step = _mm512_set1_epi32(16 * ext);
-    let mut cv = _mm512_set1_epi32(e);
+    let lext = _mm512_mullo_epi32(lane, vext);
     let mut mx = neg;
-    let mut k = 0;
-    while k < w {
-        let n = (w - k).min(16);
-        let mask: __mmask16 = if n == 16 { !0 } else { (1u16 << n) - 1 };
-        // SAFETY: lanes below `n` are in bounds of every slice; the rest are masked off.
+    // Cells k..k + 16 (the lanes in `mask`) with `cv` the maximum entering cell k (broadcast)
+    // and `ek` ext times each lane's cell index: stores H and F and returns the exclusive
+    // maxima entering each cell and the maximum after the last.
+    let mut cells = |k: usize, mask: __mmask16, cv: __m512i, ek: __m512i| {
+        // SAFETY: lanes in `mask` are in bounds of every slice (all 16 unless the row is
+        // shorter); the rest are masked off.
         let (hd, hu, fv, t) = unsafe {
-            (
-                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k)),
-                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k + 1)),
-                _mm512_maskz_loadu_epi32(mask, fu.as_ptr().add(k)),
-                _mm_maskz_loadu_epi8(mask, tx.as_ptr().add(k).cast()),
-            )
+            if mask == !0 {
+                (
+                    _mm512_loadu_si512(hprev.as_ptr().add(k).cast()),
+                    _mm512_loadu_si512(hprev.as_ptr().add(k + 1).cast()),
+                    _mm512_loadu_si512(fu.as_ptr().add(k).cast()),
+                    _mm_loadu_si128(tx.as_ptr().add(k).cast()),
+                )
+            } else {
+                (
+                    _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k)),
+                    _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k + 1)),
+                    _mm512_maskz_loadu_epi32(mask, fu.as_ptr().add(k)),
+                    _mm_maskz_loadu_epi8(mask, tx.as_ptr().add(k).cast()),
+                )
+            }
         };
         let fj = _mm512_max_epi32(
             _mm512_max_epi32(_mm512_sub_epi32(hu, vgo), _mm512_sub_epi32(fv, vext)),
@@ -1026,16 +1039,44 @@ unsafe fn row_avx512(
         v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
         v = _mm512_max_epi32(v, cv);
         let excl = _mm512_alignr_epi32::<15>(v, cv);
-        cv = _mm512_permutexvar_epi32(last, v);
         let hv = _mm512_max_epi32(x, _mm512_sub_epi32(excl, ek));
         // SAFETY: as for the loads.
         unsafe {
-            _mm512_mask_storeu_epi32(nh.as_mut_ptr().add(k), mask, hv);
-            _mm512_mask_storeu_epi32(nf.as_mut_ptr().add(k), mask, fj);
+            if mask == !0 {
+                _mm512_storeu_si512(nh.as_mut_ptr().add(k).cast(), hv);
+                _mm512_storeu_si512(nf.as_mut_ptr().add(k).cast(), fj);
+            } else {
+                _mm512_mask_storeu_epi32(nh.as_mut_ptr().add(k), mask, hv);
+                _mm512_mask_storeu_epi32(nf.as_mut_ptr().add(k), mask, fj);
+            }
         }
         mx = _mm512_mask_max_epi32(mx, mask, mx, hv);
+        (excl, _mm512_permutexvar_epi32(last, v))
+    };
+    let mut cv = _mm512_set1_epi32(e);
+    if w < 16 {
+        cells(0, (1u16 << w) - 1, cv, lext);
+        return _mm512_reduce_max_epi32(mx);
+    }
+    let mut excl = cv;
+    let mut ek = lext;
+    let step = _mm512_set1_epi32(16 * ext);
+    let mut k = 0;
+    while k + 16 <= w {
+        (excl, cv) = cells(k, !0, cv, ek);
         ek = _mm512_add_epi32(ek, step);
         k += 16;
+    }
+    if k < w {
+        // The last vector, at w - 16: lane w - k of the previous one is the maximum entering
+        // its first cell.
+        let cv = _mm512_permutexvar_epi32(_mm512_set1_epi32((w - k) as i32), excl);
+        cells(
+            w - 16,
+            !0,
+            cv,
+            _mm512_add_epi32(lext, _mm512_set1_epi32(ext * (w - 16) as i32)),
+        );
     }
     _mm512_reduce_max_epi32(mx)
 }
@@ -1068,7 +1109,8 @@ unsafe fn row_avx2(
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
-    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    (nh[w], nf[w]) = (NEG, NEG);
     if w < 8 {
         // The scalar steps (`row_scalar` without its row buffers).
         let (mut m, mut carry) = (NEG, e);
@@ -1205,7 +1247,8 @@ unsafe fn row_neon(
 ) -> i32 {
     use std::arch::aarch64::*;
     let w = fu.len();
-    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    (nh[w], nf[w]) = (NEG, NEG);
     let neg = vdupq_n_s32(NEG);
     let (vgo, vext) = (vdupq_n_s32(go), vdupq_n_s32(ext));
     let (vmat, vmis) = (vdupq_n_s32(mat), vdupq_n_s32(-mis));
@@ -1587,10 +1630,11 @@ fn run_core<R: Rows>(
         }
     };
     // h: best score ending at (i, j); f: ending in a gap that consumes pattern
-    // (vertical). Rows alternate between two buffers; cells outside a row's
-    // band stay NEG.
-    // Rows are not cleared: a row's band is written in full and a sentinel is put on each
-    // side of it, and a row reads the previous row only within one column of its band.
+    // (vertical). Rows alternate between two buffers.
+    // Rows are not cleared: a row's band is written in full with a NEG sentinel just right of
+    // it (stored by the row kernel), and a row reads the previous row only within that row's
+    // band and sentinel. None is needed on the left: a banded row starting at lo > 0 reads
+    // from column lo - 1, where the previous row starts.
     for v in [&mut b.h, &mut b.f, &mut b.nh, &mut b.nf] {
         if v.len() < n + 2 {
             v.resize(n + 2, NEG);
@@ -1645,6 +1689,7 @@ fn run_core<R: Rows>(
     let stats = crate::stats::on();
     for i in first..=m {
         let (lo, hi) = range(i);
+        debug_assert!((lo == 0 || lo == prev.0 + 1) && hi <= prev.1 + 1);
         if lo > hi {
             // Past the text's end by more than the band (only when geom > n): no
             // cell is reachable, so the rest of the pattern can't align.
@@ -1688,8 +1733,8 @@ fn run_core<R: Rows>(
                     &h[start - 1..=hi],
                     &f[start..=hi],
                     &text[start - 1..hi],
-                    &mut nh[start..=hi],
-                    &mut nf[start..=hi],
+                    &mut nh[start..=hi + 1],
+                    &mut nf[start..=hi + 1],
                     c,
                     (mat, mis, go, ext),
                     e,
@@ -1697,6 +1742,8 @@ fn run_core<R: Rows>(
                 )
             };
             row_max = row_max.max(m);
+        } else {
+            (nh[hi + 1], nf[hi + 1]) = (NEG, NEG);
         }
         if cut != usize::MAX && lo <= cut {
             let row = if hi <= cut {
@@ -1728,8 +1775,6 @@ fn run_core<R: Rows>(
                 };
             }
         }
-        edges(nh, lo, hi);
-        edges(nf, lo, hi);
         std::mem::swap(&mut h, &mut nh);
         std::mem::swap(&mut f, &mut nf);
         prev = (lo, hi);
@@ -1849,9 +1894,10 @@ mod tests {
         let w = fu.len();
         let mut out = Vec::new();
         for l in simd::supported() {
-            let (mut nh, mut nf) = (vec![7; w], vec![7; w]);
+            let (mut nh, mut nf) = (vec![7; w + 1], vec![7; w + 1]);
             let (mut a, mut b) = (Vec::new(), Vec::new());
             let m = row_at(l, hprev, fu, tx, &mut nh, &mut nf, c, sc, e, (&mut a, &mut b));
+            assert_eq!((nh[w], nf[w]), (NEG, NEG), "sentinel at {l}");
             out.push((l, nh, nf, m));
         }
         out
@@ -2285,7 +2331,7 @@ mod tests {
             let sc = (2, 4, 6, 2);
             let reps = 2_000_000 / w;
             for l in simd::supported() {
-                let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+                let (mut nh, mut nf) = (vec![0; w + 1], vec![0; w + 1]);
                 let (mut a, mut b) = (Vec::new(), Vec::new());
                 let ns = time((reps * w) as f64, || {
                     for _ in 0..reps {
