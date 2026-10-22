@@ -84,6 +84,10 @@
   for labels and starts only. 11-14% fewer instructions on ONT cDNA and simulated 90%-accuracy
   ONT reads, 6% on direct RNA, 2% on simulated 95%-accuracy ONT reads and under 1% where little
   is rescued (HiFi, PacBio), with identical output.
+- The tie-break's Global and Prefix edit distances (direct RNA's segment costs) run in the
+  batched SIMD kernels, as infix ones already did, and the affine DP rows write their own band
+  sentinel and run whole AVX-512 vectors: 17% fewer instructions on direct RNA and 0.5-3% on
+  the other read types, with identical output.
 
 ### Fixes
 
