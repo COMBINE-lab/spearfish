@@ -216,5 +216,6 @@ pub fn run(args: Args) -> Result<()> {
             st.empty
         )?;
     }
+    out.flush()?;
     Ok(())
 }

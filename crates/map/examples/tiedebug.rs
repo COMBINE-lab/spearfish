@@ -1,7 +1,7 @@
 //! For one read, print each reported hit's chain and its whole-read edit distances against
 //! the full parsed transcript (infix) and against the transcript's suffix/prefix around the
 //! chain, to see where tied isoforms gain or lose edits.
-//! Usage: tiedebug <index> <reads.fa> <read name> [max hits]
+//! Usage: tiedebug <index> <reads.fa|fq> <read name> [max hits]
 use std::sync::Arc;
 
 use index::Index;
@@ -13,14 +13,7 @@ fn main() {
     let idx = Arc::new(Index::open(a[1].as_ref()).unwrap());
     let max: usize = a.get(4).map_or(12, |s| s.parse().unwrap());
     let text = std::fs::read_to_string(&a[2]).unwrap();
-    let raw: Vec<u8> = text
-        .split('>')
-        .find(|r| r.starts_with(&format!("{}\n", a[3])))
-        .expect("read not found")
-        .lines()
-        .skip(1)
-        .flat_map(|l| l.trim().bytes())
-        .collect();
+    let raw = find_read(&text, &a[3]).expect("read not found");
     let p = MapParams::default();
     let mapper = Mapper::new(idx.clone(), OracleChainer { p: p.chain.clone() }, p).unwrap();
     let r = mapper.map(&raw);
@@ -68,4 +61,29 @@ fn main() {
             t3.len()
         );
     }
+}
+
+/// The sequence of the read whose header's first word is `name`, in FASTA or (four-line)
+/// FASTQ text.
+fn find_read(text: &str, name: &str) -> Option<Vec<u8>> {
+    let mut lines = text.lines();
+    while let Some(h) = lines.next() {
+        if let Some(id) = h.strip_prefix('@') {
+            let seq = lines.next()?;
+            lines.nth(1); // `+` and quality lines
+            if id.split_whitespace().next() == Some(name) {
+                return Some(seq.trim().as_bytes().to_vec());
+            }
+        } else if let Some(id) = h.strip_prefix('>')
+            && id.split_whitespace().next() == Some(name)
+        {
+            return Some(
+                lines
+                    .take_while(|l| !l.starts_with('>'))
+                    .flat_map(|l| l.trim().bytes())
+                    .collect(),
+            );
+        }
+    }
+    None
 }

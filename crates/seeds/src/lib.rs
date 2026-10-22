@@ -20,12 +20,28 @@ pub use spec::{SpecError, from_spec};
 
 pub trait SeedScheme: Send + Sync {
     fn seeds(&self, seq: &[u8]) -> Hierarchy;
-    /// The highest level's seeds, appended to `out` as (label, start, end) in start order.
+    /// The highest level's seeds, appended to `out` as (label, start, end) in start order, at
+    /// most one per start.
     fn top_into(&self, seq: &[u8], out: &mut Vec<(u64, u32, u32)>) {
         let h = self.seeds(seq);
         if let Some(l) = h.levels.last() {
             out.extend(l.cores.iter().map(|c| (c.label, c.start, c.end)));
         }
+    }
+    /// [`Self::top_into`] of a sequence given as 2-bit codes (A=0, C=1, G=2, T=3).
+    fn top_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32, u32)>) {
+        let seq: Vec<u8> = codes.iter().map(|&c| b"ACGT"[c as usize]).collect();
+        self.top_into(&seq, out)
+    }
+    /// The (label, start) of [`Self::top_codes_into`]'s seeds, sorted by (start, end, label)
+    /// and without duplicates (as [`BaseSeeder`] returns them), appended to `out`. Schemes that
+    /// can skip computing the ends override it.
+    fn top_starts_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32)>) {
+        let mut v = Vec::new();
+        self.top_codes_into(codes, &mut v);
+        v.sort_unstable_by_key(|&(l, s, e)| (s, e, l));
+        v.dedup();
+        out.extend(v.iter().map(|&(l, s, _)| (l, s)));
     }
     /// Canonical spec string; `from_spec(&s.name())` rebuilds the scheme.
     fn name(&self) -> String;
@@ -50,6 +66,21 @@ impl SeedScheme for LcpSeeds {
         PARSE.with(|sc| {
             self.parser
                 .top_cores(seq, self.max_level, &mut sc.borrow_mut(), out)
+        });
+    }
+
+    fn top_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32, u32)>) {
+        PARSE.with(|sc| {
+            self.parser
+                .top_cores_codes(codes, self.max_level, &mut sc.borrow_mut(), out)
+        });
+    }
+
+    fn top_starts_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32)>) {
+        // Cores come in strictly increasing start order: nothing to sort or remove.
+        PARSE.with(|sc| {
+            self.parser
+                .top_starts_codes(codes, self.max_level, &mut sc.borrow_mut(), out)
         });
     }
 

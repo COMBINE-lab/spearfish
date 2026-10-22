@@ -2,8 +2,12 @@
 //! (typically low-accuracy reads, whose base cores rarely survive). The read and each
 //! candidate transcript are parsed down to a lower LCP level, whose shorter cores survive
 //! errors far better but are too unspecific for genome-wide lookup; restricted to candidate
-//! transcripts, they are informative. Candidates are the transcripts with the most base-level
-//! anchors in each gene with any anchor on the strand; transcript sequences come from the
+//! transcripts, they are informative. Candidates are the strand's best genes by base-level
+//! score (those scoring at least `alpha` times the best gene, at most
+//! [`RescueParams::max_genes_for`] of them) and, in each, the `max_tx_per_gene` transcripts
+//! with the most base anchors, skipping those longer than `max_tx_len`. With `window` set,
+//! only the part of each transcript the read can occupy is re-seeded; identical windows (or
+//! whole transcripts) are seeded once per read orientation. Transcript sequences come from the
 //! index (parsed, 2-bit), so no extra index is needed.
 
 use index::Index;
@@ -29,8 +33,8 @@ pub struct RescueParams {
     pub max_tx_per_gene: usize,
     /// Re-seed only the window of each transcript the read can occupy (projected from its
     /// base anchors, padded by `pad` + 1/`pad_div` of the read), and compute each distinct
-    /// window sequence once per read (isoforms usually agree around the read). `None`:
-    /// whole transcripts.
+    /// window sequence once per read orientation (isoforms usually agree around the read).
+    /// `None`: whole transcripts.
     pub window: Option<(u32, u32)>,
     /// Re-seed the other read orientation only if its base-level best score is within this
     /// margin of the chosen orientation's (None: always).
@@ -77,11 +81,19 @@ pub struct Rescuer {
 /// Per-thread buffers, reused across reads.
 #[derive(Default)]
 struct Scratch {
+    /// The read's rescue seeds, in start order (starts are distinct).
     read: Vec<Seed>,
-    tx: Vec<Seed>,
+    /// Read seed label -> its first seed in `read`; `read_next` links each seed to the next one
+    /// with its label (`u32::MAX`: none).
+    read_at: rustc_hash::FxHashMap<u64, u32>,
+    read_next: Vec<u32>,
+    /// A window's rescue seeds as (label, start).
+    tx: Vec<(u64, u32)>,
     tmp: Vec<(u64, u32, u32)>,
+    /// A transcript window, as 2-bit codes.
     tseq: Vec<u8>,
-    pts: Vec<Pt>,
+    /// One window's points as (seed index in `read` << 32 | window start).
+    keys: Vec<u64>,
     /// Transcript -> (base anchors, min and max anchor diagonal ts - qs).
     per_tx: rustc_hash::FxHashMap<u32, (u32, i64, i64)>,
     txs: Vec<(u32, u32, i64, i64)>,
@@ -140,76 +152,84 @@ thread_local! {
 }
 
 impl Rescuer {
-    pub fn new(idx: &Index, p: RescueParams) -> anyhow::Result<Self> {
-        let _ = idx;
+    pub fn new(p: RescueParams) -> anyhow::Result<Self> {
         // Sequences are already parsed (HPC if the index used it): no HPC here.
         let seeder = BaseSeeder::new(&p.spec, false)?;
         Ok(Rescuer { p, seeder })
     }
 
     /// Rescue hits for one orientation of a read: `seq` is the parsed read, `base` its
-    /// base-level seeds. Hits are unsorted.
+    /// base-level seeds, `node_fam` the index's [`anchor::node_families`]. Hits are unsorted.
     pub fn rescue(
         &self,
         idx: &Index,
+        node_fam: &[u32],
         seq: &[u8],
         base: &[Seed],
         ap: &AnchorParams,
         cp: &ChainParams,
     ) -> Vec<TxHit> {
-        RESCUE.with(|sc| self.rescue_with(idx, seq, base, ap, cp, &mut sc.borrow_mut()))
+        RESCUE.with(|sc| self.rescue_with(idx, node_fam, seq, base, ap, cp, &mut sc.borrow_mut()))
     }
 
-    /// Points of the read's rescue seeds (`sc.read`, sorted by label) against one transcript
-    /// window sequence, sorted by (qs, ts), appended to `sc.pool`.
-    fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
-        self.seeder.seed_parsed_into(tseq, &mut sc.tx, &mut sc.tmp);
-        sc.tx.sort_unstable_by_key(|s| (s.label, s.start));
-        // Merge join on labels.
-        sc.pts.clear();
-        let (r, x) = (&sc.read, &sc.tx);
-        let (mut i, mut j) = (0, 0);
-        while i < r.len() && j < x.len() {
-            match r[i].label.cmp(&x[j].label) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    let l = r[i].label;
-                    let j0 = j;
-                    while j < x.len() && x[j].label == l {
-                        j += 1;
-                    }
-                    while i < r.len() && r[i].label == l {
-                        let len = r[i].end - r[i].start;
-                        for xs in &x[j0..j] {
-                            sc.pts.push(Pt {
-                                qs: r[i].start,
-                                qe: r[i].end,
-                                ts: xs.start,
-                                len,
-                                w: len as f32,
-                            });
-                        }
-                        i += 1;
-                    }
-                }
+    /// The read's rescue seeds into `sc.read`, with the label table `sc.read_at`/`read_next`
+    /// that [`Self::points_in`] probes with each transcript window's seeds.
+    fn seed_read(&self, seq: &[u8], sc: &mut Scratch) {
+        self.seeder.seed_parsed_into(seq, &mut sc.read, &mut sc.tmp);
+        debug_assert!(sc.read.windows(2).all(|w| w[0].start < w[1].start));
+        sc.read_at.clear();
+        sc.read_next.clear();
+        sc.read_next.resize(sc.read.len(), u32::MAX);
+        // Back to front, so that each label's chain runs in start order.
+        for (i, s) in sc.read.iter().enumerate().rev() {
+            if let Some(next) = sc.read_at.insert(s.label, i as u32) {
+                sc.read_next[i] = next;
             }
         }
-        sc.pts.sort_unstable_by_key(|p| (p.qs, p.ts));
-        sc.pool.extend_from_slice(&sc.pts);
+    }
+
+    /// Points of the read's rescue seeds (`sc.read`, see [`Self::seed_read`]) against one
+    /// transcript window `tseq` (2-bit codes), sorted by (qs, ts), appended to `sc.pool`.
+    /// Seeds have distinct starts on either side, so (qs, ts) is unique and fixes the order.
+    fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
+        // The join needs only the window seeds' labels and starts.
+        self.seeder.seed_starts_codes_into(tseq, &mut sc.tx);
+        // Hash join on labels: each window seed probes the read's label table. A point is
+        // packed as its read seed's index and its window start: read seeds are in start order,
+        // so sorting the keys sorts the points by (qs, ts), and the rest comes from the seed.
+        sc.keys.clear();
+        for &(label, start) in &sc.tx {
+            let mut i = sc.read_at.get(&label).copied().unwrap_or(u32::MAX);
+            while i != u32::MAX {
+                sc.keys.push((u64::from(i) << 32) | u64::from(start));
+                i = sc.read_next[i as usize];
+            }
+        }
+        sc.keys.sort_unstable();
+        sc.pool.extend(sc.keys.iter().map(|&k| {
+            let r = sc.read[(k >> 32) as usize];
+            let len = r.end - r.start;
+            Pt {
+                qs: r.start,
+                qe: r.end,
+                ts: k as u32,
+                len,
+                w: len as f32,
+            }
+        }));
     }
 
     #[allow(clippy::too_many_arguments)]
     fn rescue_with(
         &self,
         idx: &Index,
+        node_fam: &[u32],
         seq: &[u8],
         base: &[Seed],
         ap: &AnchorParams,
         cp: &ChainParams,
         sc: &mut Scratch,
     ) -> Vec<TxHit> {
-        let anchors = anchor::anchors(idx, base, ap);
         let genes = self.p.max_genes_for(seq.len());
         let all = AnchorParams {
             f_keep: genes,
@@ -217,15 +237,13 @@ impl Rescuer {
             alpha_fam: self.p.alpha,
             ..ap.clone()
         };
-        let cands = anchor::candidates(idx, anchors, &all);
+        let (cands, _) = anchor::select(idx, node_fam, base, &all);
         if cands.is_empty() {
             return Vec::new();
         }
         crate::stats::add(&crate::stats::RESCUE_STRANDS, 1);
         crate::stats::add(&crate::stats::RESCUE_GENES, cands.len() as u64);
-        // Read seeds sorted by label, for merge joins with each transcript's seeds.
-        self.seeder.seed_parsed_into(seq, &mut sc.read, &mut sc.tmp);
-        sc.read.sort_unstable_by_key(|s| (s.label, s.start));
+        self.seed_read(seq, sc);
         let mut hits = Vec::new();
         let plen = seq.len() as i64;
         sc.seen.clear();
@@ -273,7 +291,7 @@ impl Rescuer {
                     None => (0, tlen),
                 };
                 sc.tseq.clear();
-                idx.tx_codes_into(t, lo, hi, &mut sc.tseq, true);
+                idx.tx_codes_into(t, lo, hi, &mut sc.tseq);
                 let key = (xxhash_rust::xxh3::xxh3_64(&sc.tseq), sc.tseq.len() as u32);
                 let r = match sc.seen.get(&key) {
                     Some(&r) => r,
@@ -343,5 +361,70 @@ mod tests {
         assert_eq!(p.max_genes_for(10), GENES_LEN_CAP * p.max_genes);
         let off = RescueParams { genes_len: 0, ..p };
         assert_eq!(off.max_genes_for(10), off.max_genes);
+    }
+
+    /// `points_in` equals a nested-loop join of the read's and the window's seeds on labels.
+    #[test]
+    fn points_in_matches_nested_loop_join() {
+        let r = Rescuer::new(RescueParams::default()).unwrap();
+        let mut x = 0x2545f4914f6cdd1du64;
+        let mut rand = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"ACGT"[(x >> 62) as usize]
+                })
+                .collect()
+        };
+        let mut sc = Scratch::default();
+        for _ in 0..50 {
+            // A window repeating a segment, and a read sharing an excerpt of it and the repeat
+            // amid unrelated sequence: labels match several times on both sides.
+            let mut tseq = rand(2000);
+            let rep = tseq[200..400].to_vec();
+            tseq.extend_from_slice(&rep);
+            let mut read = rand(300);
+            read.extend_from_slice(&tseq[100..1300]);
+            read.extend_from_slice(&rep);
+            read.extend(rand(300));
+            r.seed_read(&read, &mut sc);
+            // Points of earlier windows stay in place.
+            sc.pool.clear();
+            sc.pool.push(Pt {
+                qs: 7,
+                qe: 9,
+                ts: 0,
+                len: 2,
+                w: 2.0,
+            });
+            let codes: Vec<u8> = tseq.iter().map(|&b| lcp_core::encode::CODE[b as usize]).collect();
+            r.points_in(&codes, &mut sc);
+            let got: Vec<_> = sc
+                .pool
+                .iter()
+                .map(|p| (p.qs, p.ts, p.qe, p.len, p.w.to_bits()))
+                .collect();
+            let (rs, ws) = (r.seeder.seed_parsed(&read), r.seeder.seed_parsed(&tseq));
+            let mut want: Vec<_> = rs
+                .iter()
+                .flat_map(|a| {
+                    let len = a.end - a.start;
+                    ws.iter()
+                        .filter(move |b| b.label == a.label)
+                        .map(move |b| (a.start, b.start, a.end, len, (len as f32).to_bits()))
+                })
+                .collect();
+            want.sort_unstable();
+            // Points are unique in (qs, ts), and some seeds match several times on each side.
+            assert!(want.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+            let distinct = |f: fn(&(u32, u32, u32, u32, u32)) -> u32| {
+                want.iter().map(f).collect::<std::collections::HashSet<_>>().len()
+            };
+            assert!(distinct(|p| p.0) < want.len() && distinct(|p| p.1) < want.len());
+            assert_eq!(got[0], (7, 0, 9, 2, 2f32.to_bits()));
+            assert_eq!(got[1..], want[..]);
+        }
     }
 }

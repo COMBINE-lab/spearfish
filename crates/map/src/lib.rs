@@ -1,5 +1,5 @@
 //! Read mapping: seeding both strands, anchor lookup, candidate-gene selection, chaining, and
-//! result extraction (design doc, "Read processing" and "Chaining").
+//! result extraction.
 
 pub mod align;
 pub mod anchor;
@@ -255,12 +255,8 @@ pub struct ReadResult {
     /// Reported transcripts, best first. Near-tied orientations are both reported; each
     /// hit records its own.
     pub hits: Vec<TxHit>,
-    pub anchors: u32,
-    pub candidates: u32,
     /// The best chain spans less than `pi_cov` of the (parsed) read.
     pub low_coverage: bool,
-    /// Transcripts re-ranked by the tie-break (0 if it didn't run).
-    pub tiebreak_size: u32,
     /// The hits come from the hierarchical rescue.
     pub rescued: bool,
     /// With HPC, the read's homopolymer runs, forward orientation: parsed query positions to
@@ -278,7 +274,6 @@ pub struct Mapper<C: Chainer> {
     node_fam: Vec<u32>,
 }
 
-/// One orientation of a read: hits (sorted), the parsed sequence and its base seeds.
 /// A read orientation's raw bases (2-bit codes) and HPC run map, for raw-space read ends.
 struct RawRead {
     codes: Vec<u8>,
@@ -301,8 +296,10 @@ struct SharedBlock {
 
 /// Match complete query intervals; TxHit does not retain seed/unitig identity.
 /// Overlapping intervals can cover one exact block only if their query-to-target
-/// translations agree in every chain. Otherwise no valid anchored segmentation exists.
-/// Adjacent intervals remain separate: a target insertion may lie between them.
+/// translations agree in every chain; an overlapping anchor whose placements disagree, or
+/// one whose targets run backwards in some chain, is dropped. `None` if no (query start,
+/// length) is in every chain. Adjacent intervals remain separate: a target insertion may lie
+/// between them.
 fn shared_blocks(hits: &[TxHit]) -> Option<Vec<SharedBlock>> {
     let first = hits.first()?;
     // Chains are already ordered by query start. Keep one monotone cursor per
@@ -377,6 +374,7 @@ fn shared_blocks(hits: &[TxHit]) -> Option<Vec<SharedBlock>> {
     (!blocks.is_empty()).then_some(blocks)
 }
 
+/// One orientation of a read: hits (sorted), the parsed sequence and its base seeds.
 struct Strand {
     hits: Vec<TxHit>,
     seq: Vec<u8>,
@@ -384,8 +382,6 @@ struct Strand {
     codes: std::cell::OnceCell<Vec<u8>>,
     raw: Option<RawRead>,
     seeds: Vec<seeds::Seed>,
-    anchors: u32,
-    candidates: u32,
 }
 
 /// A strand's `codes`, made from its `seq` on first use (a function of the two fields rather
@@ -397,11 +393,12 @@ fn strand_codes<'a>(codes: &'a std::cell::OnceCell<Vec<u8>>, seq: &[u8]) -> &'a 
 impl<C: Chainer> Mapper<C> {
     /// A mapper seeding exactly as the index was built.
     pub fn new(idx: Arc<Index>, chainer: C, p: MapParams) -> Result<Self> {
+        p.chain.check()?;
         idx.check_compatible()?;
         let spec = idx.meta("spec").context("index lacks its seed spec")?;
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";
         let seeder = BaseSeeder::new(spec, hpc)?;
-        let rescuer = p.rescue.clone().map(|r| Rescuer::new(&idx, r)).transpose()?;
+        let rescuer = p.rescue.clone().map(Rescuer::new).transpose()?;
         let node_fam = anchor::node_families(&idx);
         Ok(Mapper {
             node_fam,
@@ -493,14 +490,16 @@ impl<C: Chainer> Mapper<C> {
             let mut rep = members[0];
             if members.len() > 1 {
                 let sub: Vec<TxHit> = members.iter().map(|&i| hits[i].clone()).collect();
-                // Members share a complete interval; inconsistent placements may still fall back.
-                if let Some((cost, unit)) = self.segmented(tb, codes, raw, &sub) {
-                    let cmin = *cost.iter().min().unwrap();
-                    for (k, &i) in members.iter().enumerate() {
-                        penalty[i] = unit * (cost[k] - cmin) as f32;
-                    }
-                    rep = members[cost.iter().position(|&c| c == cmin).unwrap()];
+                // Members share an anchor (the group's set is the intersection of theirs), so
+                // `shared_blocks` always finds a block.
+                let (cost, unit) = self
+                    .segmented(tb, codes, raw, &sub)
+                    .expect("group members share an anchor");
+                let cmin = *cost.iter().min().unwrap();
+                for (k, &i) in members.iter().enumerate() {
+                    penalty[i] = unit * (cost[k] - cmin) as f32;
                 }
+                rep = members[cost.iter().position(|&c| c == cmin).unwrap()];
             }
             reps.push(rep);
         }
@@ -533,7 +532,17 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Distances of `read` against several texts with a shared band: the first is exact,
-    /// later ones are capped at (best so far + `cap`) + 1. `distinct`: no text repeats.
+    /// later ones are capped at (best so far + `cap`) + 1, as one [`align::distance_with`]
+    /// call per text in order would give them. `distinct`: no text repeats, so the texts are
+    /// not hashed to find repeats.
+    ///
+    /// Identical texts (isoforms agreeing over the region) are aligned once: the band only
+    /// tightens (k = best so far + cap), so a repeat's result is the first occurrence's
+    /// re-capped at the current k. Distinct texts are aligned in batches of eight
+    /// ([`align::batch_distances`]) with the threshold in force at each batch's first text:
+    /// later texts' thresholds are no larger (the best only falls), so a batch result is exact
+    /// wherever the sequential pass's would be, and re-capping it at each text's own threshold,
+    /// in order, gives the sequential results exactly.
     fn banded<T: AsRef<[u8]>>(
         read: &[u8],
         texts: &[T],
@@ -541,59 +550,28 @@ impl<C: Chainer> Mapper<C> {
         cap: u32,
         distinct: bool,
     ) -> Vec<u32> {
-        // Identical texts (isoforms agreeing over the region) are aligned once. The band only
-        // tightens (k = best so far + cap), so a repeat's result is the first occurrence's
-        // re-capped at the current k: exact if d <= k, else k + 1, as a fresh call returns.
-        let pat = align::Pattern::new(read);
-        if mode == align::Mode::Infix {
-            return Self::banded_infix(&pat, read.len(), texts, cap);
-        }
-        let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
-        let mut best = u32::MAX;
-        texts
-            .iter()
-            .map(|t| {
-                let t = t.as_ref();
-                let k = best.saturating_add(cap);
-                if !distinct && let Some(&d) = seen.get(t) {
-                    return if d <= k { d } else { k.saturating_add(1) };
-                }
-                stats::add(&stats::MYERS_CALLS, 1);
-                stats::add(
-                    &stats::MYERS_CELLS,
-                    (read.len() as u64).div_ceil(64) * t.len() as u64,
-                );
-                let d = align::distance_with(&pat, t, mode, k).unwrap_or(k.saturating_add(1));
-                best = best.min(d);
-                if !distinct {
-                    seen.insert(t, d);
-                }
-                d
-            })
-            .collect()
-    }
-
-    /// [`Self::banded`] in infix mode, aligning distinct texts in batches of eight
-    /// ([`align::infix_distances`]) with the threshold in force at each batch's first text:
-    /// later texts' thresholds are no larger (the best only falls), so a batch result is exact
-    /// wherever the sequential pass's would be, and re-capping it at each text's own threshold,
-    /// in order, gives the sequential results exactly.
-    fn banded_infix<T: AsRef<[u8]>>(pat: &align::Pattern, m: usize, texts: &[T], cap: u32) -> Vec<u32> {
+        let (pat, m) = (align::Pattern::new(read), read.len());
         // Each text's distinct-text index, and the distinct texts in first-occurrence order.
-        let mut first: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
-        let mut uniq: Vec<&[u8]> = Vec::new();
+        let mut uniq: Vec<&[u8]> = Vec::with_capacity(texts.len());
         let mut at: Vec<usize> = Vec::new();
-        let id: Vec<u32> = texts
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                *first.entry(t.as_ref()).or_insert_with(|| {
-                    uniq.push(t.as_ref());
-                    at.push(i);
-                    uniq.len() as u32 - 1
+        let id: Vec<u32> = if distinct {
+            uniq.extend(texts.iter().map(|t| t.as_ref()));
+            at.extend(0..texts.len());
+            (0..texts.len() as u32).collect()
+        } else {
+            let mut first: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    *first.entry(t.as_ref()).or_insert_with(|| {
+                        uniq.push(t.as_ref());
+                        at.push(i);
+                        uniq.len() as u32 - 1
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
         // Batch results (exact when within the batch's threshold), then the sequential values.
         let mut raw: Vec<Option<u32>> = Vec::with_capacity(uniq.len());
         let mut val = vec![0u32; uniq.len()];
@@ -614,7 +592,7 @@ impl<C: Chainer> Mapper<C> {
                     stats::add(&stats::MYERS_CALLS, 1);
                     stats::add(&stats::MYERS_CELLS, (m as u64).div_ceil(64) * t.len() as u64);
                 }
-                raw.extend(align::infix_distances(pat, batch, k));
+                raw.extend(align::batch_distances(&pat, batch, mode, k));
             }
             let d = match raw[u] {
                 Some(d) if d <= k => d,
@@ -774,8 +752,8 @@ impl<C: Chainer> Mapper<C> {
     /// shared anchors are aligned globally, but only where the candidates' transcript
     /// sequences differ (identical segments cost every candidate the same); the read ends are
     /// aligned against windows anchored at the outermost shared anchors. Anchor bases are
-    /// excluded from every DP slice. `None` if no complete query interval is shared or if
-    /// the placements cannot form consistent, ordered shared blocks.
+    /// excluded from every DP slice. `None` if no anchor (query start, length) is shared by
+    /// every candidate.
     fn segmented(
         &self,
         tb: &TieBreak,
@@ -1172,7 +1150,7 @@ impl<C: Chainer> Mapper<C> {
 
     fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>), salt: u64) -> Strand {
         let seeds = self.seeder.seed_parsed(&seq);
-        let (mut cands, n_anchors) = anchor::select(&self.idx, &self.node_fam, &seeds, &self.p.anchor);
+        let (mut cands, _) = anchor::select(&self.idx, &self.node_fam, &seeds, &self.p.anchor);
         if self.p.merge_collinear {
             for c in &mut cands {
                 anchor::merge_collinear(&self.idx, c);
@@ -1189,8 +1167,6 @@ impl<C: Chainer> Mapper<C> {
             codes: Default::default(),
             raw: raw_read,
             seeds,
-            anchors: n_anchors,
-            candidates: cands.len() as u32,
         }
     }
 
@@ -1303,8 +1279,6 @@ impl<C: Chainer> Mapper<C> {
             codes: Default::default(),
             raw: p.1,
             seeds: Vec::new(),
-            anchors: 0,
-            candidates: 0,
         };
         // Equal scores are ordered by a hash of the transcript salted with the read, so ties
         // are broken the same way on every run without favouring the same transcript.
@@ -1330,7 +1304,14 @@ impl<C: Chainer> Mapper<C> {
         if let Some(r) = &self.rescuer
             && Self::span_frac(st.hits.first(), st.seq.len()) < self.p.pi_cov
         {
-            let mut a = r.rescue(&self.idx, &st.seq, &st.seeds, &self.p.anchor, &self.p.chain);
+            let mut a = r.rescue(
+                &self.idx,
+                &self.node_fam,
+                &st.seq,
+                &st.seeds,
+                &self.p.anchor,
+                &self.p.chain,
+            );
             // The other orientation is re-seeded only if its base-level best comes within
             // `other_margin` of this one's (None: always).
             let try_other = match r.p.other_margin {
@@ -1338,7 +1319,14 @@ impl<C: Chainer> Mapper<C> {
                 Some(m) => other.hits.first().is_some_and(|o| o.score >= best(&st.hits) - m),
             };
             let mut b = if try_other {
-                r.rescue(&self.idx, &other.seq, &other.seeds, &self.p.anchor, &self.p.chain)
+                r.rescue(
+                    &self.idx,
+                    &self.node_fam,
+                    &other.seq,
+                    &other.seeds,
+                    &self.p.anchor,
+                    &self.p.chain,
+                )
             } else {
                 Vec::new()
             };
@@ -1360,21 +1348,20 @@ impl<C: Chainer> Mapper<C> {
             }
         }
         let plen = st.seq.len() as u32;
-        let mut tiebreak_size = 0;
         let mut both = false;
         if let Some(tb) = &self.p.tiebreak {
             let margin = |s: f32| tb.margin_abs.max(tb.orient_margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
             let codes = || strand_codes(&st.codes, &st.seq);
-            tiebreak_size = self.tiebreak(tb, codes, st.raw.as_ref(), &mut st.hits, salt);
+            self.tiebreak(tb, codes, st.raw.as_ref(), &mut st.hits, salt);
             if both {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
                 let codes = || strand_codes(&other.codes, &other.seq);
-                tiebreak_size += self.tiebreak(tb, codes, other.raw.as_ref(), &mut other.hits, salt);
+                self.tiebreak(tb, codes, other.raw.as_ref(), &mut other.hits, salt);
                 let (qa, qb) = (
                     strand_codes(&st.codes, &st.seq),
                     strand_codes(&other.codes, &other.seq),
@@ -1446,10 +1433,7 @@ impl<C: Chainer> Mapper<C> {
             plen,
             reverse,
             hits,
-            anchors: st.anchors,
-            candidates: st.candidates,
             low_coverage,
-            tiebreak_size,
             rescued,
             // `st` is the orientation `reverse` names (swapped together), `other` the opposite.
             hpc: if reverse { other.raw } else { st.raw }.map(|r| r.hpc),
@@ -1540,6 +1524,120 @@ fn tie_key(salt: u64, tx: u32) -> u64 {
 }
 
 #[cfg(test)]
+mod banded_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The sequential definition of [`Mapper::banded`]: one `distance_with` per distinct text,
+    /// in order, at the threshold `k` = best so far + `cap`; a repeated text takes its first
+    /// occurrence's distance re-capped at the current `k`.
+    fn sequential<T: AsRef<[u8]>>(read: &[u8], texts: &[T], mode: align::Mode, cap: u32) -> Vec<u32> {
+        let pat = align::Pattern::new(read);
+        let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
+        let mut best = u32::MAX;
+        texts
+            .iter()
+            .map(|t| {
+                let t = t.as_ref();
+                let k = best.saturating_add(cap);
+                if let Some(&d) = seen.get(t) {
+                    return if d <= k { d } else { k.saturating_add(1) };
+                }
+                let d = align::distance_with(&pat, t, mode, k).unwrap_or(k.saturating_add(1));
+                best = best.min(d);
+                seen.insert(t, d);
+                d
+            })
+            .collect()
+    }
+
+    /// `s` with substitutions (kind 0), insertions (1) and deletions (2) at positions taken
+    /// modulo its length.
+    fn mutate(s: &[u8], edits: &[(usize, u8, u8)]) -> Vec<u8> {
+        let mut v = s.to_vec();
+        for &(pos, b, kind) in edits {
+            if v.is_empty() {
+                if kind == 1 {
+                    v.push(b);
+                }
+                continue;
+            }
+            let i = pos % v.len();
+            match kind {
+                0 => v[i] = b,
+                1 => v.insert(i, b),
+                _ => {
+                    v.remove(i);
+                }
+            }
+        }
+        v
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// `banded` (distinct texts in batches, re-capped in order) equals the sequential
+        /// definition in every mode at every SIMD level, and so does `distinct` on the texts
+        /// without their repeats: texts are mutated excerpts of the read's source (as isoform
+        /// regions are), some empty or unrelated, with repeats, and caps range from 0 to near
+        /// `u32::MAX` (where `k` saturates).
+        #[test]
+        fn banded_matches_sequential(
+            base in prop::collection::vec(0u8..4, 0..300),
+            read_edits in prop::collection::vec((0usize..300, 0u8..4, 0u8..3), 0..30),
+            variants in prop::collection::vec(
+                (
+                    prop::collection::vec((0usize..300, 0u8..4, 0u8..3), 0..40),
+                    0usize..40,
+                    0usize..40,
+                    any::<bool>(),
+                ),
+                1..24,
+            ),
+            repeats in prop::collection::vec((0usize..64, 0usize..64), 0..8),
+            cap in prop_oneof![0u32..6, 6u32..40, (u32::MAX - 3)..=u32::MAX],
+        ) {
+            let read = mutate(&base, &read_edits);
+            let mut texts: Vec<Vec<u8>> = variants
+                .iter()
+                .map(|(edits, a, b, unrelated)| {
+                    if *unrelated {
+                        edits.iter().map(|e| e.1).collect()
+                    } else {
+                        let t = mutate(&base, edits);
+                        let lo = (*a).min(t.len());
+                        let hi = t.len().saturating_sub(*b).max(lo);
+                        t[lo..hi].to_vec()
+                    }
+                })
+                .collect();
+            for (from, to) in repeats {
+                let t = texts[from % texts.len()].clone();
+                texts.insert(to % (texts.len() + 1), t);
+            }
+            // The texts without repeats (first occurrences, in order), for `distinct`.
+            let mut once = rustc_hash::FxHashSet::default();
+            let uniq: Vec<&[u8]> = texts.iter().map(|t| t.as_slice()).filter(|t| once.insert(*t)).collect();
+            for mode in [align::Mode::Global, align::Mode::Prefix, align::Mode::Infix] {
+                let want = sequential(&read, &texts, mode, cap);
+                let want_uniq = sequential(&read, &uniq, mode, cap);
+                for level in lcp_core::simd::supported() {
+                    let got = align::at_level(level, || {
+                        Mapper::<OracleChainer>::banded(&read, &texts, mode, cap, false)
+                    });
+                    prop_assert_eq!(&got, &want, "{:?} at {}", mode, level);
+                    let got = align::at_level(level, || {
+                        Mapper::<OracleChainer>::banded(&read, &uniq, mode, cap, true)
+                    });
+                    prop_assert_eq!(&got, &want_uniq, "{:?} at {} (distinct)", mode, level);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod segmented_tests {
     use super::*;
 
@@ -1558,7 +1656,7 @@ mod segmented_tests {
             })
             .collect();
         let (data, _) = index::build(
-            &txs,
+            txs,
             &index::BuildParams {
                 spec: "lcp:K=3".into(),
                 hpc,
@@ -1570,7 +1668,7 @@ mod segmented_tests {
         )
         .unwrap();
         Mapper::new(
-            Arc::new(Index::from_bytes(&data.to_bytes()).unwrap()),
+            Arc::new(Index::from_data(&data).unwrap()),
             OracleChainer {
                 p: Default::default(),
             },

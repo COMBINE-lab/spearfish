@@ -10,6 +10,8 @@ publish.workspace = true
 [[bin]]
 name = "spearfish"
 path = "src/main.rs"
+# `cargo doc` would write the binary's pages over the library's (both are `spearfish`).
+doc = false
 
 [dependencies]
 spearfish.workspace = true
@@ -19,7 +21,6 @@ mimalloc.workspace = true
 clap.workspace = true
 lcp-core.workspace = true
 paraseq.workspace = true
-flate2.workspace = true
 rustc-hash.workspace = true
 rayon.workspace = true
 index.workspace = true
@@ -33,6 +34,3 @@ log.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
 libc = "0.2"
-
-[dev-dependencies]
-serde_json.workspace = true

@@ -37,6 +37,10 @@ fn map_toy_reads() {
     let drna = Mapper::new(index.clone(), &MapOptions::preset(Preset::Drna)).unwrap();
     let (_, _, seq) = &txs[0];
     assert!(drna.map(&revcomp(seq)).hits.iter().all(|h| !h.reverse));
+    // Chain limits set directly, without settings resolution, are checked too.
+    let mut opts = MapOptions::preset(Preset::Ont);
+    opts.params.chain.g_max = 3_000_000_000;
+    assert!(Mapper::new(index.clone(), &opts).is_err());
 }
 
 /// A read that spells T partly as U (either case) maps as its DNA spelling does, query span
