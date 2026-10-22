@@ -1513,7 +1513,7 @@ mod segmented_tests {
             })
             .collect();
         let (data, _) = index::build(
-            &txs,
+            txs,
             &index::BuildParams {
                 spec: "lcp:K=3".into(),
                 hpc,
@@ -1525,7 +1525,7 @@ mod segmented_tests {
         )
         .unwrap();
         Mapper::new(
-            Arc::new(Index::from_bytes(&data.to_bytes()).unwrap()),
+            Arc::new(Index::from_data(&data).unwrap()),
             OracleChainer {
                 p: Default::default(),
             },

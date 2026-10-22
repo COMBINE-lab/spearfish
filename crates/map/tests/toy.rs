@@ -53,7 +53,7 @@ fn mutate(seq: &[u8], rate: f64, mut x: u64) -> Vec<u8> {
 fn check(spec: &str, rate: f64) {
     let txs = toy();
     let (data, _) = build(
-        &txs,
+        txs.clone(),
         &BuildParams {
             spec: spec.into(),
             hpc: true,
@@ -64,7 +64,7 @@ fn check(spec: &str, rate: f64) {
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let mapper = Mapper::new(
         idx.clone(),
         OracleChainer {
@@ -137,7 +137,7 @@ fn antisense_overlap_reports_both_orientations() {
         },
     ];
     let (data, _) = build(
-        &txs,
+        txs,
         &BuildParams {
             spec: "lcp:K=3".into(),
             hpc: true,
@@ -148,7 +148,7 @@ fn antisense_overlap_reports_both_orientations() {
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let mapper = Mapper::new(
         idx.clone(),
         OracleChainer {

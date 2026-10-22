@@ -73,6 +73,11 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- `spearfish index` builds about a third faster with about a third less peak memory
+  (GENCODE with spike-ins, 32 threads): node keys are deduplicated within genes before the
+  global sort, unitig chains are followed in parallel, and the transcript sequences are freed
+  once seeded. Building an index in memory (`Index::build`, as oarfish does from a FASTA) lays
+  the image out once instead of copying it twice. Index sections are byte-identical.
 
 ### Fixes
 
@@ -121,6 +126,12 @@
 - `spearfish quant` keeps the RAD file when oarfish fails and names it, so `oarfish -a` can be
   rerun without mapping again; with `-v` the error no longer points to a log file that was not
   written (oarfish logs to stderr then).
+- A damaged raw-sequence section made an index load as one without raw sequence (which
+  changes mapping output), and sections of mismatched sizes loaded and then panicked while
+  mapping. Loading now fails with the section's name.
+- Index writing staged the file at the output's name with its extension replaced by `.tmp`, so
+  builds to `x.lcp` and `x.mm` at the same time shared one temporary file, and an unrelated
+  `x.tmp` was moved away. It now stages to `<output>.partial-<pid>` and removes it on failure.
 
 ### Other
 
