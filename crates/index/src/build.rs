@@ -402,11 +402,26 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
             0
         }
     };
-    let mut keys: Vec<(u64, u32)> = seeded
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(t, s)| s.seeds.iter().map(move |x| (x.label, scope(t))))
+    // Isoforms of a gene share most seeds: dedup the keys of runs of transcripts in gene order
+    // before the global sort (fixed-size runs, so one huge gene still splits across threads).
+    let mut by_gene: Vec<u32> = (0..txs.len() as u32).collect();
+    by_gene.sort_by_key(|&t| tx_gene[t as usize]);
+    let mut keys: Vec<(u64, u32)> = by_gene
+        .par_chunks(256)
+        .flat_map_iter(|ts| {
+            let mut k: Vec<(u64, u32)> = ts
+                .iter()
+                .flat_map(|&t| {
+                    let t = t as usize;
+                    seeded[t].seeds.iter().map(move |x| (x.label, scope(t)))
+                })
+                .collect();
+            k.sort_unstable();
+            k.dedup();
+            k
+        })
         .collect();
+    drop(by_gene);
     keys.par_sort_unstable();
     keys.dedup();
     if keys.len() > MAX_NODES {
