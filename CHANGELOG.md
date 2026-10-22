@@ -113,6 +113,10 @@
   read had no tail. The search now goes on past such runs, for tail trimming, `--tail-bonus`
   and `--orient-tail`. 0.1-0.35% of real reads change mapping; simulated and spike-in accuracy
   are unchanged.
+- On indexes built with `--no-hpc`, poly(A) tails were never found, so `--tail-trim`,
+  `--tail-bonus` and `--orient-tail` did nothing. On such an index, simulated ONT reads with
+  tails and adapters now reach 99.01% top-1 instead of 98.35%, and SIRV E2 Spearman on ONT
+  PCR-cDNA rises from 0.706 to 0.758. HPC indexes are unaffected.
 
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that

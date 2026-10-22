@@ -91,7 +91,8 @@ pub struct TieBreak {
     /// isoforms whose ends differ by a few bases).
     pub flank_min: i64,
     /// Shortest poly(A) tail recognized: a window this long with at most one base not A,
-    /// followed by at most `TAIL_AFTER` read bases.
+    /// followed by at most `TAIL_AFTER` read bases. Tails are searched for in the raw read,
+    /// which without HPC is the parsed one.
     pub tail_run: usize,
     /// Near-tied read orientations: points for the orientation whose raw read ends in a poly(A)
     /// tail (the molecule's 3' end) over one that doesn't. Where a transcript's sequence lies
@@ -1086,12 +1087,17 @@ impl<C: Chainer> Mapper<C> {
                 .collect()
         };
         let tail = match raw {
-            Some(r) if tb.tail_trim || tb.tail_bonus > 0 => {
+            _ if !tb.tail_trim && tb.tail_bonus <= 0 => None,
+            Some(r) => {
                 let (r0, r1) = (r.pos(ql), r.pos(last.query.end));
                 tail_start(&r.codes[r1..], a_code, tb.tail_run)
-                    .map(|(c, e)| (r, r0, r1 - r0 + c, r1 - r0 + e))
+                    .map(|(c, e)| (Some(r), r0, r1 - r0 + c, r1 - r0 + e))
             }
-            _ => None,
+            // Without HPC the parsed read is the raw read (and `ql` the last block's end).
+            None if !self.seeder.hpc => {
+                tail_start(&codes[ql as usize..], a_code, tb.tail_run).map(|(c, e)| (None, ql as usize, c, e))
+            }
+            None => None,
         };
         let short: Vec<bool> = spans
             .iter()
@@ -1122,8 +1128,10 @@ impl<C: Chainer> Mapper<C> {
                     }
                     (lo - ql) as usize
                 };
-                let cut = tail.map_or((plen - ql) as usize, |(r, r0, c, _)| parsed(r0 + c, r));
-                let run_end = tail.map_or(cut, |(r, r0, _, e)| parsed(r0 + e, r));
+                let cut = tail.map_or((plen - ql) as usize, |(r, r0, c, _)| {
+                    r.map_or(c, |r| parsed(r0 + c, r))
+                });
+                let run_end = tail.map_or(cut, |(r, r0, _, e)| r.map_or(e, |r| parsed(r0 + e, r)));
                 let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
                 let read = &codes[ql as usize..];
                 let read = if tb.tail_trim { &read[..cut] } else { read };
@@ -1381,10 +1389,13 @@ impl<C: Chainer> Mapper<C> {
                 // poly(A) tail where one orientation shows it and the other doesn't.
                 let mut lead = unit * (cb - ca) as f32;
                 if tb.orient_tail > 0 {
-                    let tailed = |r: Option<&RawRead>| r.is_some_and(|r| ends_in_tail(&r.codes, tb.tail_run));
+                    // Without HPC the parsed read is the raw read.
+                    let tailed = |s: &Strand| match &s.raw {
+                        Some(r) => ends_in_tail(&r.codes, tb.tail_run),
+                        None => !self.seeder.hpc && ends_in_tail(&codes(&s.seq), tb.tail_run),
+                    };
                     lead += tb.orient_tail as f32
-                        * (f32::from(u8::from(tailed(st.raw.as_ref())))
-                            - f32::from(u8::from(tailed(other.raw.as_ref()))));
+                        * (f32::from(u8::from(tailed(&st))) - f32::from(u8::from(tailed(&other))));
                 }
                 if lead < 0.0 {
                     std::mem::swap(&mut st, &mut other);
@@ -1738,22 +1749,26 @@ mod segmented_tests {
         // t1 continues past t0's 3' end; the read stops there and goes on into its tail.
         let body: &[u8] = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
         let t1: Vec<u8> = [body, b"GCTCGTCGTCAGCTCGTCGATCGCT"].concat();
-        let m = mapper(&[body, &t1], true);
         let q: Vec<u8> = [body, b"AAAAAAAAAAAAAAAAAAAAAAAA", b"GTCGCTCGTGCA"].concat();
-        let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &q);
-        let n = 30;
-        let hits = [hit(0, 10., &[(0, 0, n)]), hit(1, 10., &[(0, 0, n)])];
-        let cost = |tail_bonus| {
-            let tb = TieBreak {
-                tail_bonus,
-                ..Default::default()
+        // Without HPC there is no separate raw read: the tail is found in the parsed one.
+        for hpc in [true, false] {
+            let m = mapper(&[body, &t1], hpc);
+            let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &q);
+            assert_eq!(raw.is_some(), hpc);
+            let n = 30;
+            let hits = [hit(0, 10., &[(0, 0, n)]), hit(1, 10., &[(0, 0, n)])];
+            let cost = |tail_bonus| {
+                let tb = TieBreak {
+                    tail_bonus,
+                    ..Default::default()
+                };
+                m.segmented(&tb, &codes(&seq), raw.as_ref(), &hits).unwrap().0
             };
-            m.segmented(&tb, &codes(&seq), raw.as_ref(), &hits).unwrap().0
-        };
-        let (off, on) = (cost(0), cost(10));
-        assert_eq!(off[0], off[1]);
-        assert_eq!(on[0], off[0] - 10);
-        assert_eq!(on[1], off[1]);
+            let (off, on) = (cost(0), cost(10));
+            assert_eq!(off[0], off[1]);
+            assert_eq!(on[0], off[0] - 10);
+            assert_eq!(on[1], off[1]);
+        }
     }
 
     #[test]
