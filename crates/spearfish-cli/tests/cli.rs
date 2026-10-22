@@ -480,3 +480,120 @@ fn em_skips_low_coverage_reads_with_other_flags() {
     assert_eq!(counts["TOYT0000002"], 0.0);
     assert_eq!(counts["TOYT0000003"], 1.0);
 }
+
+/// The toy transcripts with Ensembl-style headers (`>TOYT0000001 cdna gene:TOYG0000001`): the
+/// ID ends at the first whitespace.
+fn described_toy(path: &std::path::Path) {
+    let fa: String = std::fs::read_to_string(toy())
+        .unwrap()
+        .lines()
+        .map(|l| match l.strip_prefix('>') {
+            Some(id) => {
+                let f: Vec<&str> = id.split('|').collect();
+                format!(">{} cdna gene:{}\n", f[0], f[1])
+            }
+            None => format!("{l}\n"),
+        })
+        .collect();
+    std::fs::write(path, fa).unwrap();
+}
+
+/// simulate, em and halo name transcripts as the index does when headers carry descriptions.
+#[test]
+fn description_headers_name_transcripts_like_the_index() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("described");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fa = dir.join("transcripts.fa");
+    described_toy(&fa);
+    let run = |args: &[&std::ffi::OsStr]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stderr).unwrap()
+    };
+    let toy_names: std::collections::HashSet<String> = (1..=6).map(|i| format!("TOYT000000{i}")).collect();
+
+    // simulate: read names are r<i>|<transcript>|<strand>|<start>|<end>, and the truth names
+    // are the index's names.
+    let (reads, truth) = (dir.join("reads.fa"), dir.join("truth.tsv"));
+    run(&[
+        "simulate".as_ref(),
+        fa.as_os_str(),
+        "-n".as_ref(),
+        "20".as_ref(),
+        "-o".as_ref(),
+        reads.as_os_str(),
+        "--truth".as_ref(),
+        truth.as_os_str(),
+    ]);
+    for l in std::fs::read_to_string(&reads).unwrap().lines() {
+        if let Some(id) = l.strip_prefix('>') {
+            let f: Vec<&str> = id.split('|').collect();
+            assert!(f.len() == 5 && toy_names.contains(f[1]), "{id}");
+        }
+    }
+    let truth_names: std::collections::HashSet<String> = std::fs::read_to_string(&truth)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(truth_names, toy_names);
+
+    // em: hits name the index's transcripts, which must be found.
+    let (map, quant) = (dir.join("map.tsv"), dir.join("quant.tsv"));
+    let line = |r: &str, t: &str| format!("{r}\t1000\t+\t0\t{t}\t100.00\t0\t1000\t0\t1000\t10\t500\t0\t-\n");
+    std::fs::write(
+        &map,
+        [
+            "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n".to_string(),
+            line("r1", "TOYT0000001"),
+            line("r2", "TOYT0000003"),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let log = run(&[
+        "em".as_ref(),
+        fa.as_os_str(),
+        map.as_os_str(),
+        "-o".as_ref(),
+        quant.as_os_str(),
+    ]);
+    assert!(
+        log.contains("2 reads used") && log.contains(" 0 hits to unknown"),
+        "{log}"
+    );
+    let counts: std::collections::HashMap<String, f64> = std::fs::read_to_string(&quant)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0].to_string(), f[2].parse().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        counts.keys().cloned().collect::<std::collections::HashSet<_>>(),
+        toy_names
+    );
+    assert_eq!((counts["TOYT0000001"], counts["TOYT0000003"]), (1.0, 1.0));
+
+    // halo: every transcript is found in the GTF.
+    let log = run(&[
+        "halo".as_ref(),
+        fa.as_os_str(),
+        toy().with_file_name("annotation.gtf").as_os_str(),
+        "-s".as_ref(),
+        "lcp:K=3".as_ref(),
+        "--hpc".as_ref(),
+        "off".as_ref(),
+        "-t".as_ref(),
+        "2".as_ref(),
+        "-o".as_ref(),
+        dir.join("halo").as_os_str(),
+    ]);
+    assert!(log.contains("6 transcripts (0 not in GTF"), "{log}");
+}

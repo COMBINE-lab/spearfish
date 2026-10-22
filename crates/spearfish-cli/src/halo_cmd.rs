@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use paraseq::{ReaderBuilder, Record};
 use rayon::prelude::*;
 
 use crate::annot::{Segments, TxModel, exonic_in, read_gtf, sym_diff};
@@ -31,7 +30,8 @@ use crate::sim::{profile, simulate};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Transcript FASTA (GENCODE headers: `tx|gene|...`).
+    /// Transcript FASTA; names are the IDs up to the first '|' or whitespace, as the index
+    /// takes them (GENCODE headers: `tx|gene|...`), and must match the GTF's transcript_id.
     transcripts: PathBuf,
     /// Matching GTF (exon records).
     gtf: PathBuf,
@@ -343,27 +343,20 @@ pub fn run(args: Args) -> Result<()> {
     let models = read_gtf(&args.gtf)?;
     let mut genes: HashMap<String, Vec<Tx>> = HashMap::new();
     let (mut missing, mut mismatched) = (0, 0);
-    let mut reader = ReaderBuilder::path(&args.transcripts).build()?;
-    let mut rset = reader.new_record_set();
-    while rset.fill(&mut reader)? {
-        for rec in rset.iter() {
-            let rec = rec?;
-            let id = rec.id_str().split('|').next().unwrap().to_string();
-            let Some(model) = models.get(&id) else {
-                missing += 1;
-                continue;
-            };
-            let seq = rec.seq().into_owned();
-            if model.len() != seq.len() as u64 {
-                mismatched += 1;
-                continue;
-            }
-            genes.entry(model.gene.clone()).or_default().push(Tx {
-                id,
-                seq,
-                model: model.clone(),
-            });
+    for (id, _, seq) in spearfish::read_transcripts(&args.transcripts)? {
+        let Some(model) = models.get(&id) else {
+            missing += 1;
+            continue;
+        };
+        if model.len() != seq.len() as u64 {
+            mismatched += 1;
+            continue;
         }
+        genes.entry(model.gene.clone()).or_default().push(Tx {
+            id,
+            seq,
+            model: model.clone(),
+        });
     }
     eprintln!(
         "halo: {} genes, {} transcripts ({missing} not in GTF, {mismatched} length mismatches), loaded in {:.1} s",
