@@ -535,10 +535,10 @@ unsafe fn pred_scores_neon(
     );
 }
 
-/// [`max_score`] of `xs` and the first position equal to it, in one NEON pass: each lane keeps
-/// its maximum and where it first reached it (strictly greater values replace it), and the
-/// lowest position among the lanes at the overall maximum is the first one. The maximum is
-/// [`max_score`]'s up to the sign of a zero, which `==` ignores.
+/// The maximum of `xs` (never NaN) and the first position equal to it, in one NEON pass: each
+/// lane keeps its maximum and where it first reached it (strictly greater values replace it),
+/// and the lowest position among the lanes at the overall maximum is the first one. The
+/// maximum is the in-order maximum up to the sign of a zero, which `==` ignores.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn max_first_neon(xs: &[f32]) -> (f32, usize) {
