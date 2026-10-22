@@ -82,6 +82,13 @@ pub fn threads(requested: usize) -> usize {
     }
 }
 
+/// `path` with `suffix` appended to its last component (`x.tsv` -> `x.tsv.meta.json`).
+pub fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    s.into()
+}
+
 /// Write `value` as pretty JSON to `path`.
 pub fn write_json(path: &std::path::Path, value: &impl Serialize) -> anyhow::Result<()> {
     let mut s = serde_json::to_string_pretty(value)?;

@@ -480,3 +480,73 @@ fn em_skips_low_coverage_reads_with_other_flags() {
     assert_eq!(counts["TOYT0000002"], 0.0);
     assert_eq!(counts["TOYT0000003"], 1.0);
 }
+
+/// `quant` maps to RAD and runs oarfish on it (here a stand-in script that records its
+/// arguments), removing the RAD file only if oarfish succeeds.
+#[cfg(unix)]
+#[test]
+fn quant_runs_oarfish() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("quant");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (idx, oarfish, argv) = (
+        dir.join("quant_toy.sfi"),
+        dir.join("oarfish"),
+        dir.join("oarfish_argv.txt"),
+    );
+    std::fs::write(
+        &oarfish,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         --help) echo 'mappers: rammap, spearfish'; exit 0;;\n\
+         --version) echo 'oarfish 0'; exit 0;;\n\
+         esac\n\
+         printf '%s\\n' \"$@\" > \"$FAKE_OARFISH_ARGV\"\n\
+         exit \"${FAKE_OARFISH_STATUS:-0}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&oarfish, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .args(["-q", "index"])
+        .arg(toy())
+        .arg("-o")
+        .arg(&idx)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let prefix = dir.join("out");
+    let quant = |status: &str| {
+        Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(["-q", "quant"])
+            .arg(&idx)
+            .arg(toy())
+            .arg("-o")
+            .arg(&prefix)
+            .args(["-t", "2", "--oarfish"])
+            .arg(&oarfish)
+            .args(["--", "--extra"])
+            .env("FAKE_OARFISH_ARGV", &argv)
+            .env("FAKE_OARFISH_STATUS", status)
+            .output()
+            .unwrap()
+    };
+    let with = |s: &str| format!("{}{s}", prefix.display());
+    let rad = with(".rad");
+
+    let o = quant("0");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let args = std::fs::read_to_string(&argv).unwrap();
+    let want = ["-a", &rad, "-o", &with(""), "-j", "2", "--quiet", "--extra"];
+    assert_eq!(args.lines().collect::<Vec<_>>(), want);
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(with(".map.meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["kind"], "spearfish-map-run");
+    assert!(!std::path::Path::new(&rad).exists(), "the RAD file is removed");
+
+    // oarfish fails: the RAD file is kept, and the error says where.
+    let o = quant("1");
+    assert!(!o.status.success());
+    assert!(std::path::Path::new(&rad).exists(), "the RAD file is kept");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains(&rad), "{err}");
+}

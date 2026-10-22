@@ -118,6 +118,9 @@
   or `spearfish em`, an output that can't be created). `spearfish index --write-t2g` and
   `--t2g`, and `spearfish em -o`, fail on a bad path before the index build or the EM rather
   than after it.
+- `spearfish quant` keeps the RAD file when oarfish fails and names it, so `oarfish -a` can be
+  rerun without mapping again; with `-v` the error no longer points to a log file that was not
+  written (oarfish logs to stderr then).
 
 ### Other
 
