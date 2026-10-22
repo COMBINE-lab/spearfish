@@ -38,6 +38,9 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # oarfish builds the library with default-features = false; keep that build compiling.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --locked -p spearfish --no-default-features --all-targets -- -D warnings
       - if: matrix.os == 'ubuntu-latest'
         run: cargo doc --locked --no-deps --workspace
         env:

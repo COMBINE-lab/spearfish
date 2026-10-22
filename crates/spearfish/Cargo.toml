@@ -27,5 +27,10 @@ default = ["fasta"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
 fasta = ["dep:paraseq", "dep:flate2"]
 
+# Reads transcripts from FASTA; skipped in builds without the feature.
+[[test]]
+name = "api"
+required-features = ["fasta"]
+
 [dev-dependencies]
 lcp-core.workspace = true
