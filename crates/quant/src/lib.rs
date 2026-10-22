@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct QuantParams {
-    /// Score denominator D in exp((s - s_max) / D). The default, 5, was oarfish's for
-    /// minimap2 alignment scores; `spearfish em` uses 2 and oarfish D = 1 for spearfish's
-    /// scores (`spearfish::SCORE_DENOM`).
+    /// Score denominator D in exp((s - s_max) / D). The default, 2, is `spearfish em`'s.
+    /// oarfish weighs spearfish's hits with D = 1 (`spearfish::SCORE_DENOM`, in spearfish's
+    /// units) and minimap2 alignments with its own default.
     pub score_denom: f64,
     /// Keep transcripts scoring at least this fraction of the read's best score.
     pub min_frac: f64,
@@ -29,7 +29,7 @@ pub struct QuantParams {
 impl Default for QuantParams {
     fn default() -> Self {
         QuantParams {
-            score_denom: 5.0,
+            score_denom: 2.0,
             min_frac: 0.95,
             length_norm: false,
             max_iter: 10_000,
@@ -100,7 +100,14 @@ impl EqBuilder {
             .into_iter()
             .map(|((txs, _), (weights, count))| EqClass { txs, weights, count })
             .collect();
-        v.sort_unstable_by(|a, b| a.txs.cmp(&b.txs).then(a.weights.partial_cmp(&b.weights).unwrap()));
+        // Weights compared by total_cmp: the order partial_cmp gives for real runs' weights
+        // (finite, non-negative), without a panic on NaN (an infinite score, or D = 0).
+        v.sort_unstable_by(|a, b| {
+            a.txs.cmp(&b.txs).then_with(|| {
+                let mut w = a.weights.iter().zip(&b.weights).map(|(x, y)| x.total_cmp(y));
+                w.find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
         v
     }
 }
@@ -262,6 +269,17 @@ mod tests {
         b.add(&[(0, 100.0), (1, 97.0), (2, 90.0)], &lens, &p);
         let c = b.finish();
         assert_eq!(c[0].txs, vec![0, 1]);
-        assert!((c[0].weights[1] - (-3.0f64 / 5.0).exp()).abs() < 1e-12);
+        assert!((c[0].weights[1] - (-3.0f64 / 2.0).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn infinite_scores_do_not_panic() {
+        let p = QuantParams::default();
+        let lens = [1, 1];
+        let mut b = EqBuilder::default();
+        b.add(&[(0, f64::INFINITY), (1, 1.0)], &lens, &p);
+        b.add(&[(0, 2.0), (1, 1.0)], &lens, &p);
+        b.add(&[(0, 2.0), (1, 2.0)], &lens, &p);
+        assert_eq!(b.finish().len(), 3);
     }
 }

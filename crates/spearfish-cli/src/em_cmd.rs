@@ -18,12 +18,13 @@ pub struct Args {
     /// Mapping TSV.
     mapping: PathBuf,
     /// Score denominator D in exp((s - s_max) / D). This EM's default (2) is what the
-    /// mapper's ablations were evaluated with; oarfish uses D = 1 for spearfish's scores
-    /// (`spearfish::SCORE_DENOM`) and 3 for minimap2's.
-    #[arg(long, default_value_t = 2.0)]
+    /// mapper's ablations were evaluated with; oarfish weighs spearfish's hits with D = 1
+    /// (`spearfish::SCORE_DENOM`, in spearfish's units) and minimap2 alignments with its own
+    /// default.
+    #[arg(long, default_value_t = QuantParams::default().score_denom)]
     score_denom: f64,
     /// Keep hits scoring at least this fraction of the read's best.
-    #[arg(long, default_value_t = 0.95)]
+    #[arg(long, default_value_t = QuantParams::default().min_frac)]
     min_frac: f64,
     /// Divide likelihoods by transcript length.
     #[arg(long)]
@@ -32,11 +33,11 @@ pub struct Args {
     #[arg(long)]
     keep_low_coverage: bool,
     /// EM: maximum iterations.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = QuantParams::default().max_iter)]
     max_iter: usize,
     /// EM: stop when the largest relative change (transcripts with >= 0.01 reads) is below
     /// this.
-    #[arg(long, default_value_t = 1e-6)]
+    #[arg(long, default_value_t = QuantParams::default().tol)]
     tol: f64,
     /// Output TSV.
     #[arg(short, long)]

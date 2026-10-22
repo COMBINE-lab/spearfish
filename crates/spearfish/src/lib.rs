@@ -45,10 +45,10 @@ pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands,
 pub use settings::{MapSettings, RescueWindow};
 
 /// Scale of score differences: a hit scoring `d` below its read's best is `exp(-d /
-/// SCORE_DENOM)` times as likely. spearfish's scores are on minimap2's alignment-score scale;
-/// D = 1 was the sharpest weighting tried with oarfish's EM on simulated reads and gave the
-/// most accurate estimates (minimap2 alignments do best with a wider D, e.g. oarfish's 3).
-/// RAD output records it, and oarfish's spearfish backend uses it.
+/// SCORE_DENOM)` times as likely. spearfish's scores are on minimap2's alignment-score scale.
+/// RAD output records it. oarfish's spearfish backend weighs hits with this D = 1, in-process
+/// and from RAD files alike (it scales scores by 10 and uses a denominator of 10); for
+/// minimap2 alignments, oarfish uses its own default.
 pub const SCORE_DENOM: f32 = 1.0;
 
 /// Read technology / protocol presets.
