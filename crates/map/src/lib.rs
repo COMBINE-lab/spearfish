@@ -1290,7 +1290,11 @@ impl<C: Chainer> Mapper<C> {
         // Equal scores are ordered by a hash of the transcript salted with the read, so ties
         // are broken the same way on every run without favouring the same transcript.
         let salt = xxhash_rust::xxh3::xxh3_64(raw);
-        let [pf, pr] = Self::parse_both(&self.seeder, raw);
+        let [pf, pr] = match self.p.strands {
+            // The reverse orientation would be skipped: not parsed either.
+            Strands::Forward => [Self::parse(&self.seeder, raw), (Vec::new(), None)],
+            _ => Self::parse_both(&self.seeder, raw),
+        };
         let (fwd, rc) = match self.p.strands {
             Strands::Both => (self.map_strand(pf, salt), self.map_strand(pr, salt)),
             Strands::Forward => (self.map_strand(pf, salt), skip(pr)),
