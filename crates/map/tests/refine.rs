@@ -77,6 +77,26 @@ fn scores(hits: Vec<map::TxHit>) -> BTreeMap<u32, u32> {
     hits.into_iter().map(|h| (h.tx, h.score.to_bits())).collect()
 }
 
+/// Whether every anchor of `h`'s chain is placed in its transcript where the chain says, and
+/// the hit's span is the chain's (the oracle copies hits between transcripts with the same
+/// placements, shifting their positions).
+fn placed(idx: &Index, c: &anchor::Candidate, h: &map::TxHit) -> bool {
+    let (unitig, offset) = (idx.node_unitig(), idx.node_offset());
+    let at = |&(qs, ts, len): &(u32, u32, u32)| {
+        c.anchors.iter().any(|a| {
+            let (txs, ps) = idx.occurrences(unitig[a.node as usize]);
+            a.qs == qs
+                && a.qe - a.qs == len
+                && txs
+                    .iter()
+                    .zip(ps)
+                    .any(|(&t, &p)| t == h.tx && p + offset[a.node as usize] == ts)
+        })
+    };
+    let (first, last) = (h.chain[0], h.chain[h.chain.len() - 1]);
+    h.chain.iter().all(at) && (h.tstart, h.tend) == (first.1, last.1 + last.2)
+}
+
 fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError> {
     let txs = family(seed, 3);
     let (data, _) = build(
@@ -111,6 +131,9 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
         let anchors = anchor::anchors(&idx, &seeds, &AnchorParams::default());
         for mut c in anchor::candidates(&idx, anchors, &AnchorParams::default()) {
             let (o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
+            for h in &o {
+                prop_assert!(placed(&idx, &c, h), "seed {} read from {}: {:?}", seed, t.name, h);
+            }
             prop_assert_eq!(scores(o), scores(r), "seed {} read from {}", seed, t.name);
             // With collinear anchors merged, as the mapper chains candidates by default.
             anchor::merge_collinear(&idx, &mut c);

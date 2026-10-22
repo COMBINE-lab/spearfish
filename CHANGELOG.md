@@ -88,6 +88,10 @@
   batched SIMD kernels, as infix ones already did, and the affine DP rows write their own band
   sentinel and run whole AVX-512 vectors: 17% fewer instructions on direct RNA and 0.5-3% on
   the other read types, with identical output.
+- Chaining does less work per transcript: the DP scores predecessor windows in whole vector
+  blocks and finds the best one in the same pass, a transcript whose placements match the
+  previous transcript's reuses its chain, and placements are stored relative to their
+  transcript's first. 6-13% fewer instructions across read types, with identical output.
 
 ### Fixes
 
