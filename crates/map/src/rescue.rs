@@ -87,7 +87,8 @@ struct Scratch {
     /// with its label (`u32::MAX`: none).
     read_at: rustc_hash::FxHashMap<u64, u32>,
     read_next: Vec<u32>,
-    tx: Vec<Seed>,
+    /// A window's rescue seeds as (label, start).
+    tx: Vec<(u64, u32)>,
     tmp: Vec<(u64, u32, u32)>,
     /// A transcript window, as 2-bit codes.
     tseq: Vec<u8>,
@@ -191,15 +192,16 @@ impl Rescuer {
     /// transcript window `tseq` (2-bit codes), sorted by (qs, ts), appended to `sc.pool`.
     /// Seeds have distinct starts on either side, so (qs, ts) is unique and fixes the order.
     fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
-        self.seeder.seed_codes_into(tseq, &mut sc.tx, &mut sc.tmp);
+        // The join needs only the window seeds' labels and starts.
+        self.seeder.seed_starts_codes_into(tseq, &mut sc.tx);
         // Hash join on labels: each window seed probes the read's label table. A point is
         // packed as its read seed's index and its window start: read seeds are in start order,
         // so sorting the keys sorts the points by (qs, ts), and the rest comes from the seed.
         sc.keys.clear();
-        for x in &sc.tx {
-            let mut i = sc.read_at.get(&x.label).copied().unwrap_or(u32::MAX);
+        for &(label, start) in &sc.tx {
+            let mut i = sc.read_at.get(&label).copied().unwrap_or(u32::MAX);
             while i != u32::MAX {
-                sc.keys.push((u64::from(i) << 32) | u64::from(x.start));
+                sc.keys.push((u64::from(i) << 32) | u64::from(start));
                 i = sc.read_next[i as usize];
             }
         }

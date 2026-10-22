@@ -68,6 +68,13 @@ impl BaseSeeder {
         Self::finish(tmp, out);
     }
 
+    /// (label, start) of [`Self::seed_codes_into`]'s seeds, in its order, into `out` (cleared
+    /// first), for callers that need no ends (LCP then skips computing them).
+    pub fn seed_starts_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32)>) {
+        out.clear();
+        self.scheme.top_starts_codes_into(codes, out);
+    }
+
     /// The scheme's seeds `tmp` as `Seed`s into `out`, sorted and without duplicates.
     fn finish(tmp: &[(u64, u32, u32)], out: &mut Vec<Seed>) {
         out.clear();
@@ -141,6 +148,10 @@ mod tests {
             let mut got = Vec::new();
             s.seed_codes_into(&codes, &mut got, &mut Vec::new());
             assert_eq!(got, s.seed_parsed(&seq), "{spec}");
+            let mut starts = Vec::new();
+            s.seed_starts_codes_into(&codes, &mut starts);
+            let want: Vec<_> = got.iter().map(|x| (x.label, x.start)).collect();
+            assert_eq!(starts, want, "{spec}");
         }
     }
 }

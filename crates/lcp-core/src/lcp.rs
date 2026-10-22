@@ -178,12 +178,42 @@ impl LcpParser {
     }
 }
 
+/// Where a top-level parse appends its cores: as (label, start, end), or as (label, start),
+/// for which the parser skips the ends.
+trait TopOut {
+    const ENDS: bool;
+    /// Append the cores with these labels, starts and ends (empty unless `ENDS`), offset by `o`.
+    fn extend_top(&mut self, labels: &[u64], starts: &[u32], ends: &[u32], o: u32);
+}
+
+impl TopOut for Vec<(u64, u32, u32)> {
+    const ENDS: bool = true;
+    #[inline(always)]
+    fn extend_top(&mut self, labels: &[u64], starts: &[u32], ends: &[u32], o: u32) {
+        self.extend(
+            labels
+                .iter()
+                .zip(starts)
+                .zip(ends)
+                .map(|((&l, &s), &e)| (l, s + o, e + o)),
+        );
+    }
+}
+
+impl TopOut for Vec<(u64, u32)> {
+    const ENDS: bool = false;
+    #[inline(always)]
+    fn extend_top(&mut self, labels: &[u64], starts: &[u32], _: &[u32], o: u32) {
+        self.extend(labels.iter().zip(starts).map(|(&l, &s)| (l, s + o)));
+    }
+}
+
 impl LcpParser {
     /// The level-`k` cores of `seq` as (label, start, end), appended to `out` in start order;
     /// identical to `parse(seq, k).level(k)` but without building the hierarchy, reusing the
     /// buffers in `sc`.
     pub fn top_cores(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
-        self.top::<false>(seq, k, sc, out)
+        self.top::<false, _>(seq, k, sc, out)
     }
 
     /// [`Self::top_cores`] of a sequence given as 2-bit codes (A=0, C=1, G=2, T=3; one run,
@@ -196,62 +226,63 @@ impl LcpParser {
         out: &mut Vec<(u64, u32, u32)>,
     ) {
         debug_assert!(codes.iter().all(|&c| c < 4));
-        self.top::<true>(codes, k, sc, out)
+        self.top::<true, _>(codes, k, sc, out)
     }
 
-    /// `top_cores` (`seq` is ACGT text) or `top_cores_codes` (`CODES`: `seq` is codes).
+    /// [`Self::top_cores_codes`] as (label, start) only: the cores' ends are not computed.
+    pub fn top_starts_codes(&self, codes: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32)>) {
+        debug_assert!(codes.iter().all(|&c| c < 4));
+        self.top::<true, _>(codes, k, sc, out)
+    }
+
+    /// `top_cores` (`seq` is ACGT text) or `top_cores_codes` (`CODES`: `seq` is codes), into
+    /// either kind of output.
     #[inline(always)]
-    fn top<const CODES: bool>(
-        &self,
-        seq: &[u8],
-        k: u8,
-        sc: &mut ParseScratch,
-        out: &mut Vec<(u64, u32, u32)>,
-    ) {
+    fn top<const CODES: bool, O: TopOut>(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut O) {
         match simd::active() {
             #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx512 => unsafe { self.top_cores_avx512::<CODES>(seq, k, sc, out) },
+            SimdLevel::Avx512 => unsafe { self.top_cores_avx512::<CODES, O>(seq, k, sc, out) },
             #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx2 => unsafe { self.top_cores_avx2::<CODES>(seq, k, sc, out) },
+            SimdLevel::Avx2 => unsafe { self.top_cores_avx2::<CODES, O>(seq, k, sc, out) },
             // NEON is part of the aarch64 baseline: no entry point of its own.
             #[cfg(target_arch = "aarch64")]
-            SimdLevel::Neon => self.top_cores_at::<CODES>(SimdLevel::Neon, seq, k, sc, out),
-            _ => self.top_cores_at::<CODES>(SimdLevel::Scalar, seq, k, sc, out),
+            SimdLevel::Neon => self.top_cores_at::<CODES, O>(SimdLevel::Neon, seq, k, sc, out),
+            _ => self.top_cores_at::<CODES, O>(SimdLevel::Scalar, seq, k, sc, out),
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-    fn top_cores_avx512<const CODES: bool>(
+    fn top_cores_avx512<const CODES: bool, O: TopOut>(
         &self,
         seq: &[u8],
         k: u8,
         sc: &mut ParseScratch,
-        out: &mut Vec<(u64, u32, u32)>,
+        out: &mut O,
     ) {
-        self.top_cores_at::<CODES>(SimdLevel::Avx512, seq, k, sc, out)
+        self.top_cores_at::<CODES, O>(SimdLevel::Avx512, seq, k, sc, out)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-    fn top_cores_avx2<const CODES: bool>(
+    fn top_cores_avx2<const CODES: bool, O: TopOut>(
         &self,
         seq: &[u8],
         k: u8,
         sc: &mut ParseScratch,
-        out: &mut Vec<(u64, u32, u32)>,
+        out: &mut O,
     ) {
-        self.top_cores_at::<CODES>(SimdLevel::Avx2, seq, k, sc, out)
+        self.top_cores_at::<CODES, O>(SimdLevel::Avx2, seq, k, sc, out)
     }
 
     #[inline(always)]
-    fn top_cores_at<const CODES: bool>(
+    fn top_cores_at<const CODES: bool, O: TopOut>(
         &self,
         simd: SimdLevel,
         seq: &[u8],
         k: u8,
         sc: &mut ParseScratch,
-        out: &mut Vec<(u64, u32, u32)>,
+        out: &mut O,
     ) {
         if k == 0 {
             return;
@@ -290,14 +321,14 @@ impl LcpParser {
     /// The level-`k` cores (`k >= 1`) of one non-empty run of 2-bit codes that starts at `o` in
     /// the sequence, appended to `out`.
     #[inline(always)]
-    fn segment_cores(
+    fn segment_cores<O: TopOut>(
         &self,
         simd: SimdLevel,
         codes: &[u8],
         o: u32,
         k: u8,
         sc: &mut ParseScratch,
-        out: &mut Vec<(u64, u32, u32)>,
+        out: &mut O,
     ) {
         let d = self.cfg.dct_iters as usize;
         // Level 1.
@@ -326,7 +357,9 @@ impl LcpParser {
             }));
         }
         cur.1.extend(sc.spans.iter().map(|s| s.0 as u32));
-        cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
+        if O::ENDS {
+            cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
+        }
         let mut ci = 0; // index of the current level's buffers
         for level in 2..=k {
             let n = sc.lv[ci].0.len();
@@ -359,11 +392,13 @@ impl LcpParser {
                 label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed)
             }));
             next.1.extend(sc.spans.iter().map(|&(lo, _)| prev.1[lo]));
-            next.2.extend(
-                sc.spans
-                    .iter()
-                    .map(|&(lo, hi)| prev.2[lo..hi].iter().copied().max().unwrap()),
-            );
+            if O::ENDS {
+                next.2.extend(
+                    sc.spans
+                        .iter()
+                        .map(|&(lo, hi)| prev.2[lo..hi].iter().copied().max().unwrap()),
+                );
+            }
             if level < k {
                 for &(lo, hi) in &sc.spans {
                     nbits.push_values(&sc.vals[lo..hi]);
@@ -372,13 +407,7 @@ impl LcpParser {
             ci = ni;
         }
         let top = &sc.lv[ci];
-        out.extend(
-            top.0
-                .iter()
-                .zip(&top.1)
-                .zip(&top.2)
-                .map(|((&l, &s), &e)| (l, s + o, e + o)),
-        );
+        out.extend_top(&top.0, &top.1, &top.2, o);
     }
 }
 
@@ -1141,6 +1170,25 @@ mod top_cores_tests {
             let mut got = Vec::new();
             p.top_cores_codes(&codes, k, &mut sc, &mut got);
             prop_assert_eq!(got, want);
+        }
+
+        /// Parsing starts only gives the full parse's labels and starts, and leaves the scratch
+        /// fit for a full parse.
+        #[test]
+        fn top_starts_codes_equal_cores(
+            codes in prop::collection::vec(prop::sample::select(vec![0u8, 0, 1, 2, 3, 3, 3, 2]), 0..3000),
+            k in 1u8..=5,
+        ) {
+            let p = LcpParser::default();
+            let mut sc = ParseScratch::default();
+            let mut want = Vec::new();
+            p.top_cores_codes(&codes, k, &mut sc, &mut want);
+            let mut got = Vec::new();
+            p.top_starts_codes(&codes, k, &mut sc, &mut got);
+            prop_assert_eq!(got, want.iter().map(|&(l, s, _)| (l, s)).collect::<Vec<_>>());
+            let mut again = Vec::new();
+            p.top_cores_codes(&codes, k, &mut sc, &mut again);
+            prop_assert_eq!(again, want);
         }
     }
 }
