@@ -1,4 +1,4 @@
-//! Empirical context radii (design doc, Property 2).
+//! Empirical context radii.
 //!
 //! A level-k core at `[s, e)` depends only on `S[s - λ_k, e + ρ_k)`. We measure λ_k and ρ_k
 //! by applying single edits (substitution, insertion, deletion) and recording how far from

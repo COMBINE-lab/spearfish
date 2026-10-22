@@ -1,4 +1,4 @@
-//! Index construction (design doc, "Construction"), over any base-level seed scheme.
+//! Index construction, over any base-level seed scheme.
 //!
 //! 1. Seed every transcript (parallel).
 //! 2. Nodes are distinct seed labels; node id = rank of the label in sorted order.
@@ -156,9 +156,19 @@ impl Uf {
     }
 }
 
-/// Per transcript: seeds, parsed length, content hash per seed, 2-bit packed parsed sequence,
-/// and (HPC) the packed raw sequence with its raw-position checkpoints.
-type Seeded = (Vec<Seed>, u32, Vec<u64>, Vec<u64>, (Vec<u64>, Vec<u32>));
+/// Per-transcript results of the seeding pass.
+struct Seeded {
+    seeds: Vec<Seed>,
+    /// Parsed (HPC or raw) length.
+    plen: u32,
+    /// Independent hash of each seed's content (for the collision check).
+    content: Vec<u64>,
+    /// 2-bit packed parsed sequence.
+    packed: Vec<u64>,
+    /// (HPC) The packed raw sequence and its raw-position checkpoints (see [`raw_packing`]).
+    raw: Vec<u64>,
+    raw_ck: Vec<u32>,
+}
 
 /// Packed raw sequence and raw starts of every `RAW_CK`-th parsed base (through the parsed
 /// length), if the packed sequence's runs are exactly the parsed runs (non-ACGT bases pack
@@ -188,10 +198,6 @@ fn raw_packing(raw: &[u8], h: &lcp_core::hpc::Hpc) -> (Vec<u64>, Vec<u32>) {
     (crate::pack2(raw), ck)
 }
 
-/// Transcript groups from shared seed runs: union-find over transcripts, linking all
-/// transcripts that hold a run unless more than `max_tx` do. Groups are named `group<k>`,
-/// numbered in order of their first transcript. Returns (group per transcript, names, largest
-/// group size).
 /// (run hash, transcript) for every run of `span` consecutive seeds, sorted and deduplicated.
 fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
     let span = span.max(1);
@@ -199,7 +205,7 @@ fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
         .par_iter()
         .enumerate()
         .flat_map_iter(|(t, s)| {
-            let seeds = &s.0;
+            let seeds = &s.seeds;
             (0..seeds.len().saturating_sub(span - 1)).map(move |i| {
                 let mut h = xxhash_rust::xxh3::Xxh3::with_seed(0x6e_6e_65_73);
                 for x in &seeds[i..i + span] {
@@ -218,9 +224,9 @@ fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
 /// The attach-only pass of [`InferGenes`]: each group of at most `attach_max` transcripts joins
 /// the larger group holding the most of its `attach_span`-seed runs (runs in at most `max_tx`
 /// transcripts), if that group holds at least twice as many as any other.
-fn attach_small(seeded: &[Seeded], parent: &mut [u32], inf: InferGenes, find: fn(&mut [u32], u32) -> u32) {
-    let n = parent.len();
-    let root: Vec<u32> = (0..n as u32).map(|t| find(parent, t)).collect();
+fn attach_small(seeded: &[Seeded], uf: &mut Uf, inf: InferGenes) {
+    let n = uf.0.len();
+    let root: Vec<u32> = (0..n as u32).map(|t| uf.find(t)).collect();
     let mut size: HashMap<u32, usize> = HashMap::new();
     for &r in &root {
         *size.entry(r).or_default() += 1;
@@ -258,23 +264,16 @@ fn attach_small(seeded: &[Seeded], parent: &mut [u32], inf: InferGenes, find: fn
     }
     for (a, (b, top, second)) in best {
         if top >= 2 * second.max(1) {
-            parent[a as usize] = b;
+            uf.0[a as usize] = b;
         }
     }
 }
 
-fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
-    let n = txs.len();
-    let max_tx = inf.max_tx;
-    let pairs = seed_runs(seeded, inf.span);
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            parent[x as usize] = parent[parent[x as usize] as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
+/// Union-find over `n` transcripts linking all transcripts that hold a run (`pairs` as
+/// [`seed_runs`] gives them) unless more than `max_tx` do. Union by smaller index keeps roots
+/// at a group's first transcript.
+fn link_runs(n: usize, pairs: &[(u64, u32)], max_tx: u32) -> Uf {
+    let mut uf = Uf((0..n as u32).collect());
     let mut i = 0;
     while i < pairs.len() {
         let mut j = i + 1;
@@ -282,27 +281,31 @@ fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>
             j += 1;
         }
         if j - i > 1 && j - i <= max_tx as usize {
-            let r0 = find(&mut parent, pairs[i].1);
             for &(_, t) in &pairs[i + 1..j] {
-                let r = find(&mut parent, t);
-                if r != r0 {
-                    // Union by smaller index keeps roots at a group's first transcript.
-                    let (a, b) = if r < r0 { (r, r0) } else { (r0, r) };
-                    parent[b as usize] = a;
-                }
+                uf.union(pairs[i].1, t);
             }
         }
         i = j;
     }
+    uf
+}
+
+/// Transcript groups from shared seed runs ([`link_runs`], then [`attach_small`]). Groups are
+/// named `group<k>`, numbered in order of their first transcript. Returns (group per
+/// transcript, names, largest group size).
+fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
+    let n = txs.len();
+    let pairs = seed_runs(seeded, inf.span);
+    let mut uf = link_runs(n, &pairs, inf.max_tx);
     drop(pairs);
     if inf.attach_span > 0 {
-        attach_small(seeded, &mut parent, inf, find);
+        attach_small(seeded, &mut uf, inf);
     }
     let mut group_of_root: HashMap<u32, u32> = HashMap::new();
     let mut size: Vec<usize> = Vec::new();
     let tx_gene: Vec<u32> = (0..n as u32)
         .map(|t| {
-            let r = find(&mut parent, t);
+            let r = uf.find(t);
             let g = *group_of_root.entry(r).or_insert_with(|| {
                 size.push(0);
                 size.len() as u32 - 1
@@ -316,7 +319,8 @@ fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>
     (tx_gene, names, largest)
 }
 
-pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport)> {
+/// Build the index. `txs` is consumed so that the raw sequences can be freed once seeded.
+pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, BuildReport)> {
     let mut rep = BuildReport {
         transcripts: txs.len(),
         ..Default::default()
@@ -345,19 +349,39 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
                     )
                 })
                 .collect();
-            let raw = h.as_ref().map(|h| raw_packing(&t.seq, h)).unwrap_or_default();
-            (seeds, seq.len() as u32, content, crate::pack2(seq), raw)
+            let (raw, raw_ck) = h.as_ref().map(|h| raw_packing(&t.seq, h)).unwrap_or_default();
+            Seeded {
+                seeds,
+                plen: seq.len() as u32,
+                content,
+                packed: crate::pack2(seq),
+                raw,
+                raw_ck,
+            }
         })
         .collect();
-    rep.seed_occurrences = seeded.iter().map(|s| s.0.len() as u64).sum();
-    rep.unseeded_transcripts = seeded.iter().filter(|s| s.0.is_empty()).count();
+    // Past seeding, the raw sequences are needed only for their lengths and the input hash.
+    let tx_len: Vec<u32> = txs.iter().map(|t| t.seq.len() as u32).collect();
+    let input_xxh3 = {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        for t in &txs {
+            h.update(t.name.as_bytes());
+            h.update(&t.seq);
+        }
+        h.digest()
+    };
+    for t in &mut txs {
+        t.seq = Vec::new();
+    }
+    rep.seed_occurrences = seeded.iter().map(|s| s.seeds.len() as u64).sum();
+    rep.unseeded_transcripts = seeded.iter().filter(|s| s.seeds.is_empty()).count();
     lap(&mut rep, "seed");
 
     // 2. Genes and nodes. A node is a (label, scope) pair, scope = gene or 0; nodes are
     // sorted by label, so each label's nodes are contiguous.
     let (tx_gene, gene_names): (Vec<u32>, Vec<String>) = match p.infer_genes {
         Some(inf) => {
-            let (tx_gene, names, largest) = infer_genes(txs, &seeded, inf);
+            let (tx_gene, names, largest) = infer_genes(&txs, &seeded, inf);
             rep.largest_group_tx = largest;
             (tx_gene, names)
         }
@@ -385,11 +409,26 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
             0
         }
     };
-    let mut keys: Vec<(u64, u32)> = seeded
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(t, s)| s.0.iter().map(move |x| (x.label, scope(t))))
+    // Isoforms of a gene share most seeds: dedup the keys of runs of transcripts in gene order
+    // before the global sort (fixed-size runs, so one huge gene still splits across threads).
+    let mut by_gene: Vec<u32> = (0..txs.len() as u32).collect();
+    by_gene.sort_by_key(|&t| tx_gene[t as usize]);
+    let mut keys: Vec<(u64, u32)> = by_gene
+        .par_chunks(256)
+        .flat_map_iter(|ts| {
+            let mut k: Vec<(u64, u32)> = ts
+                .iter()
+                .flat_map(|&t| {
+                    let t = t as usize;
+                    seeded[t].seeds.iter().map(move |x| (x.label, scope(t)))
+                })
+                .collect();
+            k.sort_unstable();
+            k.dedup();
+            k
+        })
         .collect();
+    drop(by_gene);
     keys.par_sort_unstable();
     keys.dedup();
     if keys.len() > MAX_NODES {
@@ -400,7 +439,8 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         .par_iter()
         .enumerate()
         .map(|(t, s)| {
-            s.0.iter()
+            s.seeds
+                .iter()
                 .map(|x| keys.binary_search(&(x.label, scope(t))).unwrap() as u32)
                 .collect()
         })
@@ -415,7 +455,8 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     let mut succ = vec![UNSET; n];
     let mut node_len = vec![u32::MAX; n];
     let mut node_content = vec![0u64; n];
-    for ((s, _, content, _, _), v) in seeded.iter().zip(&nodes) {
+    for (sd, v) in seeded.iter().zip(&nodes) {
+        let (s, content) = (&sd.seeds, &sd.content);
         for i in 0..v.len() {
             let c = &mut node_content[v[i] as usize];
             if node_len[v[i] as usize] == u32::MAX {
@@ -468,8 +509,11 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         Some((u, d)) => !(u != v && succ[u as usize] == enc(v, d)),
         None => true,
     };
-    let acyclic = (0..n as u32).filter(|&v| is_head(v)).count();
+    let mut heads: Vec<u32> = Vec::new();
     for (v, &e) in pred.iter().enumerate() {
+        if is_head(v as u32) {
+            heads.push(v as u32);
+        }
         match e {
             START => rep.heads_start += 1,
             MULTI => rep.heads_multi_pred += 1,
@@ -487,36 +531,43 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     let mut unitig_off: Vec<u64> = vec![0];
     let mut unitig_nodes: Vec<u32> = Vec::with_capacity(n);
     let mut unitig_span: Vec<u32> = Vec::new();
-    let mut walk = |start: u32, node_unitig: &mut Vec<u32>, cyclic: bool| {
-        let u = unitig_span.len() as u32;
+    // The chain of (node, offset) from `start` (a cycle stops before returning to it).
+    let chain = |start: u32, cyclic: bool| {
         let (mut cur, mut delta) = (start, 0u32);
-        loop {
-            node_unitig[cur as usize] = u;
-            node_offset[cur as usize] = delta;
-            unitig_nodes.push(cur);
-            match cont(cur) {
-                Some((next, d)) if !(cyclic && next == start) => {
-                    cur = next;
-                    delta += d;
-                }
-                _ => break,
-            }
+        let mut c = vec![(cur, delta)];
+        while let Some((next, d)) = cont(cur).filter(|&(next, _)| !(cyclic && next == start)) {
+            cur = next;
+            delta += d;
+            c.push((cur, delta));
         }
-        unitig_span.push(delta + node_len[cur as usize]);
+        c
+    };
+    let mut add = |c: &[(u32, u32)], node_unitig: &mut Vec<u32>| {
+        let u = unitig_span.len() as u32;
+        for &(w, d) in c {
+            node_unitig[w as usize] = u;
+            node_offset[w as usize] = d;
+            unitig_nodes.push(w);
+        }
+        let &(last, d) = c.last().unwrap();
+        unitig_span.push(d + node_len[last as usize]);
         unitig_off.push(unitig_nodes.len() as u64);
     };
-    for v in 0..n as u32 {
-        if is_head(v) {
-            walk(v, &mut node_unitig, false);
-        }
+    // Chains from heads only read pred and succ, so follow them in parallel (the walks are
+    // latency-bound pointer chasing), then number them in head order.
+    let chains: Vec<Vec<(u32, u32)>> = heads.par_iter().map(|&h| chain(h, false)).collect();
+    for c in &chains {
+        add(c, &mut node_unitig);
     }
+    drop(chains);
+    // What is left are pure cycles: cut each at its first node.
     for v in 0..n as u32 {
         if node_unitig[v as usize] == u32::MAX {
-            walk(v, &mut node_unitig, true);
+            add(&chain(v, true), &mut node_unitig);
         }
     }
     rep.unitigs = unitig_span.len();
-    rep.cyclic_unitigs = rep.unitigs - acyclic;
+    rep.cyclic_unitigs = rep.unitigs - heads.len();
     let mut lens: Vec<usize> = unitig_off.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
     lens.sort_unstable_by(|a, b| b.cmp(a));
     let half = lens.iter().sum::<usize>() / 2;
@@ -536,7 +587,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         .par_iter()
         .zip(&nodes)
         .enumerate()
-        .map(|(ti, ((s, _, _, _, _), v))| {
+        .map(|(ti, (Seeded { seeds: s, .. }, v))| {
             let mut out = Vec::new();
             let mut i = 0;
             while i < v.len() {
@@ -670,17 +721,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
                 "lcp_seed".into(),
                 format!("{:#x}", lcp_core::LcpConfig::default().seed),
             ),
-            (
-                "input_xxh3".into(),
-                format!("{:016x}", {
-                    let mut h = xxhash_rust::xxh3::Xxh3::new();
-                    for t in txs {
-                        h.update(t.name.as_bytes());
-                        h.update(&t.seq);
-                    }
-                    h.digest()
-                }),
-            ),
+            ("input_xxh3".into(), format!("{input_xxh3:016x}")),
         ],
         labels,
         node_unitig,
@@ -699,45 +740,45 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         color_tx,
         tx_gene,
         tx_family,
-        tx_len: txs.iter().map(|t| t.seq.len() as u32).collect(),
-        tx_plen: seeded.iter().map(|s| s.1).collect(),
-        tx_seq: {
-            // Concatenate the per-transcript packings, each starting on a word boundary.
-            let mut words = Vec::new();
-            let mut off = vec![0u64];
-            for s in &seeded {
-                words.extend_from_slice(&s.3);
-                off.push(words.len() as u64);
-            }
-            (off, words)
-        },
+        tx_len,
+        tx_plen: seeded.iter().map(|s| s.plen).collect(),
+        // The per-transcript packings, each starting on a word boundary.
+        tx_seq: crate::concat(seeded.iter().map(|s| &s.packed[..])),
         tx_raw: if p.hpc {
-            let mut words = Vec::new();
-            let mut off = vec![0u64];
-            for s in &seeded {
-                words.extend_from_slice(&s.4.0);
-                off.push(words.len() as u64);
-            }
-            (off, words)
+            crate::concat(seeded.iter().map(|s| &s.raw[..]))
         } else {
             Default::default()
         },
         tx_raw_ck: if p.hpc {
-            let mut ck = Vec::new();
-            let mut off = vec![0u64];
-            for s in &seeded {
-                ck.extend_from_slice(&s.4.1);
-                off.push(ck.len() as u64);
-            }
-            (off, ck)
+            crate::concat(seeded.iter().map(|s| &s.raw_ck[..]))
         } else {
             Default::default()
         },
-        tx_names: txs.iter().map(|t| t.name.clone()).collect(),
+        tx_names: txs.into_iter().map(|t| t.name).collect(),
         gene_names: gene_names.clone(),
         manifest: None,
     };
     rep.tx_gene = data.tx_gene.clone();
     rep.gene_names = gene_names;
     Ok((data, rep))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every transcript holding a run joins one group, however the groups it links were rooted.
+    #[test]
+    fn runs_link_all_their_groups() {
+        // Runs 1 and 2 make groups {0, 10} and {1, 11}; run 3, held by 5, 10 and 11, joins
+        // both with {5}.
+        let pairs = [(1, 0), (1, 10), (2, 1), (2, 11), (3, 5), (3, 10), (3, 11)];
+        let mut uf = link_runs(12, &pairs, 64);
+        let roots: Vec<u32> = [0, 1, 5, 10, 11].iter().map(|&t| uf.find(t)).collect();
+        assert_eq!(roots, [0; 5]);
+        // Runs held by more than max_tx transcripts link nothing.
+        let mut uf = link_runs(12, &pairs, 2);
+        assert_ne!(uf.find(5), uf.find(10));
+        assert_eq!(uf.find(11), 1);
+    }
 }
