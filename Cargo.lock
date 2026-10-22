@@ -1321,7 +1321,6 @@ dependencies = [
  "log",
  "map",
  "paraseq",
- "quant",
  "serde",
  "serde_json",
  "xxhash-rust",

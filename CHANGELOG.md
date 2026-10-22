@@ -59,6 +59,8 @@
   `Index::id()`. `Strands`, `TieBreak`, `MapParams` and the other parameter types are
   re-exported. The existing API (`MapOptions::preset`, `Mapper::new`, `Index::build`) is
   unchanged.
+- Removed: `MapOptions::tiebreak_mut` and `chain_mut` (use the public `params` fields), and
+  the `spearfish::quant` re-export (the EM crate serves `spearfish em` only).
 
 ### Performance
 

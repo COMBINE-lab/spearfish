@@ -1,5 +1,4 @@
-//! spearfish as a library: build or load an index, map long reads to the transcriptome,
-//! and quantify.
+//! spearfish as a library: build or load an index and map long reads to the transcriptome.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -34,7 +33,7 @@ pub mod settings;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use index::{BuildParams, Collapse, TxInput};
 use lcp_core::hpc::Hpc;
 use map::{AnyChainer, OracleChainer, RefineChainer};
@@ -43,7 +42,6 @@ use serde::{Deserialize, Serialize};
 pub use index::{BuildReport, InferGenes};
 pub use map::align::Affine;
 pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands, TieBreak};
-pub use quant;
 pub use settings::{MapSettings, RescueWindow};
 
 /// Scale of score differences: a hit scoring `d` below its read's best is `exp(-d /
@@ -69,12 +67,10 @@ pub enum Preset {
 impl std::str::FromStr for Preset {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        Ok(match s {
-            "ont" => Preset::Ont,
-            "drna" => Preset::Drna,
-            "hifi" => Preset::Hifi,
-            x => bail!("unknown preset {x:?} (ont, drna, hifi)"),
-        })
+        Preset::ALL
+            .into_iter()
+            .find(|p| p.name() == s)
+            .ok_or_else(|| anyhow::anyhow!("unknown preset {s:?} (ont, drna, hifi)"))
     }
 }
 
@@ -196,16 +192,6 @@ impl MapOptions {
             params,
             chainer: ChainerKind::Oracle,
         }
-    }
-
-    /// Mutable access to the tie-break options (None if disabled).
-    pub fn tiebreak_mut(&mut self) -> Option<&mut TieBreak> {
-        self.params.tiebreak.as_mut()
-    }
-
-    /// Mutable access to the chaining parameters.
-    pub fn chain_mut(&mut self) -> &mut ChainParams {
-        &mut self.params.chain
     }
 }
 
@@ -610,5 +596,18 @@ impl Mapper {
             low_coverage: r.low_coverage,
             rescued: r.rescued,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_parse_by_name() {
+        for p in Preset::ALL {
+            assert_eq!(p.name().parse::<Preset>().unwrap(), p);
+        }
+        assert!("clr".parse::<Preset>().is_err());
     }
 }
