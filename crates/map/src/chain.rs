@@ -109,12 +109,15 @@ pub trait Chainer {
     fn chain(&self, idx: &Index, cand: &Candidate) -> Vec<TxHit>;
 }
 
-/// An anchor placed in one transcript.
-#[derive(Clone, Copy)]
+/// An anchor placed in one transcript, ordered as placement lists are compared: by anchor,
+/// then relative target start.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Placed {
     /// Index of the anchor in the candidate's family order.
     a: u32,
-    ts: u32,
+    /// Target start relative to the transcript's first placement, plus `REL_BIAS` (as the DP
+    /// takes it).
+    rel: i32,
 }
 
 pub struct OracleChainer {
@@ -364,6 +367,8 @@ struct DpScratch {
     /// order.
     bucket_of: Vec<u32>,
     tx: Vec<u32>,
+    /// Per bucket, the target start of its first placement.
+    ts0: Vec<u32>,
     buckets: Vec<Vec<Placed>>,
     // Structure-of-arrays for one transcript's placements.
     a: Vec<u32>,
@@ -865,6 +870,7 @@ impl OracleChainer {
             sc.bucket_of.resize(idx.n_transcripts(), 0);
         }
         sc.tx.clear();
+        sc.ts0.clear();
         let mut used = 0;
         // Occurrence lookups miss in cache twice (offsets, then lists): issue them ahead.
         const AHEAD: usize = 4;
@@ -885,14 +891,13 @@ impl OracleChainer {
                     }
                     sc.buckets[used].clear();
                     sc.tx.push(t);
+                    sc.ts0.push(p + off);
                     used += 1;
                     b = used as u32;
                     sc.bucket_of[t as usize] = b;
                 }
-                sc.buckets[b as usize - 1].push(Placed {
-                    a: i as u32,
-                    ts: p + off,
-                });
+                let rel = (i64::from(p + off) - i64::from(sc.ts0[b as usize - 1]) + REL_BIAS) as i32;
+                sc.buckets[b as usize - 1].push(Placed { a: i as u32, rel });
             }
         }
         for &t in &sc.tx {
@@ -912,19 +917,8 @@ impl OracleChainer {
         sc.order.extend(0..used as u32);
         {
             let b = &sc.buckets;
-            sc.order.sort_unstable_by(|&x, &y| {
-                let (u, v) = (&b[x as usize], &b[y as usize]);
-                let (u0, v0) = (u[0].ts as i64, v[0].ts as i64);
-                for (pu, pv) in u.iter().zip(v) {
-                    let c =
-                        pu.a.cmp(&pv.a)
-                            .then((pu.ts as i64 - u0).cmp(&(pv.ts as i64 - v0)));
-                    if c.is_ne() {
-                        return c;
-                    }
-                }
-                u.len().cmp(&v.len())
-            });
+            sc.order
+                .sort_unstable_by(|&x, &y| b[x as usize].cmp(&b[y as usize]));
         }
         let mut hits: Vec<TxHit> = Vec::with_capacity(used);
         let mut prev: Option<usize> = None;
@@ -935,18 +929,13 @@ impl OracleChainer {
             let n = el.len();
             // Target positions are stored relative to the first placement (plus a bias that
             // keeps them positive); transitions only use their differences.
-            let base = el[0].ts as i64 - REL_BIAS;
+            let base = sc.ts0[bi] as i64 - REL_BIAS;
             // The common prefix with the previous transcript's list, that list's length, and
             // the offset between their target positions.
             let (lcp, pn, shift) = prev.map_or((0, 0, 0), |pb| {
                 let pe = &sc.buckets[pb];
-                let pbase = pe[0].ts as i64 - REL_BIAS;
-                let lcp = el
-                    .iter()
-                    .zip(pe)
-                    .take_while(|(x, y)| x.a == y.a && x.ts as i64 - base == y.ts as i64 - pbase)
-                    .count();
-                (lcp, pe.len(), base - pbase)
+                let lcp = el.iter().zip(pe).take_while(|(x, y)| x == y).count();
+                (lcp, pe.len(), base - (sc.ts0[pb] as i64 - REL_BIAS))
             });
             if lcp == n && pn == n {
                 // The previous transcript's list (isoforms that agree over the read): the DP
@@ -971,7 +960,7 @@ impl OracleChainer {
             sc.w.truncate(lcp);
             for x in &el[lcp..] {
                 let an = &cand.anchors[x.a as usize];
-                let rel = (x.ts as i64 - base) as i32;
+                let rel = x.rel;
                 sc.a.push(x.a);
                 sc.qs.push(an.qs as i32);
                 sc.qe.push(an.qe as i32);
