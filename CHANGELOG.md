@@ -71,6 +71,10 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- Chaining does less work per transcript: the DP scores predecessor windows in whole vector
+  blocks and finds the best one in the same pass, a transcript whose placements match the
+  previous transcript's reuses its chain, and placements are stored relative to their
+  transcript's first. 6-13% fewer instructions across read types, with identical output.
 
 ### Fixes
 
