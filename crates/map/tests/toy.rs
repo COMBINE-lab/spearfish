@@ -64,7 +64,7 @@ fn check(spec: &str, rate: f64) {
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let mapper = Mapper::new(
         idx.clone(),
         OracleChainer {
@@ -148,7 +148,7 @@ fn antisense_overlap_reports_both_orientations() {
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let mapper = Mapper::new(
         idx.clone(),
         OracleChainer {

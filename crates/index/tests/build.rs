@@ -40,6 +40,8 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
     assert_eq!(rep.inconsistent_lengths, 0, "{spec}");
     let idx = Index::from_bytes(&data.to_bytes()).unwrap();
     assert_eq!(idx.meta("spec"), Some(spec));
+    let direct = Index::from_data(&data).unwrap();
+    assert_eq!(direct.section_checksums(), idx.section_checksums());
     let seeder = BaseSeeder::new(spec, hpc).unwrap();
     let got = idx.transcript_seeds();
     for (t, tx) in txs.iter().enumerate() {
@@ -292,7 +294,7 @@ fn raw_sequence_skipped_where_non_acgt_merges_runs() {
         collapse: Collapse::Gene,
         infer_genes: None,
     };
-    let idx = Index::from_bytes(&build(txs, &p).unwrap().0.to_bytes()).unwrap();
+    let idx = Index::from_data(&build(txs, &p).unwrap().0).unwrap();
     assert_eq!(idx.tx_raw_codes(0, 0, 3), None);
     assert_eq!(idx.tx_raw_codes(1, 0, 3), Some(vec![0, 1, 2]));
 }

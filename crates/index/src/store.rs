@@ -67,11 +67,24 @@ impl<'a> Writer<'a> {
     pub fn to_bytes(&self) -> Vec<u8> {
         let (h, offsets, total) = self.layout();
         let mut out = vec![0u8; total];
-        out[..h.len()].copy_from_slice(&h);
-        for ((_, d), &off) in self.sections.iter().zip(&offsets) {
+        self.fill(&mut out, &h, &offsets);
+        out
+    }
+
+    /// [`Writer::to_bytes`] into 8-byte-aligned words, with the length in bytes: what
+    /// [`Store::from_words`] takes without another copy.
+    pub(crate) fn to_words(&self) -> (Vec<u64>, usize) {
+        let (h, offsets, total) = self.layout();
+        let mut words = vec![0u64; total.div_ceil(8)];
+        self.fill(&mut bytemuck::cast_slice_mut(&mut words)[..total], &h, &offsets);
+        (words, total)
+    }
+
+    fn fill(&self, out: &mut [u8], h: &[u8], offsets: &[usize]) {
+        out[..h.len()].copy_from_slice(h);
+        for ((_, d), &off) in self.sections.iter().zip(offsets) {
             out[off..off + d.len()].copy_from_slice(d);
         }
-        out
     }
 
     /// Stream to `w`, as [`Writer::to_bytes`] lays the bytes out; returns bytes written.
@@ -125,7 +138,12 @@ impl Store {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut words = vec![0u64; bytes.len().div_ceil(8)];
         bytemuck::cast_slice_mut::<u64, u8>(&mut words)[..bytes.len()].copy_from_slice(bytes);
-        Self::new(Backing::Owned(words, bytes.len()))
+        Self::from_words(words, bytes.len())
+    }
+
+    /// A container over the first `len` bytes of `words` (no copy).
+    pub(crate) fn from_words(words: Vec<u64>, len: usize) -> Result<Self> {
+        Self::new(Backing::Owned(words, len))
     }
 
     fn bytes_of(b: &Backing) -> &[u8] {
@@ -201,6 +219,8 @@ mod tests {
         let mut streamed = Vec::new();
         assert_eq!(w.write_to(&mut streamed).unwrap(), bytes.len() as u64);
         assert_eq!(streamed, bytes);
+        let (words, len) = w.to_words();
+        assert_eq!(&bytemuck::cast_slice::<u64, u8>(&words)[..len], &bytes[..]);
         let s = Store::from_bytes(&bytes).unwrap();
         assert_eq!(s.get::<u32>("owned").unwrap(), &[9, 10, 11]);
         assert!(s.has("a") && !s.has("missing"));

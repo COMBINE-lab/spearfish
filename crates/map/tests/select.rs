@@ -93,7 +93,7 @@ fn check(seed: u64, n_genes: usize, alpha_fam: f32, f_keep: usize) -> Result<(),
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let mapper = Mapper::new(
         idx.clone(),
         OracleChainer {

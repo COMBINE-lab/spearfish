@@ -316,7 +316,7 @@ impl Index {
         let (data, rep, _) = Self::build_data(txs, opts, Default::default(), Vec::new())?;
         Ok((
             Index {
-                inner: Arc::new(index::Index::from_bytes(&data.to_bytes())?),
+                inner: Arc::new(index::Index::from_data(&data)?),
             },
             rep,
         ))

@@ -91,7 +91,7 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let p = ChainParams {
         h,
         beta,

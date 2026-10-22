@@ -418,6 +418,12 @@ impl Index {
         Self::from_store(Store::from_bytes(bytes)?)
     }
 
+    /// An index built in memory, laid out once (`from_bytes(&data.to_bytes())` copies twice).
+    pub fn from_data(data: &IndexData) -> Result<Self> {
+        let (words, len) = data.writer().to_words();
+        Self::from_store(Store::from_words(words, len)?)
+    }
+
     fn from_store(store: Store) -> Result<Self> {
         let text = std::str::from_utf8(store.get::<u8>("meta")?)?;
         let meta = text
