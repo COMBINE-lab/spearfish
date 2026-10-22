@@ -930,7 +930,7 @@ unsafe fn row_avx512(
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
-    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
     let neg = _mm512_set1_epi32(NEG);
     let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
     let (vmat, vmis) = (_mm512_set1_epi32(mat), _mm512_set1_epi32(-mis));
