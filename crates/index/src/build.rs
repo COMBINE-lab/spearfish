@@ -720,35 +720,15 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         tx_family,
         tx_len: txs.iter().map(|t| t.seq.len() as u32).collect(),
         tx_plen: seeded.iter().map(|s| s.plen).collect(),
-        tx_seq: {
-            // Concatenate the per-transcript packings, each starting on a word boundary.
-            let mut words = Vec::new();
-            let mut off = vec![0u64];
-            for s in &seeded {
-                words.extend_from_slice(&s.packed);
-                off.push(words.len() as u64);
-            }
-            (off, words)
-        },
+        // The per-transcript packings, each starting on a word boundary.
+        tx_seq: crate::concat(seeded.iter().map(|s| &s.packed[..])),
         tx_raw: if p.hpc {
-            let mut words = Vec::new();
-            let mut off = vec![0u64];
-            for s in &seeded {
-                words.extend_from_slice(&s.raw);
-                off.push(words.len() as u64);
-            }
-            (off, words)
+            crate::concat(seeded.iter().map(|s| &s.raw[..]))
         } else {
             Default::default()
         },
         tx_raw_ck: if p.hpc {
-            let mut ck = Vec::new();
-            let mut off = vec![0u64];
-            for s in &seeded {
-                ck.extend_from_slice(&s.raw_ck);
-                off.push(ck.len() as u64);
-            }
-            (off, ck)
+            crate::concat(seeded.iter().map(|s| &s.raw_ck[..]))
         } else {
             Default::default()
         },

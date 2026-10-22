@@ -194,14 +194,17 @@ pub(crate) fn pack2(seq: &[u8]) -> Vec<u64> {
     words
 }
 
-fn pool(strings: &[String]) -> (Vec<u64>, Vec<u8>) {
-    let mut off = vec![0u64];
-    let mut bytes = Vec::new();
-    for s in strings {
-        bytes.extend_from_slice(s.as_bytes());
-        off.push(bytes.len() as u64);
+/// Concatenate `parts` with offsets: part `i` is `data[off[i]..off[i + 1]]`.
+pub(crate) fn concat<'a, T: Copy + 'a>(parts: impl Iterator<Item = &'a [T]> + Clone) -> (Vec<u64>, Vec<T>) {
+    let (n, total) = parts.clone().fold((0, 0), |(n, t), p| (n + 1, t + p.len()));
+    let mut off = Vec::with_capacity(n + 1);
+    let mut data = Vec::with_capacity(total);
+    off.push(0);
+    for p in parts {
+        data.extend_from_slice(p);
+        off.push(data.len() as u64);
     }
-    (off, bytes)
+    (off, data)
 }
 
 impl IndexData {
@@ -241,10 +244,10 @@ impl IndexData {
             w.add("tx_raw_ck_off", &self.tx_raw_ck.0);
             w.add("tx_raw_ck", &self.tx_raw_ck.1);
         }
-        let (o, b) = pool(&self.tx_names);
+        let (o, b) = concat(self.tx_names.iter().map(|s| s.as_bytes()));
         w.add_owned("tx_name_off", o);
         w.add_owned("tx_names", b);
-        let (o, b) = pool(&self.gene_names);
+        let (o, b) = concat(self.gene_names.iter().map(|s| s.as_bytes()));
         w.add_owned("gene_name_off", o);
         w.add_owned("gene_names", b);
         if let Some(m) = &self.manifest {
