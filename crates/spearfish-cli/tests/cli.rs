@@ -600,3 +600,58 @@ fn description_headers_name_transcripts_like_the_index() {
     ]);
     assert!(log.contains("6 transcripts (0 not in GTF"), "{log}");
 }
+
+/// Headers that are not UTF-8 are read lossily, in transcripts and in reads.
+#[test]
+fn non_utf8_headers() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("non_utf8");
+    std::fs::create_dir_all(&dir).unwrap();
+    let toy_fa = std::fs::read(toy()).unwrap();
+    // A transcript header with byte 0xE9 (Latin-1 'é').
+    let mut fa = b">TOYT0000000_\xe9|TOYG0000000\n".to_vec();
+    let first_seq: Vec<u8> = toy_fa
+        .split(|&b| b == b'\n')
+        .skip(1)
+        .take_while(|l| !l.starts_with(b">"))
+        .flat_map(|l| l.iter().copied())
+        .collect();
+    fa.extend_from_slice(&first_seq);
+    fa.push(b'\n');
+    fa.extend_from_slice(&toy_fa);
+    let (tx, idx) = (dir.join("transcripts.fa"), dir.join("toy.sfi"));
+    std::fs::write(&tx, &fa).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    run(&["index".as_ref(), tx.as_os_str(), "-o".as_ref(), idx.as_os_str()]);
+    let mut reads = b">read_\xe9 sample=caf\xe9\n".to_vec();
+    reads.extend_from_slice(&first_seq);
+    reads.push(b'\n');
+    let (rd, tsv, paf) = (dir.join("reads.fa"), dir.join("out.tsv"), dir.join("out.paf"));
+    std::fs::write(&rd, reads).unwrap();
+    run(&[
+        "map".as_ref(),
+        idx.as_os_str(),
+        rd.as_os_str(),
+        "-o".as_ref(),
+        tsv.as_os_str(),
+        "--paf".as_ref(),
+        paf.as_os_str(),
+    ]);
+    let text = std::fs::read_to_string(&tsv).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split('\t').collect()).collect();
+    assert!(
+        !rows.is_empty() && rows.iter().all(|r| r[0] == "read_\u{fffd}"),
+        "{text}"
+    );
+    assert!(rows.iter().any(|r| r[4] == "TOYT0000000_\u{fffd}"), "{text}");
+    assert!(
+        std::fs::read_to_string(&paf)
+            .unwrap()
+            .starts_with("read_\u{fffd}\t")
+    );
+}

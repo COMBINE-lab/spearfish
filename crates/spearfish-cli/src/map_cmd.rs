@@ -313,7 +313,9 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         if self.tsv.is_none() && self.paf.is_none() {
             return Ok(());
         }
-        let name = record.id_str().split_whitespace().next().unwrap_or("");
+        // Lossy: a header that is not UTF-8 gets U+FFFD instead of failing the run.
+        let id = String::from_utf8_lossy(record.id());
+        let name = id.split_whitespace().next().unwrap_or("");
         let idx = self.mapper.index();
         if let Some((_, buf)) = &mut self.tsv {
             tsv_lines(buf, name, &r, idx);

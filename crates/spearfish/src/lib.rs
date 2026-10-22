@@ -430,7 +430,7 @@ pub fn name_and_gene(id: &str) -> (String, String) {
 }
 
 /// Read transcripts from a (optionally compressed) FASTA as (name, gene, sequence), names
-/// and genes as [`name_and_gene`] splits the IDs.
+/// and genes as [`name_and_gene`] splits the IDs (bytes that are not UTF-8 become U+FFFD).
 #[cfg(feature = "fasta")]
 pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     use paraseq::{ReaderBuilder, Record};
@@ -440,7 +440,7 @@ pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
             let rec = rec?;
-            let (name, gene) = name_and_gene(rec.id_str());
+            let (name, gene) = name_and_gene(&String::from_utf8_lossy(rec.id()));
             txs.push((name, gene, rec.seq().into_owned()));
         }
     }

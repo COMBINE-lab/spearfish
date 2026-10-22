@@ -56,7 +56,7 @@ pub fn run(args: Args) -> Result<()> {
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
             let rec = rec?;
-            names.push(spearfish::name_and_gene(rec.id_str()).0);
+            names.push(spearfish::name_and_gene(&String::from_utf8_lossy(rec.id())).0);
             lens.push(rec.seq().len() as u32);
         }
     }
