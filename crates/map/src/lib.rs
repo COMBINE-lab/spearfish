@@ -105,6 +105,13 @@ pub struct TieBreak {
     pub orient_margin_rel: f32,
 }
 
+impl TieBreak {
+    /// Transcript bases searched for an unanchored read end of `x` bases: `x + pad + x / pad_div`.
+    fn window(&self, x: u32) -> u32 {
+        x + self.pad + x / self.pad_div
+    }
+}
+
 impl Default for TieBreak {
     fn default() -> Self {
         TieBreak {
@@ -648,9 +655,8 @@ impl<C: Chainer> Mapper<C> {
     fn hit_region(&self, tb: &TieBreak, lo: u32, hi: u32, h: &TxHit) -> Vec<u8> {
         let tlen = self.idx.tx_plen()[h.tx as usize];
         let (left, right) = (h.qstart - lo, hi - h.qend);
-        let slack = |ext: u32| tb.pad + ext / tb.pad_div;
-        let lo = h.tstart.saturating_sub(left + slack(left));
-        let hi = (h.tend + right + slack(right)).min(tlen);
+        let lo = h.tstart.saturating_sub(tb.window(left));
+        let hi = (h.tend + tb.window(right)).min(tlen);
         self.idx.tx_codes(h.tx, lo, hi)
     }
 
@@ -670,7 +676,6 @@ impl<C: Chainer> Mapper<C> {
     ) -> i32 {
         let plen = codes.len() as u32;
         let tlen = self.idx.tx_plen()[h.tx as usize];
-        let slack = |ext: u32| tb.pad + ext / tb.pad_div;
         let (qs, qe) = (h.qstart as usize, h.qend as usize);
         let w0 = align::dp_work();
         let mid = match self.raw_texts(tb, raw, &[(h.tx, h.tstart, h.tend)]) {
@@ -691,11 +696,7 @@ impl<C: Chainer> Mapper<C> {
         };
         let w1 = align::dp_work();
         let left = if qs > 0 {
-            let span = [(
-                h.tx,
-                h.tstart.saturating_sub(h.qstart + slack(h.qstart)),
-                h.tstart,
-            )];
+            let span = [(h.tx, h.tstart.saturating_sub(tb.window(h.qstart)), h.tstart)];
             let (read, text) = match self.raw_texts(tb, raw, &span) {
                 Some((r, mut t)) => (&r.codes[..r.pos(h.qstart)], t.pop().unwrap()),
                 None => (&codes[..qs], self.idx.tx_codes(h.tx, span[0].1, h.tstart)),
@@ -708,7 +709,7 @@ impl<C: Chainer> Mapper<C> {
         };
         let rest = plen - h.qend;
         let right = if rest > 0 {
-            let span = [(h.tx, h.tend, (h.tend + rest + slack(rest)).min(tlen))];
+            let span = [(h.tx, h.tend, (h.tend + tb.window(rest)).min(tlen))];
             let (read, text) = match self.raw_texts(tb, raw, &span) {
                 Some((r, mut t)) => (&r.codes[r.pos(h.qend)..], t.pop().unwrap()),
                 None => (&codes[qe..], self.idx.tx_codes(h.tx, h.tend, span[0].2)),
@@ -902,8 +903,10 @@ impl<C: Chainer> Mapper<C> {
                     let w0 = align::dp_work();
                     let xs = if mode == align::Mode::Prefix && tb.clip_ends {
                         // The band is laid out for the window the read end would get against a
-                        // transcript that doesn't end inside it.
-                        let window = read.len() + tb.pad as usize + read.len() / tb.pad_div as usize;
+                        // transcript that doesn't end inside it (`tb.window`, as the windows
+                        // below are cut). With raw read ends `read` is raw and the windows are
+                        // parsed spans' raw bases, so this only approximates their lengths.
+                        let window = tb.window(read.len() as u32) as usize;
                         align::affine_extend_sorted_cut(
                             read,
                             &tx,
@@ -1047,13 +1050,7 @@ impl<C: Chainer> Mapper<C> {
             let spans: Vec<(u32, u32, u32)> = hits
                 .iter()
                 .zip(&first.targets)
-                .map(|(h, t)| {
-                    (
-                        h.tx,
-                        t.start.saturating_sub(q0 + tb.pad + q0 / tb.pad_div),
-                        t.start,
-                    )
-                })
+                .map(|(h, t)| (h.tx, t.start.saturating_sub(tb.window(q0)), t.start))
                 .collect();
             let short: Vec<bool> = spans.iter().map(|&(_, lo, _)| lo == 0).collect();
             add(match self.raw_ranges(tb, raw, &spans) {
@@ -1094,7 +1091,7 @@ impl<C: Chainer> Mapper<C> {
             .map(|(h, t)| {
                 let tlen = self.idx.tx_plen()[h.tx as usize];
                 let s = if through { t.start } else { t.end };
-                (h.tx, s, (s + rest + tb.pad + rest / tb.pad_div).min(tlen))
+                (h.tx, s, (s + tb.window(rest)).min(tlen))
             })
             .collect();
         // The read's poly(A) tail, searched for past the last block (raw positions from ql).
