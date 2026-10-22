@@ -1,12 +1,12 @@
-//! Colinear chaining in transcript coordinates (design doc, "Chaining").
+//! Colinear chaining in transcript coordinates.
 //!
 //! `OracleChainer` runs one DP per candidate transcript. Transcripts are visited in order of
 //! their placement lists (shifted to the first placement), and each DP resumes where its list
 //! diverges from the previous transcript's: identical prefixes give identical DP values, so
 //! this is exact and shares the work of isoforms that agree over a read's anchors. It defines
-//! the scores the multi-transcript refinement chainer (M6, `RefineChainer`) must reproduce
-//! exactly with an unbounded beam (Theorem 2), so the window, validity rule, gain and cost here
-//! are the specification:
+//! the scores the multi-transcript refinement chainer (`RefineChainer`) must reproduce exactly
+//! with an unbounded beam, so the window, validity rule, gain and cost here are the
+//! specification:
 //!
 //! - Anchors of a candidate are indexed in their family order (sorted by query start);
 //!   anchor `i'` may extend a chain ending at anchor `i` only if `i' - h <= i < i'`.

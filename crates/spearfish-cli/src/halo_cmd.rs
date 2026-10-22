@@ -1,5 +1,5 @@
-//! `spearfish halo`: junction halos and isoform resolution per seed scheme (milestone M4,
-//! pulled forward to decide the seeding scheme).
+//! `spearfish halo`: junction halos and isoform resolution per seed scheme (used to choose
+//! the seed scheme).
 //!
 //! Seeds are keyed by (label, genomic position of their first transcript base), so the same
 //! seed in two isoforms gets the same key, as in the core graph. Three outputs, written to
@@ -7,13 +7,13 @@
 //!
 //! - **halo**: for seeds inside a segment shared by >= 2 isoforms, the fraction present in
 //!   all of them (isoform-invariant), by distance to the nearest alternative boundary
-//!   (the Lemma's halo profile).
+//!   (the junction halo: how close to a boundary seeds stop being isoform-invariant).
 //! - **iso**: for ordered pairs (t1, t2) of overlapping isoforms of a gene, restricted to
 //!   their common genomic extent, whether t1 has a seed whose key t2 lacks (a
 //!   discriminating seed), error-free and after simulated errors in a read from t1. Binned by
 //!   how many exonic bases the pair differs by within the overlap.
 //! - **genes**: per gene and seed unit, distinct labels against exonic bases and junctions
-//!   (Theorem 1 data).
+//!   (how the core graph's size grows with a gene's sequence and splicing).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -181,7 +181,7 @@ fn gene(cx: &Ctx, gene_id: &str, txs: &[Tx]) -> (Acc, Vec<String>) {
         })
         .collect();
 
-    // Theorem 1 data.
+    // Per gene and unit: distinct labels against exonic bases and junctions.
     let sum_len: u64 = txs.iter().map(|t| t.seq.len() as u64).sum();
     let mut rows = Vec::new();
     for (h, &hpc) in cx.hpc.iter().enumerate() {

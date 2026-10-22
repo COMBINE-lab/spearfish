@@ -12,14 +12,13 @@ anyhow.workspace = true
 index.workspace = true
 lcp-core.workspace = true
 map.workspace = true
-quant.workspace = true
-seeds.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bon.workspace = true
 log.workspace = true
 xxhash-rust.workspace = true
 paraseq = { workspace = true, optional = true }
+# Not used directly: switches paraseq's gzip decoding to zlib-rs (see the workspace manifest).
 flate2 = { workspace = true, optional = true }
 
 [features]
@@ -27,5 +26,7 @@ default = ["fasta"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
 fasta = ["dep:paraseq", "dep:flate2"]
 
-[dev-dependencies]
-lcp-core.workspace = true
+# Reads transcripts from FASTA; skipped in builds without the feature.
+[[test]]
+name = "api"
+required-features = ["fasta"]

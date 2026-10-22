@@ -59,6 +59,8 @@
   `Index::id()`. `Strands`, `TieBreak`, `MapParams` and the other parameter types are
   re-exported. The existing API (`MapOptions::preset`, `Mapper::new`, `Index::build`) is
   unchanged.
+- Removed: `MapOptions::tiebreak_mut` and `chain_mut` (use the public `params` fields), and
+  the `spearfish::quant` re-export (the EM crate serves `spearfish em` only).
 
 ### Performance
 
@@ -109,9 +111,23 @@
 - aarch64 (Apple Silicon, ARM Linux): the affine alignment rows were not computed at all,
   because a configuration attribute removed the scalar code along with the x86 path.
 
+- Settings that have no effect are now also reported for `--no-clip-ends` with the tie-break
+  off, and for `--end-bonus`, `--xdrop`, `--band`, `--pad` and `--pad-div` with both the
+  tie-break and span extension off (e.g. `--preset hifi --no-tiebreak`).
+- Errors about input and output files name the file (a missing FASTA for `spearfish index`
+  or `spearfish em`, an output that can't be created). `spearfish index --write-t2g` and
+  `--t2g`, and `spearfish em -o`, fail on a bad path before the index build or the EM rather
+  than after it.
+- `spearfish quant` keeps the RAD file when oarfish fails and names it, so `oarfish -a` can be
+  rerun without mapping again; with `-v` the error no longer points to a log file that was not
+  written (oarfish logs to stderr then).
+
 ### Other
 
 - gzip input decodes with zlib-rs.
 - Index writing streams sections to disk instead of building the file in memory.
 - The workspace declares its minimum Rust version, 1.89.
 - CI runs on x86-64 Linux, arm64 Linux and Apple Silicon, and checks the minimum Rust version.
+- Release builds (`cargo install`) no longer embed debug info, so the binary is about 8 times
+  smaller; backtraces lose file and line numbers (panic messages keep them). The `profiling`
+  profile builds with line tables (see CONTRIBUTING.md).

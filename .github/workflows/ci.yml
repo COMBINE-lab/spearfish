@@ -1,5 +1,19 @@
 name: CI
-on: [push, pull_request]
+# Pull requests, and pushes to main: a pushed branch with an open PR would otherwise run every
+# job twice. Other branches can be run by hand.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+# A newer push to a pull request cancels its older run. Every other run gets a group of its own
+# (one shared group would still cancel a queued run when a newer one arrives), so pushes to main
+# are never cancelled and never wait on each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -23,13 +37,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # oarfish builds the library with default-features = false; keep that build compiling.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --locked -p spearfish --no-default-features --all-targets -- -D warnings
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo doc --locked --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test --locked --workspace
       - run: python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
-      - run: cargo run --release -q -p spearfish-cli -- doctor
+      # The SIMD level the tests ran at depends on the runner's CPU (hosted x86-64 runners may
+      # lack AVX-512): the job summary shows it.
+      - name: doctor
+        shell: bash
+        run: |
+          cargo run --locked --release -q -p spearfish-cli -- doctor | tee doctor.txt
+          { echo '```'; cat doctor.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-  # The lower x86-64 SIMD levels, forced: the tests and the doctor self-test must agree with
-  # the default level's.
+  # Lower x86-64 SIMD levels, forced: the tests and the doctor self-test must agree with the
+  # runner's own level (avx2 repeats the default job on a runner without AVX-512).
   simd-levels:
     strategy:
       fail-fast: false
@@ -41,8 +68,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
-      - run: cargo run --release -q -p spearfish-cli -- doctor
+      - run: cargo test --locked --workspace
+      - run: cargo run --locked --release -q -p spearfish-cli -- doctor
 
   # The scalar level on Apple Silicon, forced: the NEON kernels (the default there) must agree
   # with it.
@@ -53,12 +80,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
-      - run: cargo run --release -q -p spearfish-cli -- doctor
+      - run: cargo test --locked --workspace
+      - run: cargo run --locked --release -q -p spearfish-cli -- doctor
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --locked --workspace --all-targets
