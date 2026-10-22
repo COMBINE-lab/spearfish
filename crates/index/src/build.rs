@@ -156,9 +156,19 @@ impl Uf {
     }
 }
 
-/// Per transcript: seeds, parsed length, content hash per seed, 2-bit packed parsed sequence,
-/// and (HPC) the packed raw sequence with its raw-position checkpoints.
-type Seeded = (Vec<Seed>, u32, Vec<u64>, Vec<u64>, (Vec<u64>, Vec<u32>));
+/// Per-transcript results of the seeding pass.
+struct Seeded {
+    seeds: Vec<Seed>,
+    /// Parsed (HPC or raw) length.
+    plen: u32,
+    /// Independent hash of each seed's content (for the collision check).
+    content: Vec<u64>,
+    /// 2-bit packed parsed sequence.
+    packed: Vec<u64>,
+    /// (HPC) The packed raw sequence and its raw-position checkpoints (see [`raw_packing`]).
+    raw: Vec<u64>,
+    raw_ck: Vec<u32>,
+}
 
 /// Packed raw sequence and raw starts of every `RAW_CK`-th parsed base (through the parsed
 /// length), if the packed sequence's runs are exactly the parsed runs (non-ACGT bases pack
@@ -199,7 +209,7 @@ fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
         .par_iter()
         .enumerate()
         .flat_map_iter(|(t, s)| {
-            let seeds = &s.0;
+            let seeds = &s.seeds;
             (0..seeds.len().saturating_sub(span - 1)).map(move |i| {
                 let mut h = xxhash_rust::xxh3::Xxh3::with_seed(0x6e_6e_65_73);
                 for x in &seeds[i..i + span] {
@@ -345,12 +355,19 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
                     )
                 })
                 .collect();
-            let raw = h.as_ref().map(|h| raw_packing(&t.seq, h)).unwrap_or_default();
-            (seeds, seq.len() as u32, content, crate::pack2(seq), raw)
+            let (raw, raw_ck) = h.as_ref().map(|h| raw_packing(&t.seq, h)).unwrap_or_default();
+            Seeded {
+                seeds,
+                plen: seq.len() as u32,
+                content,
+                packed: crate::pack2(seq),
+                raw,
+                raw_ck,
+            }
         })
         .collect();
-    rep.seed_occurrences = seeded.iter().map(|s| s.0.len() as u64).sum();
-    rep.unseeded_transcripts = seeded.iter().filter(|s| s.0.is_empty()).count();
+    rep.seed_occurrences = seeded.iter().map(|s| s.seeds.len() as u64).sum();
+    rep.unseeded_transcripts = seeded.iter().filter(|s| s.seeds.is_empty()).count();
     lap(&mut rep, "seed");
 
     // 2. Genes and nodes. A node is a (label, scope) pair, scope = gene or 0; nodes are
@@ -388,7 +405,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     let mut keys: Vec<(u64, u32)> = seeded
         .par_iter()
         .enumerate()
-        .flat_map_iter(|(t, s)| s.0.iter().map(move |x| (x.label, scope(t))))
+        .flat_map_iter(|(t, s)| s.seeds.iter().map(move |x| (x.label, scope(t))))
         .collect();
     keys.par_sort_unstable();
     keys.dedup();
@@ -400,7 +417,8 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         .par_iter()
         .enumerate()
         .map(|(t, s)| {
-            s.0.iter()
+            s.seeds
+                .iter()
                 .map(|x| keys.binary_search(&(x.label, scope(t))).unwrap() as u32)
                 .collect()
         })
@@ -415,7 +433,8 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     let mut succ = vec![UNSET; n];
     let mut node_len = vec![u32::MAX; n];
     let mut node_content = vec![0u64; n];
-    for ((s, _, content, _, _), v) in seeded.iter().zip(&nodes) {
+    for (sd, v) in seeded.iter().zip(&nodes) {
+        let (s, content) = (&sd.seeds, &sd.content);
         for i in 0..v.len() {
             let c = &mut node_content[v[i] as usize];
             if node_len[v[i] as usize] == u32::MAX {
@@ -536,7 +555,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         .par_iter()
         .zip(&nodes)
         .enumerate()
-        .map(|(ti, ((s, _, _, _, _), v))| {
+        .map(|(ti, (Seeded { seeds: s, .. }, v))| {
             let mut out = Vec::new();
             let mut i = 0;
             while i < v.len() {
@@ -700,13 +719,13 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         tx_gene,
         tx_family,
         tx_len: txs.iter().map(|t| t.seq.len() as u32).collect(),
-        tx_plen: seeded.iter().map(|s| s.1).collect(),
+        tx_plen: seeded.iter().map(|s| s.plen).collect(),
         tx_seq: {
             // Concatenate the per-transcript packings, each starting on a word boundary.
             let mut words = Vec::new();
             let mut off = vec![0u64];
             for s in &seeded {
-                words.extend_from_slice(&s.3);
+                words.extend_from_slice(&s.packed);
                 off.push(words.len() as u64);
             }
             (off, words)
@@ -715,7 +734,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
             let mut words = Vec::new();
             let mut off = vec![0u64];
             for s in &seeded {
-                words.extend_from_slice(&s.4.0);
+                words.extend_from_slice(&s.raw);
                 off.push(words.len() as u64);
             }
             (off, words)
@@ -726,7 +745,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
             let mut ck = Vec::new();
             let mut off = vec![0u64];
             for s in &seeded {
-                ck.extend_from_slice(&s.4.1);
+                ck.extend_from_slice(&s.raw_ck);
                 off.push(ck.len() as u64);
             }
             (off, ck)
