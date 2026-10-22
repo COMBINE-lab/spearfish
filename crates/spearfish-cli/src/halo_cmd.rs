@@ -1,5 +1,5 @@
-//! `spearfish halo`: junction halos and isoform resolution per seed scheme (milestone M4,
-//! pulled forward to decide the seeding scheme).
+//! `spearfish halo`: junction halos and isoform resolution per seed scheme (used to choose
+//! the seed scheme).
 //!
 //! Seeds are keyed by (label, genomic position of their first transcript base), so the same
 //! seed in two isoforms gets the same key, as in the core graph. Three outputs, written to
@@ -7,13 +7,13 @@
 //!
 //! - **halo**: for seeds inside a segment shared by >= 2 isoforms, the fraction present in
 //!   all of them (isoform-invariant), by distance to the nearest alternative boundary
-//!   (the Lemma's halo profile).
+//!   (the junction halo: how close to a boundary seeds stop being isoform-invariant).
 //! - **iso**: for ordered pairs (t1, t2) of overlapping isoforms of a gene, restricted to
 //!   their common genomic extent, whether t1 has a seed whose key t2 lacks (a
 //!   discriminating seed), error-free and after simulated errors in a read from t1. Binned by
 //!   how many exonic bases the pair differs by within the overlap.
 //! - **genes**: per gene and seed unit, distinct labels against exonic bases and junctions
-//!   (Theorem 1 data).
+//!   (how the core graph's size grows with a gene's sequence and splicing).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use paraseq::{ReaderBuilder, Record};
 use rayon::prelude::*;
 
 use crate::annot::{Segments, TxModel, exonic_in, read_gtf, sym_diff};
@@ -31,7 +30,8 @@ use crate::sim::{profile, simulate};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Transcript FASTA (GENCODE headers: `tx|gene|...`).
+    /// Transcript FASTA; names are the IDs up to the first '|' or whitespace, as the index
+    /// takes them (GENCODE headers: `tx|gene|...`), and must match the GTF's transcript_id.
     transcripts: PathBuf,
     /// Matching GTF (exon records).
     gtf: PathBuf,
@@ -181,7 +181,7 @@ fn gene(cx: &Ctx, gene_id: &str, txs: &[Tx]) -> (Acc, Vec<String>) {
         })
         .collect();
 
-    // Theorem 1 data.
+    // Per gene and unit: distinct labels against exonic bases and junctions.
     let sum_len: u64 = txs.iter().map(|t| t.seq.len() as u64).sum();
     let mut rows = Vec::new();
     for (h, &hpc) in cx.hpc.iter().enumerate() {
@@ -343,27 +343,20 @@ pub fn run(args: Args) -> Result<()> {
     let models = read_gtf(&args.gtf)?;
     let mut genes: HashMap<String, Vec<Tx>> = HashMap::new();
     let (mut missing, mut mismatched) = (0, 0);
-    let mut reader = ReaderBuilder::path(&args.transcripts).build()?;
-    let mut rset = reader.new_record_set();
-    while rset.fill(&mut reader)? {
-        for rec in rset.iter() {
-            let rec = rec?;
-            let id = rec.id_str().split('|').next().unwrap().to_string();
-            let Some(model) = models.get(&id) else {
-                missing += 1;
-                continue;
-            };
-            let seq = rec.seq().into_owned();
-            if model.len() != seq.len() as u64 {
-                mismatched += 1;
-                continue;
-            }
-            genes.entry(model.gene.clone()).or_default().push(Tx {
-                id,
-                seq,
-                model: model.clone(),
-            });
+    for (id, _, seq) in spearfish::read_transcripts(&args.transcripts)? {
+        let Some(model) = models.get(&id) else {
+            missing += 1;
+            continue;
+        };
+        if model.len() != seq.len() as u64 {
+            mismatched += 1;
+            continue;
         }
+        genes.entry(model.gene.clone()).or_default().push(Tx {
+            id,
+            seq,
+            model: model.clone(),
+        });
     }
     eprintln!(
         "halo: {} genes, {} transcripts ({missing} not in GTF, {mismatched} length mismatches), loaded in {:.1} s",
@@ -447,6 +440,8 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
+    // Flush each file explicitly: dropping a BufWriter discards write errors.
+    f.flush()?;
     let mut f = open("iso")?;
     writeln!(
         f,
@@ -475,6 +470,7 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
+    f.flush()?;
     let mut f = open("genes")?;
     writeln!(
         f,
@@ -483,5 +479,6 @@ pub fn run(args: Args) -> Result<()> {
     for r in rows {
         writeln!(f, "{r}")?;
     }
+    f.flush()?;
     Ok(())
 }

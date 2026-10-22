@@ -170,7 +170,7 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
 /// [`distance_with`] in `mode` for each of `texts` with one threshold `k`: the same results
 /// as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit lane,
 /// sharing the pattern's blocks; with AVX2, up to four; at the NEON level, four in lockstep
-/// ([`batch_lanes`]).
+/// (`batch_lanes`).
 pub fn batch_distances(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32) -> Vec<Option<u32>> {
     match simd_level() {
         #[cfg(target_arch = "x86_64")]
@@ -737,43 +737,22 @@ pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, b
         .collect()
 }
 
-/// [`affine_extend`] (or, with `diagonal`, [`affine_extend_diagonal`]) for each of `texts`,
-/// which must be sorted, sharing rows as [`affine_sorted`] does. Without `diagonal`, the band is
+/// [`affine_extend`] for each of `texts`, which must be sorted, sharing rows as
+/// [`affine_sorted`] does, with each text's score also over its first `cut` bases only:
+/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
+/// one pass (`cut = usize::MAX` for none).
+///
+/// With `diagonal`, the band stays on the diagonal from the start (`2 * band + 1` cells per
+/// row) however much longer the text is: for accurate reads, whose extensions stay near it. A
+/// text shorter than the pattern (a transcript ending inside the read's flank) keeps the band
+/// of [`affine_extend`], which can place the read's extra bases. Without `diagonal`, the band is
 /// laid out for a text of at least `window` bases, as [`affine_extend_window`] does: a text cut
 /// short where its transcript ends gets the band of the full window, so a read whose far end
 /// doesn't align (a primer, an adapter) is placed as it would be against a longer transcript.
-#[allow(clippy::too_many_arguments)]
-pub fn affine_extend_sorted(
-    pattern: &[u8],
-    texts: &[&[u8]],
-    sc: &Affine,
-    band: usize,
-    end_bonus: i32,
-    xdrop: i32,
-    diagonal: bool,
-    window: usize,
-) -> Vec<i32> {
-    affine_extend_sorted_cut(
-        pattern,
-        texts,
-        sc,
-        band,
-        end_bonus,
-        xdrop,
-        diagonal,
-        window,
-        usize::MAX,
-    )
-    .into_iter()
-    .map(|(x, _, _)| x)
-    .collect()
-}
-
-/// [`affine_extend_sorted`], with each text's score also over its first `cut` bases only:
-/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
-/// one pass. Without X-drop, the second equals the pass
-/// over the cut text (same band layout: `window` at least as long as the texts); with it, the
-/// cut score may extend further, since the pass stops only when the whole text's does.
+///
+/// Without X-drop, the cut score equals the pass over the cut text (same band layout: `window`
+/// at least as long as the texts); with it, the cut score may extend further, since the pass
+/// stops only when the whole text's does.
 #[allow(clippy::too_many_arguments)]
 pub fn affine_extend_sorted_cut(
     pattern: &[u8],
@@ -817,38 +796,10 @@ pub fn affine_extend_sorted_cut(
     .collect()
 }
 
-/// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
-/// row) however much longer the text is: for accurate reads, whose extensions stay near it.
-/// A text shorter than the pattern (a transcript ending inside the read's flank) keeps the
-/// band of [`affine_extend`], which can place the read's extra bases.
-pub fn affine_extend_diagonal(
-    pattern: &[u8],
-    text: &[u8],
-    sc: &Affine,
-    band: usize,
-    end_bonus: i32,
-    xdrop: i32,
-) -> i32 {
-    let geom = pattern.len().min(text.len());
-    let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some((xdrop, false)), geom);
-    d.clip_best.max(d.score.saturating_add(end_bonus))
-}
-
-/// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases,
-/// text bases read).
-pub fn affine_extend_end(
-    pattern: &[u8],
-    text: &[u8],
-    sc: &Affine,
-    band: usize,
-    end_bonus: i32,
-    xdrop: i32,
-) -> (i32, usize, usize, usize) {
-    affine_extend_window(pattern, text, text.len(), sc, band, end_bonus, xdrop)
-}
-
-/// [`affine_extend_end`] on a text cut from a window of `window` bases (`text.len() <=
-/// window`): the band is laid out for the whole window, so the result depends on the text only
+/// [`affine_extend`] with where the best extension ends, (score, pattern bases, text bases,
+/// text bases read), on a text cut from a window of `window` bases (`text.len() <= window`;
+/// `text.len()` for a plain extension): the band is laid out for the whole window, so the
+/// result depends on the text only
 /// through the bases read and, if it read them all, the text's length. Texts cut from windows
 /// of one length share results on that basis.
 pub fn affine_extend_window(
@@ -1059,7 +1010,7 @@ unsafe fn row_avx512(
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
-    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
     (nh[w], nf[w]) = (NEG, NEG);
     let neg = _mm512_set1_epi32(NEG);
     let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
@@ -1870,6 +1821,60 @@ fn run_core<R: Rows>(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// [`affine_extend_sorted_cut`]'s whole-text scores.
+    #[allow(clippy::too_many_arguments)]
+    fn affine_extend_sorted(
+        pattern: &[u8],
+        texts: &[&[u8]],
+        sc: &Affine,
+        band: usize,
+        end_bonus: i32,
+        xdrop: i32,
+        diagonal: bool,
+        window: usize,
+    ) -> Vec<i32> {
+        affine_extend_sorted_cut(
+            pattern,
+            texts,
+            sc,
+            band,
+            end_bonus,
+            xdrop,
+            diagonal,
+            window,
+            usize::MAX,
+        )
+        .into_iter()
+        .map(|(x, _, _)| x)
+        .collect()
+    }
+
+    /// One text's score as [`affine_extend_sorted_cut`] computes it with `diagonal`.
+    fn affine_extend_diagonal(
+        pattern: &[u8],
+        text: &[u8],
+        sc: &Affine,
+        band: usize,
+        end_bonus: i32,
+        xdrop: i32,
+    ) -> i32 {
+        let geom = pattern.len().min(text.len());
+        let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some((xdrop, false)), geom);
+        d.clip_best.max(d.score.saturating_add(end_bonus))
+    }
+
+    /// [`affine_extend_window`] on a whole text.
+    fn affine_extend_end(
+        pattern: &[u8],
+        text: &[u8],
+        sc: &Affine,
+        band: usize,
+        end_bonus: i32,
+        xdrop: i32,
+    ) -> (i32, usize, usize, usize) {
+        affine_extend_window(pattern, text, text.len(), sc, band, end_bonus, xdrop)
+    }
 
     fn naive(p: &[u8], t: &[u8], mode: Mode) -> u32 {
         let (m, n) = (p.len(), t.len());

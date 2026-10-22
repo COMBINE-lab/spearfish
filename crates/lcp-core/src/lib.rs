@@ -1,7 +1,7 @@
 //! Locally consistent parsing (LCP) behind an abstract [`Parser`] interface.
 //!
 //! Everything downstream (index, seeding, chaining) is written against [`Parser`] and
-//! [`Hierarchy`], so the LCP variant can be swapped. See the design doc, "LCP preliminaries".
+//! [`Hierarchy`], so the LCP variant can be swapped.
 
 mod bits;
 pub mod encode;

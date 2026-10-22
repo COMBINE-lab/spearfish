@@ -43,9 +43,13 @@ clap_complete = "4.6"
 clap_mangen = "0.3"
 
 [profile.release]
-debug = 1
 lto = "thin"
 codegen-units = 1
+
+# Release code with line tables, for profilers (see CONTRIBUTING.md).
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
 
 # Tests exercise the parser on long inputs; keep them fast.
 [profile.test]

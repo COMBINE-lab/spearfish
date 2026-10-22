@@ -23,8 +23,8 @@ sequence and 300–1500 nt introns.
 
 ## What the index should show
 
-Let h_b be the halo width at the base level (λ_b + ρ_b plus a core length; it's measured in
-M1, roughly 20–60 nt at levels 3–4).
+Let h_b be the halo width at the base level: λ_b + ρ_b plus a core length, roughly 20–60 nt
+at levels 3–4 (`spearfish locality` measures λ and ρ).
 
 - **GENEA.** The interiors of A1, A2 and A4 are isoform-invariant, giving unitigs colored
   {201, 202}. A3 and the junction halos A2|A3, A3|A4 are colored {201} only, and the
@@ -37,7 +37,7 @@ M1, roughly 20–60 nt at levels 3–4).
 - **GENEC / GENECP.** Each substitution splits the shared sequence. Where consecutive
   substitutions are more than about 2·h_b apart, there are paralog-shared unitigs colored
   {C, CP}; near substitutions, gene-specific unitigs. GENEC and GENECP form one family
-  (masking threshold F_max = 20 genes isn't reached).
+  (the `spearfish index --mask-genes` threshold, default 20 genes, isn't reached).
 - **Families.** {GENEA}, {GENEB}, {GENEC, GENECP}.
 
 The chainer tests use these cases: an exon-skip read (A-202) must score higher on

@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use bytemuck::Pod;
@@ -67,11 +67,24 @@ impl<'a> Writer<'a> {
     pub fn to_bytes(&self) -> Vec<u8> {
         let (h, offsets, total) = self.layout();
         let mut out = vec![0u8; total];
-        out[..h.len()].copy_from_slice(&h);
-        for ((_, d), &off) in self.sections.iter().zip(&offsets) {
+        self.fill(&mut out, &h, &offsets);
+        out
+    }
+
+    /// [`Writer::to_bytes`] into 8-byte-aligned words, with the length in bytes: what
+    /// [`Store::from_words`] takes without another copy.
+    pub(crate) fn to_words(&self) -> (Vec<u64>, usize) {
+        let (h, offsets, total) = self.layout();
+        let mut words = vec![0u64; total.div_ceil(8)];
+        self.fill(&mut bytemuck::cast_slice_mut(&mut words)[..total], &h, &offsets);
+        (words, total)
+    }
+
+    fn fill(&self, out: &mut [u8], h: &[u8], offsets: &[usize]) {
+        out[..h.len()].copy_from_slice(h);
+        for ((_, d), &off) in self.sections.iter().zip(offsets) {
             out[off..off + d.len()].copy_from_slice(d);
         }
-        out
     }
 
     /// Stream to `w`, as [`Writer::to_bytes`] lays the bytes out; returns bytes written.
@@ -89,15 +102,26 @@ impl<'a> Writer<'a> {
         Ok(total as u64)
     }
 
-    /// Write to `path` (through a temporary file renamed into place); returns bytes written.
+    /// Write to `path` (through `<path>.partial-<pid>`, renamed into place, or removed if the
+    /// write fails); returns bytes written.
     pub fn write(&self, path: &Path) -> Result<u64> {
-        let tmp = path.with_extension("tmp");
-        let f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".partial-{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        let res = self.write_via(&tmp, path);
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    }
+
+    fn write_via(&self, tmp: &Path, path: &Path) -> Result<u64> {
+        let f = std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
         let n = self.write_to(&mut w)?;
         let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
+        std::fs::rename(tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
         Ok(n)
     }
 }
@@ -125,7 +149,12 @@ impl Store {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut words = vec![0u64; bytes.len().div_ceil(8)];
         bytemuck::cast_slice_mut::<u64, u8>(&mut words)[..bytes.len()].copy_from_slice(bytes);
-        Self::new(Backing::Owned(words, bytes.len()))
+        Self::from_words(words, bytes.len())
+    }
+
+    /// A container over the first `len` bytes of `words` (no copy).
+    pub(crate) fn from_words(words: Vec<u64>, len: usize) -> Result<Self> {
+        Self::new(Backing::Owned(words, len))
     }
 
     fn bytes_of(b: &Backing) -> &[u8] {
@@ -156,7 +185,7 @@ impl Store {
             let off = u64::from_le_bytes(b[e + NAME_LEN..e + NAME_LEN + 8].try_into().unwrap()) as usize;
             let len = u64::from_le_bytes(b[e + NAME_LEN + 8..e + NAME_LEN + 16].try_into().unwrap()) as usize;
             ensure!(
-                off.is_multiple_of(ALIGN) && off + len <= b.len(),
+                off.is_multiple_of(ALIGN) && off.checked_add(len).is_some_and(|e| e <= b.len()),
                 "section {name} out of bounds"
             );
             sections.insert(name, (off, len));
@@ -201,6 +230,8 @@ mod tests {
         let mut streamed = Vec::new();
         assert_eq!(w.write_to(&mut streamed).unwrap(), bytes.len() as u64);
         assert_eq!(streamed, bytes);
+        let (words, len) = w.to_words();
+        assert_eq!(&bytemuck::cast_slice::<u64, u8>(&words)[..len], &bytes[..]);
         let s = Store::from_bytes(&bytes).unwrap();
         assert_eq!(s.get::<u32>("owned").unwrap(), &[9, 10, 11]);
         assert!(s.has("a") && !s.has("missing"));
@@ -209,5 +240,10 @@ mod tests {
         assert_eq!(s.get::<u8>("text").unwrap(), b"hello");
         assert!(s.get::<u8>("missing").is_err());
         assert!(Store::from_bytes(b"not an index at all").is_err());
+        // A section length that wraps around past the end is an error, not a slice panic.
+        let mut bad = bytes.clone();
+        let e = 16 + NAME_LEN + 8;
+        bad[e..e + 8].copy_from_slice(&(u64::MAX - 63).to_le_bytes());
+        assert!(Store::from_bytes(&bad).is_err());
     }
 }
