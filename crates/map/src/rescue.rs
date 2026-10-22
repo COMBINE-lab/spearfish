@@ -2,9 +2,13 @@
 //! (typically low-accuracy reads, whose base cores rarely survive). The read and each
 //! candidate transcript are parsed down to a lower LCP level, whose shorter cores survive
 //! errors far better but are too unspecific for genome-wide lookup; restricted to candidate
-//! transcripts, they are informative. Candidates are the transcripts with the most base-level
-//! anchors in each gene with any anchor on the strand; transcript sequences come from the
-//! index (parsed, 2-bit), so no extra index is needed.
+//! transcripts, they are informative. Candidates are the strand's best genes by base-level
+//! score (those scoring at least `alpha` times the best gene, at most
+//! [`RescueParams::max_genes_for`] of them) and, in each, the `max_tx_per_gene` transcripts
+//! with the most base anchors, skipping those longer than `max_tx_len`. With `window` set,
+//! only the part of each transcript the read can occupy is re-seeded, and identical windows
+//! are seeded once per read. Transcript sequences come from the index (parsed, 2-bit), so no
+//! extra index is needed.
 
 use index::Index;
 use seeds::{BaseSeeder, Seed};
@@ -140,8 +144,7 @@ thread_local! {
 }
 
 impl Rescuer {
-    pub fn new(idx: &Index, p: RescueParams) -> anyhow::Result<Self> {
-        let _ = idx;
+    pub fn new(p: RescueParams) -> anyhow::Result<Self> {
         // Sequences are already parsed (HPC if the index used it): no HPC here.
         let seeder = BaseSeeder::new(&p.spec, false)?;
         Ok(Rescuer { p, seeder })

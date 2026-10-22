@@ -383,7 +383,7 @@ impl<C: Chainer> Mapper<C> {
         let spec = idx.meta("spec").context("index lacks its seed spec")?;
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";
         let seeder = BaseSeeder::new(spec, hpc)?;
-        let rescuer = p.rescue.clone().map(|r| Rescuer::new(&idx, r)).transpose()?;
+        let rescuer = p.rescue.clone().map(Rescuer::new).transpose()?;
         let node_fam = anchor::node_families(&idx);
         Ok(Mapper {
             node_fam,
