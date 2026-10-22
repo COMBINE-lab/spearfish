@@ -61,7 +61,8 @@ fn label_k(children: impl Iterator<Item = (u64, u32)>, seed: u64) -> u64 {
     fmix64(h)
 }
 
-/// Reusable buffers for `LcpParser::top_cores`.
+/// Reusable buffers for [`LcpParser::top_cores`], [`LcpParser::top_cores_codes`] and
+/// [`LcpParser::top_starts_codes`].
 #[derive(Default)]
 pub struct ParseScratch {
     codes: Vec<u8>,
