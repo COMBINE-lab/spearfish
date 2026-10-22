@@ -166,3 +166,68 @@ fn antisense_overlap_reports_both_orientations() {
     assert_eq!(idx.tx_name(r.hits[0].tx), "sense");
     assert!(r.hits.iter().skip(1).all(|h| h.score < r.hits[0].score));
 }
+
+/// Reads too noisy for their level-3 chains to cover half of them are rescued at level 2 onto
+/// their own transcript; without the rescue they stay low-coverage.
+#[test]
+fn noisy_reads_are_rescued() {
+    let txs = toy();
+    let (data, _) = build(
+        &txs,
+        &BuildParams {
+            spec: "lcp:K=3".into(),
+            hpc: true,
+            f_max: 20,
+            allow_collisions: false,
+            collapse: Collapse::Gene,
+            infer_genes: None,
+        },
+    )
+    .unwrap();
+    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let mapper = |p: MapParams| {
+        Mapper::new(
+            idx.clone(),
+            OracleChainer {
+                p: Default::default(),
+            },
+            p,
+        )
+        .unwrap()
+    };
+    let on = mapper(MapParams::default());
+    let off = mapper(MapParams {
+        rescue: None,
+        ..MapParams::default()
+    });
+    let mut rescued = 0;
+    for (t, tx) in txs.iter().enumerate() {
+        for (rev, seed) in [(false, 1u64), (true, 2u64)] {
+            let mut read = mutate(&tx.seq, 0.2, 0x9e37 + seed * 7919 + t as u64);
+            if rev {
+                read = revcomp(&read);
+            }
+            let r = on.map(&read);
+            if !r.rescued {
+                continue;
+            }
+            rescued += 1;
+            assert!(
+                !r.low_coverage && r.reverse == rev,
+                "{} rev {rev}: {r:?}",
+                tx.name
+            );
+            assert_eq!(idx.tx_name(r.hits[0].tx), tx.name, "{:?}", r.hits);
+            assert!(
+                r.hits.iter().skip(1).all(|h| h.score < r.hits[0].score),
+                "{:?}",
+                r.hits
+            );
+            let r = off.map(&read);
+            assert!(!r.rescued && r.low_coverage, "{} rev {rev}: {r:?}", tx.name);
+        }
+    }
+    // At least half of the 12 reads (7 when written; the others keep half their coverage at
+    // level 3, or have no base anchor at all).
+    assert!(rescued >= 6, "{rescued} reads rescued");
+}

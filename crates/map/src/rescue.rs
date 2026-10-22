@@ -163,8 +163,15 @@ impl Rescuer {
         RESCUE.with(|sc| self.rescue_with(idx, seq, base, ap, cp, &mut sc.borrow_mut()))
     }
 
-    /// Points of the read's rescue seeds (`sc.read`, sorted by label) against one transcript
-    /// window sequence, sorted by (qs, ts), appended to `sc.pool`.
+    /// The read's rescue seeds into `sc.read`, sorted by label, for merge joins with each
+    /// transcript window's seeds in [`Self::points_in`].
+    fn seed_read(&self, seq: &[u8], sc: &mut Scratch) {
+        self.seeder.seed_parsed_into(seq, &mut sc.read, &mut sc.tmp);
+        sc.read.sort_unstable_by_key(|s| (s.label, s.start));
+    }
+
+    /// Points of the read's rescue seeds (`sc.read`, see [`Self::seed_read`]) against one
+    /// transcript window sequence, sorted by (qs, ts), appended to `sc.pool`.
     fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
         self.seeder.seed_parsed_into(tseq, &mut sc.tx, &mut sc.tmp);
         sc.tx.sort_unstable_by_key(|s| (s.label, s.start));
@@ -226,9 +233,7 @@ impl Rescuer {
         }
         crate::stats::add(&crate::stats::RESCUE_STRANDS, 1);
         crate::stats::add(&crate::stats::RESCUE_GENES, cands.len() as u64);
-        // Read seeds sorted by label, for merge joins with each transcript's seeds.
-        self.seeder.seed_parsed_into(seq, &mut sc.read, &mut sc.tmp);
-        sc.read.sort_unstable_by_key(|s| (s.label, s.start));
+        self.seed_read(seq, sc);
         let mut hits = Vec::new();
         let plen = seq.len() as i64;
         sc.seen.clear();
@@ -346,5 +351,69 @@ mod tests {
         assert_eq!(p.max_genes_for(10), GENES_LEN_CAP * p.max_genes);
         let off = RescueParams { genes_len: 0, ..p };
         assert_eq!(off.max_genes_for(10), off.max_genes);
+    }
+
+    /// `points_in` equals a nested-loop join of the read's and the window's seeds on labels.
+    #[test]
+    fn points_in_matches_nested_loop_join() {
+        let r = Rescuer::new(RescueParams::default()).unwrap();
+        let mut x = 0x2545f4914f6cdd1du64;
+        let mut rand = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"ACGT"[(x >> 62) as usize]
+                })
+                .collect()
+        };
+        let mut sc = Scratch::default();
+        for _ in 0..50 {
+            // A window repeating a segment, and a read sharing an excerpt of it and the repeat
+            // amid unrelated sequence: labels match several times on both sides.
+            let mut tseq = rand(2000);
+            let rep = tseq[200..400].to_vec();
+            tseq.extend_from_slice(&rep);
+            let mut read = rand(300);
+            read.extend_from_slice(&tseq[100..1300]);
+            read.extend_from_slice(&rep);
+            read.extend(rand(300));
+            r.seed_read(&read, &mut sc);
+            // Points of earlier windows stay in place.
+            sc.pool.clear();
+            sc.pool.push(Pt {
+                qs: 7,
+                qe: 9,
+                ts: 0,
+                len: 2,
+                w: 2.0,
+            });
+            r.points_in(&tseq, &mut sc);
+            let got: Vec<_> = sc
+                .pool
+                .iter()
+                .map(|p| (p.qs, p.ts, p.qe, p.len, p.w.to_bits()))
+                .collect();
+            let (rs, ws) = (r.seeder.seed_parsed(&read), r.seeder.seed_parsed(&tseq));
+            let mut want: Vec<_> = rs
+                .iter()
+                .flat_map(|a| {
+                    let len = a.end - a.start;
+                    ws.iter()
+                        .filter(move |b| b.label == a.label)
+                        .map(move |b| (a.start, b.start, a.end, len, (len as f32).to_bits()))
+                })
+                .collect();
+            want.sort_unstable();
+            // Points are unique in (qs, ts), and some seeds match several times on each side.
+            assert!(want.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+            let distinct = |f: fn(&(u32, u32, u32, u32, u32)) -> u32| {
+                want.iter().map(f).collect::<std::collections::HashSet<_>>().len()
+            };
+            assert!(distinct(|p| p.0) < want.len() && distinct(|p| p.1) < want.len());
+            assert_eq!(got[0], (7, 0, 9, 2, 2f32.to_bits()));
+            assert_eq!(got[1..], want[..]);
+        }
     }
 }
