@@ -1,5 +1,6 @@
 //! `spearfish survival`: how many seeds survive sequencing errors, per seed scheme, level,
-//! error profile, error rate and HPC setting (milestone M2, the go/no-go gate).
+//! error profile, error rate and HPC setting (used to choose the seed scheme, the seeding
+//! level and the HPC default).
 //!
 //! Each input sequence is treated as a full-length read: it's mutated by the simulator,
 //! both versions are seeded, and a transcript seed survives if the read has a seed with the

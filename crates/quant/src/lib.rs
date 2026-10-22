@@ -1,5 +1,4 @@
-//! Transcript quantification by EM over per-read compatibility records (design doc,
-//! "Quantification model").
+//! Transcript quantification by EM over per-read compatibility records.
 //!
 //! A read compatible with transcripts `j` with scores `s_j` contributes the conditional
 //! likelihood `P(r | j) ∝ exp((s_j - s_max) / D)` (optionally divided by an effective

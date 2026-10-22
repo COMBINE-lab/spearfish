@@ -1,6 +1,6 @@
-//! Theorem 2: with an unbounded beam, the refinement chainer's per-transcript scores equal the
-//! per-transcript oracle's exactly, on random multi-isoform genes (alternative exons, repeated
-//! exons) and reads drawn from them with errors.
+//! With an unbounded beam, the refinement chainer's per-transcript scores equal the oracle's
+//! exactly, on random multi-isoform genes (alternative exons, repeated exons) and reads drawn
+//! from them with errors.
 
 use std::collections::BTreeMap;
 

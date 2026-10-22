@@ -68,7 +68,10 @@ instead of silently mismatching.
 
 Hidden commands (`em`, `simulate`, `lcp-stats`, `locality`, `survival`, `halo`) and hidden
 mapping flags exist for method development; `spearfish <command> --help` does not list them,
-but they are in `crates/spearfish-cli/src`. Each mapping flag sets the `MapSettings` field of
+but they are in `crates/spearfish-cli/src`. `locality`, `survival` and `halo` measure what the
+seed scheme and level were chosen by (LCP context radii, seed survival under sequencing errors,
+junction halos and isoform resolution); `em` is a plain EM over a mapping TSV, a baseline for
+comparing mapping changes by their estimates. Each mapping flag sets the `MapSettings` field of
 its name (`--no-x` turns `x` off; `--beam` goes with `--chainer`), documented there, and
 `spearfish map --print-params` shows the values a run would use.
 

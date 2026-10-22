@@ -1,5 +1,4 @@
-//! Read seeding, anchor lookup and candidate-gene selection (design doc, "Read processing",
-//! stages 1–4, single-level seeding per D12b).
+//! Read seeding (at a single level), anchor lookup and candidate-gene selection.
 
 use index::{FLAG_MASKED, Index, NO_FAMILY};
 use seeds::Seed;
@@ -96,7 +95,7 @@ pub fn anchors(idx: &Index, seeds: &[Seed], p: &AnchorParams) -> Vec<Anchor> {
 }
 
 /// Sum of weights over a greedy, query-increasing, non-overlapping subset of anchors (sorted by
-/// query start): the cheap family score of the design doc.
+/// query start): a cheap family score.
 fn greedy_score(anchors: &[Anchor]) -> f32 {
     let mut end = 0;
     let mut score = 0.0;

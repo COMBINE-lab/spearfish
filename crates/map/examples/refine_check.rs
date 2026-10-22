@@ -1,7 +1,7 @@
-//! Theorem 2 on real data: for each read (both orientations), every candidate's per-transcript
-//! chain scores from the refinement chainer (unbounded beam unless given) must equal the
-//! oracle's exactly. Also times both chainers and counts identical hits (chain paths can
-//! differ only on score ties).
+//! The refinement chainer on real data: for each read (both orientations), every candidate's
+//! per-transcript chain scores from the refinement chainer (unbounded beam unless given) must
+//! equal the oracle's exactly. Also times both chainers and counts identical hits (chain paths
+//! can differ only on score ties).
 //! Usage: refine_check <index> <reads.fa> [max_reads] [beam]
 use std::collections::BTreeMap;
 use std::sync::Arc;

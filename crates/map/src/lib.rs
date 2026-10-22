@@ -1,5 +1,5 @@
 //! Read mapping: seeding both strands, anchor lookup, candidate-gene selection, chaining, and
-//! result extraction (design doc, "Read processing" and "Chaining").
+//! result extraction.
 
 pub mod align;
 pub mod anchor;
