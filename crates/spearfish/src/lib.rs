@@ -361,7 +361,7 @@ impl Index {
             .into_iter()
             .map(|(name, gene, seq)| TxInput { name, gene, seq })
             .collect();
-        let (mut data, rep) = index::build(&txs, &opts.build_params())?;
+        let (mut data, rep) = index::build(txs, &opts.build_params())?;
         let mut manifest = provenance::IndexManifest::new(&data, opts, &rep, input);
         manifest.command_line = command_line;
         manifest.working_directory = std::env::current_dir()

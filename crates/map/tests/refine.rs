@@ -80,7 +80,7 @@ fn scores(hits: Vec<map::TxHit>) -> BTreeMap<u32, u32> {
 fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError> {
     let txs = family(seed, 3);
     let (data, _) = build(
-        &txs,
+        txs.clone(),
         &BuildParams {
             spec: spec.into(),
             hpc: true,

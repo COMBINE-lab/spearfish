@@ -36,7 +36,7 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
         collapse,
         infer_genes: None,
     };
-    let (data, rep) = build(txs, &p).unwrap();
+    let (data, rep) = build(txs.to_vec(), &p).unwrap();
     assert_eq!(rep.inconsistent_lengths, 0, "{spec}");
     let idx = Index::from_bytes(&data.to_bytes()).unwrap();
     assert_eq!(idx.meta("spec"), Some(spec));
@@ -165,7 +165,7 @@ fn toy_roundtrip_and_structure() {
 fn file_roundtrip() {
     let txs = toy();
     let (data, _) = build(
-        &txs,
+        txs,
         &BuildParams {
             spec: "lcp:K=3".into(),
             hpc: true,
@@ -248,7 +248,7 @@ fn inferred_genes_follow_shared_exons() {
                 attach_max: 3,
             }),
         };
-        build(&txs, &p).unwrap().1.tx_gene
+        build(txs.clone(), &p).unwrap().1.tx_gene
     };
     // Same partition as the annotation: same group iff same annotated gene.
     let g = groups(12, 64);
@@ -292,7 +292,7 @@ fn raw_sequence_skipped_where_non_acgt_merges_runs() {
         collapse: Collapse::Gene,
         infer_genes: None,
     };
-    let idx = Index::from_bytes(&build(&txs, &p).unwrap().0.to_bytes()).unwrap();
+    let idx = Index::from_bytes(&build(txs, &p).unwrap().0.to_bytes()).unwrap();
     assert_eq!(idx.tx_raw_codes(0, 0, 3), None);
     assert_eq!(idx.tx_raw_codes(1, 0, 3), Some(vec![0, 1, 2]));
 }

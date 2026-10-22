@@ -82,7 +82,7 @@ fn check(seed: u64, n_genes: usize, alpha_fam: f32, f_keep: usize) -> Result<(),
     let mut rng = Rng(seed.wrapping_mul(0x9e3779b97f4a7c15) | 1);
     let txs = genes(&mut rng, n_genes);
     let (data, _) = build(
-        &txs,
+        txs.clone(),
         &BuildParams {
             spec: "lcp:K=3".into(),
             hpc: true,

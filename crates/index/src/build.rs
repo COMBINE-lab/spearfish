@@ -326,7 +326,8 @@ fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>
     (tx_gene, names, largest)
 }
 
-pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport)> {
+/// Build the index. `txs` is consumed so that the raw sequences can be freed once seeded.
+pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, BuildReport)> {
     let mut rep = BuildReport {
         transcripts: txs.len(),
         ..Default::default()
@@ -366,6 +367,19 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
             }
         })
         .collect();
+    // Past seeding, the raw sequences are needed only for their lengths and the input hash.
+    let tx_len: Vec<u32> = txs.iter().map(|t| t.seq.len() as u32).collect();
+    let input_xxh3 = {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        for t in &txs {
+            h.update(t.name.as_bytes());
+            h.update(&t.seq);
+        }
+        h.digest()
+    };
+    for t in &mut txs {
+        t.seq = Vec::new();
+    }
     rep.seed_occurrences = seeded.iter().map(|s| s.seeds.len() as u64).sum();
     rep.unseeded_transcripts = seeded.iter().filter(|s| s.seeds.is_empty()).count();
     lap(&mut rep, "seed");
@@ -374,7 +388,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
     // sorted by label, so each label's nodes are contiguous.
     let (tx_gene, gene_names): (Vec<u32>, Vec<String>) = match p.infer_genes {
         Some(inf) => {
-            let (tx_gene, names, largest) = infer_genes(txs, &seeded, inf);
+            let (tx_gene, names, largest) = infer_genes(&txs, &seeded, inf);
             rep.largest_group_tx = largest;
             (tx_gene, names)
         }
@@ -714,17 +728,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
                 "lcp_seed".into(),
                 format!("{:#x}", lcp_core::LcpConfig::default().seed),
             ),
-            (
-                "input_xxh3".into(),
-                format!("{:016x}", {
-                    let mut h = xxhash_rust::xxh3::Xxh3::new();
-                    for t in txs {
-                        h.update(t.name.as_bytes());
-                        h.update(&t.seq);
-                    }
-                    h.digest()
-                }),
-            ),
+            ("input_xxh3".into(), format!("{input_xxh3:016x}")),
         ],
         labels,
         node_unitig,
@@ -743,7 +747,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         color_tx,
         tx_gene,
         tx_family,
-        tx_len: txs.iter().map(|t| t.seq.len() as u32).collect(),
+        tx_len,
         tx_plen: seeded.iter().map(|s| s.plen).collect(),
         // The per-transcript packings, each starting on a word boundary.
         tx_seq: crate::concat(seeded.iter().map(|s| &s.packed[..])),
@@ -757,7 +761,7 @@ pub fn build(txs: &[TxInput], p: &BuildParams) -> Result<(IndexData, BuildReport
         } else {
             Default::default()
         },
-        tx_names: txs.iter().map(|t| t.name.clone()).collect(),
+        tx_names: txs.into_iter().map(|t| t.name).collect(),
         gene_names: gene_names.clone(),
         manifest: None,
     };

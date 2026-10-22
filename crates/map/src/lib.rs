@@ -1522,7 +1522,7 @@ mod segmented_tests {
             })
             .collect();
         let (data, _) = index::build(
-            &txs,
+            txs,
             &index::BuildParams {
                 spec: "lcp:K=3".into(),
                 hpc,
