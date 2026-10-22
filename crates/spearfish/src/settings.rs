@@ -265,6 +265,16 @@ macro_rules! set {
     };
 }
 
+/// The names of the given optional fields of `$s` that are set, in the order given.
+macro_rules! set_names {
+    ($s:ident: $($f:ident),+ $(,)?) => {
+        [$((stringify!($f), $s.$f.is_some())),+]
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect::<Vec<&'static str>>()
+    };
+}
+
 impl MapSettings {
     /// Every field's name, as serialized.
     pub const FIELDS: &[&str] = &[
@@ -337,11 +347,7 @@ impl MapSettings {
 
     /// Every setting that only applies when the tie-break runs, by name, if set.
     fn tiebreak_only(&self) -> Vec<&'static str> {
-        let mut v = Vec::new();
-        macro_rules! chk {
-            ($($f:ident),*) => { $( if self.$f.is_some() { v.push(stringify!($f)); } )* };
-        }
-        chk!(
+        set_names!(self:
             tie_margin,
             tie_margin_rel,
             tie_cands,
@@ -355,23 +361,20 @@ impl MapSettings {
             tie_whole_trim,
             tie_orient_edit,
             tie_flank_min,
+            clip_ends,
             raw_ends,
             tail_trim,
             tail_run,
             tail_bonus,
             orient_tail,
             orient_margin_rel,
-            end_diagonal
-        );
-        v
+            end_diagonal,
+        )
     }
 
+    /// Every setting that only applies when the rescue runs, by name, if set.
     fn rescue_only(&self) -> Vec<&'static str> {
-        let mut v = Vec::new();
-        macro_rules! chk {
-            ($($f:ident),*) => { $( if self.$f.is_some() { v.push(stringify!($f)); } )* };
-        }
-        chk!(
+        set_names!(self:
             rescue_scheme,
             rescue_genes,
             rescue_genes_len,
@@ -380,9 +383,13 @@ impl MapSettings {
             rescue_window,
             rescue_other_margin,
             rescue_other_always,
-            rescue_max_tx_len
-        );
-        v
+            rescue_max_tx_len,
+        )
+    }
+
+    /// Read-end settings shared by the tie-break and span extension, by name, if set.
+    fn read_end_only(&self) -> Vec<&'static str> {
+        set_names!(self: end_bonus, xdrop, band, pad, pad_div)
     }
 
     /// The complete options: the preset's, with the settings given applied. Fails on
@@ -525,6 +532,15 @@ impl MapSettings {
                 }
             }
         }
+        if o.params.tiebreak.is_none() && o.params.ends.is_none() {
+            let unused = self.read_end_only();
+            if !unused.is_empty() {
+                log::warn!(
+                    "tie-break and span extension are off; ignoring {}",
+                    unused.join(", ")
+                );
+            }
+        }
         if let ChainerKind::Refine { beam: Some(0) } = o.chainer {
             bail!("the refine chainer's beam must be at least 1");
         }
@@ -631,6 +647,19 @@ mod tests {
         for f in MapSettings::FIELDS.iter().filter(|f| **f != "preset") {
             assert!(j.get(*f).is_none(), "{f}");
         }
+    }
+
+    /// Settings that can have no effect are found (resolve warns about them).
+    #[test]
+    fn unused_settings_are_named() {
+        let s = MapSettings::builder(Preset::Hifi)
+            .tiebreak(false)
+            .clip_ends(false)
+            .build();
+        assert_eq!(s.tiebreak_only(), ["clip_ends"]);
+        let s = MapSettings::builder(Preset::Hifi).xdrop(40).pad(5).build();
+        assert_eq!(s.read_end_only(), ["xdrop", "pad"]);
+        assert!(MapSettings::preset(Preset::Ont).rescue_only().is_empty());
     }
 
     #[test]

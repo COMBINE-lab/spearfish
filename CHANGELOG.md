@@ -111,6 +111,10 @@
 - aarch64 (Apple Silicon, ARM Linux): the affine alignment rows were not computed at all,
   because a configuration attribute removed the scalar code along with the x86 path.
 
+- Settings that have no effect are now also reported for `--no-clip-ends` with the tie-break
+  off, and for `--end-bonus`, `--xdrop`, `--band`, `--pad` and `--pad-div` with both the
+  tie-break and span extension off (e.g. `--preset hifi --no-tiebreak`).
+
 ### Other
 
 - gzip input decodes with zlib-rs.
