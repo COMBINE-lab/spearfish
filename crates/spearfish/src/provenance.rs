@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 /// `version (git revision)` of this build.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SPEARFISH_GIT"), ")");
 
-/// The library build: version, git revision, target and SIMD level.
+/// The library build: version, git revision, target and Cargo profile. Fields missing from a
+/// record read back are `unknown`, never this build's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BuildInfo {
     /// Crate version.
     pub version: String,
@@ -17,6 +19,19 @@ pub struct BuildInfo {
     pub target: String,
     /// Cargo profile (`release`, `debug`).
     pub profile: String,
+}
+
+impl Default for BuildInfo {
+    /// An unknown build: every field `unknown`.
+    fn default() -> Self {
+        let unknown = || "unknown".to_string();
+        BuildInfo {
+            version: unknown(),
+            git: unknown(),
+            target: unknown(),
+            profile: unknown(),
+        }
+    }
 }
 
 impl BuildInfo {
@@ -43,7 +58,7 @@ pub struct InputInfo {
     /// Transcript FASTA, as an absolute path where it can be resolved (empty when built in
     /// memory).
     pub path: String,
-    /// Transcripts and genes.
+    /// Transcripts.
     pub transcripts: usize,
     /// Genes (given, from a table, or inferred).
     pub genes: usize,
@@ -58,7 +73,8 @@ pub struct InputInfo {
 }
 
 /// What built an index and from what, stored in the index (section `manifest`) and written
-/// next to it as `<index>.json`.
+/// next to it as `<index>.json`. Fields missing from a manifest read back take neutral defaults
+/// (format and parser version 0, an `unknown` build), not this build's values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexManifest {
@@ -78,7 +94,7 @@ pub struct IndexManifest {
     pub working_directory: String,
     /// Build options.
     pub options: crate::IndexOptions,
-    /// LCP parser version and hash seed the index was parsed with.
+    /// LCP parser version the index was parsed with.
     pub lcp_parser_version: u32,
     /// LCP hash seed.
     pub lcp_seed: String,
@@ -89,18 +105,19 @@ pub struct IndexManifest {
 }
 
 impl Default for IndexManifest {
+    /// An empty manifest that claims no build (what missing fields read as).
     fn default() -> Self {
         IndexManifest {
             kind: "spearfish-index".into(),
-            format_version: index::store::FORMAT_VERSION,
+            format_version: 0,
             index_id: String::new(),
-            built_by: BuildInfo::current(),
+            built_by: BuildInfo::default(),
             created_unix: 0,
             command_line: Vec::new(),
             working_directory: String::new(),
             options: Default::default(),
-            lcp_parser_version: lcp_core::LCP_PARSER_VERSION,
-            lcp_seed: format!("{:#x}", lcp_core::LcpConfig::default().seed),
+            lcp_parser_version: 0,
+            lcp_seed: String::new(),
             input: Default::default(),
             stats: Default::default(),
         }
@@ -108,9 +125,11 @@ impl Default for IndexManifest {
 }
 
 impl IndexManifest {
-    /// The manifest of a loaded index, if it has one.
+    /// The manifest of a loaded index, if it has one that can be read.
     pub fn of(idx: &index::Index) -> Option<Self> {
-        serde_json::from_str(idx.manifest()?).ok()
+        serde_json::from_str(idx.manifest()?)
+            .map_err(|e| log::debug!("the index manifest can't be read: {e}"))
+            .ok()
     }
 
     /// The manifest of a freshly built index.
@@ -157,9 +176,13 @@ impl IndexManifest {
             .collect();
         stats.insert("seconds".into(), secs.into());
         IndexManifest {
+            format_version: index::store::FORMAT_VERSION,
             index_id: id_of_meta(&data.meta_text()),
+            built_by: BuildInfo::current(),
             created_unix,
             options: opts.clone(),
+            lcp_parser_version: lcp_core::LCP_PARSER_VERSION,
+            lcp_seed: format!("{:#x}", lcp_core::LcpConfig::default().seed),
             input,
             stats,
             ..Default::default()
@@ -218,4 +241,33 @@ pub fn simd_level() -> &'static str {
 /// The most capable SIMD kernels this CPU supports.
 pub fn simd_detected() -> &'static str {
     lcp_core::simd::detected().name()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest lacking fields (as an older or newer build may write it) still reads, and the
+    /// missing fields don't claim this build.
+    #[test]
+    fn missing_manifest_fields_are_neutral() {
+        let j = r#"{
+            "kind": "spearfish-index",
+            "index_id": "0123456789abcdef",
+            "built_by": {"version": "0.0.1", "git": "abc", "target": "x86_64-unknown-linux-gnu"},
+            "options": {"scheme": "lcp:K=3", "hpc": true, "infer_genes": {"max_tx": 32}}
+        }"#;
+        let m: IndexManifest = serde_json::from_str(j).unwrap();
+        assert_eq!(m.built_by.version, "0.0.1");
+        assert_eq!(m.built_by.profile, "unknown");
+        assert_eq!((m.format_version, m.lcp_parser_version), (0, 0));
+        assert!(m.lcp_seed.is_empty());
+        assert_eq!(m.options.f_max, crate::IndexOptions::default().f_max);
+        assert!(!m.options.allow_collisions);
+        let inf = m.options.infer_genes.unwrap();
+        assert_eq!(
+            (inf.max_tx, inf.span),
+            (32, crate::InferGenesOptions::default().span)
+        );
+    }
 }

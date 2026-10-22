@@ -6,13 +6,24 @@ Before every push, run what CI runs:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
 ```
 
 CI also runs these on arm64 Linux and Apple Silicon, runs `spearfish doctor`, and checks that
 the workspace builds with the minimum Rust version (`rust-version` in `Cargo.toml`).
+
+## Profiling
+
+Release builds carry no debug info. For profilers, build with line tables, and with frame
+pointers for call graphs (`perf record --call-graph fp`):
+
+```sh
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling -p spearfish-cli
+```
+
+The binary is `target/profiling/spearfish`, optimized as a release build is.
 
 ## Output must not change by accident
 
@@ -27,8 +38,11 @@ the output byte-identical. Checks, from cheapest:
   `spearfish inspect --sections` of indexes they build (the per-section checksums must agree).
 
 The SIMD kernels must agree exactly with the scalar code; each kernel's property test checks
-every level the machine supports against a scalar reference, and CI also runs the tests and
-`spearfish doctor` with `SPEARFISH_SIMD` forcing each lower level. The levels live in
+every level the machine supports against a scalar reference. CI runs the tests on each
+runner's own level and again with `SPEARFISH_SIMD` forcing scalar and avx2 (x86-64) or scalar
+(Apple Silicon). Hosted x86-64 runners may lack AVX-512, so CI may not run the AVX-512
+kernels at all (each run's summary shows the level it used): run `cargo test` on an AVX-512
+machine after changing them. The levels live in
 `lcp_core::simd`; adding one (e.g. NEON) means a `Level` variant, its detection, and an arm in
 each kernel's dispatch.
 
@@ -54,7 +68,22 @@ instead of silently mismatching.
 
 Hidden commands (`em`, `simulate`, `lcp-stats`, `locality`, `survival`, `halo`) and hidden
 mapping flags exist for method development; `spearfish <command> --help` does not list them,
-but they are in `crates/spearfish-cli/src`. Environment variables:
+but they are in `crates/spearfish-cli/src`. `locality`, `survival` and `halo` measure what the
+seed scheme and level were chosen by (LCP context radii, seed survival under sequencing errors,
+junction halos and isoform resolution); `em` is a plain EM over a mapping TSV, a baseline for
+comparing mapping changes by their estimates. Each mapping flag sets the `MapSettings` field of
+its name (`--no-x` turns `x` off; `--beam` goes with `--chainer`), documented there, and
+`spearfish map --print-params` shows the values a run would use.
+
+Renamed flags keep their old names as hidden aliases: `--delta-rep`, `--f-keep`, `--f-tie`,
+`--f-max`, `--h-max`, `--g-max`, `--alpha`, `--window`, `--beta`, `--no-merge`, `--kappa`,
+`--lambda`, `--affine-within`, `--unit-tiebreak`, `--whole-read-tiebreak`, `--orient-edit`,
+`--flank-min`, `--no-tie-clip`, `--tie-band`, `--tie-pad` and `--tie-pad-div` for `map` (a
+test in `map_args.rs` maps each to its current name), `--f-max` (now `--mask-genes`) for
+`index`, and `index-stats` for `inspect`. Benchmark scripts still use `--no-merge`,
+`--unit-tiebreak`, `--whole-read-tiebreak`, `--no-tie-clip` and `--orient-edit`.
+
+Environment variables:
 
 | Variable | Effect |
 | --- | --- |

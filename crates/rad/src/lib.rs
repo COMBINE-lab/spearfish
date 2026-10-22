@@ -516,14 +516,37 @@ const CHUNK_BYTES: usize = 128 * 1024;
 
 type Out = ConcurrentChunkWriter<BufWriter<File>>;
 
-/// Writes a RAD file. The file is written under a temporary name and moved into place by
-/// [`RadWriter::finish`], so an interrupted run leaves no file that looks complete.
+/// Writes a RAD file. The file is written under a temporary name (`<path>.partial-<pid>`) and
+/// moved into place by [`RadWriter::finish`], so an interrupted run leaves no file that looks
+/// complete. A writer dropped without finishing, or whose `finish` fails, removes the partial
+/// file (a killed process leaves it).
 pub struct RadWriter {
     out: Arc<Out>,
     ctx: Arc<Context>,
     codec: ChunkCodec,
     path: PathBuf,
-    tmp: PathBuf,
+    tmp: Partial,
+}
+
+/// A file removed when dropped, unless kept.
+struct Partial(Option<PathBuf>);
+
+impl Partial {
+    fn path(&self) -> &Path {
+        self.0.as_deref().unwrap()
+    }
+
+    fn keep(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 impl RadWriter {
@@ -545,6 +568,7 @@ impl RadWriter {
         tmp.push(format!(".partial-{}", std::process::id()));
         let tmp = PathBuf::from(tmp);
         let f = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let tmp = Partial(Some(tmp));
         let w = RadFileWriter::new(BufWriter::new(f), &prelude, &values)?;
         Ok(RadWriter {
             out: Arc::new(ConcurrentChunkWriter::new(w)),
@@ -576,8 +600,10 @@ impl RadWriter {
         w.backpatch_file_tag_value("num_bases", &TagValue::U64(counts.bases))?;
         let f = w.finalize()?.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
-        std::fs::rename(&self.tmp, &self.path)
+        let mut tmp = self.tmp;
+        std::fs::rename(tmp.path(), &self.path)
             .with_context(|| format!("moving {} into place", self.path.display()))?;
+        tmp.keep();
         Ok(())
     }
 }
@@ -790,6 +816,11 @@ mod tests {
         };
         w.finish(counts).unwrap();
         assert!(is_rad(&path).unwrap());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no partial file is left"
+        );
         let h = read_header(&path).unwrap();
         assert_eq!(h.meta, meta);
         assert_eq!(h.counts, counts);
@@ -812,6 +843,26 @@ mod tests {
         for (i, r) in got.iter().enumerate() {
             assert_eq!(*r, rec(i as u32));
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A writer that is dropped, or whose finish fails, leaves no partial file behind.
+    #[test]
+    fn unfinished_writer_removes_partial_file() {
+        let dir = std::env::temp_dir().join(format!("lrrad-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.rad");
+        let refs = [("tA", 2000u32)];
+        let files = || std::fs::read_dir(&dir).unwrap().count();
+        let w = RadWriter::create(&path, &refs, &Meta::default(), ChunkCodec::None).unwrap();
+        assert_eq!(files(), 1, "the partial file");
+        drop(w);
+        assert_eq!(files(), 0);
+        let w = RadWriter::create(&path, &refs, &Meta::default(), ChunkCodec::None).unwrap();
+        let sink = w.sink();
+        assert!(w.finish(Counts::default()).is_err(), "a sink is still alive");
+        drop(sink);
+        assert_eq!(files(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

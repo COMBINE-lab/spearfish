@@ -167,51 +167,48 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
     (best <= k).then_some(best as u32)
 }
 
-/// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
-/// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
-/// lane, sharing the pattern's blocks; with AVX2, up to four; at the NEON level, four in
-/// lockstep ([`infix_lanes`]).
-pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+/// [`distance_with`] in `mode` for each of `texts` with one threshold `k`: the same results
+/// as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit lane,
+/// sharing the pattern's blocks; with AVX2, up to four; at the NEON level, four in lockstep
+/// (`batch_lanes`).
+pub fn batch_distances(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32) -> Vec<Option<u32>> {
     match simd_level() {
         #[cfg(target_arch = "x86_64")]
         Level::Avx512 if pat.m > 0 => {
             let mut out = Vec::with_capacity(texts.len());
             // SAFETY: the CPU has AVX-512 (the active level).
-            unsafe { infix_avx512(pat, texts, k, &mut out) };
+            unsafe { batch_avx512(pat, texts, mode, k, &mut out) };
             out
         }
         #[cfg(target_arch = "x86_64")]
         Level::Avx2 if pat.m > 0 => {
             let mut out = Vec::with_capacity(texts.len());
             // SAFETY: the CPU has AVX2 (the active level).
-            unsafe { infix_avx2(pat, texts, k, &mut out) };
+            unsafe { batch_avx2(pat, texts, mode, k, &mut out) };
             out
         }
         #[cfg(target_arch = "aarch64")]
         Level::Neon if pat.m > 0 => {
             let mut out = Vec::with_capacity(texts.len());
-            for batch in texts.chunks(INFIX_LANES) {
-                infix_lanes::<INFIX_LANES>(pat, batch, k, &mut out);
+            for batch in texts.chunks(BATCH_LANES) {
+                batch_lanes::<BATCH_LANES>(pat, batch, mode, k, &mut out);
             }
             out
         }
-        _ => texts
-            .iter()
-            .map(|t| distance_with(pat, t, Mode::Infix, k))
-            .collect(),
+        _ => texts.iter().map(|t| distance_with(pat, t, mode, k)).collect(),
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-fn infix_avx512(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+fn batch_avx512(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     for batch in texts.chunks(8) {
         // SAFETY: AVX-512F is enabled here.
-        unsafe { infix_x8(pat, batch, k, out) };
+        unsafe { batch_x8(pat, batch, mode, k, out) };
     }
 }
 
-/// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
+/// Distances in `mode` of up to eight texts, one per lane, appended to `out`. Each lane runs
 /// [`distance_with`]'s recurrence; the band is the union of the lanes' Ukkonen bands (a block
 /// is added if any lane would add it, dropped only if every lane would), and blocks are
 /// added with the same upper-bound state. Every lane's band thus contains its own, which
@@ -220,7 +217,7 @@ fn infix_avx512(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
-unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+unsafe fn batch_x8(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     use std::arch::x86_64::*;
     debug_assert!((1..=8).contains(&texts.len()) && pat.m > 0);
     let m = pat.m;
@@ -265,11 +262,23 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     let kv = _mm512_set1_epi64(kk);
     let kw = _mm512_set1_epi64(kk + W as i64);
     let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
-    // Column 0: D[m][0] = m.
-    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+    // Column 0: D[m][0] = m (Global: only for an empty text).
+    let mut best = if mode == Mode::Global {
+        _mm512_mask_mov_epi64(
+            _mm512_set1_epi64(i64::MAX),
+            _mm512_cmpeq_epi64_mask(lens, zero),
+            _mm512_set1_epi64(m as i64),
+        )
+    } else if last as usize + 1 == blocks && m as i64 <= kk {
         _mm512_set1_epi64(m as i64)
     } else {
         _mm512_set1_epi64(i64::MAX)
+    };
+    // Horizontal delta entering row 0 (as -1/+1 bits): D[0][j] is 0 (free text start) or j.
+    let h0 = if mode == Mode::Infix {
+        (zero, zero)
+    } else {
+        (zero, one)
     };
     // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
     #[inline]
@@ -309,8 +318,7 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
         let live: __mmask8 = _mm512_cmpgt_epi64_mask(lens, _mm512_set1_epi64(j as i64));
         // SAFETY: tx holds 8 codes per column.
         let c = _mm512_cvtepu8_epi64(unsafe { _mm_loadl_epi64(tx.as_ptr().add(8 * j).cast()) });
-        // Infix: the top row is free (horizontal delta 0).
-        let mut h = (zero, zero);
+        let mut h = h0;
         for b in 0..=last as usize {
             let eq = _mm512_permutexvar_epi64(c, peq[b]);
             h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
@@ -346,7 +354,12 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
             }
         }
         if last as usize + 1 == blocks {
-            best = _mm512_mask_min_epi64(best, live, best, score[blocks - 1]);
+            if mode == Mode::Global {
+                let end = _mm512_cmpeq_epi64_mask(lens, _mm512_set1_epi64(j as i64 + 1));
+                best = _mm512_mask_mov_epi64(best, end, score[blocks - 1]);
+            } else {
+                best = _mm512_mask_min_epi64(best, live, best, score[blocks - 1]);
+            }
         }
     }
     let mut bs = [0i64; 8];
@@ -360,20 +373,20 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-fn infix_avx2(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+fn batch_avx2(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     for batch in texts.chunks(4) {
         // SAFETY: AVX2 is enabled here.
-        unsafe { infix_x4(pat, batch, k, out) };
+        unsafe { batch_x4(pat, batch, mode, k, out) };
     }
 }
 
-/// [`infix_x8`] for up to four texts in AVX2, one per 64-bit lane: the same recurrence and
+/// [`batch_x8`] for up to four texts in AVX2, one per 64-bit lane: the same recurrence and
 /// band union, with blends for the per-lane masked updates and vector compares for the mask
 /// tests. A lane's code selects its block mask through a dword permute.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+unsafe fn batch_x4(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     use std::arch::x86_64::*;
     debug_assert!((1..=4).contains(&texts.len()) && pat.m > 0);
     let m = pat.m;
@@ -411,11 +424,23 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     let kv = _mm256_set1_epi64x(kk);
     let kw = _mm256_set1_epi64x(kk + W as i64);
     let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
-    // Column 0: D[m][0] = m.
-    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+    // Column 0: D[m][0] = m (Global: only for an empty text).
+    let mut best = if mode == Mode::Global {
+        _mm256_blendv_epi8(
+            _mm256_set1_epi64x(i64::MAX),
+            _mm256_set1_epi64x(m as i64),
+            _mm256_cmpeq_epi64(lens, zero),
+        )
+    } else if last as usize + 1 == blocks && m as i64 <= kk {
         _mm256_set1_epi64x(m as i64)
     } else {
         _mm256_set1_epi64x(i64::MAX)
+    };
+    // Horizontal delta entering row 0 (as -1/+1 bits): D[0][j] is 0 (free text start) or j.
+    let h0 = if mode == Mode::Infix {
+        (zero, zero)
+    } else {
+        (zero, one)
     };
     // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
     #[inline]
@@ -456,8 +481,7 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
         let live = _mm256_cmpgt_epi64(lens, _mm256_set1_epi64x(j as i64));
         // SAFETY: tx holds 4 indices per column.
         let idx = unsafe { _mm256_loadu_si256(tx.as_ptr().add(4 * j).cast()) };
-        // Infix: the top row is free (horizontal delta 0).
-        let mut h = (zero, zero);
+        let mut h = h0;
         for b in 0..=last as usize {
             let eq = _mm256_permutevar8x32_epi32(peq[b], idx);
             h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
@@ -504,7 +528,11 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
         }
         if last as usize + 1 == blocks {
             let s = score[blocks - 1];
-            let lt = _mm256_and_si256(live, _mm256_cmpgt_epi64(best, s));
+            let lt = if mode == Mode::Global {
+                _mm256_cmpeq_epi64(lens, _mm256_set1_epi64x(j as i64 + 1))
+            } else {
+                _mm256_and_si256(live, _mm256_cmpgt_epi64(best, s))
+            };
             best = _mm256_blendv_epi8(best, s, lt);
         }
     }
@@ -517,17 +545,23 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     }
 }
 
-/// Lanes of [`infix_lanes`] on aarch64.
+/// Lanes of [`batch_lanes`] on aarch64.
 #[cfg(target_arch = "aarch64")]
-const INFIX_LANES: usize = 4;
+const BATCH_LANES: usize = 4;
 
-/// [`infix_x8`] in scalar code, `L` texts in lockstep: the lanes' block steps are
+/// [`batch_x8`] in scalar code, `L` texts in lockstep: the lanes' block steps are
 /// independent, so a wide core overlaps their carried horizontal deltas, the critical path
-/// of one [`distance_with`] call. Same band rules as `infix_x8`, so the same results. A lane
+/// of one [`distance_with`] call. Same band rules as `batch_x8`, so the same results. A lane
 /// past its text's end keeps stepping (on code 0) but no longer counts in the band or its
 /// best, so it changes no output.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+fn batch_lanes<const L: usize>(
+    pat: &Pattern,
+    texts: &[&[u8]],
+    mode: Mode,
+    k: u32,
+    out: &mut Vec<Option<u32>>,
+) {
     debug_assert!((1..=L).contains(&texts.len()) && pat.m > 0);
     let m = pat.m;
     let n_max = texts.iter().map(|t| t.len()).max().unwrap();
@@ -551,17 +585,23 @@ fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut
     let mut score: Vec<[i32; L]> = (0..blocks).map(|b| [(b * W + rows(b)) as i32; L]).collect();
     let kw = kk + W as i32;
     let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
-    // Column 0: D[m][0] = m.
-    let mut best = [if last as usize + 1 == blocks && m as i32 <= kk {
+    // Column 0: D[m][0] = m (Global: only for an empty text).
+    let best0 = if last as usize + 1 == blocks && m as i32 <= kk {
         m as i32
     } else {
         i32::MAX
-    }; L];
+    };
+    let mut best: [i32; L] = std::array::from_fn(|l| match mode {
+        Mode::Global if lens[l] == 0 => m as i32,
+        Mode::Global => i32::MAX,
+        _ => best0,
+    });
+    // Horizontal delta entering row 0: D[0][j] is 0 (free text start) or j.
+    let h0: i32 = if mode == Mode::Infix { 0 } else { 1 };
     for (j, c) in tx.as_chunks::<L>().0.iter().enumerate() {
         let c: [usize; L] = std::array::from_fn(|l| c[l] as usize);
         let live: [bool; L] = std::array::from_fn(|l| j < lens[l]);
-        // Infix: the top row is free (horizontal delta 0).
-        let mut h = [0i32; L];
+        let mut h = [h0; L];
         for b in 0..=last as usize {
             let (p, mm, s, q, bt) = (&mut pv[b], &mut mv[b], &mut score[b], &peq[b], bit(b));
             for l in 0..L {
@@ -596,7 +636,11 @@ fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut
         }
         if last as usize + 1 == blocks {
             for l in 0..L {
-                if live[l] {
+                if mode == Mode::Global {
+                    if j + 1 == lens[l] {
+                        best[l] = score[blocks - 1][l];
+                    }
+                } else if live[l] {
                     best[l] = best[l].min(score[blocks - 1][l]);
                 }
             }
@@ -693,43 +737,22 @@ pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, b
         .collect()
 }
 
-/// [`affine_extend`] (or, with `diagonal`, [`affine_extend_diagonal`]) for each of `texts`,
-/// which must be sorted, sharing rows as [`affine_sorted`] does. Without `diagonal`, the band is
+/// [`affine_extend`] for each of `texts`, which must be sorted, sharing rows as
+/// [`affine_sorted`] does, with each text's score also over its first `cut` bases only:
+/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
+/// one pass (`cut = usize::MAX` for none).
+///
+/// With `diagonal`, the band stays on the diagonal from the start (`2 * band + 1` cells per
+/// row) however much longer the text is: for accurate reads, whose extensions stay near it. A
+/// text shorter than the pattern (a transcript ending inside the read's flank) keeps the band
+/// of [`affine_extend`], which can place the read's extra bases. Without `diagonal`, the band is
 /// laid out for a text of at least `window` bases, as [`affine_extend_window`] does: a text cut
 /// short where its transcript ends gets the band of the full window, so a read whose far end
 /// doesn't align (a primer, an adapter) is placed as it would be against a longer transcript.
-#[allow(clippy::too_many_arguments)]
-pub fn affine_extend_sorted(
-    pattern: &[u8],
-    texts: &[&[u8]],
-    sc: &Affine,
-    band: usize,
-    end_bonus: i32,
-    xdrop: i32,
-    diagonal: bool,
-    window: usize,
-) -> Vec<i32> {
-    affine_extend_sorted_cut(
-        pattern,
-        texts,
-        sc,
-        band,
-        end_bonus,
-        xdrop,
-        diagonal,
-        window,
-        usize::MAX,
-    )
-    .into_iter()
-    .map(|(x, _, _)| x)
-    .collect()
-}
-
-/// [`affine_extend_sorted`], with each text's score also over its first `cut` bases only:
-/// (whole text, text cut at `cut`, text bases the whole text's best extension covers), from
-/// one pass. Without X-drop, the second equals the pass
-/// over the cut text (same band layout: `window` at least as long as the texts); with it, the
-/// cut score may extend further, since the pass stops only when the whole text's does.
+///
+/// Without X-drop, the cut score equals the pass over the cut text (same band layout: `window`
+/// at least as long as the texts); with it, the cut score may extend further, since the pass
+/// stops only when the whole text's does.
 #[allow(clippy::too_many_arguments)]
 pub fn affine_extend_sorted_cut(
     pattern: &[u8],
@@ -773,38 +796,10 @@ pub fn affine_extend_sorted_cut(
     .collect()
 }
 
-/// [`affine_extend`] with the band on the diagonal from the start (`2 * band + 1` cells per
-/// row) however much longer the text is: for accurate reads, whose extensions stay near it.
-/// A text shorter than the pattern (a transcript ending inside the read's flank) keeps the
-/// band of [`affine_extend`], which can place the read's extra bases.
-pub fn affine_extend_diagonal(
-    pattern: &[u8],
-    text: &[u8],
-    sc: &Affine,
-    band: usize,
-    end_bonus: i32,
-    xdrop: i32,
-) -> i32 {
-    let geom = pattern.len().min(text.len());
-    let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some((xdrop, false)), geom);
-    d.clip_best.max(d.score.saturating_add(end_bonus))
-}
-
-/// [`affine_extend`] with where the best extension ends: (score, pattern bases, text bases,
-/// text bases read).
-pub fn affine_extend_end(
-    pattern: &[u8],
-    text: &[u8],
-    sc: &Affine,
-    band: usize,
-    end_bonus: i32,
-    xdrop: i32,
-) -> (i32, usize, usize, usize) {
-    affine_extend_window(pattern, text, text.len(), sc, band, end_bonus, xdrop)
-}
-
-/// [`affine_extend_end`] on a text cut from a window of `window` bases (`text.len() <=
-/// window`): the band is laid out for the whole window, so the result depends on the text only
+/// [`affine_extend`] with where the best extension ends, (score, pattern bases, text bases,
+/// text bases read), on a text cut from a window of `window` bases (`text.len() <= window`;
+/// `text.len()` for a plain extension): the band is laid out for the whole window, so the
+/// result depends on the text only
 /// through the bases read and, if it read them all, the text's length. Texts cut from windows
 /// of one length share results on that basis.
 pub fn affine_extend_window(
@@ -870,8 +865,9 @@ trait Rows {
 /// One DP row over `w` cells by three passes over the row (the first and last autovectorize
 /// for the entry point's level): `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
 /// F[i-1][start..=hi], `tx` the text bases of columns start..=hi, `c` the pattern base, `e`
-/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` and
-/// returns the row's maximum. `scratch` holds two rows of temporaries.
+/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` (`w + 1`
+/// cells: the last gets NEG, the band's right sentinel) and returns the row's maximum. `scratch`
+/// holds two rows of temporaries.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn row_scalar(
@@ -893,6 +889,8 @@ fn row_scalar(
     let (hp, gs) = (&mut hpv[..w], &mut gsv[..w]);
     let hd = &hprev[..w]; // H[i-1][j-1]
     let hu = &hprev[1..=w]; // H[i-1][j]
+    // The band's right sentinel.
+    (nh[w], nf[w]) = (NEG, NEG);
     let (tx, nf, nh) = (&tx[..w], &mut nf[..w], &mut nh[..w]);
     // Pass 1: vertical gaps and diagonal moves (H' = H without horizontal gaps), from the
     // previous row only.
@@ -938,6 +936,37 @@ impl Rows for ScalarRows {
     }
 }
 
+/// Cells `k0..w` of a row one at a time: [`row_scalar`]'s steps fused per cell (no row
+/// buffers), with `carry` the horizontal-gap maximum entering cell `k0` and `m` the row's
+/// maximum so far, which it returns updated. The vector kernels' short rows and tails.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn cells_scalar(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    k0: usize,
+    mut carry: i32,
+    mut m: i32,
+) -> i32 {
+    for k in k0..fu.len() {
+        let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
+        let s = if c == tx[k] & 3 { mat } else { -mis };
+        let x = (hprev[k] + s).max(fj).max(NEG);
+        let v = x.max(carry - ext * k as i32);
+        carry = carry.max(x - go + ext * (k as i32 + 1));
+        nh[k] = v;
+        nf[k] = fj;
+        m = m.max(v);
+    }
+    m
+}
+
 #[cfg(target_arch = "x86_64")]
 struct Avx512Rows;
 
@@ -963,6 +992,8 @@ impl Rows for Avx512Rows {
 /// [`row_scalar`] with its three passes fused per 16-lane block: diagonal and vertical moves,
 /// then horizontal gaps as an in-register prefix max carried across blocks, with no
 /// intermediate row written. Same integer operations as the scalar passes, so the same results.
+/// As in [`row_avx2`], whole vectors only: a row's last `w % 16` cells are covered by one more
+/// vector ending at the row's end (rows under 16 cells take one masked block).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 #[inline]
@@ -979,7 +1010,8 @@ unsafe fn row_avx512(
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
-    debug_assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    (nh[w], nf[w]) = (NEG, NEG);
     let neg = _mm512_set1_epi32(NEG);
     let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
     let (vmat, vmis) = (_mm512_set1_epi32(mat), _mm512_set1_epi32(-mis));
@@ -987,23 +1019,30 @@ unsafe fn row_avx512(
     let three = _mm512_set1_epi32(3);
     let last = _mm512_set1_epi32(15);
     let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    // ext * k for the block's lanes, advanced by 16 * ext per block.
-    let mut ek = _mm512_mullo_epi32(lane, vext);
-    let step = _mm512_set1_epi32(16 * ext);
-    let mut cv = _mm512_set1_epi32(e);
+    let lext = _mm512_mullo_epi32(lane, vext);
     let mut mx = neg;
-    let mut k = 0;
-    while k < w {
-        let n = (w - k).min(16);
-        let mask: __mmask16 = if n == 16 { !0 } else { (1u16 << n) - 1 };
-        // SAFETY: lanes below `n` are in bounds of every slice; the rest are masked off.
+    // Cells k..k + 16 (the lanes in `mask`) with `cv` the maximum entering cell k (broadcast)
+    // and `ek` ext times each lane's cell index: stores H and F and returns the exclusive
+    // maxima entering each cell and the maximum after the last.
+    let mut cells = |k: usize, mask: __mmask16, cv: __m512i, ek: __m512i| {
+        // SAFETY: lanes in `mask` are in bounds of every slice (all 16 unless the row is
+        // shorter); the rest are masked off.
         let (hd, hu, fv, t) = unsafe {
-            (
-                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k)),
-                _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k + 1)),
-                _mm512_maskz_loadu_epi32(mask, fu.as_ptr().add(k)),
-                _mm_maskz_loadu_epi8(mask, tx.as_ptr().add(k).cast()),
-            )
+            if mask == !0 {
+                (
+                    _mm512_loadu_si512(hprev.as_ptr().add(k).cast()),
+                    _mm512_loadu_si512(hprev.as_ptr().add(k + 1).cast()),
+                    _mm512_loadu_si512(fu.as_ptr().add(k).cast()),
+                    _mm_loadu_si128(tx.as_ptr().add(k).cast()),
+                )
+            } else {
+                (
+                    _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k)),
+                    _mm512_maskz_loadu_epi32(mask, hprev.as_ptr().add(k + 1)),
+                    _mm512_maskz_loadu_epi32(mask, fu.as_ptr().add(k)),
+                    _mm_maskz_loadu_epi8(mask, tx.as_ptr().add(k).cast()),
+                )
+            }
         };
         let fj = _mm512_max_epi32(
             _mm512_max_epi32(_mm512_sub_epi32(hu, vgo), _mm512_sub_epi32(fv, vext)),
@@ -1026,16 +1065,44 @@ unsafe fn row_avx512(
         v = _mm512_max_epi32(v, _mm512_alignr_epi32::<8>(v, neg));
         v = _mm512_max_epi32(v, cv);
         let excl = _mm512_alignr_epi32::<15>(v, cv);
-        cv = _mm512_permutexvar_epi32(last, v);
         let hv = _mm512_max_epi32(x, _mm512_sub_epi32(excl, ek));
         // SAFETY: as for the loads.
         unsafe {
-            _mm512_mask_storeu_epi32(nh.as_mut_ptr().add(k), mask, hv);
-            _mm512_mask_storeu_epi32(nf.as_mut_ptr().add(k), mask, fj);
+            if mask == !0 {
+                _mm512_storeu_si512(nh.as_mut_ptr().add(k).cast(), hv);
+                _mm512_storeu_si512(nf.as_mut_ptr().add(k).cast(), fj);
+            } else {
+                _mm512_mask_storeu_epi32(nh.as_mut_ptr().add(k), mask, hv);
+                _mm512_mask_storeu_epi32(nf.as_mut_ptr().add(k), mask, fj);
+            }
         }
         mx = _mm512_mask_max_epi32(mx, mask, mx, hv);
+        (excl, _mm512_permutexvar_epi32(last, v))
+    };
+    let mut cv = _mm512_set1_epi32(e);
+    if w < 16 {
+        cells(0, (1u16 << w) - 1, cv, lext);
+        return _mm512_reduce_max_epi32(mx);
+    }
+    let mut excl = cv;
+    let mut ek = lext;
+    let step = _mm512_set1_epi32(16 * ext);
+    let mut k = 0;
+    while k + 16 <= w {
+        (excl, cv) = cells(k, !0, cv, ek);
         ek = _mm512_add_epi32(ek, step);
         k += 16;
+    }
+    if k < w {
+        // The last vector, at w - 16: lane w - k of the previous one is the maximum entering
+        // its first cell.
+        let cv = _mm512_permutexvar_epi32(_mm512_set1_epi32((w - k) as i32), excl);
+        cells(
+            w - 16,
+            !0,
+            cv,
+            _mm512_add_epi32(lext, _mm512_set1_epi32(ext * (w - 16) as i32)),
+        );
     }
     _mm512_reduce_max_epi32(mx)
 }
@@ -1068,21 +1135,10 @@ unsafe fn row_avx2(
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
-    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    (nh[w], nf[w]) = (NEG, NEG);
     if w < 8 {
-        // The scalar steps (`row_scalar` without its row buffers).
-        let (mut m, mut carry) = (NEG, e);
-        for k in 0..w {
-            let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
-            let s = if c == tx[k] & 3 { mat } else { -mis };
-            let x = (hprev[k] + s).max(fj).max(NEG);
-            let v = x.max(carry - ext * k as i32);
-            carry = carry.max(x - go + ext * (k as i32 + 1));
-            nh[k] = v;
-            nf[k] = fj;
-            m = m.max(v);
-        }
-        return m;
+        return cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), 0, e, NEG);
     }
     let neg = _mm256_set1_epi32(NEG);
     let (vgo, vext) = (_mm256_set1_epi32(go), _mm256_set1_epi32(ext));
@@ -1205,7 +1261,8 @@ unsafe fn row_neon(
 ) -> i32 {
     use std::arch::aarch64::*;
     let w = fu.len();
-    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w && nf.len() == w);
+    assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
+    (nh[w], nf[w]) = (NEG, NEG);
     let neg = vdupq_n_s32(NEG);
     let (vgo, vext) = (vdupq_n_s32(go), vdupq_n_s32(ext));
     let (vmat, vmis) = (vdupq_n_s32(mat), vdupq_n_s32(-mis));
@@ -1251,19 +1308,8 @@ unsafe fn row_neon(
         ek = vaddq_s32(ek, step);
         k += 4;
     }
-    let mut m = vmaxvq_s32(mx);
-    let mut g = vgetq_lane_s32::<0>(cv);
-    for k in k..w {
-        let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
-        let s = if c == tx[k] & 3 { mat } else { -mis };
-        let x = (hprev[k] + s).max(fj).max(NEG);
-        let v = x.max(g - ext * k as i32);
-        g = g.max(x - go + ext * (k as i32 + 1));
-        nh[k] = v;
-        nf[k] = fj;
-        m = m.max(v);
-    }
-    m
+    let (m, g) = (vmaxvq_s32(mx), vgetq_lane_s32::<0>(cv));
+    cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), k, g, m)
 }
 
 /// [`row_neon`] (NEON is part of the aarch64 baseline).
@@ -1587,10 +1633,11 @@ fn run_core<R: Rows>(
         }
     };
     // h: best score ending at (i, j); f: ending in a gap that consumes pattern
-    // (vertical). Rows alternate between two buffers; cells outside a row's
-    // band stay NEG.
-    // Rows are not cleared: a row's band is written in full and a sentinel is put on each
-    // side of it, and a row reads the previous row only within one column of its band.
+    // (vertical). Rows alternate between two buffers.
+    // Rows are not cleared: a row's band is written in full with a NEG sentinel just right of
+    // it (stored by the row kernel), and a row reads the previous row only within that row's
+    // band and sentinel. None is needed on the left: a banded row starting at lo > 0 reads
+    // from column lo - 1, where the previous row starts.
     for v in [&mut b.h, &mut b.f, &mut b.nh, &mut b.nf] {
         if v.len() < n + 2 {
             v.resize(n + 2, NEG);
@@ -1645,6 +1692,7 @@ fn run_core<R: Rows>(
     let stats = crate::stats::on();
     for i in first..=m {
         let (lo, hi) = range(i);
+        debug_assert!((lo == 0 || lo == prev.0 + 1) && hi <= prev.1 + 1);
         if lo > hi {
             // Past the text's end by more than the band (only when geom > n): no
             // cell is reachable, so the rest of the pattern can't align.
@@ -1688,8 +1736,8 @@ fn run_core<R: Rows>(
                     &h[start - 1..=hi],
                     &f[start..=hi],
                     &text[start - 1..hi],
-                    &mut nh[start..=hi],
-                    &mut nf[start..=hi],
+                    &mut nh[start..=hi + 1],
+                    &mut nf[start..=hi + 1],
                     c,
                     (mat, mis, go, ext),
                     e,
@@ -1697,6 +1745,8 @@ fn run_core<R: Rows>(
                 )
             };
             row_max = row_max.max(m);
+        } else {
+            (nh[hi + 1], nf[hi + 1]) = (NEG, NEG);
         }
         if cut != usize::MAX && lo <= cut {
             let row = if hi <= cut {
@@ -1728,8 +1778,6 @@ fn run_core<R: Rows>(
                 };
             }
         }
-        edges(nh, lo, hi);
-        edges(nf, lo, hi);
         std::mem::swap(&mut h, &mut nh);
         std::mem::swap(&mut f, &mut nf);
         prev = (lo, hi);
@@ -1773,6 +1821,60 @@ fn run_core<R: Rows>(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// [`affine_extend_sorted_cut`]'s whole-text scores.
+    #[allow(clippy::too_many_arguments)]
+    fn affine_extend_sorted(
+        pattern: &[u8],
+        texts: &[&[u8]],
+        sc: &Affine,
+        band: usize,
+        end_bonus: i32,
+        xdrop: i32,
+        diagonal: bool,
+        window: usize,
+    ) -> Vec<i32> {
+        affine_extend_sorted_cut(
+            pattern,
+            texts,
+            sc,
+            band,
+            end_bonus,
+            xdrop,
+            diagonal,
+            window,
+            usize::MAX,
+        )
+        .into_iter()
+        .map(|(x, _, _)| x)
+        .collect()
+    }
+
+    /// One text's score as [`affine_extend_sorted_cut`] computes it with `diagonal`.
+    fn affine_extend_diagonal(
+        pattern: &[u8],
+        text: &[u8],
+        sc: &Affine,
+        band: usize,
+        end_bonus: i32,
+        xdrop: i32,
+    ) -> i32 {
+        let geom = pattern.len().min(text.len());
+        let d = affine_dp(pattern, text, Mode::Prefix, sc, band, Some((xdrop, false)), geom);
+        d.clip_best.max(d.score.saturating_add(end_bonus))
+    }
+
+    /// [`affine_extend_window`] on a whole text.
+    fn affine_extend_end(
+        pattern: &[u8],
+        text: &[u8],
+        sc: &Affine,
+        band: usize,
+        end_bonus: i32,
+        xdrop: i32,
+    ) -> (i32, usize, usize, usize) {
+        affine_extend_window(pattern, text, text.len(), sc, band, end_bonus, xdrop)
+    }
 
     fn naive(p: &[u8], t: &[u8], mode: Mode) -> u32 {
         let (m, n) = (p.len(), t.len());
@@ -1849,9 +1951,10 @@ mod tests {
         let w = fu.len();
         let mut out = Vec::new();
         for l in simd::supported() {
-            let (mut nh, mut nf) = (vec![7; w], vec![7; w]);
+            let (mut nh, mut nf) = (vec![7; w + 1], vec![7; w + 1]);
             let (mut a, mut b) = (Vec::new(), Vec::new());
             let m = row_at(l, hprev, fu, tx, &mut nh, &mut nf, c, sc, e, (&mut a, &mut b));
+            assert_eq!((nh[w], nf[w]), (NEG, NEG), "sentinel at {l}");
             out.push((l, nh, nf, m));
         }
         out
@@ -2178,11 +2281,11 @@ mod tests {
             }
         }
 
-        /// Batched infix distances equal one `distance_with` call per text: texts are
+        /// Batched distances equal one `distance_with` call per text, in every mode: texts are
         /// mutated copies of one sequence (as isoform regions are) of differing lengths,
         /// some empty or unrelated, in batches of any size.
         #[test]
-        fn infix_batch_matches_single(
+        fn batch_distances_match_single(
             base in prop::collection::vec(0u8..4, 0..700),
             texts in prop::collection::vec(
                 (0usize..700, 0usize..700, prop::collection::vec((0usize..700, 0u8..4, 0u8..3), 0..25), any::<bool>()),
@@ -2215,25 +2318,27 @@ mod tests {
                 })
                 .collect();
             let pat = Pattern::new(&p);
-            let exact: Vec<u32> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, u32::MAX).unwrap()).collect();
-            let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
             let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
-            let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
-            each_level(|level| {
-                prop_assert_eq!(infix_distances(&pat, &refs, k), want.clone(), "at {}", level);
-                Ok(())
-            })?;
             // The lockstep lanes at any width (on every target, not only where they are used).
-            fn lanes<const L: usize>(pat: &Pattern, refs: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+            fn lanes<const L: usize>(pat: &Pattern, refs: &[&[u8]], mode: Mode, k: u32) -> Vec<Option<u32>> {
                 let mut out = Vec::new();
-                refs.chunks(L).for_each(|c| infix_lanes::<L>(pat, c, k, &mut out));
+                refs.chunks(L).for_each(|c| batch_lanes::<L>(pat, c, mode, k, &mut out));
                 out
             }
-            if !p.is_empty() {
-                prop_assert_eq!(&lanes::<1>(&pat, &refs, k), &want);
-                prop_assert_eq!(&lanes::<2>(&pat, &refs, k), &want);
-                prop_assert_eq!(&lanes::<4>(&pat, &refs, k), &want);
-                prop_assert_eq!(&lanes::<8>(&pat, &refs, k), &want);
+            for mode in [Mode::Infix, Mode::Prefix, Mode::Global] {
+                let exact: Vec<u32> = ts.iter().map(|t| distance_with(&pat, t, mode, u32::MAX).unwrap()).collect();
+                let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
+                let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, mode, k)).collect();
+                each_level(|level| {
+                    prop_assert_eq!(batch_distances(&pat, &refs, mode, k), want.clone(), "at {} {:?}", level, mode);
+                    Ok(())
+                })?;
+                if !p.is_empty() {
+                    prop_assert_eq!(&lanes::<1>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                    prop_assert_eq!(&lanes::<2>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                    prop_assert_eq!(&lanes::<4>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                    prop_assert_eq!(&lanes::<8>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                }
             }
         }
     }
@@ -2285,7 +2390,7 @@ mod tests {
             let sc = (2, 4, 6, 2);
             let reps = 2_000_000 / w;
             for l in simd::supported() {
-                let (mut nh, mut nf) = (vec![0; w], vec![0; w]);
+                let (mut nh, mut nf) = (vec![0; w + 1], vec![0; w + 1]);
                 let (mut a, mut b) = (Vec::new(), Vec::new());
                 let ns = time((reps * w) as f64, || {
                     for _ in 0..reps {
@@ -2346,7 +2451,7 @@ mod tests {
                 let ns = time(20.0 * 16.0, || {
                     at_level(l, || {
                         for _ in 0..20 {
-                            black_box(infix_distances(&pat, black_box(&refs), k));
+                            black_box(batch_distances(&pat, black_box(&refs), Mode::Infix, k));
                         }
                     })
                 });

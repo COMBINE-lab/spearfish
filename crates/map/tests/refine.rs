@@ -1,6 +1,6 @@
-//! Theorem 2: with an unbounded beam, the refinement chainer's per-transcript scores equal the
-//! per-transcript oracle's exactly, on random multi-isoform genes (alternative exons, repeated
-//! exons) and reads drawn from them with errors.
+//! With an unbounded beam, the refinement chainer's per-transcript scores equal the oracle's
+//! exactly, on random multi-isoform genes (alternative exons, repeated exons) and reads drawn
+//! from them with errors.
 
 use std::collections::BTreeMap;
 
@@ -100,7 +100,7 @@ fn placed(idx: &Index, c: &anchor::Candidate, h: &map::TxHit) -> bool {
 fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError> {
     let txs = family(seed, 3);
     let (data, _) = build(
-        &txs,
+        txs.clone(),
         &BuildParams {
             spec: spec.into(),
             hpc: true,
@@ -111,7 +111,7 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
         },
     )
     .unwrap();
-    let idx = std::sync::Arc::new(Index::from_bytes(&data.to_bytes()).unwrap());
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
     let p = ChainParams {
         h,
         beta,
@@ -129,12 +129,16 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
         let read = mutate(&mut rng, &t.seq[a..b], rate);
         let seeds = mapper.seeder.seed(&read);
         let anchors = anchor::anchors(&idx, &seeds, &AnchorParams::default());
-        for c in anchor::candidates(&idx, anchors, &AnchorParams::default()) {
+        for mut c in anchor::candidates(&idx, anchors, &AnchorParams::default()) {
             let (o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
             for h in &o {
                 prop_assert!(placed(&idx, &c, h), "seed {} read from {}: {:?}", seed, t.name, h);
             }
             prop_assert_eq!(scores(o), scores(r), "seed {} read from {}", seed, t.name);
+            // With collinear anchors merged, as the mapper chains candidates by default.
+            anchor::merge_collinear(&idx, &mut c);
+            let (o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
+            prop_assert_eq!(scores(o), scores(r), "merged: seed {} read from {}", seed, t.name);
         }
     }
     Ok(())
