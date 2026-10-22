@@ -463,10 +463,13 @@ fn em_skips_low_coverage_reads_with_other_flags() {
             map.as_os_str(),
             "-o".as_ref(),
             out.as_os_str(),
+            "-q".as_ref(),
         ])
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // `-q` silences the summary.
+    assert!(o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
     let counts: std::collections::HashMap<String, f64> = std::fs::read_to_string(&out)
         .unwrap()
         .lines()
