@@ -815,6 +815,8 @@ fn dp_beta0_core<K: Preds>(
     cs: &mut [f32],
     cd: &mut [f32],
 ) {
+    // A window rounded up to whole blocks ends within the `LANES - 1` points of padding.
+    const { assert!(K::BLOCK <= LANES) };
     let n = back.len();
     debug_assert!(a.len() >= n + LANES - 1 && f.len() >= n + LANES - 1);
     let mut lo = 0;
