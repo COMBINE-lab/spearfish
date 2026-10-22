@@ -63,7 +63,8 @@ pub struct Args {
     /// PAF output (`-`: stdout).
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     paf: Option<PathBuf>,
-    /// RAD output (`bulk_long_read` records, which oarfish quantifies with `-a`).
+    /// RAD output, a file and not `-` (`bulk_long_read` records, which oarfish quantifies with
+    /// `-a`).
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     rad: Option<PathBuf>,
     /// RAD chunk compression.
@@ -500,6 +501,11 @@ pub fn execute(args: Job) -> Result<Counts> {
         .count();
     if stdout_outputs > 1 {
         bail!("only one output can go to stdout");
+    }
+    if args.rad.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+        bail!(
+            "RAD output needs a file (its read counts are written when it is finished); `-` (stdout) is not supported"
+        );
     }
     let tsv_path = match (&args.output, &args.paf, &args.rad) {
         (None, None, None) => Some(PathBuf::from("-")),

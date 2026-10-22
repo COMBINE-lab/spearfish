@@ -263,6 +263,13 @@ fn utility_commands() {
         .output()
         .unwrap();
     assert!(!o.status.success());
+    // RAD can't go to stdout (checked before the index is opened, so x.sfi need not exist).
+    let o = Command::new(bin)
+        .args(["map", "x.sfi", "-", "--rad", "-"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("RAD output needs a file"));
 }
 
 #[test]
