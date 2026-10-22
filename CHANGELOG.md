@@ -115,3 +115,6 @@
 - Index writing streams sections to disk instead of building the file in memory.
 - The workspace declares its minimum Rust version, 1.89.
 - CI runs on x86-64 Linux, arm64 Linux and Apple Silicon, and checks the minimum Rust version.
+- Release builds (`cargo install`) no longer embed debug info, so the binary is about 8 times
+  smaller; backtraces lose file and line numbers (panic messages keep them). The `profiling`
+  profile builds with line tables (see CONTRIBUTING.md).

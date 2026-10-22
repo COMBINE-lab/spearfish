@@ -14,6 +14,17 @@ python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
 CI also runs these on arm64 Linux and Apple Silicon, runs `spearfish doctor`, and checks that
 the workspace builds with the minimum Rust version (`rust-version` in `Cargo.toml`).
 
+## Profiling
+
+Release builds carry no debug info. For profilers, build with line tables, and with frame
+pointers for call graphs (`perf record --call-graph fp`):
+
+```sh
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling -p spearfish-cli
+```
+
+The binary is `target/profiling/spearfish`, optimized as a release build is.
+
 ## Output must not change by accident
 
 Changes that are not meant to change mappings (speedups, refactors, interface work) must leave
