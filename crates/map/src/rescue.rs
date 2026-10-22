@@ -289,7 +289,7 @@ impl Rescuer {
                     None => (0, tlen),
                 };
                 sc.tseq.clear();
-                idx.tx_codes_into(t, lo, hi, &mut sc.tseq, false);
+                idx.tx_codes_into(t, lo, hi, &mut sc.tseq);
                 let key = (xxhash_rust::xxh3::xxh3_64(&sc.tseq), sc.tseq.len() as u32);
                 let r = match sc.seen.get(&key) {
                     Some(&r) => r,
