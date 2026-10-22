@@ -526,8 +526,14 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Distances of `read` against several texts with a shared band: the first is exact,
-    /// later ones are capped at (best so far + `cap`) + 1.
-    fn banded(read: &[u8], texts: &[Vec<u8>], mode: align::Mode, cap: u32) -> Vec<u32> {
+    /// later ones are capped at (best so far + `cap`) + 1. `distinct`: no text repeats.
+    fn banded<T: AsRef<[u8]>>(
+        read: &[u8],
+        texts: &[T],
+        mode: align::Mode,
+        cap: u32,
+        distinct: bool,
+    ) -> Vec<u32> {
         // Identical texts (isoforms agreeing over the region) are aligned once. The band only
         // tightens (k = best so far + cap), so a repeat's result is the first occurrence's
         // re-capped at the current k: exact if d <= k, else k + 1, as a fresh call returns.
@@ -540,8 +546,9 @@ impl<C: Chainer> Mapper<C> {
         texts
             .iter()
             .map(|t| {
+                let t = t.as_ref();
                 let k = best.saturating_add(cap);
-                if let Some(&d) = seen.get(t.as_slice()) {
+                if !distinct && let Some(&d) = seen.get(t) {
                     return if d <= k { d } else { k.saturating_add(1) };
                 }
                 stats::add(&stats::MYERS_CALLS, 1);
@@ -551,7 +558,9 @@ impl<C: Chainer> Mapper<C> {
                 );
                 let d = align::distance_with(&pat, t, mode, k).unwrap_or(k.saturating_add(1));
                 best = best.min(d);
-                seen.insert(t.as_slice(), d);
+                if !distinct {
+                    seen.insert(t, d);
+                }
                 d
             })
             .collect()
@@ -562,7 +571,7 @@ impl<C: Chainer> Mapper<C> {
     /// later texts' thresholds are no larger (the best only falls), so a batch result is exact
     /// wherever the sequential pass's would be, and re-capping it at each text's own threshold,
     /// in order, gives the sequential results exactly.
-    fn banded_infix(pat: &align::Pattern, m: usize, texts: &[Vec<u8>], cap: u32) -> Vec<u32> {
+    fn banded_infix<T: AsRef<[u8]>>(pat: &align::Pattern, m: usize, texts: &[T], cap: u32) -> Vec<u32> {
         // Each text's distinct-text index, and the distinct texts in first-occurrence order.
         let mut first: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
         let mut uniq: Vec<&[u8]> = Vec::new();
@@ -571,8 +580,8 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                *first.entry(t.as_slice()).or_insert_with(|| {
-                    uniq.push(t.as_slice());
+                *first.entry(t.as_ref()).or_insert_with(|| {
+                    uniq.push(t.as_ref());
                     at.push(i);
                     uniq.len() as u32 - 1
                 })
@@ -631,6 +640,7 @@ impl<C: Chainer> Mapper<C> {
             &texts,
             align::Mode::Infix,
             tb.cap,
+            false,
         )
     }
 
@@ -827,10 +837,12 @@ impl<C: Chainer> Mapper<C> {
                     v
                 })
                 .collect();
-            let read: Vec<u8> = if rev {
-                read.iter().rev().copied().collect()
+            let rread: Vec<u8>;
+            let read = if rev {
+                rread = read.iter().rev().copied().collect();
+                &rread[..]
             } else {
-                read.to_vec()
+                read
             };
             match &tb.affine {
                 Some(sc) => {
@@ -847,8 +859,9 @@ impl<C: Chainer> Mapper<C> {
                     let rep: Vec<usize> = rep0.iter().map(|&d| place[d]).collect();
                     let unit = match tb.affine_within {
                         Some(w) if uniq.len() > 1 => {
-                            let ut: Vec<Vec<u8>> = uniq.iter().map(|&u| decoded[u].clone()).collect();
-                            Some((Self::banded(&read, &ut, mode, w), w))
+                            // The distinct texts: none repeats.
+                            let ut: Vec<&[u8]> = uniq.iter().map(|&u| decoded[u].as_slice()).collect();
+                            Some((Self::banded(read, &ut, mode, w, true), w))
                         }
                         _ => None,
                     };
@@ -892,7 +905,7 @@ impl<C: Chainer> Mapper<C> {
                         // transcript that doesn't end inside it.
                         let window = read.len() + tb.pad as usize + read.len() / tb.pad_div as usize;
                         align::affine_extend_sorted_cut(
-                            &read,
+                            read,
                             &tx,
                             sc,
                             tb.band,
@@ -903,7 +916,7 @@ impl<C: Chainer> Mapper<C> {
                             cut.unwrap_or(usize::MAX),
                         )
                     } else {
-                        align::affine_sorted(&read, &tx, mode, sc, tb.band)
+                        align::affine_sorted(read, &tx, mode, sc, tb.band)
                             .into_iter()
                             .map(|x| (x, x, 0))
                             .collect()
@@ -942,8 +955,11 @@ impl<C: Chainer> Mapper<C> {
                     }
                 }
                 None => {
-                    let texts: Vec<Vec<u8>> = rep0.iter().map(|&d| decoded[d].clone()).collect();
-                    for (c, x) in delta.iter_mut().zip(Self::banded(&read, &texts, mode, tb.cap)) {
+                    let texts: Vec<&[u8]> = rep0.iter().map(|&d| decoded[d].as_slice()).collect();
+                    for (c, x) in delta
+                        .iter_mut()
+                        .zip(Self::banded(read, &texts, mode, tb.cap, false))
+                    {
                         *c += i64::from(x);
                     }
                     delta_cut.copy_from_slice(&delta);
