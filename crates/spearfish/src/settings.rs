@@ -413,7 +413,7 @@ impl MapSettings {
         set!(self.chain_window => c.h);
         set!(self.chain_max_gap => c.g_max);
         set!(self.chain_max_overlap => c.o_max);
-        ensure!(c.h >= 1, "chain_window must be at least 1");
+        c.check()?;
 
         if let Some(k) = self.chainer {
             o.chainer = k;
@@ -579,6 +579,41 @@ mod tests {
         // Extended spans are scored as the preset scores.
         assert_eq!(e.sc, map::align::Affine::HIFI);
         assert!(MapSettings::builder(Preset::Ont).pad_div(0).resolve().is_err());
+        // Chain limits the kernels can't represent (i32 gaps, window arithmetic) are errors.
+        assert!(
+            MapSettings::builder(Preset::Ont)
+                .chain_window(0)
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            MapSettings::builder(Preset::Ont)
+                .chain_window(usize::MAX)
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            MapSettings::builder(Preset::Ont)
+                .chain_max_gap(3_000_000_000)
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            MapSettings::builder(Preset::Ont)
+                .chain_max_overlap(1 << 31)
+                .resolve()
+                .is_err()
+        );
+        let o = MapSettings::builder(Preset::Ont)
+            .chain_max_gap(i32::MAX as i64)
+            .chain_max_overlap(-10)
+            .chain_window(1000)
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            (o.params.chain.g_max, o.params.chain.o_max),
+            (i32::MAX as i64, -10)
+        );
         assert!(
             MapSettings::builder(Preset::Ont)
                 .rescue_other_always(true)

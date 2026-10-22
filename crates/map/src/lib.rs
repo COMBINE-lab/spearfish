@@ -379,6 +379,7 @@ struct Strand {
 impl<C: Chainer> Mapper<C> {
     /// A mapper seeding exactly as the index was built.
     pub fn new(idx: Arc<Index>, chainer: C, p: MapParams) -> Result<Self> {
+        p.chain.check()?;
         idx.check_compatible()?;
         let spec = idx.meta("spec").context("index lacks its seed spec")?;
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";

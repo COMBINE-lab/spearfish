@@ -37,6 +37,10 @@ fn map_toy_reads() {
     let drna = Mapper::new(index.clone(), &MapOptions::preset(Preset::Drna)).unwrap();
     let (_, _, seq) = &txs[0];
     assert!(drna.map(&revcomp(seq)).hits.iter().all(|h| !h.reverse));
+    // Chain limits set directly, without settings resolution, are checked too.
+    let mut opts = MapOptions::preset(Preset::Ont);
+    opts.chain_mut().g_max = 3_000_000_000;
+    assert!(Mapper::new(index.clone(), &opts).is_err());
 }
 
 /// The settings builder gives the same mapper as the preset's options, and records what it

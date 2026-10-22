@@ -47,6 +47,28 @@ impl Default for ChainParams {
     }
 }
 
+impl ChainParams {
+    /// Errors unless the gap limits fit the i32 kernels (coordinates are below 2^31) and the
+    /// window arithmetic (`2 * h`, `anchor + h`) can't overflow.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let lim = i32::MAX as i64;
+        anyhow::ensure!(
+            (-lim..=lim).contains(&self.g_max),
+            "chain_max_gap must be within ±{lim}"
+        );
+        anyhow::ensure!(
+            (-lim..=lim).contains(&self.o_max),
+            "chain_max_overlap must be within ±{lim}"
+        );
+        anyhow::ensure!(
+            (1..=u32::MAX as usize).contains(&self.h),
+            "chain_window must be in 1..={}",
+            u32::MAX
+        );
+        Ok(())
+    }
+}
+
 /// The best chain of one transcript.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxHit {
