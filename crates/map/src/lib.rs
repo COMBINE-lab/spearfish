@@ -1055,11 +1055,16 @@ impl<C: Chainer> Mapper<C> {
         let t0 = &last.targets[0];
         let through = raw.is_some()
             && tb.raw_ends
-            && hits.iter().zip(&last.targets).skip(1).any(|(h, t)| {
-                self.idx
-                    .tx_raw_eq(hits[0].tx, t0.start, t0.end, h.tx, t.start, t.end)
-                    == Some(false)
-            });
+            && self
+                .idx
+                .tx_range(hits[0].tx, t0.start, t0.end, true)
+                .is_some_and(|r0| {
+                    hits.iter().zip(&last.targets).skip(1).any(|(h, t)| {
+                        self.idx
+                            .tx_range(h.tx, t.start, t.end, true)
+                            .is_some_and(|r| !r.sequence_eq(&r0))
+                    })
+                });
         let ql = if through { last.query.start } else { last.query.end };
         let rest = plen - ql;
         let spans: Vec<(u32, u32, u32)> = hits
