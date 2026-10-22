@@ -1159,7 +1159,7 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .flat_map(|c| self.chainer.chain(&self.idx, c))
             .collect();
-        sort_hits(&mut hits, salt);
+        sort_distinct_hits(&mut hits, salt);
         Strand {
             hits,
             seq,
@@ -1504,6 +1504,24 @@ fn sort_hits(hits: &mut [TxHit], salt: u64) {
             .then_with(|| tie_key(salt, a.tx).cmp(&tie_key(salt, b.tx)))
             .then(a.tx.cmp(&b.tx))
     });
+}
+
+/// [`sort_hits`] for one orientation's chains, whose transcripts are distinct (a chainer gives
+/// one hit per transcript of a candidate, and candidates are families, which share no
+/// transcript): each hit's key is computed once and each hit moved once. Distinct transcripts
+/// make the order total, so it is `sort_hits`' order.
+fn sort_distinct_hits(hits: &mut [TxHit], salt: u64) {
+    // `f32::total_cmp` order as an unsigned key, reversed (best score first).
+    let desc = |s: f32| {
+        let b = s.to_bits() as i32;
+        !(((b ^ ((((b >> 31) as u32) >> 1) as i32)) as u32) ^ 0x8000_0000)
+    };
+    hits.sort_by_cached_key(|h| (desc(h.score), tie_key(salt, h.tx), h.tx));
+    // Hits `sort_hits` can't order (same score and transcript) would now be adjacent.
+    debug_assert!(
+        hits.windows(2)
+            .all(|w| (w[0].score.to_bits(), w[0].tx) != (w[1].score.to_bits(), w[1].tx))
+    );
 }
 
 /// splitmix64 of the read salt and a transcript id.
@@ -1857,5 +1875,31 @@ mod segmented_tests {
         assert_eq!(costs, [-34, -4]);
         tb.raw_ends = false;
         assert_eq!(m.segmented(&tb, &parsed, Some(&raw), &hits).unwrap().0, [0, 0]);
+    }
+
+    proptest::proptest! {
+        /// Sorting one orientation's hits (distinct transcripts) by cached keys gives
+        /// `sort_hits`' order, with tied, signed-zero, infinite and NaN scores.
+        #[test]
+        fn distinct_hit_sort_is_sort_hits(
+            scores in proptest::collection::vec(proptest::sample::select(vec![
+                0.0, -0.0, 1.5, -3.0, 100.0, 7.25, f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
+                -f32::NAN,
+            ]), 0..80),
+            salt: u64,
+            mul in 0u32..u32::MAX,
+        ) {
+            // Distinct transcripts: i -> i * odd is a bijection.
+            let hits: Vec<TxHit> = scores
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| hit((i as u32).wrapping_mul(mul | 1), s, &[(0, 0, 1)]))
+                .collect();
+            let key = |h: &[TxHit]| h.iter().map(|h| (h.tx, h.score.to_bits())).collect::<Vec<_>>();
+            let (mut a, mut b) = (hits.clone(), hits);
+            sort_hits(&mut a, salt);
+            sort_distinct_hits(&mut b, salt);
+            proptest::prop_assert_eq!(key(&a), key(&b));
+        }
     }
 }
