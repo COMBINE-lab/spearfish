@@ -432,20 +432,22 @@ impl Index {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let s = Sections::load(&store)?;
-        let raw = (|| -> Result<RawSections> {
-            Ok(RawSections {
+        let raw = if store.has("tx_raw_off") {
+            Some(RawSections {
                 off: Raw::of(store.get::<u64>("tx_raw_off")?),
                 words: Raw::of(store.get::<u64>("tx_raw")?),
                 ck_off: Raw::of(store.get::<u64>("tx_raw_ck_off")?),
                 ck: Raw::of(store.get::<u32>("tx_raw_ck")?),
             })
-        })()
-        .ok();
+        } else {
+            None
+        };
         let bits = label_dir_bits(s.labels.len);
         anyhow::ensure!(
             s.label_dir.len == (1usize << bits) + 1,
             "label directory has the wrong size"
         );
+        Self::check_sizes(&s, raw.as_ref())?;
         Ok(Index {
             store,
             s,
@@ -453,6 +455,49 @@ impl Index {
             meta,
             dir_shift: 64 - bits,
         })
+    }
+
+    /// Check that the sections' sizes agree with each other, so that a truncated or mismatched
+    /// index fails to load instead of panicking while mapping. Values are not checked.
+    fn check_sizes(s: &Sections, raw: Option<&RawSections>) -> Result<()> {
+        // The last entry of an offsets section (None if it is empty).
+        // SAFETY: borrowed from the store, which outlives this call.
+        let end = |r: Raw<u64>| unsafe { r.slice() }.last().map(|&x| x as usize);
+        let (nn, nu, nt) = (s.labels.len, s.unitig_span.len, s.tx_gene.len);
+        let mut checks = vec![
+            ("node_unitig", s.node_unitig.len == nn),
+            ("node_offset", s.node_offset.len == nn),
+            ("node_len", s.node_len.len == nn),
+            ("node_flags", s.node_flags.len == nn),
+            ("unitig_off", s.unitig_off.len == nu + 1),
+            ("unitig_nodes", Some(s.unitig_nodes.len) == end(s.unitig_off)),
+            ("unitig_color", s.unitig_color.len == nu),
+            ("unitig_family", s.unitig_family.len == nu),
+            ("occ_off", s.occ_off.len == nu + 1),
+            ("occ_tx", Some(s.occ_tx.len) == end(s.occ_off)),
+            ("occ_pos", Some(s.occ_pos.len) == end(s.occ_off)),
+            ("color_tx", Some(s.color_tx.len) == end(s.color_off)),
+            ("tx_family", s.tx_family.len == nt),
+            ("tx_len", s.tx_len.len == nt),
+            ("tx_plen", s.tx_plen.len == nt),
+            ("tx_seq_off", s.tx_seq_off.len == nt + 1),
+            ("tx_seq", Some(s.tx_seq.len) == end(s.tx_seq_off)),
+            ("tx_name_off", s.tx_name_off.len == nt + 1),
+            ("tx_names", Some(s.tx_names.len) == end(s.tx_name_off)),
+            ("gene_names", Some(s.gene_names.len) == end(s.gene_name_off)),
+        ];
+        if let Some(r) = raw {
+            checks.extend([
+                ("tx_raw_off", r.off.len == nt + 1),
+                ("tx_raw", Some(r.words.len) == end(r.off)),
+                ("tx_raw_ck_off", r.ck_off.len == nt + 1),
+                ("tx_raw_ck", Some(r.ck.len) == end(r.ck_off)),
+            ]);
+        }
+        for (name, ok) in checks {
+            anyhow::ensure!(ok, "index section {name} has the wrong size; rebuild the index");
+        }
+        Ok(())
     }
 
     pub fn meta(&self, key: &str) -> Option<&str> {
@@ -472,9 +517,7 @@ impl Index {
 
     /// The index holds raw (uncompressed) transcript sequence.
     pub fn has_raw(&self) -> bool {
-        self.raw
-            .as_ref()
-            .is_some_and(|r| r.off.len > self.n_transcripts())
+        self.raw.is_some()
     }
 
     /// Check that this build parses sequence as the index was built: an index built with

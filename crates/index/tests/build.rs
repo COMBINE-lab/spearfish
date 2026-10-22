@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use index::{BuildParams, Collapse, Index, InferGenes, TxInput, build};
+use index::{BuildParams, Collapse, Index, IndexData, InferGenes, TxInput, build};
 use proptest::prelude::*;
 use seeds::BaseSeeder;
 
@@ -161,6 +161,34 @@ fn toy_roundtrip_and_structure() {
             }
         }
     }
+}
+
+#[test]
+fn mismatched_sections_fail_to_load() {
+    let p = BuildParams {
+        spec: "lcp:K=3".into(),
+        hpc: true,
+        f_max: 20,
+        allow_collisions: false,
+        collapse: Collapse::Gene,
+        infer_genes: None,
+    };
+    let (data, _) = build(toy(), &p).unwrap();
+    assert!(Index::from_data(&data).unwrap().has_raw());
+    let fails = |d: &IndexData, section: &str| match Index::from_data(d) {
+        Ok(_) => panic!("{section}: loaded"),
+        Err(e) => assert!(e.to_string().contains(section), "{section}: {e}"),
+    };
+    let mut d = data.clone();
+    d.occ_tx.pop();
+    fails(&d, "occ_tx");
+    let mut d = data.clone();
+    d.node_len.push(0);
+    fails(&d, "node_len");
+    // A damaged raw section is an error, not an index without raw sequence.
+    let mut d = data.clone();
+    d.tx_raw_ck.1.pop();
+    fails(&d, "tx_raw_ck");
 }
 
 #[test]

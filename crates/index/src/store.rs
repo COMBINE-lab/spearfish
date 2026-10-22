@@ -174,7 +174,7 @@ impl Store {
             let off = u64::from_le_bytes(b[e + NAME_LEN..e + NAME_LEN + 8].try_into().unwrap()) as usize;
             let len = u64::from_le_bytes(b[e + NAME_LEN + 8..e + NAME_LEN + 16].try_into().unwrap()) as usize;
             ensure!(
-                off.is_multiple_of(ALIGN) && off + len <= b.len(),
+                off.is_multiple_of(ALIGN) && off.checked_add(len).is_some_and(|e| e <= b.len()),
                 "section {name} out of bounds"
             );
             sections.insert(name, (off, len));
@@ -229,5 +229,10 @@ mod tests {
         assert_eq!(s.get::<u8>("text").unwrap(), b"hello");
         assert!(s.get::<u8>("missing").is_err());
         assert!(Store::from_bytes(b"not an index at all").is_err());
+        // A section length that wraps around past the end is an error, not a slice panic.
+        let mut bad = bytes.clone();
+        let e = 16 + NAME_LEN + 8;
+        bad[e..e + 8].copy_from_slice(&(u64::MAX - 63).to_le_bytes());
+        assert!(Store::from_bytes(&bad).is_err());
     }
 }
