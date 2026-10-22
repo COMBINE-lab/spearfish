@@ -10,6 +10,8 @@ publish.workspace = true
 [[bin]]
 name = "spearfish"
 path = "src/main.rs"
+# `cargo doc` would write the binary's pages over the library's (both are `spearfish`).
+doc = false
 
 [dependencies]
 spearfish.workspace = true

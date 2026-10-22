@@ -170,7 +170,7 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
 /// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
 /// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
 /// lane, sharing the pattern's blocks; with AVX2, up to four; at the NEON level, four in
-/// lockstep ([`infix_lanes`]).
+/// lockstep (`infix_lanes`).
 pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
     match simd_level() {
         #[cfg(target_arch = "x86_64")]

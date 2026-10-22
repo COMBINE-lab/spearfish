@@ -38,6 +38,10 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo doc --locked --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked --workspace
       - run: python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
       - run: cargo run --locked --release -q -p spearfish-cli -- doctor
