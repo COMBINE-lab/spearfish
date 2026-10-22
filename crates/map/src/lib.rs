@@ -1302,7 +1302,14 @@ impl<C: Chainer> Mapper<C> {
         if let Some(r) = &self.rescuer
             && Self::span_frac(st.hits.first(), st.seq.len()) < self.p.pi_cov
         {
-            let mut a = r.rescue(&self.idx, &st.seq, &st.seeds, &self.p.anchor, &self.p.chain);
+            let mut a = r.rescue(
+                &self.idx,
+                &self.node_fam,
+                &st.seq,
+                &st.seeds,
+                &self.p.anchor,
+                &self.p.chain,
+            );
             // The other orientation is re-seeded only if its base-level best comes within
             // `other_margin` of this one's (None: always).
             let try_other = match r.p.other_margin {
@@ -1310,7 +1317,14 @@ impl<C: Chainer> Mapper<C> {
                 Some(m) => other.hits.first().is_some_and(|o| o.score >= best(&st.hits) - m),
             };
             let mut b = if try_other {
-                r.rescue(&self.idx, &other.seq, &other.seeds, &self.p.anchor, &self.p.chain)
+                r.rescue(
+                    &self.idx,
+                    &self.node_fam,
+                    &other.seq,
+                    &other.seeds,
+                    &self.p.anchor,
+                    &self.p.chain,
+                )
             } else {
                 Vec::new()
             };

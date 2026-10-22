@@ -151,16 +151,17 @@ impl Rescuer {
     }
 
     /// Rescue hits for one orientation of a read: `seq` is the parsed read, `base` its
-    /// base-level seeds. Hits are unsorted.
+    /// base-level seeds, `node_fam` the index's [`anchor::node_families`]. Hits are unsorted.
     pub fn rescue(
         &self,
         idx: &Index,
+        node_fam: &[u32],
         seq: &[u8],
         base: &[Seed],
         ap: &AnchorParams,
         cp: &ChainParams,
     ) -> Vec<TxHit> {
-        RESCUE.with(|sc| self.rescue_with(idx, seq, base, ap, cp, &mut sc.borrow_mut()))
+        RESCUE.with(|sc| self.rescue_with(idx, node_fam, seq, base, ap, cp, &mut sc.borrow_mut()))
     }
 
     /// The read's rescue seeds into `sc.read`, sorted by label, for merge joins with each
@@ -213,13 +214,13 @@ impl Rescuer {
     fn rescue_with(
         &self,
         idx: &Index,
+        node_fam: &[u32],
         seq: &[u8],
         base: &[Seed],
         ap: &AnchorParams,
         cp: &ChainParams,
         sc: &mut Scratch,
     ) -> Vec<TxHit> {
-        let anchors = anchor::anchors(idx, base, ap);
         let genes = self.p.max_genes_for(seq.len());
         let all = AnchorParams {
             f_keep: genes,
@@ -227,7 +228,7 @@ impl Rescuer {
             alpha_fam: self.p.alpha,
             ..ap.clone()
         };
-        let cands = anchor::candidates(idx, anchors, &all);
+        let (cands, _) = anchor::select(idx, node_fam, base, &all);
         if cands.is_empty() {
             return Vec::new();
         }
