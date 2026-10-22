@@ -114,6 +114,10 @@
 - Settings that have no effect are now also reported for `--no-clip-ends` with the tie-break
   off, and for `--end-bonus`, `--xdrop`, `--band`, `--pad` and `--pad-div` with both the
   tie-break and span extension off (e.g. `--preset hifi --no-tiebreak`).
+- Errors about input and output files name the file (a missing FASTA for `spearfish index`
+  or `spearfish em`, an output that can't be created). `spearfish index --write-t2g` and
+  `--t2g`, and `spearfish em -o`, fail on a bad path before the index build or the EM rather
+  than after it.
 
 ### Other
 

@@ -351,7 +351,7 @@ fn sink(p: &Path) -> Result<Out> {
     let w: Box<dyn Write + Send> = if p.as_os_str() == "-" {
         Box::new(std::io::BufWriter::new(std::io::stdout()))
     } else {
-        let f = std::fs::File::create(p).map_err(|e| anyhow::anyhow!("creating {}: {e}", p.display()))?;
+        let f = std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
         Box::new(std::io::BufWriter::new(f))
     };
     Ok(Arc::new(Mutex::new(w)))

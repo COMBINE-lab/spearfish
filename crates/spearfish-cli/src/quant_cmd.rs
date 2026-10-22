@@ -74,7 +74,7 @@ fn with_suffix(prefix: &std::path::Path, suffix: &str) -> PathBuf {
 pub fn run(args: Args) -> Result<()> {
     let oarfish = find_oarfish(args.oarfish.clone())?;
     if let Some(dir) = args.output.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let threads = crate::runinfo::threads(args.threads);
     let rad = with_suffix(&args.output, ".rad");
@@ -105,7 +105,9 @@ pub fn run(args: Args) -> Result<()> {
     let log_path = with_suffix(&args.output, ".oarfish.log");
     let to_file = log::max_level() < log::LevelFilter::Debug;
     if to_file {
-        cmd.stderr(std::fs::File::create(&log_path)?);
+        cmd.stderr(
+            std::fs::File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?,
+        );
     }
     if to_file || !std::io::stderr().is_terminal() {
         cmd.env("NO_COLOR", "1");

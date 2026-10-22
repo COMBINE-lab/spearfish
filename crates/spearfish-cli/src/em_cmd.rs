@@ -51,7 +51,9 @@ pub fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let mut names: Vec<String> = Vec::new();
     let mut lens: Vec<u32> = Vec::new();
-    let mut reader = ReaderBuilder::path(&args.transcripts).build()?;
+    let mut reader = ReaderBuilder::path(&args.transcripts)
+        .build()
+        .with_context(|| format!("reading {}", args.transcripts.display()))?;
     let mut rset = reader.new_record_set();
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
@@ -119,12 +121,16 @@ pub fn run(args: Args) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build()?;
+    // Created before the EM runs, so a bad path fails early.
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(&args.output).with_context(|| format!("creating {}", args.output.display()))?,
+    );
     let (counts, iters) = pool.install(|| em(names.len(), &classes, &p));
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&args.output)?);
     writeln!(out, "transcript\tlength\treads")?;
     for ((n, l), c) in names.iter().zip(&lens).zip(&counts) {
         writeln!(out, "{n}\t{l}\t{c:.4}")?;
     }
+    out.flush()?;
     eprintln!(
         "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
         classes.len(),

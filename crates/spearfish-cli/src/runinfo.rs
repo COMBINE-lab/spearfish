@@ -1,5 +1,6 @@
 //! Run provenance: what ran, on what, with which settings, and how it went.
 
+use anyhow::Context;
 use serde::Serialize;
 use spearfish::provenance::BuildInfo;
 
@@ -85,7 +86,7 @@ pub fn threads(requested: usize) -> usize {
 pub fn write_json(path: &std::path::Path, value: &impl Serialize) -> anyhow::Result<()> {
     let mut s = serde_json::to_string_pretty(value)?;
     s.push('\n');
-    std::fs::write(path, s).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
+    std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The index part of a run record: where it is, what it is and what built it.
