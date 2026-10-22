@@ -109,6 +109,11 @@
 - aarch64 (Apple Silicon, ARM Linux): the affine alignment rows were not computed at all,
   because a configuration attribute removed the scalar code along with the x86 path.
 
+- Reads that spell T both as T and as U got wrong query coordinates. The mapper reads U as T,
+  so a T next to a U is one homopolymer run, but the query span was converted back to raw
+  bases with the runs of the read as given. Basecallers write one spelling per read, so
+  mapping real reads is unchanged.
+
 ### Other
 
 - gzip input decodes with zlib-rs.

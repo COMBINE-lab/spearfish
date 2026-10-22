@@ -569,7 +569,15 @@ impl Mapper {
         let r = self.inner.map(seq);
         let len = seq.len() as u32;
         let plen = r.plen;
-        let hpc = self.hpc.then(|| Hpc::new(seq));
+        // The read's runs as the mapper compressed it, with U read as T (a T next to a U is
+        // one run).
+        let hpc = self.hpc.then(|| {
+            let dna: Vec<u8> = seq
+                .iter()
+                .map(|&b| if b == b'U' || b == b'u' { b'T' } else { b })
+                .collect();
+            Hpc::new(&dna)
+        });
         // Parsed query span in the hit's orientation -> raw span on the forward strand.
         let q_raw = |s: u32, e: u32, rev: bool| -> (u32, u32) {
             let (fs, fe) = if rev { (plen - e, plen - s) } else { (s, e) };
