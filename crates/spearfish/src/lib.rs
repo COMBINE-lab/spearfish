@@ -586,14 +586,15 @@ impl Mapper {
                     idx.tx_plen()[h.tx as usize].max(1) as u64,
                 );
                 let scale = |x: u32| idx.tx_raw_pos(h.tx, x).unwrap_or(((x as u64 * tl) / tpl) as u32);
+                let ts = scale(h.tstart);
                 Hit {
                     tx: h.tx,
                     reverse: h.reverse,
                     score: h.score,
                     query_start: qs,
                     query_end: qe,
-                    target_start: scale(h.tstart),
-                    target_end: scale(h.tend).max(scale(h.tstart)),
+                    target_start: ts,
+                    target_end: scale(h.tend).max(ts),
                     anchors: h.anchors,
                     anchored: h.anchored,
                     max_discrepancy: h.max_discrepancy,
