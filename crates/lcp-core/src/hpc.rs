@@ -24,8 +24,12 @@ impl Hpc {
         let mut prev = u16::MAX; // matches no base
         for (i, &b) in raw.iter().enumerate() {
             let u = b.to_ascii_uppercase() as u16;
-            seq[k] = b;
-            raw_start[k] = i as u32;
+            // SAFETY: k <= i (k starts at 0 and grows by at most 1 per base), i < n = seq.len(),
+            // and raw_start.len() = n + 1.
+            unsafe {
+                *seq.get_unchecked_mut(k) = b;
+                *raw_start.get_unchecked_mut(k) = i as u32;
+            }
             k += (u != prev) as usize;
             prev = u;
         }
@@ -41,14 +45,13 @@ impl Hpc {
     /// `N` under `revcomp` and can merge runs, so callers must check.
     pub fn revcomp_acgt(&self) -> Self {
         let n = self.raw_len();
-        let k = self.seq.len();
         let seq = self
             .seq
             .iter()
             .rev()
             .map(|&b| b"TGCA"[(crate::encode::CODE[b as usize] & 3) as usize])
             .collect();
-        let raw_start = (0..=k).map(|i| n - self.raw_start[k - i]).collect();
+        let raw_start = self.raw_start.iter().rev().map(|&r| n - r).collect();
         Hpc { seq, raw_start }
     }
 

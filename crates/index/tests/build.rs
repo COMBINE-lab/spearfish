@@ -84,11 +84,7 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
             continue;
         };
         let n = idx.tx_plen()[t];
-        let raw: Vec<u8> = tx
-            .seq
-            .iter()
-            .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
-            .collect();
+        let raw = lcp_core::encode::codes(&tx.seq);
         for (lo, hi) in [
             (0, n),
             (0, 0),

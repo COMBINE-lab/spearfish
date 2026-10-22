@@ -31,12 +31,30 @@ fn base_at(words: &[u64], i: u32) -> u8 {
     ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8
 }
 
-/// Bases `[lo, hi)` of 2-bit packed `words`, appended to `out` as codes a word at a time.
+/// The 8 bases of a 16-bit packed group, one 2-bit code per byte (base j in byte j).
+#[inline(always)]
+fn spread8(x: u64) -> u64 {
+    let x = (x | (x << 24)) & 0x0000_00ff_0000_00ff;
+    let x = (x | (x << 12)) & 0x000f_000f_000f_000f;
+    (x | (x << 6)) & 0x0303_0303_0303_0303
+}
+
+/// Bases `[lo, hi)` of 2-bit packed `words`, appended to `out` as codes: whole words 8 bases at
+/// a time (each 16-bit group spread to a code per byte), the rest a word at a time.
 fn decode_into(words: &[u64], lo: u32, hi: u32, out: &mut Vec<u8>) {
     let start = out.len();
     out.resize(start + (hi - lo) as usize, 0);
     let dst = &mut out[start..];
     let (mut i, mut d) = (lo, 0usize);
+    while i + 32 <= hi {
+        let w = word_at(words, i);
+        for g in 0..4 {
+            let v = spread8((w >> (16 * g)) & 0xffff);
+            dst[d + 8 * g..d + 8 * g + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        i += 32;
+        d += 32;
+    }
     while i < hi {
         let w = words[(i / 32) as usize] >> (2 * (i % 32));
         let take = ((32 - i % 32).min(hi - i)) as usize;
@@ -668,19 +686,6 @@ impl Index {
         Some(v)
     }
 
-    /// Whether the raw bases under parsed `[lo, hi)` of transcript `t` equal those under parsed
-    /// `[ulo, uhi)` of `u` (homopolymer run lengths included), compared on the packed sequence.
-    /// None if the index lacks either raw sequence.
-    pub fn tx_raw_eq(&self, t: u32, lo: u32, hi: u32, u: u32, ulo: u32, uhi: u32) -> Option<bool> {
-        let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
-        let (ua, ub) = (self.tx_raw_pos(u, ulo)?, self.tx_raw_pos(u, uhi)?);
-        if b - a != ub - ua {
-            return Some(false);
-        }
-        let ((tw, _), (uw, _)) = (self.raw_words(t)?, self.raw_words(u)?);
-        Some(packed_eq(tw, a, uw, ua, b - a))
-    }
-
     /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
     /// parsed length), if the index has its raw sequence.
     pub fn tx_raw_pos(&self, t: u32, p: u32) -> Option<u32> {
@@ -838,9 +843,10 @@ mod packed_tests {
             let n = bases.len() as u32;
             let (lo, hi) = ((a as u32).min(n), (b as u32).min(n));
             let (lo, hi) = (lo.min(hi), lo.max(hi));
-            let mut got = Vec::new();
+            // Codes (whole words 8 at a time, then the rest), appended after earlier bytes.
+            let mut got = b"xyz".to_vec();
             decode_into(&w, lo, hi, &mut got);
-            let want: Vec<u8> = (lo..hi).map(|i| base_at(&w, i)).collect();
+            let want: Vec<u8> = b"xyz".iter().copied().chain((lo..hi).map(|i| base_at(&w, i))).collect();
             prop_assert_eq!(got, want);
             // A run start: position 0 or a change.
             let starts: Vec<u32> =

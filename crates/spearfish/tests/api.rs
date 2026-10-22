@@ -43,6 +43,36 @@ fn map_toy_reads() {
     assert!(Mapper::new(index.clone(), &opts).is_err());
 }
 
+/// A read that spells T partly as U (either case) maps as its DNA spelling does, query span
+/// included: U is read as T, so a T next to a U is one homopolymer run.
+#[test]
+fn mixed_t_and_u_map_as_t() {
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let txs = read_transcripts(&fa).unwrap();
+    let index = Arc::new(Index::build(txs.clone(), &IndexOptions::default()).unwrap().0);
+    for p in [Preset::Ont, Preset::Hifi, Preset::Drna] {
+        let mapper = Mapper::new(index.clone(), &MapOptions::preset(p)).unwrap();
+        for (_, _, seq) in &txs {
+            for (rev, read) in [(false, seq.clone()), (true, revcomp(seq))] {
+                // Every second base of each T run as U, alternating U and u.
+                let mut mixed = read.clone();
+                let mut k = 0;
+                for i in 1..mixed.len() {
+                    if read[i] == b'T' && read[i - 1] == b'T' && mixed[i - 1] == b'T' {
+                        mixed[i] = if k % 2 == 0 { b'U' } else { b'u' };
+                        k += 1;
+                    }
+                }
+                assert!(k > 0);
+                let want = mapper.map(&read);
+                // Direct RNA maps the sense orientation only.
+                assert!(rev && p == Preset::Drna || !want.hits.is_empty());
+                assert_eq!(mapper.map(&mixed), want, "{p:?} rev {rev}");
+            }
+        }
+    }
+}
+
 /// The settings builder gives the same mapper as the preset's options, and records what it
 /// resolved to.
 #[test]

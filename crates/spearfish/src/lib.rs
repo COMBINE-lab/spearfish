@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use index::{BuildParams, Collapse, TxInput};
-use lcp_core::hpc::Hpc;
 use map::{AnyChainer, OracleChainer, RefineChainer};
 use serde::{Deserialize, Serialize};
 
@@ -503,7 +502,6 @@ pub struct MappedRead {
 pub struct Mapper {
     index: Arc<Index>,
     inner: map::Mapper<AnyChainer>,
-    hpc: bool,
     opts: MapOptions,
 }
 
@@ -526,11 +524,9 @@ impl Mapper {
             ChainerKind::Refine { beam } => AnyChainer::Refine(RefineChainer { p: chain, beam }),
         };
         let inner = map::Mapper::new(index.inner.clone(), chainer, opts.params.clone())?;
-        let hpc = inner.seeder.hpc;
         Ok(Mapper {
             index,
             inner,
-            hpc,
             opts: opts.clone(),
         })
     }
@@ -555,11 +551,12 @@ impl Mapper {
         let r = self.inner.map(seq);
         let len = seq.len() as u32;
         let plen = r.plen;
-        let hpc = self.hpc.then(|| Hpc::new(seq));
+        // The read's runs as the mapper compressed it (U read as T).
+        let hpc = r.hpc.as_ref();
         // Parsed query span in the hit's orientation -> raw span on the forward strand.
         let q_raw = |s: u32, e: u32, rev: bool| -> (u32, u32) {
             let (fs, fe) = if rev { (plen - e, plen - s) } else { (s, e) };
-            match &hpc {
+            match hpc {
                 Some(h) => h.to_raw(fs, fe),
                 None => (fs, fe),
             }
@@ -575,14 +572,15 @@ impl Mapper {
                     idx.tx_plen()[h.tx as usize].max(1) as u64,
                 );
                 let scale = |x: u32| idx.tx_raw_pos(h.tx, x).unwrap_or(((x as u64 * tl) / tpl) as u32);
+                let ts = scale(h.tstart);
                 Hit {
                     tx: h.tx,
                     reverse: h.reverse,
                     score: h.score,
                     query_start: qs,
                     query_end: qe,
-                    target_start: scale(h.tstart),
-                    target_end: scale(h.tend).max(scale(h.tstart)),
+                    target_start: ts,
+                    target_end: scale(h.tend).max(ts),
                     anchors: h.anchors,
                     anchored: h.anchored,
                     max_discrepancy: h.max_discrepancy,

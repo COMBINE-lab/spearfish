@@ -92,6 +92,12 @@
   blocks and finds the best one in the same pass, a transcript whose placements match the
   previous transcript's reuses its chain, and placements are stored relative to their
   transcript's first. 6-13% fewer instructions across read types, with identical output.
+- Less work per read outside the alignment and chaining kernels: the read is compressed once
+  (the library reuses the mapper's homopolymer runs for query spans), TSV and PAF lines are
+  written without `core::fmt`, packed bases are decoded 8 at a time, LCP core ends and the
+  first DCT step skip redundant work, and one orientation's hits are sorted by cached keys.
+  9-12% fewer instructions (ONT cDNA, direct RNA, PacBio and simulated reads) and 4-8% fewer
+  cycles single-threaded, with identical output.
 
 ### Fixes
 
@@ -146,6 +152,10 @@
 - Index writing staged the file at the output's name with its extension replaced by `.tmp`, so
   builds to `x.lcp` and `x.mm` at the same time shared one temporary file, and an unrelated
   `x.tmp` was moved away. It now stages to `<output>.partial-<pid>` and removes it on failure.
+- Reads that spell T both as T and as U got wrong query coordinates. The mapper reads U as T,
+  so a T next to a U is one homopolymer run, but the query span was converted back to raw
+  bases with the runs of the read as given. Basecallers write one spelling per read, so
+  mapping real reads is unchanged.
 
 ### Other
 
