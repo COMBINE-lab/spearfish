@@ -689,7 +689,8 @@ impl<const B: usize> Preds for ScalarPreds<B> {
         }
         let mx = max_lanes(acc);
         // An early return, not `then`: a closure borrowing `cs` costs the loop above its
-        // vectorization.
+        // vectorization. Candidate scores are never NaN, so this is exactly `!(mx > best)`,
+        // NeonPreds' test: every level keeps the same predecessors.
         if mx <= best {
             return None;
         }
