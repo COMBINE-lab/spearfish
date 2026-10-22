@@ -38,12 +38,16 @@ use spearfish::{Index, MapOptions, MapSettings, MappedRead, Mapper};
 use crate::map_args::MapArgs;
 use crate::runinfo::{self, IndexInfo, Invocation, Usage};
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum Codec {
+    #[default]
     Lz4,
     Zstd,
     None,
 }
+
+/// Reads per work batch, unless `--batch-size` says otherwise.
+pub const DEFAULT_BATCH_SIZE: usize = 32;
 
 #[derive(clap::Args, Debug)]
 #[command(after_long_help = preset_table())]
@@ -71,7 +75,7 @@ pub struct Args {
     #[arg(
         long,
         value_enum,
-        default_value = "lz4",
+        default_value_t = Codec::default(),
         hide_short_help = true,
         help_heading = "Input and output"
     )]
@@ -86,7 +90,7 @@ pub struct Args {
     /// Reads per work batch (smaller batches balance load when read costs vary).
     #[arg(
         long,
-        default_value_t = 32,
+        default_value_t = DEFAULT_BATCH_SIZE,
         hide_short_help = true,
         help_heading = "Input and output"
     )]
@@ -354,7 +358,7 @@ fn sink(p: &Path) -> Result<Out> {
     let w: Box<dyn Write + Send> = if p.as_os_str() == "-" {
         Box::new(std::io::BufWriter::new(std::io::stdout()))
     } else {
-        let f = std::fs::File::create(p).map_err(|e| anyhow::anyhow!("creating {}: {e}", p.display()))?;
+        let f = std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
         Box::new(std::io::BufWriter::new(f))
     };
     Ok(Arc::new(Mutex::new(w)))
@@ -516,11 +520,7 @@ pub fn execute(args: Job) -> Result<Counts> {
             .into_iter()
             .flatten()
             .find(|p| is_file_output(p))
-            .map(|p| {
-                let mut s = p.as_os_str().to_owned();
-                s.push(".meta.json");
-                PathBuf::from(s)
-            })
+            .map(|p| runinfo::with_suffix(p, ".meta.json"))
     });
     let threads = runinfo::threads(args.threads);
     let invocation = Invocation::new(threads);

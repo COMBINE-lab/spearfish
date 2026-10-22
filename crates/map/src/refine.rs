@@ -1,5 +1,4 @@
-//! Multi-transcript chaining with lazy color refinement (design doc, "Chaining: multi-transcript
-//! DP with lazy color refinement"; M6).
+//! Multi-transcript chaining with lazy color refinement.
 //!
 //! One DP over a candidate's anchors computes the best chain score of every transcript at once.
 //! A state is (anchor, D, f): D is the set of transcript placements of the anchor for which a
@@ -8,7 +7,7 @@
 //! depends on), so transcripts share states until their isoform paths diverge. Each placement
 //! is then kept only in its best-scoring state (which merges identical sets and drops dominated
 //! states), and an optional beam keeps the B best. With no beam the scores equal [`OracleChainer`](crate::OracleChainer)'s
-//! bit for bit (Theorem 2): the window, validity rule and transition arithmetic are the same.
+//! bit for bit: the window, validity rule and transition arithmetic are the same.
 //!
 //! Sets are bitsets over the candidate's transcripts, one per occurrence rank: rank r holds the
 //! transcripts whose r-th occurrence of the unitig is in the set (repeats are rare, so almost

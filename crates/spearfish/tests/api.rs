@@ -39,7 +39,7 @@ fn map_toy_reads() {
     assert!(drna.map(&revcomp(seq)).hits.iter().all(|h| !h.reverse));
     // Chain limits set directly, without settings resolution, are checked too.
     let mut opts = MapOptions::preset(Preset::Ont);
-    opts.chain_mut().g_max = 3_000_000_000;
+    opts.params.chain.g_max = 3_000_000_000;
     assert!(Mapper::new(index.clone(), &opts).is_err());
 }
 

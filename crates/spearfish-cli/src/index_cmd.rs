@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use spearfish::provenance::{InputInfo, file_xxh3};
 use spearfish::{Index, IndexOptions, InferGenesOptions};
@@ -75,6 +75,27 @@ pub struct Args {
     allow_collisions: bool,
 }
 
+impl Args {
+    /// The library options these arguments select.
+    fn options(&self) -> IndexOptions {
+        IndexOptions::builder()
+            .scheme(self.scheme.clone())
+            .hpc(!self.no_hpc)
+            .f_max(self.mask_genes)
+            .per_gene(self.collapse == CollapseArg::Gene)
+            .allow_collisions(self.allow_collisions)
+            .maybe_infer_genes(self.infer_genes.map(|max_tx| {
+                InferGenesOptions::builder()
+                    .max_tx(max_tx)
+                    .span(self.infer_span)
+                    .attach_span(self.infer_attach_span)
+                    .attach_max(self.infer_attach_max)
+                    .build()
+            }))
+            .build()
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct InspectArgs {
     /// Index built by `spearfish index`.
@@ -89,19 +110,27 @@ pub struct InspectArgs {
 
 pub fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
-    let mut txs = spearfish::read_transcripts(&args.transcripts)?;
+    // The gene table is small: read it first, so a bad path fails before the FASTA is read.
+    let t2g = match &args.t2g {
+        Some(path) => {
+            let reading = || format!("reading {}", path.display());
+            let table = std::fs::read_to_string(path).with_context(reading)?;
+            Some((path, table, file_xxh3(path).with_context(reading)?))
+        }
+        None => None,
+    };
+    let mut txs = spearfish::read_transcripts(&args.transcripts)
+        .with_context(|| format!("reading {}", args.transcripts.display()))?;
     let mut input = InputInfo {
         path: spearfish::provenance::absolute(&args.transcripts),
         genes_from: "fasta".into(),
         ..Default::default()
     };
     let mut missing = 0usize;
-    if let Some(path) = &args.t2g {
-        let table =
-            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    if let Some((path, table, hash)) = t2g {
         missing = spearfish::apply_t2g(&mut txs, &table);
         input.genes_from = "t2g".into();
-        input.t2g = Some((spearfish::provenance::absolute(path), file_xxh3(path)?));
+        input.t2g = Some((spearfish::provenance::absolute(path), hash));
     }
     if args.infer_genes.is_some() {
         input.genes_from = "inferred".into();
@@ -109,21 +138,7 @@ pub fn run(args: Args) -> Result<()> {
         input.genes_from = "none".into();
     }
     let read_s = t0.elapsed().as_secs_f64();
-    let opts = IndexOptions::builder()
-        .scheme(args.scheme.clone())
-        .hpc(!args.no_hpc)
-        .f_max(args.mask_genes)
-        .per_gene(args.collapse == CollapseArg::Gene)
-        .allow_collisions(args.allow_collisions)
-        .maybe_infer_genes(args.infer_genes.map(|max_tx| {
-            InferGenesOptions::builder()
-                .max_tx(max_tx)
-                .span(args.infer_span)
-                .attach_span(args.infer_attach_span)
-                .attach_max(args.infer_attach_max)
-                .build()
-        }))
-        .build();
+    let opts = args.options();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(crate::runinfo::threads(args.threads))
         .build()?;
@@ -132,13 +147,20 @@ pub fn run(args: Args) -> Result<()> {
     } else {
         Vec::new()
     };
+    // Created before the build, so a bad path fails before the expensive part, and after every
+    // input is read, since it may name one of them.
+    let mut t2g_out = match &args.write_t2g {
+        Some(path) => Some(std::io::BufWriter::new(
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => None,
+    };
     let t = Instant::now();
     let (bytes, rep, manifest) = pool.install(|| {
         Index::build_to_file_with(txs, &opts, &args.output, input, crate::runinfo::command_line())
     })?;
     let build_write_s = t.elapsed().as_secs_f64();
-    if let Some(path) = &args.write_t2g {
-        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+    if let Some(w) = &mut t2g_out {
         for (t, g) in names.iter().zip(&rep.tx_gene) {
             writeln!(w, "{t}\t{}", rep.gene_names[*g as usize])?;
         }
@@ -304,4 +326,41 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        a: Args,
+    }
+
+    fn options(extra: &[&str]) -> IndexOptions {
+        Cli::try_parse_from(["x", "tx.fa", "-o", "o"].into_iter().chain(extra.iter().copied()))
+            .unwrap()
+            .a
+            .options()
+    }
+
+    /// `spearfish index` without options builds what `Index::build` builds with the library's
+    /// defaults (as doctor and library callers do).
+    #[test]
+    fn cli_defaults_are_library_defaults() {
+        assert_eq!(options(&[]), IndexOptions::default());
+        assert_eq!(
+            options(&["--infer-genes"]).infer_genes,
+            Some(InferGenesOptions::default())
+        );
+    }
+
+    /// The old name of --mask-genes still works (a hidden alias).
+    #[test]
+    fn legacy_alias() {
+        assert_eq!(options(&["--f-max", "7"]), options(&["--mask-genes", "7"]));
+        assert_eq!(options(&["--f-max", "7"]).f_max, 7);
+    }
 }

@@ -1,5 +1,5 @@
-//! `spearfish locality`: measure LCP context radii λ_k and ρ_k by random single edits
-//! (design doc, Property 2 and the edit-locality corollary).
+//! `spearfish locality`: measure LCP context radii λ_k and ρ_k by random single edits (an edit
+//! changes only cores whose extended window `[s - λ_k, e + ρ_k)` contains it).
 //!
 //! For each sequence and edit type, apply `--edits` random edits, re-parse, and record for
 //! every changed core whether it overlaps the edit or how far left/right of it it lies.

@@ -1,8 +1,9 @@
 //! Mapping settings on the command line: one flag per [`MapSettings`] field. Every flag is
 //! optional; an unset flag keeps the preset's value (`spearfish map --print-params` shows
 //! them all). On/off settings take `--x` / `--no-x`. `-h` lists the common flags, `--help`
-//! all of them; experimental flags are hidden (see the documentation's developer notes).
-//! Old flag names are kept as hidden aliases.
+//! all of them; experimental flags are hidden (each is a [`MapSettings`] field, documented
+//! there). Old flag names are kept as hidden aliases; a test lists them and checks that each
+//! still means what its new name does.
 
 use clap::{Args, ValueEnum};
 use spearfish::{ChainerKind, MapSettings, Preset, RescueWindow, Strands};
@@ -166,7 +167,7 @@ pub struct MapArgs {
         help_heading = "Candidate genes"
     )]
     pub min_gene_frac: Option<f32>,
-    /// Cap on a seed's span in the gene score [default: 100].
+    /// Cap on a seed's span in its weight (gene scores and chaining) [default: 100].
     #[arg(long, hide_short_help = true, help_heading = "Candidate genes")]
     pub seed_span_cap: Option<u32>,
     #[arg(long, alias = "g-max", hide = true)]
@@ -509,6 +510,65 @@ mod tests {
     fn unset_flags_change_nothing() {
         assert_eq!(settings(&[]), MapSettings::preset(Preset::Ont));
         assert_eq!(settings(&["--preset", "hifi"]), MapSettings::preset(Preset::Hifi));
+    }
+
+    /// Every old flag name (a hidden alias), its current name and a value to give both.
+    /// Benchmark scripts use some of them (--no-merge, --unit-tiebreak, --whole-read-tiebreak,
+    /// --no-tie-clip, --orient-edit).
+    const ALIASES: &[(&str, &str, Option<&str>)] = &[
+        ("delta-rep", "report-within", Some("0.2")),
+        ("f-keep", "keep-genes", Some("4")),
+        ("f-tie", "keep-genes-tie", Some("0.02")),
+        ("f-max", "max-genes", Some("32")),
+        ("h-max", "max-seed-genes", Some("500")),
+        ("g-max", "seed-gene-weight-max", Some("100")),
+        ("alpha", "chain-alpha", Some("1")),
+        ("window", "chain-window", Some("40")),
+        ("beta", "chain-beta", Some("0.1")),
+        ("no-merge", "no-merge-anchors", None),
+        ("kappa", "tie-kappa", Some("5")),
+        ("lambda", "tie-lambda", Some("2")),
+        ("affine-within", "tie-affine-within", Some("3")),
+        ("unit-tiebreak", "tie-unit-cost", None),
+        ("whole-read-tiebreak", "tie-whole-read", None),
+        ("orient-edit", "tie-orient-edit", None),
+        ("flank-min", "tie-flank-min", Some("10")),
+        ("no-tie-clip", "no-clip-ends", None),
+        ("tie-band", "band", Some("8")),
+        ("tie-pad", "pad", Some("10")),
+        ("tie-pad-div", "pad-div", Some("5")),
+    ];
+
+    /// Each old flag name sets what its current name sets, and the list is complete.
+    #[test]
+    fn legacy_aliases_parse_as_canonical() {
+        use clap::CommandFactory;
+        let flag = |name: &str, v: Option<&str>| match v {
+            Some(v) => format!("--{name}={v}"),
+            None => format!("--{name}"),
+        };
+        for &(old, new, v) in ALIASES {
+            let s = settings(&[&flag(old, v)]);
+            assert_eq!(s, settings(&[&flag(new, v)]), "--{old}");
+            assert_ne!(s, settings(&[]), "--{old} changes nothing");
+        }
+        let mut aliases: Vec<(String, String)> = Cli::command()
+            .get_arguments()
+            .flat_map(|a| {
+                let long = a.get_long().unwrap_or_default().to_string();
+                a.get_all_aliases()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |x| (x.to_string(), long.clone()))
+            })
+            .collect();
+        aliases.sort();
+        let mut listed: Vec<(String, String)> = ALIASES
+            .iter()
+            .map(|&(old, new, _)| (old.to_string(), new.to_string()))
+            .collect();
+        listed.sort();
+        assert_eq!(aliases, listed);
     }
 
     /// Every setting is reachable from the command line: with every flag given, no field of

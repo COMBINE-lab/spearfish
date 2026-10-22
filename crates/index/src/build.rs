@@ -1,4 +1,4 @@
-//! Index construction (design doc, "Construction"), over any base-level seed scheme.
+//! Index construction, over any base-level seed scheme.
 //!
 //! 1. Seed every transcript (parallel).
 //! 2. Nodes are distinct seed labels; node id = rank of the label in sorted order.
