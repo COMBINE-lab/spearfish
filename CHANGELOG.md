@@ -108,6 +108,11 @@
   always stayed. Both are now scored over the whole read: on the simulated ONT 90% set, top-1
   95.75% -> 96.07% (`--orient-edit`) and 95.74% -> 96.05% (`--unit-tiebreak`). The presets
   don't use this comparison.
+- A poly(A) tail after an A-run inside the read (an A-rich 3' UTR, a genomic A-stretch) was
+  missed: only the first A-run was looked at, and with more than 80 read bases after it the
+  read had no tail. The search now goes on past such runs, for tail trimming, `--tail-bonus`
+  and `--orient-tail`. 0.1-0.35% of real reads change mapping; simulated and spike-in accuracy
+  are unchanged.
 
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that

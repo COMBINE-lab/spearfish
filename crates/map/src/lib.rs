@@ -1456,17 +1456,14 @@ fn ends_in_tail(codes: &[u8], run: usize) -> bool {
     tail_start(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run).is_some()
 }
 
-/// The first poly(A) window of `run` bases in `rest` (raw codes): its first A, and the end of the A-run from
-/// there (the longest stretch ending in A with at most one other base per ten).
+/// The first poly(A) tail in `rest` (raw codes): a window of `run` bases with at most one other
+/// base whose A-run is followed by at most `TAIL_AFTER` bases. Returns the window's first A and
+/// the end of the A-run from there (the longest stretch ending in A with at most one other base
+/// per ten).
 fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
-    if rest.len() < run {
-        return None;
-    }
-    let mut other = rest[..run].iter().filter(|&&c| c != a).count();
-    for i in 0..=rest.len() - run {
-        if i > 0 {
-            other = other + usize::from(rest[i + run - 1] != a) - usize::from(rest[i - 1] != a);
-        }
+    let others = |w: &[u8]| w.iter().filter(|&&c| c != a).count();
+    let (mut i, mut other) = (0, others(rest.get(..run)?));
+    loop {
         if other <= 1 {
             let s = i + rest[i..].iter().position(|&c| c == a).unwrap_or(0);
             let (mut end, mut non) = (s, 0);
@@ -1476,15 +1473,22 @@ fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
                     end = k + 1;
                 }
             }
+            if rest.len() - end <= TAIL_AFTER {
+                return Some((s, end));
+            }
             // A tail is followed only by adapter: an A-run with more of the read after it is
-            // transcript sequence (or internal priming), not the molecule's 3' end.
-            if rest.len() - end > TAIL_AFTER {
+            // transcript sequence (or internal priming), not the molecule's 3' end. The tail
+            // may still come after it; the windows inside the run are part of it.
+            i = end.max(i + 1);
+            other = others(rest.get(i..i + run)?);
+        } else {
+            if i + run >= rest.len() {
                 return None;
             }
-            return Some((s, end));
+            other = other + usize::from(rest[i + run] != a) - usize::from(rest[i] != a);
+            i += 1;
         }
     }
-    None
 }
 
 /// Best score first; equal scores in the order of `tie_key(salt, tx)`, a per-read
@@ -1701,6 +1705,18 @@ mod segmented_tests {
         // One base in a window may be a sequencing error.
         assert_eq!(tail_start(&codes(b"CGAAAAAAACAAAAAAAGT"), a, 15), Some((2, 17)));
         assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAGTCAAAA"), a, 15), None);
+    }
+
+    #[test]
+    fn an_a_run_inside_the_read_does_not_hide_its_tail() {
+        // A 3' UTR's A-run, more of the UTR, then the tail and an adapter.
+        let utr = b"CGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCATG".repeat(3);
+        let adapter: &[u8] = b"GTACTCTGCGTTGATACCACTGCTT";
+        let read = [&b"A".repeat(16)[..], &utr, &b"A".repeat(30), adapter].concat();
+        let a = codes(b"A")[0];
+        assert_eq!(tail_start(&codes(&read), a, 15).map(|t| t.0), Some(136));
+        let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
+        assert!(ends_in_tail(&codes(&[&body[..], &read].concat()), 15));
     }
 
     #[test]
