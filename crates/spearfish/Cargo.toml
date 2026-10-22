@@ -13,13 +13,13 @@ index.workspace = true
 lcp-core.workspace = true
 map.workspace = true
 quant.workspace = true
-seeds.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bon.workspace = true
 log.workspace = true
 xxhash-rust.workspace = true
 paraseq = { workspace = true, optional = true }
+# Not used directly: switches paraseq's gzip decoding to zlib-rs (see the workspace manifest).
 flate2 = { workspace = true, optional = true }
 
 [features]
@@ -31,6 +31,3 @@ fasta = ["dep:paraseq", "dep:flate2"]
 [[test]]
 name = "api"
 required-features = ["fasta"]
-
-[dev-dependencies]
-lcp-core.workspace = true
