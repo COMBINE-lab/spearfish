@@ -78,6 +78,12 @@
   global sort, unitig chains are followed in parallel, and the transcript sequences are freed
   once seeded. Building an index in memory (`Index::build`, as oarfish does from a FASTA) lays
   the image out once instead of copying it twice. Index sections are byte-identical.
+- Rescue does less work per candidate window: genes come from the strand's anchor selection,
+  window seeds probe a table of the read's seed labels instead of being sorted and merged,
+  points are sorted as packed keys, and windows are parsed straight from their 2-bit codes,
+  for labels and starts only. 11-14% fewer instructions on ONT cDNA and simulated 90%-accuracy
+  ONT reads, 6% on direct RNA, 2% on simulated 95%-accuracy ONT reads and under 1% where little
+  is rescued (HiFi, PacBio), with identical output.
 
 ### Fixes
 

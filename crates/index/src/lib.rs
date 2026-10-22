@@ -31,8 +31,8 @@ fn base_at(words: &[u64], i: u32) -> u8 {
     ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8
 }
 
-/// Bases `[lo, hi)` of 2-bit packed `words`, through `map`, appended to `out` a word at a time.
-fn decode_into(words: &[u64], lo: u32, hi: u32, map: [u8; 4], out: &mut Vec<u8>) {
+/// Bases `[lo, hi)` of 2-bit packed `words`, appended to `out` as codes a word at a time.
+fn decode_into(words: &[u64], lo: u32, hi: u32, out: &mut Vec<u8>) {
     let start = out.len();
     out.resize(start + (hi - lo) as usize, 0);
     let dst = &mut out[start..];
@@ -41,7 +41,7 @@ fn decode_into(words: &[u64], lo: u32, hi: u32, map: [u8; 4], out: &mut Vec<u8>)
         let w = words[(i / 32) as usize] >> (2 * (i % 32));
         let take = ((32 - i % 32).min(hi - i)) as usize;
         for (k, x) in dst[d..d + take].iter_mut().enumerate() {
-            *x = map[((w >> (2 * k)) & 3) as usize];
+            *x = ((w >> (2 * k)) & 3) as u8;
         }
         i += take as u32;
         d += take;
@@ -100,7 +100,7 @@ impl PackedRange<'_> {
 
     pub fn decode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        decode_into(self.words, self.lo, self.hi, [0, 1, 2, 3], &mut out);
+        decode_into(self.words, self.lo, self.hi, &mut out);
         out
     }
 
@@ -616,7 +616,7 @@ impl Index {
     /// 2-bit codes (A=0, C=1, G=2, T=3) of the parsed transcript `t` over `[lo, hi)`.
     pub fn tx_codes(&self, t: u32, lo: u32, hi: u32) -> Vec<u8> {
         let mut v = Vec::new();
-        self.tx_codes_into(t, lo, hi, &mut v, false);
+        self.tx_codes_into(t, lo, hi, &mut v);
         v
     }
 
@@ -639,12 +639,10 @@ impl Index {
         }
     }
 
-    /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes or (if
-    /// `ascii`) as ACGT.
-    pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>, ascii: bool) {
+    /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes.
+    pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>) {
         let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
-        let map: [u8; 4] = if ascii { *b"ACGT" } else { [0, 1, 2, 3] };
-        decode_into(words, lo, hi, map, out);
+        decode_into(words, lo, hi, out);
     }
 
     /// Whether the parsed transcripts `t` from `lo` and `u` from `ulo` agree on `len` bases,
@@ -666,7 +664,7 @@ impl Index {
         let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
         let (words, _) = self.raw_words(t)?;
         let mut v = Vec::new();
-        decode_into(words, a, b, [0, 1, 2, 3], &mut v);
+        decode_into(words, a, b, &mut v);
         Some(v)
     }
 
@@ -841,8 +839,8 @@ mod packed_tests {
             let (lo, hi) = ((a as u32).min(n), (b as u32).min(n));
             let (lo, hi) = (lo.min(hi), lo.max(hi));
             let mut got = Vec::new();
-            decode_into(&w, lo, hi, *b"ACGT", &mut got);
-            let want: Vec<u8> = (lo..hi).map(|i| b"ACGT"[base_at(&w, i) as usize]).collect();
+            decode_into(&w, lo, hi, &mut got);
+            let want: Vec<u8> = (lo..hi).map(|i| base_at(&w, i)).collect();
             prop_assert_eq!(got, want);
             // A run start: position 0 or a change.
             let starts: Vec<u32> =
