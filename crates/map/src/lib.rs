@@ -256,6 +256,9 @@ pub struct ReadResult {
     pub tiebreak_size: u32,
     /// The hits come from the hierarchical rescue.
     pub rescued: bool,
+    /// With HPC, the read's homopolymer runs, forward orientation: parsed query positions to
+    /// raw ones (`to_raw`; its `seq` is not kept).
+    pub hpc: Option<lcp_core::hpc::Hpc>,
 }
 
 pub struct Mapper<C: Chainer> {
@@ -1274,10 +1277,12 @@ impl<C: Chainer> Mapper<C> {
         } else {
             raw
         };
+        // A skipped orientation has no seeds, hence no hits; it keeps its raw read for
+        // `ReadResult::hpc` (the forward runs, also when only the reverse is mapped).
         let skip = |p: (Vec<u8>, Option<RawRead>)| Strand {
             hits: Vec::new(),
             seq: p.0,
-            raw: None,
+            raw: p.1,
             seeds: Vec::new(),
             anchors: 0,
             candidates: 0,
@@ -1435,6 +1440,8 @@ impl<C: Chainer> Mapper<C> {
             low_coverage,
             tiebreak_size,
             rescued,
+            // `st` is the orientation `reverse` names (swapped together), `other` the opposite.
+            hpc: if reverse { other.raw } else { st.raw }.map(|r| r.hpc),
         }
     }
 }

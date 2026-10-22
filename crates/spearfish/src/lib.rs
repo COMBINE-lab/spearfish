@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use index::{BuildParams, Collapse, TxInput};
-use lcp_core::hpc::Hpc;
 use map::{AnyChainer, OracleChainer, RefineChainer};
 use serde::{Deserialize, Serialize};
 
@@ -517,7 +516,6 @@ pub struct MappedRead {
 pub struct Mapper {
     index: Arc<Index>,
     inner: map::Mapper<AnyChainer>,
-    hpc: bool,
     opts: MapOptions,
 }
 
@@ -540,11 +538,9 @@ impl Mapper {
             ChainerKind::Refine { beam } => AnyChainer::Refine(RefineChainer { p: chain, beam }),
         };
         let inner = map::Mapper::new(index.inner.clone(), chainer, opts.params.clone())?;
-        let hpc = inner.seeder.hpc;
         Ok(Mapper {
             index,
             inner,
-            hpc,
             opts: opts.clone(),
         })
     }
@@ -569,19 +565,12 @@ impl Mapper {
         let r = self.inner.map(seq);
         let len = seq.len() as u32;
         let plen = r.plen;
-        // The read's runs as the mapper compressed it, with U read as T (a T next to a U is
-        // one run).
-        let hpc = self.hpc.then(|| {
-            let dna: Vec<u8> = seq
-                .iter()
-                .map(|&b| if b == b'U' || b == b'u' { b'T' } else { b })
-                .collect();
-            Hpc::new(&dna)
-        });
+        // The read's runs as the mapper compressed it (U read as T).
+        let hpc = r.hpc.as_ref();
         // Parsed query span in the hit's orientation -> raw span on the forward strand.
         let q_raw = |s: u32, e: u32, rev: bool| -> (u32, u32) {
             let (fs, fe) = if rev { (plen - e, plen - s) } else { (s, e) };
-            match &hpc {
+            match hpc {
                 Some(h) => h.to_raw(fs, fe),
                 None => (fs, fe),
             }
