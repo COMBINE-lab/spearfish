@@ -117,6 +117,12 @@
   `--tail-bonus` and `--orient-tail` did nothing. On such an index, simulated ONT reads with
   tails and adapters now reach 99.01% top-1 instead of 98.35%, and SIRV E2 Spearman on ONT
   PCR-cDNA rises from 0.706 to 0.758. HPC indexes are unaffected.
+- With raw read ends (`ont`), a read end's band was laid out for a window computed from the
+  raw read end, while the candidate transcript windows are sized in compressed bases and are
+  often longer in raw ones: isoforms that agree near the read end got different bands and
+  could not share DP rows. Every candidate now gets the band of the longest window. About 0.1%
+  of ONT reads change mapping, accuracy is unchanged, and ONT mapping takes 0.4-2% fewer
+  instructions.
 
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that

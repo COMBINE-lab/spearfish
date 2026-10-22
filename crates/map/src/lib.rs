@@ -883,8 +883,12 @@ impl<C: Chainer> Mapper<C> {
                     let w0 = align::dp_work();
                     let xs = if mode == align::Mode::Prefix && tb.clip_ends {
                         // The band is laid out for the window the read end would get against a
-                        // transcript that doesn't end inside it.
-                        let window = read.len() + tb.pad as usize + read.len() / tb.pad_div as usize;
+                        // transcript that doesn't end inside it, or for the longest text: texts
+                        // are windows sized in parsed bases, which in raw bases (raw read ends)
+                        // or against a tail-trimmed read end can be longer. Every text then gets
+                        // the same band, and sorted texts share rows.
+                        let window = (read.len() + tb.pad as usize + read.len() / tb.pad_div as usize)
+                            .max(tx.iter().map(|t| t.len()).max().unwrap_or(0));
                         align::affine_extend_sorted_cut(
                             &read,
                             &tx,
