@@ -27,8 +27,11 @@ the output byte-identical. Checks, from cheapest:
   `spearfish inspect --sections` of indexes they build (the per-section checksums must agree).
 
 The SIMD kernels must agree exactly with the scalar code; each kernel's property test checks
-every level the machine supports against a scalar reference, and CI also runs the tests and
-`spearfish doctor` with `SPEARFISH_SIMD` forcing each lower level. The levels live in
+every level the machine supports against a scalar reference. CI runs the tests on each
+runner's own level and again with `SPEARFISH_SIMD` forcing scalar and avx2 (x86-64) or scalar
+(Apple Silicon). Hosted x86-64 runners may lack AVX-512, so CI may not run the AVX-512
+kernels at all (each run's summary shows the level it used): run `cargo test` on an AVX-512
+machine after changing them. The levels live in
 `lcp_core::simd`; adding one (e.g. NEON) means a `Level` variant, its detection, and an arm in
 each kernel's dispatch.
 
