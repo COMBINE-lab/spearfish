@@ -46,16 +46,41 @@ impl Params<'_> {
         self.get(key)?
             .ok_or_else(|| SpecError(format!("{}: missing {key}", self.spec)))
     }
+
+    /// A required value of at least 1.
+    fn req_positive<T: std::str::FromStr + PartialOrd + From<u8>>(&self, key: &str) -> Result<T, SpecError> {
+        let v: T = self.req(key)?;
+        if v < T::from(1) {
+            return Err(SpecError(format!("{}: need {key} >= 1", self.spec)));
+        }
+        Ok(v)
+    }
 }
 
 pub fn from_spec(spec: &str) -> Result<Box<dyn SeedScheme>, SpecError> {
     let (name, rest) = spec.split_once(':').unwrap_or((spec, ""));
+    // The keys each scheme reads: any other key, like a repeated one, is an error rather than
+    // silently ignored.
+    let keys: &[&str] = match name {
+        "lcp" => &["K"],
+        "minimizer" => &["k", "w"],
+        "closed-syncmer" => &["k", "s", "keep"],
+        "open-syncmer" => &["k", "s", "t", "keep"],
+        "randstrobe" => &["k", "s", "t", "keep", "wmin", "wmax"],
+        "linked-lcp" => &["b", "wmin", "wmax", "order", "keep", "pool"],
+        _ => return Err(SpecError(format!("{spec}: unknown scheme {name}"))),
+    };
     let mut kv = HashMap::new();
     for part in rest.split(',').filter(|p| !p.is_empty()) {
         let (k, v) = part
             .split_once('=')
             .ok_or_else(|| SpecError(format!("{spec}: expected key=value, got {part}")))?;
-        kv.insert(k, v);
+        if !keys.contains(&k) {
+            return Err(SpecError(format!("{spec}: unknown key {k} for {name}")));
+        }
+        if kv.insert(k, v).is_some() {
+            return Err(SpecError(format!("{spec}: duplicate key {k}")));
+        }
     }
     let p = Params { spec, kv };
     let check_k = |k: usize| {
@@ -85,11 +110,11 @@ pub fn from_spec(spec: &str) -> Result<Box<dyn SeedScheme>, SpecError> {
     Ok(match name {
         "lcp" => Box::new(LcpSeeds {
             parser: LcpParser::default(),
-            max_level: p.req("K")?,
+            max_level: p.req_positive("K")?,
         }),
         "minimizer" => Box::new(Minimizer {
             k: check_k(p.req("k")?)?,
-            w: p.req("w")?,
+            w: p.req_positive("w")?,
         }),
         "closed-syncmer" => Box::new(syncmer(SyncmerKind::Closed)?),
         "open-syncmer" => Box::new(syncmer(SyncmerKind::Open { t: p.req("t")? })?),
@@ -125,7 +150,7 @@ pub fn from_spec(spec: &str) -> Result<Box<dyn SeedScheme>, SpecError> {
             };
             Box::new(LinkedCores {
                 parser: LcpParser::default(),
-                base: p.req("b")?,
+                base: p.req_positive("b")?,
                 w_min,
                 w_max,
                 order,
@@ -133,7 +158,7 @@ pub fn from_spec(spec: &str) -> Result<Box<dyn SeedScheme>, SpecError> {
                 sampled,
             })
         }
-        _ => return Err(SpecError(format!("{spec}: unknown scheme {name}"))),
+        _ => unreachable!("checked above"),
     })
 }
 
@@ -168,6 +193,14 @@ mod tests {
             "foo:k=1",
             "minimizer:k=15",
             "randstrobe:k=15,s=5,wmin=3,wmax=2",
+            // Degenerate values: no seeds, or a panic when seeding.
+            "minimizer:k=15,w=0",
+            "lcp:K=0",
+            "linked-lcp:b=0,wmin=1,wmax=2,order=2",
+            // Unknown and repeated keys.
+            "closed-syncmer:k=15,s=5,kep=0.5",
+            "minimizer:k=15,w=10,s=5",
+            "lcp:K=3,K=5",
         ] {
             assert!(from_spec(s).is_err(), "{s}");
         }
