@@ -20,7 +20,8 @@ pub use spec::{SpecError, from_spec};
 
 pub trait SeedScheme: Send + Sync {
     fn seeds(&self, seq: &[u8]) -> Hierarchy;
-    /// The highest level's seeds, appended to `out` as (label, start, end) in start order.
+    /// The highest level's seeds, appended to `out` as (label, start, end) in start order, at
+    /// most one per start.
     fn top_into(&self, seq: &[u8], out: &mut Vec<(u64, u32, u32)>) {
         let h = self.seeds(seq);
         if let Some(l) = h.levels.last() {

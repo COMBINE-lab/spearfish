@@ -40,7 +40,7 @@ impl BaseSeeder {
         self.hpc.then(|| Hpc::new(raw))
     }
 
-    /// Seeds of `raw`, sorted by (start, end), in parsed coordinates.
+    /// Seeds of `raw`, sorted by start (starts are distinct), in parsed coordinates.
     pub fn seed(&self, raw: &[u8]) -> Vec<Seed> {
         let h = self.parsed(raw);
         let seq: &[u8] = h.as_ref().map_or(raw, |h| &h.seq);
@@ -90,5 +90,27 @@ mod tests {
         let plen = Hpc::new(&raw).seq.len() as u32;
         assert!(hs.iter().all(|x| x.end <= plen));
         assert_eq!(s.spec(), "lcp:K=3");
+    }
+
+    /// Every scheme emits at most one seed per start, also across non-ACGT breaks.
+    #[test]
+    fn starts_are_distinct() {
+        let mut raw = b"ACGTTTTGCAAAGGCTTACGATCGATCGGGATCGATCGTAGCTAGCATCGACTGACTAGCCCGATTACG".repeat(20);
+        raw[700] = b'N';
+        for spec in [
+            "lcp:K=1",
+            "lcp:K=2",
+            "lcp:K=3",
+            "minimizer:k=15,w=10",
+            "closed-syncmer:k=15,s=5",
+            "open-syncmer:t=3,k=15,s=9",
+            "randstrobe:k=15,s=5,wmin=2,wmax=6",
+            "linked-lcp:b=2,wmin=1,wmax=4,order=2",
+            "linked-lcp:b=2,wmin=1,wmax=3,order=2,keep=0.43,pool=sampled",
+        ] {
+            let seeds = BaseSeeder::new(spec, false).unwrap().seed(&raw);
+            assert!(!seeds.is_empty(), "{spec}");
+            assert!(seeds.windows(2).all(|w| w[0].start < w[1].start), "{spec}");
+        }
     }
 }

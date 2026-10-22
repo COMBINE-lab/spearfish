@@ -81,7 +81,12 @@ pub struct Rescuer {
 /// Per-thread buffers, reused across reads.
 #[derive(Default)]
 struct Scratch {
+    /// The read's rescue seeds, in start order (starts are distinct).
     read: Vec<Seed>,
+    /// Read seed label -> its first seed in `read`; `read_next` links each seed to the next one
+    /// with its label (`u32::MAX`: none).
+    read_at: rustc_hash::FxHashMap<u64, u32>,
+    read_next: Vec<u32>,
     tx: Vec<Seed>,
     tmp: Vec<(u64, u32, u32)>,
     tseq: Vec<u8>,
@@ -164,46 +169,42 @@ impl Rescuer {
         RESCUE.with(|sc| self.rescue_with(idx, node_fam, seq, base, ap, cp, &mut sc.borrow_mut()))
     }
 
-    /// The read's rescue seeds into `sc.read`, sorted by label, for merge joins with each
-    /// transcript window's seeds in [`Self::points_in`].
+    /// The read's rescue seeds into `sc.read`, with the label table `sc.read_at`/`read_next`
+    /// that [`Self::points_in`] probes with each transcript window's seeds.
     fn seed_read(&self, seq: &[u8], sc: &mut Scratch) {
         self.seeder.seed_parsed_into(seq, &mut sc.read, &mut sc.tmp);
-        sc.read.sort_unstable_by_key(|s| (s.label, s.start));
+        debug_assert!(sc.read.windows(2).all(|w| w[0].start < w[1].start));
+        sc.read_at.clear();
+        sc.read_next.clear();
+        sc.read_next.resize(sc.read.len(), u32::MAX);
+        // Back to front, so that each label's chain runs in start order.
+        for (i, s) in sc.read.iter().enumerate().rev() {
+            if let Some(next) = sc.read_at.insert(s.label, i as u32) {
+                sc.read_next[i] = next;
+            }
+        }
     }
 
     /// Points of the read's rescue seeds (`sc.read`, see [`Self::seed_read`]) against one
-    /// transcript window sequence, sorted by (qs, ts), appended to `sc.pool`.
+    /// transcript window sequence, sorted by (qs, ts), appended to `sc.pool`. Seeds have
+    /// distinct starts on either side, so (qs, ts) is unique and fixes the order.
     fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
         self.seeder.seed_parsed_into(tseq, &mut sc.tx, &mut sc.tmp);
-        sc.tx.sort_unstable_by_key(|s| (s.label, s.start));
-        // Merge join on labels.
+        // Hash join on labels: each window seed probes the read's label table.
         sc.pts.clear();
-        let (r, x) = (&sc.read, &sc.tx);
-        let (mut i, mut j) = (0, 0);
-        while i < r.len() && j < x.len() {
-            match r[i].label.cmp(&x[j].label) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    let l = r[i].label;
-                    let j0 = j;
-                    while j < x.len() && x[j].label == l {
-                        j += 1;
-                    }
-                    while i < r.len() && r[i].label == l {
-                        let len = r[i].end - r[i].start;
-                        for xs in &x[j0..j] {
-                            sc.pts.push(Pt {
-                                qs: r[i].start,
-                                qe: r[i].end,
-                                ts: xs.start,
-                                len,
-                                w: len as f32,
-                            });
-                        }
-                        i += 1;
-                    }
-                }
+        for x in &sc.tx {
+            let mut i = sc.read_at.get(&x.label).copied().unwrap_or(u32::MAX);
+            while i != u32::MAX {
+                let r = sc.read[i as usize];
+                let len = r.end - r.start;
+                sc.pts.push(Pt {
+                    qs: r.start,
+                    qe: r.end,
+                    ts: x.start,
+                    len,
+                    w: len as f32,
+                });
+                i = sc.read_next[i as usize];
             }
         }
         sc.pts.sort_unstable_by_key(|p| (p.qs, p.ts));
