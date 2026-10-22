@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use bytemuck::Pod;
@@ -102,15 +102,26 @@ impl<'a> Writer<'a> {
         Ok(total as u64)
     }
 
-    /// Write to `path` (through a temporary file renamed into place); returns bytes written.
+    /// Write to `path` (through `<path>.partial-<pid>`, renamed into place, or removed if the
+    /// write fails); returns bytes written.
     pub fn write(&self, path: &Path) -> Result<u64> {
-        let tmp = path.with_extension("tmp");
-        let f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".partial-{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        let res = self.write_via(&tmp, path);
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    }
+
+    fn write_via(&self, tmp: &Path, path: &Path) -> Result<u64> {
+        let f = std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
         let n = self.write_to(&mut w)?;
         let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
+        std::fs::rename(tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
         Ok(n)
     }
 }

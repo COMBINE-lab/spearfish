@@ -206,8 +206,19 @@ fn file_roundtrip() {
         },
     )
     .unwrap();
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("toy.sfi");
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("index_file_roundtrip");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The write stages next to the output without touching other files there.
+    std::fs::write(dir.join("toy.tmp"), "unrelated").unwrap();
+    let path = dir.join("toy.sfi");
     data.write(&path).unwrap();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["toy.sfi", "toy.tmp"]);
+    assert_eq!(std::fs::read_to_string(dir.join("toy.tmp")).unwrap(), "unrelated");
     let idx = Index::open(&path).unwrap();
     assert_eq!(idx.labels(), &data.labels[..]);
     assert_eq!(idx.occ_pos(), &data.occ_pos[..]);
