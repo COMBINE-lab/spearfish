@@ -12,7 +12,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use lcp_core::encode::revcomp;
-use paraseq::{ReaderBuilder, Record};
 
 use crate::rng::SplitMix64;
 use crate::sim::{profile, simulate};
@@ -51,18 +50,12 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let prof = profile(&args.profile).with_context(|| format!("unknown profile {}", args.profile))?;
-    let mut txs: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut reader = ReaderBuilder::path(&args.transcripts).build()?;
-    let mut rset = reader.new_record_set();
-    while rset.fill(&mut reader)? {
-        for rec in rset.iter() {
-            let rec = rec?;
-            let seq = rec.seq().into_owned();
-            if seq.len() >= args.min_len {
-                txs.push((rec.id_str().split('|').next().unwrap().to_string(), seq));
-            }
-        }
-    }
+    // Named as the index names them, so the names in reads and truth match its transcripts.
+    let txs: Vec<(String, Vec<u8>)> = spearfish::read_transcripts(&args.transcripts)?
+        .into_iter()
+        .filter(|t| t.2.len() >= args.min_len)
+        .map(|(name, _, seq)| (name, seq))
+        .collect();
     anyhow::ensure!(!txs.is_empty(), "no transcripts of at least {} nt", args.min_len);
     let mut rng = SplitMix64::for_record(args.seed, 0);
     // Log-normal abundances via Box-Muller.
@@ -102,12 +95,14 @@ pub fn run(args: Args) -> Result<()> {
         out.write_all(&s)?;
         out.write_all(b"\n")?;
     }
+    out.flush()?;
     if let Some(p) = &args.truth {
         let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
         writeln!(f, "transcript\tlength\treads\tweight")?;
         for ((name, seq), (c, w)) in txs.iter().zip(counts.iter().zip(&weights)) {
             writeln!(f, "{name}\t{}\t{c}\t{w:.6}", seq.len())?;
         }
+        f.flush()?;
     }
     eprintln!("simulate: {} reads from {} transcripts", args.n, txs.len());
     Ok(())

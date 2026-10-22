@@ -59,6 +59,8 @@
   `Index::id()`. `Strands`, `TieBreak`, `MapParams` and the other parameter types are
   re-exported. The existing API (`MapOptions::preset`, `Mapper::new`, `Index::build`) is
   unchanged.
+- Removed: `MapOptions::tiebreak_mut` and `chain_mut` (use the public `params` fields), and
+  the `spearfish::quant` re-export (the EM crate serves `spearfish em` only).
 
 ### Performance
 
@@ -71,6 +73,11 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- `spearfish index` builds about a third faster with about a third less peak memory
+  (GENCODE with spike-ins, 32 threads): node keys are deduplicated within genes before the
+  global sort, unitig chains are followed in parallel, and the transcript sequences are freed
+  once seeded. Building an index in memory (`Index::build`, as oarfish does from a FASTA) lays
+  the image out once instead of copying it twice. Index sections are byte-identical.
 - Rescue does less work per candidate window: genes come from the strand's anchor selection,
   window seeds probe a table of the read's seed labels instead of being sorted and merged,
   points are sorted as packed keys, and windows are parsed straight from their 2-bit codes,
@@ -115,9 +122,29 @@
 - aarch64 (Apple Silicon, ARM Linux): the affine alignment rows were not computed at all,
   because a configuration attribute removed the scalar code along with the x86 path.
 
+- Settings that have no effect are now also reported for `--no-clip-ends` with the tie-break
+  off, and for `--end-bonus`, `--xdrop`, `--band`, `--pad` and `--pad-div` with both the
+  tie-break and span extension off (e.g. `--preset hifi --no-tiebreak`).
+- Errors about input and output files name the file (a missing FASTA for `spearfish index`
+  or `spearfish em`, an output that can't be created). `spearfish index --write-t2g` and
+  `--t2g`, and `spearfish em -o`, fail on a bad path before the index build or the EM rather
+  than after it.
+- `spearfish quant` keeps the RAD file when oarfish fails and names it, so `oarfish -a` can be
+  rerun without mapping again; with `-v` the error no longer points to a log file that was not
+  written (oarfish logs to stderr then).
+- A damaged raw-sequence section made an index load as one without raw sequence (which
+  changes mapping output), and sections of mismatched sizes loaded and then panicked while
+  mapping. Loading now fails with the section's name.
+- Index writing staged the file at the output's name with its extension replaced by `.tmp`, so
+  builds to `x.lcp` and `x.mm` at the same time shared one temporary file, and an unrelated
+  `x.tmp` was moved away. It now stages to `<output>.partial-<pid>` and removes it on failure.
+
 ### Other
 
 - gzip input decodes with zlib-rs.
 - Index writing streams sections to disk instead of building the file in memory.
 - The workspace declares its minimum Rust version, 1.89.
 - CI runs on x86-64 Linux, arm64 Linux and Apple Silicon, and checks the minimum Rust version.
+- Release builds (`cargo install`) no longer embed debug info, so the binary is about 8 times
+  smaller; backtraces lose file and line numbers (panic messages keep them). The `profiling`
+  profile builds with line tables (see CONTRIBUTING.md).
