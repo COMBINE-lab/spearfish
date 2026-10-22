@@ -355,4 +355,11 @@ mod tests {
             Some(InferGenesOptions::default())
         );
     }
+
+    /// The old name of --mask-genes still works (a hidden alias).
+    #[test]
+    fn legacy_alias() {
+        assert_eq!(options(&["--f-max", "7"]), options(&["--mask-genes", "7"]));
+        assert_eq!(options(&["--f-max", "7"]).f_max, 7);
+    }
 }

@@ -68,7 +68,19 @@ instead of silently mismatching.
 
 Hidden commands (`em`, `simulate`, `lcp-stats`, `locality`, `survival`, `halo`) and hidden
 mapping flags exist for method development; `spearfish <command> --help` does not list them,
-but they are in `crates/spearfish-cli/src`. Environment variables:
+but they are in `crates/spearfish-cli/src`. Each mapping flag sets the `MapSettings` field of
+its name (`--no-x` turns `x` off; `--beam` goes with `--chainer`), documented there, and
+`spearfish map --print-params` shows the values a run would use.
+
+Renamed flags keep their old names as hidden aliases: `--delta-rep`, `--f-keep`, `--f-tie`,
+`--f-max`, `--h-max`, `--g-max`, `--alpha`, `--window`, `--beta`, `--no-merge`, `--kappa`,
+`--lambda`, `--affine-within`, `--unit-tiebreak`, `--whole-read-tiebreak`, `--orient-edit`,
+`--flank-min`, `--no-tie-clip`, `--tie-band`, `--tie-pad` and `--tie-pad-div` for `map` (a
+test in `map_args.rs` maps each to its current name), `--f-max` (now `--mask-genes`) for
+`index`, and `index-stats` for `inspect`. Benchmark scripts still use `--no-merge`,
+`--unit-tiebreak`, `--whole-read-tiebreak`, `--no-tie-clip` and `--orient-edit`.
+
+Environment variables:
 
 | Variable | Effect |
 | --- | --- |
