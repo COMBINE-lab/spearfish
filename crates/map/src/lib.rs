@@ -57,7 +57,8 @@ pub struct TieBreak {
     /// group representatives placed by clipped alignments) instead of aligning every hit's
     /// whole read.
     pub group_fallback: bool,
-    /// Whole-read distances cover only the read between the tied hits' outermost anchors.
+    /// Whole-read distances within a tie set cover only the read between the tied hits'
+    /// outermost anchors (the read orientations are still compared whole).
     pub whole_trim: bool,
     /// With `clip_ends`: stop extending a read end once a row falls this far below the best
     /// score so far (X-drop; `i32::MAX`: never).
@@ -1364,7 +1365,9 @@ impl<C: Chainer> Mapper<C> {
                         tb.lambda,
                     ),
                     _ => {
-                        let da = self.whole_read(tb, &codes(&st.seq), &st.hits[..1])[0];
+                        // Both whole reads: trimming each to its own hit's anchors would score
+                        // the two orientations over different read spans.
+                        let da = self.whole_read_k(tb, &codes(&st.seq), &st.hits[0], u32::MAX);
                         let db = self.whole_read_k(
                             tb,
                             &codes(&other.seq),

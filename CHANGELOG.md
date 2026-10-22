@@ -102,6 +102,13 @@
   within ±0.001 Spearman. Mapping cost rises 0.4-1.8% in instructions (largest on ONT cDNA)
   and at most 1.5% in wall time.
 
+- `--orient-edit` and `--unit-tiebreak` (experimental): near-tied read orientations were
+  compared by edit distance over the leading orientation's anchored span but over the other
+  orientation's whole read, adapters and primers included, so the chain-score leader almost
+  always stayed. Both are now scored over the whole read: on the simulated ONT 90% set, top-1
+  95.75% -> 96.07% (`--orient-edit`) and 95.74% -> 96.05% (`--unit-tiebreak`). The presets
+  don't use this comparison.
+
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that
   is a regular file, and is skipped if there is none and `--meta` is not given.
