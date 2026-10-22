@@ -6,8 +6,8 @@ Before every push, run what CI runs:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
 ```
 
