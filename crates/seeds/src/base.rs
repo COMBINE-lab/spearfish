@@ -141,6 +141,8 @@ mod tests {
         for spec in [
             "lcp:K=2",
             "minimizer:k=15,w=10",
+            "closed-syncmer:k=15,s=5",
+            "open-syncmer:t=3,k=15,s=9",
             "randstrobe:k=15,s=5,wmin=2,wmax=6",
             "linked-lcp:b=2,wmin=1,wmax=4,order=2",
         ] {
