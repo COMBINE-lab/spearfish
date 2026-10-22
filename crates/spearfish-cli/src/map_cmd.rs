@@ -547,7 +547,7 @@ pub fn execute(args: Job) -> Result<Counts> {
         None => None,
     };
     let rad = match &args.rad {
-        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings)?),
+        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings, &invocation)?),
         None => None,
     };
     let total = Arc::new(Mutex::new(Counts::default()));
@@ -655,6 +655,7 @@ fn rad_writer(
     codec: Codec,
     mapper: &Mapper,
     settings: &MapSettings,
+    invocation: &Invocation,
 ) -> Result<long_read_rad::RadWriter> {
     let codec = match codec {
         Codec::Lz4 => long_read_rad::ChunkCodec::Lz4,
@@ -669,7 +670,7 @@ fn rad_writer(
     let meta = long_read_rad::Meta {
         mapper: "spearfish".into(),
         mapper_version: spearfish::provenance::BuildInfo::current().short(),
-        cmdline: std::env::args().collect::<Vec<_>>().join(" "),
+        cmdline: invocation.command_line.join(" "),
         params: serde_json::to_string(&serde_json::json!({
             "settings": settings,
             "parameters": opts,

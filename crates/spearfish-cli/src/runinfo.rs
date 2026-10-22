@@ -50,7 +50,7 @@ impl Invocation {
         Invocation {
             spearfish: BuildInfo::current(),
             simd: spearfish::provenance::simd_level(),
-            command_line: std::env::args().collect(),
+            command_line: command_line(),
             working_directory: std::env::current_dir()
                 .map(|d| d.display().to_string())
                 .unwrap_or_default(),
@@ -59,6 +59,14 @@ impl Invocation {
             cpus_available: available_cpus(),
         }
     }
+}
+
+/// The process arguments, lossily decoded: `std::env::args` panics on an argument that is
+/// not valid Unicode, and paths need not be.
+pub fn command_line() -> Vec<String> {
+    std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 pub fn unix_now() -> u64 {

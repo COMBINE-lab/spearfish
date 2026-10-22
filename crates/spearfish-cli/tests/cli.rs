@@ -655,3 +655,50 @@ fn non_utf8_headers() {
             .starts_with("read_\u{fffd}\t")
     );
 }
+
+/// Paths that are not valid Unicode work as arguments, and are recorded lossily.
+/// Linux only: macOS file systems refuse names that are not UTF-8, so the case can't arise there.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_unicode_path_arguments() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("non_unicode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |name: &[u8]| dir.join(std::ffi::OsStr::from_bytes(name));
+    let (idx, tsv, rad) = (path(b"idx_\xe9.sfi"), path(b"o_\xe9.tsv"), path(b"o_\xe9.rad"));
+    let run = |args: &[&std::ffi::OsStr]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    run(&[
+        "index".as_ref(),
+        toy().as_os_str(),
+        "-o".as_ref(),
+        idx.as_os_str(),
+    ]);
+    run(&[
+        "map".as_ref(),
+        idx.as_os_str(),
+        toy().as_os_str(),
+        "-o".as_ref(),
+        tsv.as_os_str(),
+        "--rad".as_ref(),
+        rad.as_os_str(),
+    ]);
+    // The run records hold the arguments with U+FFFD for the invalid byte.
+    let has = |record: &[u8], arg: &str| {
+        let j: serde_json::Value = serde_json::from_slice(&std::fs::read(path(record)).unwrap()).unwrap();
+        let args = j["command_line"].as_array().unwrap();
+        assert!(
+            args.iter().any(|a| a.as_str().unwrap().ends_with(arg)),
+            "{args:?}"
+        );
+    };
+    has(b"idx_\xe9.sfi.json", "idx_\u{fffd}.sfi");
+    has(b"o_\xe9.tsv.meta.json", "o_\u{fffd}.tsv");
+    let h = long_read_rad::read_header(&rad).unwrap();
+    assert!(h.meta.cmdline.contains("o_\u{fffd}.rad"), "{}", h.meta.cmdline);
+}
