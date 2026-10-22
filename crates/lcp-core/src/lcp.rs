@@ -373,8 +373,8 @@ fn dct_into(bits: &BitArena, d: usize, vals: &mut Vec<u64>) {
     let n = bits.len();
     vals.clear();
     vals.resize(n, 0);
-    for (i, v) in vals.iter_mut().enumerate().skip(1) {
-        *v = bits.dct(i);
+    if n > 1 {
+        bits.dct_all(&mut vals[1..]);
     }
     for t in 1..d {
         // Iteration t compresses cores i > t against their left neighbour's previous value.
