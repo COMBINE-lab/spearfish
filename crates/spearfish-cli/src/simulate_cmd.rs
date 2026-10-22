@@ -95,12 +95,14 @@ pub fn run(args: Args) -> Result<()> {
         out.write_all(&s)?;
         out.write_all(b"\n")?;
     }
+    out.flush()?;
     if let Some(p) = &args.truth {
         let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
         writeln!(f, "transcript\tlength\treads\tweight")?;
         for ((name, seq), (c, w)) in txs.iter().zip(counts.iter().zip(&weights)) {
             writeln!(f, "{name}\t{}\t{c}\t{w:.6}", seq.len())?;
         }
+        f.flush()?;
     }
     eprintln!("simulate: {} reads from {} transcripts", args.n, txs.len());
     Ok(())

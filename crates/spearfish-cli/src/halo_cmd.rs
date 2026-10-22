@@ -440,6 +440,8 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
+    // Flush each file explicitly: dropping a BufWriter discards write errors.
+    f.flush()?;
     let mut f = open("iso")?;
     writeln!(
         f,
@@ -468,6 +470,7 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
+    f.flush()?;
     let mut f = open("genes")?;
     writeln!(
         f,
@@ -476,5 +479,6 @@ pub fn run(args: Args) -> Result<()> {
     for r in rows {
         writeln!(f, "{r}")?;
     }
+    f.flush()?;
     Ok(())
 }

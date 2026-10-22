@@ -125,6 +125,7 @@ pub fn run(args: Args) -> Result<()> {
     for ((n, l), c) in names.iter().zip(&lens).zip(&counts) {
         writeln!(out, "{n}\t{l}\t{c:.4}")?;
     }
+    out.flush()?;
     log::info!(
         "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
         classes.len(),

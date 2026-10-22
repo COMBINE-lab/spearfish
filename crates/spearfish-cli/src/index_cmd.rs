@@ -142,6 +142,7 @@ pub fn run(args: Args) -> Result<()> {
         for (t, g) in names.iter().zip(&rep.tx_gene) {
             writeln!(w, "{t}\t{}", rep.gene_names[*g as usize])?;
         }
+        w.flush()?;
     }
     let hpc = opts.hpc;
     let collapse_gene = opts.per_gene;

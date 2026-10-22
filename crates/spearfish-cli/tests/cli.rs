@@ -709,3 +709,35 @@ fn non_unicode_path_arguments() {
     let h = long_read_rad::read_header(&rad).unwrap();
     assert!(h.meta.cmdline.contains("o_\u{fffd}.rad"), "{}", h.meta.cmdline);
 }
+
+/// A failed write of the last buffered output is an error, not a silent truncation.
+#[cfg(target_os = "linux")]
+#[test]
+fn final_flush_errors_are_reported() {
+    use std::ffi::OsStr;
+    let (tx, full) = (toy(), OsStr::new("/dev/full"));
+    let idx = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("full_t2g.sfi");
+    let s = |x: &'static str| OsStr::new(x);
+    for args in [
+        vec![s("lcp-stats"), tx.as_os_str(), s("-K"), s("4"), s("-o"), full],
+        vec![s("simulate"), tx.as_os_str(), s("-n"), s("5"), s("-o"), full],
+        vec![
+            s("index"),
+            tx.as_os_str(),
+            s("-o"),
+            idx.as_os_str(),
+            s("--write-t2g"),
+            full,
+        ],
+    ] {
+        let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("No space left"),
+            "{args:?}"
+        );
+    }
+}
