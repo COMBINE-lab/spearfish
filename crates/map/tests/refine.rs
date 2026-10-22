@@ -109,9 +109,13 @@ fn check(seed: u64, spec: &str, h: usize, beta: f32) -> Result<(), TestCaseError
         let read = mutate(&mut rng, &t.seq[a..b], rate);
         let seeds = mapper.seeder.seed(&read);
         let anchors = anchor::anchors(&idx, &seeds, &AnchorParams::default());
-        for c in anchor::candidates(&idx, anchors, &AnchorParams::default()) {
+        for mut c in anchor::candidates(&idx, anchors, &AnchorParams::default()) {
             let (o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
             prop_assert_eq!(scores(o), scores(r), "seed {} read from {}", seed, t.name);
+            // With collinear anchors merged, as the mapper chains candidates by default.
+            anchor::merge_collinear(&idx, &mut c);
+            let (o, r) = (oracle.chain(&idx, &c), refine.chain(&idx, &c));
+            prop_assert_eq!(scores(o), scores(r), "merged: seed {} read from {}", seed, t.name);
         }
     }
     Ok(())

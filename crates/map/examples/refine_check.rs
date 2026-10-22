@@ -47,7 +47,11 @@ fn main() {
         for s in [seq.clone(), revcomp(&seq)] {
             let seeds = mapper.seeder.seed(&s);
             let an = anchor::anchors(&idx, &seeds, &p.anchor);
-            for c in anchor::candidates(&idx, an, &p.anchor) {
+            for mut c in anchor::candidates(&idx, an, &p.anchor) {
+                // The candidates the mapper chains: collinear anchors merged, if on.
+                if p.merge_collinear {
+                    anchor::merge_collinear(&idx, &mut c);
+                }
                 cands += 1;
                 {
                     // Placement lists per transcript, shifted to start at 0: transcripts with
