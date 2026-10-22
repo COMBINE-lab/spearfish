@@ -167,51 +167,48 @@ pub fn distance_with(pat: &Pattern, text: &[u8], mode: Mode, k: u32) -> Option<u
     (best <= k).then_some(best as u32)
 }
 
-/// [`distance_with`] in `Infix` mode for each of `texts` with one threshold `k`: the same
-/// results as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit
-/// lane, sharing the pattern's blocks; with AVX2, up to four; at the NEON level, four in
-/// lockstep ([`infix_lanes`]).
-pub fn infix_distances(pat: &Pattern, texts: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+/// [`distance_with`] in `mode` for each of `texts` with one threshold `k`: the same results
+/// as separate calls. With AVX-512, up to eight texts run at once, one per 64-bit lane,
+/// sharing the pattern's blocks; with AVX2, up to four; at the NEON level, four in lockstep
+/// ([`batch_lanes`]).
+pub fn batch_distances(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32) -> Vec<Option<u32>> {
     match simd_level() {
         #[cfg(target_arch = "x86_64")]
         Level::Avx512 if pat.m > 0 => {
             let mut out = Vec::with_capacity(texts.len());
             // SAFETY: the CPU has AVX-512 (the active level).
-            unsafe { infix_avx512(pat, texts, k, &mut out) };
+            unsafe { batch_avx512(pat, texts, mode, k, &mut out) };
             out
         }
         #[cfg(target_arch = "x86_64")]
         Level::Avx2 if pat.m > 0 => {
             let mut out = Vec::with_capacity(texts.len());
             // SAFETY: the CPU has AVX2 (the active level).
-            unsafe { infix_avx2(pat, texts, k, &mut out) };
+            unsafe { batch_avx2(pat, texts, mode, k, &mut out) };
             out
         }
         #[cfg(target_arch = "aarch64")]
         Level::Neon if pat.m > 0 => {
             let mut out = Vec::with_capacity(texts.len());
-            for batch in texts.chunks(INFIX_LANES) {
-                infix_lanes::<INFIX_LANES>(pat, batch, k, &mut out);
+            for batch in texts.chunks(BATCH_LANES) {
+                batch_lanes::<BATCH_LANES>(pat, batch, mode, k, &mut out);
             }
             out
         }
-        _ => texts
-            .iter()
-            .map(|t| distance_with(pat, t, Mode::Infix, k))
-            .collect(),
+        _ => texts.iter().map(|t| distance_with(pat, t, mode, k)).collect(),
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-fn infix_avx512(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+fn batch_avx512(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     for batch in texts.chunks(8) {
         // SAFETY: AVX-512F is enabled here.
-        unsafe { infix_x8(pat, batch, k, out) };
+        unsafe { batch_x8(pat, batch, mode, k, out) };
     }
 }
 
-/// Infix distances of up to eight texts, one per lane, appended to `out`. Each lane runs
+/// Distances in `mode` of up to eight texts, one per lane, appended to `out`. Each lane runs
 /// [`distance_with`]'s recurrence; the band is the union of the lanes' Ukkonen bands (a block
 /// is added if any lane would add it, dropped only if every lane would), and blocks are
 /// added with the same upper-bound state. Every lane's band thus contains its own, which
@@ -220,7 +217,7 @@ fn infix_avx512(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
-unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+unsafe fn batch_x8(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     use std::arch::x86_64::*;
     debug_assert!((1..=8).contains(&texts.len()) && pat.m > 0);
     let m = pat.m;
@@ -265,11 +262,23 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     let kv = _mm512_set1_epi64(kk);
     let kw = _mm512_set1_epi64(kk + W as i64);
     let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
-    // Column 0: D[m][0] = m.
-    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+    // Column 0: D[m][0] = m (Global: only for an empty text).
+    let mut best = if mode == Mode::Global {
+        _mm512_mask_mov_epi64(
+            _mm512_set1_epi64(i64::MAX),
+            _mm512_cmpeq_epi64_mask(lens, zero),
+            _mm512_set1_epi64(m as i64),
+        )
+    } else if last as usize + 1 == blocks && m as i64 <= kk {
         _mm512_set1_epi64(m as i64)
     } else {
         _mm512_set1_epi64(i64::MAX)
+    };
+    // Horizontal delta entering row 0 (as -1/+1 bits): D[0][j] is 0 (free text start) or j.
+    let h0 = if mode == Mode::Infix {
+        (zero, zero)
+    } else {
+        (zero, one)
     };
     // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
     #[inline]
@@ -309,8 +318,7 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
         let live: __mmask8 = _mm512_cmpgt_epi64_mask(lens, _mm512_set1_epi64(j as i64));
         // SAFETY: tx holds 8 codes per column.
         let c = _mm512_cvtepu8_epi64(unsafe { _mm_loadl_epi64(tx.as_ptr().add(8 * j).cast()) });
-        // Infix: the top row is free (horizontal delta 0).
-        let mut h = (zero, zero);
+        let mut h = h0;
         for b in 0..=last as usize {
             let eq = _mm512_permutexvar_epi64(c, peq[b]);
             h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
@@ -346,7 +354,12 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
             }
         }
         if last as usize + 1 == blocks {
-            best = _mm512_mask_min_epi64(best, live, best, score[blocks - 1]);
+            if mode == Mode::Global {
+                let end = _mm512_cmpeq_epi64_mask(lens, _mm512_set1_epi64(j as i64 + 1));
+                best = _mm512_mask_mov_epi64(best, end, score[blocks - 1]);
+            } else {
+                best = _mm512_mask_min_epi64(best, live, best, score[blocks - 1]);
+            }
         }
     }
     let mut bs = [0i64; 8];
@@ -360,20 +373,20 @@ unsafe fn infix_x8(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-fn infix_avx2(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+fn batch_avx2(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     for batch in texts.chunks(4) {
         // SAFETY: AVX2 is enabled here.
-        unsafe { infix_x4(pat, batch, k, out) };
+        unsafe { batch_x4(pat, batch, mode, k, out) };
     }
 }
 
-/// [`infix_x8`] for up to four texts in AVX2, one per 64-bit lane: the same recurrence and
+/// [`batch_x8`] for up to four texts in AVX2, one per 64-bit lane: the same recurrence and
 /// band union, with blends for the per-lane masked updates and vector compares for the mask
 /// tests. A lane's code selects its block mask through a dword permute.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+unsafe fn batch_x4(pat: &Pattern, texts: &[&[u8]], mode: Mode, k: u32, out: &mut Vec<Option<u32>>) {
     use std::arch::x86_64::*;
     debug_assert!((1..=4).contains(&texts.len()) && pat.m > 0);
     let m = pat.m;
@@ -411,11 +424,23 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     let kv = _mm256_set1_epi64x(kk);
     let kw = _mm256_set1_epi64x(kk + W as i64);
     let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
-    // Column 0: D[m][0] = m.
-    let mut best = if last as usize + 1 == blocks && m as i64 <= kk {
+    // Column 0: D[m][0] = m (Global: only for an empty text).
+    let mut best = if mode == Mode::Global {
+        _mm256_blendv_epi8(
+            _mm256_set1_epi64x(i64::MAX),
+            _mm256_set1_epi64x(m as i64),
+            _mm256_cmpeq_epi64(lens, zero),
+        )
+    } else if last as usize + 1 == blocks && m as i64 <= kk {
         _mm256_set1_epi64x(m as i64)
     } else {
         _mm256_set1_epi64x(i64::MAX)
+    };
+    // Horizontal delta entering row 0 (as -1/+1 bits): D[0][j] is 0 (free text start) or j.
+    let h0 = if mode == Mode::Infix {
+        (zero, zero)
+    } else {
+        (zero, one)
     };
     // One block step on all lanes (`distance_with`'s `block`): (h out as +1/-1 bits).
     #[inline]
@@ -456,8 +481,7 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
         let live = _mm256_cmpgt_epi64(lens, _mm256_set1_epi64x(j as i64));
         // SAFETY: tx holds 4 indices per column.
         let idx = unsafe { _mm256_loadu_si256(tx.as_ptr().add(4 * j).cast()) };
-        // Infix: the top row is free (horizontal delta 0).
-        let mut h = (zero, zero);
+        let mut h = h0;
         for b in 0..=last as usize {
             let eq = _mm256_permutevar8x32_epi32(peq[b], idx);
             h = step(&mut pv[b], &mut mv[b], eq, h, bitv(b), live);
@@ -504,7 +528,11 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
         }
         if last as usize + 1 == blocks {
             let s = score[blocks - 1];
-            let lt = _mm256_and_si256(live, _mm256_cmpgt_epi64(best, s));
+            let lt = if mode == Mode::Global {
+                _mm256_cmpeq_epi64(lens, _mm256_set1_epi64x(j as i64 + 1))
+            } else {
+                _mm256_and_si256(live, _mm256_cmpgt_epi64(best, s))
+            };
             best = _mm256_blendv_epi8(best, s, lt);
         }
     }
@@ -517,17 +545,23 @@ unsafe fn infix_x4(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<
     }
 }
 
-/// Lanes of [`infix_lanes`] on aarch64.
+/// Lanes of [`batch_lanes`] on aarch64.
 #[cfg(target_arch = "aarch64")]
-const INFIX_LANES: usize = 4;
+const BATCH_LANES: usize = 4;
 
-/// [`infix_x8`] in scalar code, `L` texts in lockstep: the lanes' block steps are
+/// [`batch_x8`] in scalar code, `L` texts in lockstep: the lanes' block steps are
 /// independent, so a wide core overlaps their carried horizontal deltas, the critical path
-/// of one [`distance_with`] call. Same band rules as `infix_x8`, so the same results. A lane
+/// of one [`distance_with`] call. Same band rules as `batch_x8`, so the same results. A lane
 /// past its text's end keeps stepping (on code 0) but no longer counts in the band or its
 /// best, so it changes no output.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut Vec<Option<u32>>) {
+fn batch_lanes<const L: usize>(
+    pat: &Pattern,
+    texts: &[&[u8]],
+    mode: Mode,
+    k: u32,
+    out: &mut Vec<Option<u32>>,
+) {
     debug_assert!((1..=L).contains(&texts.len()) && pat.m > 0);
     let m = pat.m;
     let n_max = texts.iter().map(|t| t.len()).max().unwrap();
@@ -551,17 +585,23 @@ fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut
     let mut score: Vec<[i32; L]> = (0..blocks).map(|b| [(b * W + rows(b)) as i32; L]).collect();
     let kw = kk + W as i32;
     let mut last: isize = (blocks.min((kk as usize + 1).div_ceil(W)) as isize) - 1;
-    // Column 0: D[m][0] = m.
-    let mut best = [if last as usize + 1 == blocks && m as i32 <= kk {
+    // Column 0: D[m][0] = m (Global: only for an empty text).
+    let best0 = if last as usize + 1 == blocks && m as i32 <= kk {
         m as i32
     } else {
         i32::MAX
-    }; L];
+    };
+    let mut best: [i32; L] = std::array::from_fn(|l| match mode {
+        Mode::Global if lens[l] == 0 => m as i32,
+        Mode::Global => i32::MAX,
+        _ => best0,
+    });
+    // Horizontal delta entering row 0: D[0][j] is 0 (free text start) or j.
+    let h0: i32 = if mode == Mode::Infix { 0 } else { 1 };
     for (j, c) in tx.as_chunks::<L>().0.iter().enumerate() {
         let c: [usize; L] = std::array::from_fn(|l| c[l] as usize);
         let live: [bool; L] = std::array::from_fn(|l| j < lens[l]);
-        // Infix: the top row is free (horizontal delta 0).
-        let mut h = [0i32; L];
+        let mut h = [h0; L];
         for b in 0..=last as usize {
             let (p, mm, s, q, bt) = (&mut pv[b], &mut mv[b], &mut score[b], &peq[b], bit(b));
             for l in 0..L {
@@ -596,7 +636,11 @@ fn infix_lanes<const L: usize>(pat: &Pattern, texts: &[&[u8]], k: u32, out: &mut
         }
         if last as usize + 1 == blocks {
             for l in 0..L {
-                if live[l] {
+                if mode == Mode::Global {
+                    if j + 1 == lens[l] {
+                        best[l] = score[blocks - 1][l];
+                    }
+                } else if live[l] {
                     best[l] = best[l].min(score[blocks - 1][l]);
                 }
             }
@@ -2232,11 +2276,11 @@ mod tests {
             }
         }
 
-        /// Batched infix distances equal one `distance_with` call per text: texts are
+        /// Batched distances equal one `distance_with` call per text, in every mode: texts are
         /// mutated copies of one sequence (as isoform regions are) of differing lengths,
         /// some empty or unrelated, in batches of any size.
         #[test]
-        fn infix_batch_matches_single(
+        fn batch_distances_match_single(
             base in prop::collection::vec(0u8..4, 0..700),
             texts in prop::collection::vec(
                 (0usize..700, 0usize..700, prop::collection::vec((0usize..700, 0u8..4, 0u8..3), 0..25), any::<bool>()),
@@ -2269,25 +2313,27 @@ mod tests {
                 })
                 .collect();
             let pat = Pattern::new(&p);
-            let exact: Vec<u32> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, u32::MAX).unwrap()).collect();
-            let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
             let refs: Vec<&[u8]> = ts.iter().map(|t| t.as_slice()).collect();
-            let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, Mode::Infix, k)).collect();
-            each_level(|level| {
-                prop_assert_eq!(infix_distances(&pat, &refs, k), want.clone(), "at {}", level);
-                Ok(())
-            })?;
             // The lockstep lanes at any width (on every target, not only where they are used).
-            fn lanes<const L: usize>(pat: &Pattern, refs: &[&[u8]], k: u32) -> Vec<Option<u32>> {
+            fn lanes<const L: usize>(pat: &Pattern, refs: &[&[u8]], mode: Mode, k: u32) -> Vec<Option<u32>> {
                 let mut out = Vec::new();
-                refs.chunks(L).for_each(|c| infix_lanes::<L>(pat, c, k, &mut out));
+                refs.chunks(L).for_each(|c| batch_lanes::<L>(pat, c, mode, k, &mut out));
                 out
             }
-            if !p.is_empty() {
-                prop_assert_eq!(&lanes::<1>(&pat, &refs, k), &want);
-                prop_assert_eq!(&lanes::<2>(&pat, &refs, k), &want);
-                prop_assert_eq!(&lanes::<4>(&pat, &refs, k), &want);
-                prop_assert_eq!(&lanes::<8>(&pat, &refs, k), &want);
+            for mode in [Mode::Infix, Mode::Prefix, Mode::Global] {
+                let exact: Vec<u32> = ts.iter().map(|t| distance_with(&pat, t, mode, u32::MAX).unwrap()).collect();
+                let k = match kdelta { None => u32::MAX, Some(x) => exact.iter().min().unwrap() + x };
+                let want: Vec<Option<u32>> = ts.iter().map(|t| distance_with(&pat, t, mode, k)).collect();
+                each_level(|level| {
+                    prop_assert_eq!(batch_distances(&pat, &refs, mode, k), want.clone(), "at {} {:?}", level, mode);
+                    Ok(())
+                })?;
+                if !p.is_empty() {
+                    prop_assert_eq!(&lanes::<1>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                    prop_assert_eq!(&lanes::<2>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                    prop_assert_eq!(&lanes::<4>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                    prop_assert_eq!(&lanes::<8>(&pat, &refs, mode, k), &want, "{:?}", mode);
+                }
             }
         }
     }
@@ -2400,7 +2446,7 @@ mod tests {
                 let ns = time(20.0 * 16.0, || {
                     at_level(l, || {
                         for _ in 0..20 {
-                            black_box(infix_distances(&pat, black_box(&refs), k));
+                            black_box(batch_distances(&pat, black_box(&refs), Mode::Infix, k));
                         }
                     })
                 });

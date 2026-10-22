@@ -518,43 +518,18 @@ impl<C: Chainer> Mapper<C> {
     }
 
     /// Distances of `read` against several texts with a shared band: the first is exact,
-    /// later ones are capped at (best so far + `cap`) + 1.
-    fn banded(read: &[u8], texts: &[Vec<u8>], mode: align::Mode, cap: u32) -> Vec<u32> {
-        // Identical texts (isoforms agreeing over the region) are aligned once. The band only
-        // tightens (k = best so far + cap), so a repeat's result is the first occurrence's
-        // re-capped at the current k: exact if d <= k, else k + 1, as a fresh call returns.
-        let pat = align::Pattern::new(read);
-        if mode == align::Mode::Infix {
-            return Self::banded_infix(&pat, read.len(), texts, cap);
-        }
-        let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
-        let mut best = u32::MAX;
-        texts
-            .iter()
-            .map(|t| {
-                let k = best.saturating_add(cap);
-                if let Some(&d) = seen.get(t.as_slice()) {
-                    return if d <= k { d } else { k.saturating_add(1) };
-                }
-                stats::add(&stats::MYERS_CALLS, 1);
-                stats::add(
-                    &stats::MYERS_CELLS,
-                    (read.len() as u64).div_ceil(64) * t.len() as u64,
-                );
-                let d = align::distance_with(&pat, t, mode, k).unwrap_or(k.saturating_add(1));
-                best = best.min(d);
-                seen.insert(t.as_slice(), d);
-                d
-            })
-            .collect()
-    }
-
-    /// [`Self::banded`] in infix mode, aligning distinct texts in batches of eight
-    /// ([`align::infix_distances`]) with the threshold in force at each batch's first text:
+    /// later ones are capped at (best so far + `cap`) + 1, as one [`align::distance_with`]
+    /// call per text in order would give them.
+    ///
+    /// Identical texts (isoforms agreeing over the region) are aligned once: the band only
+    /// tightens (k = best so far + cap), so a repeat's result is the first occurrence's
+    /// re-capped at the current k. Distinct texts are aligned in batches of eight
+    /// ([`align::batch_distances`]) with the threshold in force at each batch's first text:
     /// later texts' thresholds are no larger (the best only falls), so a batch result is exact
     /// wherever the sequential pass's would be, and re-capping it at each text's own threshold,
     /// in order, gives the sequential results exactly.
-    fn banded_infix(pat: &align::Pattern, m: usize, texts: &[Vec<u8>], cap: u32) -> Vec<u32> {
+    fn banded(read: &[u8], texts: &[Vec<u8>], mode: align::Mode, cap: u32) -> Vec<u32> {
+        let (pat, m) = (align::Pattern::new(read), read.len());
         // Each text's distinct-text index, and the distinct texts in first-occurrence order.
         let mut first: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
         let mut uniq: Vec<&[u8]> = Vec::new();
@@ -590,7 +565,7 @@ impl<C: Chainer> Mapper<C> {
                     stats::add(&stats::MYERS_CALLS, 1);
                     stats::add(&stats::MYERS_CELLS, (m as u64).div_ceil(64) * t.len() as u64);
                 }
-                raw.extend(align::infix_distances(pat, batch, k));
+                raw.extend(align::batch_distances(&pat, batch, mode, k));
             }
             let d = match raw[u] {
                 Some(d) if d <= k => d,
