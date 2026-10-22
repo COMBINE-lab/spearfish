@@ -71,6 +71,10 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- The tie-break's Global and Prefix edit distances (direct RNA's segment costs) run in the
+  batched SIMD kernels, as infix ones already did, and the affine DP rows write their own band
+  sentinel and run whole AVX-512 vectors: 17% fewer instructions on direct RNA and 0.5-3% on
+  the other read types, with identical output.
 
 ### Fixes
 
