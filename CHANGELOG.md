@@ -129,6 +129,28 @@
   within ±0.001 Spearman. Mapping cost rises 0.4-1.8% in instructions (largest on ONT cDNA)
   and at most 1.5% in wall time.
 
+- `--orient-edit` and `--unit-tiebreak` (experimental): near-tied read orientations were
+  compared by edit distance over the leading orientation's anchored span but over the other
+  orientation's whole read, adapters and primers included, so the chain-score leader almost
+  always stayed. Both are now scored over the whole read: on the simulated ONT 90% set, top-1
+  95.75% -> 96.07% (`--orient-edit`) and 95.74% -> 96.05% (`--unit-tiebreak`). The presets
+  don't use this comparison.
+- A poly(A) tail after an A-run inside the read (an A-rich 3' UTR, a genomic A-stretch) was
+  missed: only the first A-run was looked at, and with more than 80 read bases after it the
+  read had no tail. The search now goes on past such runs, for tail trimming, `--tail-bonus`
+  and `--orient-tail`. 0.1-0.35% of real reads change mapping; simulated and spike-in accuracy
+  are unchanged.
+- On indexes built with `--no-hpc`, poly(A) tails were never found, so `--tail-trim`,
+  `--tail-bonus` and `--orient-tail` did nothing. On such an index, simulated ONT reads with
+  tails and adapters now reach 99.01% top-1 instead of 98.35%, and SIRV E2 Spearman on ONT
+  PCR-cDNA rises from 0.706 to 0.758. HPC indexes are unaffected.
+- With raw read ends (`ont`), a read end's band was laid out for a window computed from the
+  raw read end, while the candidate transcript windows are sized in compressed bases and are
+  often longer in raw ones: isoforms that agree near the read end got different bands and
+  could not share DP rows. Every candidate now gets the band of the longest window. About 0.1%
+  of ONT reads change mapping, accuracy is unchanged, and ONT mapping takes 0.4-2% fewer
+  instructions.
+
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that
   is a regular file, and is skipped if there is none and `--meta` is not given.

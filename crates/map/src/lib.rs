@@ -57,7 +57,8 @@ pub struct TieBreak {
     /// group representatives placed by clipped alignments) instead of aligning every hit's
     /// whole read.
     pub group_fallback: bool,
-    /// Whole-read distances cover only the read between the tied hits' outermost anchors.
+    /// Whole-read distances within a tie set cover only the read between the tied hits'
+    /// outermost anchors (the read orientations are still compared whole).
     pub whole_trim: bool,
     /// With `clip_ends`: stop extending a read end once a row falls this far below the best
     /// score so far (X-drop; `i32::MAX`: never).
@@ -90,7 +91,8 @@ pub struct TieBreak {
     /// isoforms whose ends differ by a few bases).
     pub flank_min: i64,
     /// Shortest poly(A) tail recognized: a window this long with at most one base not A,
-    /// followed by at most `TAIL_AFTER` read bases.
+    /// followed by at most `TAIL_AFTER` read bases. Tails are searched for in the raw read,
+    /// which without HPC is the parsed one.
     pub tail_run: usize,
     /// Near-tied read orientations: points for the orientation whose raw read ends in a poly(A)
     /// tail (the molecule's 3' end) over one that doesn't. Where a transcript's sequence lies
@@ -882,9 +884,12 @@ impl<C: Chainer> Mapper<C> {
                     let xs = if mode == align::Mode::Prefix && tb.clip_ends {
                         // The band is laid out for the window the read end would get against a
                         // transcript that doesn't end inside it (`tb.window`, as the windows
-                        // below are cut). With raw read ends `read` is raw and the windows are
-                        // parsed spans' raw bases, so this only approximates their lengths.
-                        let window = tb.window(read.len() as u32) as usize;
+                        // below are cut), or for the longest text: texts are windows sized in
+                        // parsed bases, which in raw bases (raw read ends) or against a
+                        // tail-trimmed read end can be longer. Every text then gets the same band,
+                        // and sorted texts share rows.
+                        let window = (tb.window(read.len() as u32) as usize)
+                            .max(tx.iter().map(|t| t.len()).max().unwrap_or(0));
                         align::affine_extend_sorted_cut(
                             read,
                             &tx,
@@ -1089,12 +1094,17 @@ impl<C: Chainer> Mapper<C> {
                 .collect()
         };
         let tail = match raw {
-            Some(r) if tb.tail_trim || tb.tail_bonus > 0 => {
+            _ if !tb.tail_trim && tb.tail_bonus <= 0 => None,
+            Some(r) => {
                 let (r0, r1) = (r.pos(ql), r.pos(last.query.end));
                 tail_start(&r.codes[r1..], a_code, tb.tail_run)
-                    .map(|(c, e)| (r, r0, r1 - r0 + c, r1 - r0 + e))
+                    .map(|(c, e)| (Some(r), r0, r1 - r0 + c, r1 - r0 + e))
             }
-            _ => None,
+            // Without HPC the parsed read is the raw read (and `ql` the last block's end).
+            None if !self.seeder.hpc => {
+                tail_start(&codes[ql as usize..], a_code, tb.tail_run).map(|(c, e)| (None, ql as usize, c, e))
+            }
+            None => None,
         };
         let short: Vec<bool> = spans
             .iter()
@@ -1125,8 +1135,10 @@ impl<C: Chainer> Mapper<C> {
                     }
                     (lo - ql) as usize
                 };
-                let cut = tail.map_or((plen - ql) as usize, |(r, r0, c, _)| parsed(r0 + c, r));
-                let run_end = tail.map_or(cut, |(r, r0, _, e)| parsed(r0 + e, r));
+                let cut = tail.map_or((plen - ql) as usize, |(r, r0, c, _)| {
+                    r.map_or(c, |r| parsed(r0 + c, r))
+                });
+                let run_end = tail.map_or(cut, |(r, r0, _, e)| r.map_or(e, |r| parsed(r0 + e, r)));
                 let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
                 let read = &codes[ql as usize..];
                 let read = if tb.tail_trim { &read[..cut] } else { read };
@@ -1374,7 +1386,9 @@ impl<C: Chainer> Mapper<C> {
                         tb.lambda,
                     ),
                     _ => {
-                        let da = self.whole_read(tb, qa, &st.hits[..1])[0];
+                        // Both whole reads: trimming each to its own hit's anchors would score
+                        // the two orientations over different read spans.
+                        let da = self.whole_read_k(tb, qa, &st.hits[0], u32::MAX);
                         let db = self.whole_read_k(tb, qb, &other.hits[0], da.saturating_add(tb.cap));
                         (i64::from(da), i64::from(db), tb.kappa)
                     }
@@ -1383,10 +1397,13 @@ impl<C: Chainer> Mapper<C> {
                 // poly(A) tail where one orientation shows it and the other doesn't.
                 let mut lead = unit * (cb - ca) as f32;
                 if tb.orient_tail > 0 {
-                    let tailed = |r: Option<&RawRead>| r.is_some_and(|r| ends_in_tail(&r.codes, tb.tail_run));
+                    // Without HPC the parsed read is the raw read.
+                    let tailed = |s: &Strand| match &s.raw {
+                        Some(r) => ends_in_tail(&r.codes, tb.tail_run),
+                        None => !self.seeder.hpc && ends_in_tail(strand_codes(&s.codes, &s.seq), tb.tail_run),
+                    };
                     lead += tb.orient_tail as f32
-                        * (f32::from(u8::from(tailed(st.raw.as_ref())))
-                            - f32::from(u8::from(tailed(other.raw.as_ref()))));
+                        * (f32::from(u8::from(tailed(&st))) - f32::from(u8::from(tailed(&other))));
                 }
                 if lead < 0.0 {
                     std::mem::swap(&mut st, &mut other);
@@ -1455,17 +1472,14 @@ fn ends_in_tail(codes: &[u8], run: usize) -> bool {
     tail_start(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run).is_some()
 }
 
-/// The first poly(A) window of `run` bases in `rest` (raw codes): its first A, and the end of the A-run from
-/// there (the longest stretch ending in A with at most one other base per ten).
+/// The first poly(A) tail in `rest` (raw codes): a window of `run` bases with at most one other
+/// base whose A-run is followed by at most `TAIL_AFTER` bases. Returns the window's first A and
+/// the end of the A-run from there (the longest stretch ending in A with at most one other base
+/// per ten).
 fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
-    if rest.len() < run {
-        return None;
-    }
-    let mut other = rest[..run].iter().filter(|&&c| c != a).count();
-    for i in 0..=rest.len() - run {
-        if i > 0 {
-            other = other + usize::from(rest[i + run - 1] != a) - usize::from(rest[i - 1] != a);
-        }
+    let others = |w: &[u8]| w.iter().filter(|&&c| c != a).count();
+    let (mut i, mut other) = (0, others(rest.get(..run)?));
+    loop {
         if other <= 1 {
             let s = i + rest[i..].iter().position(|&c| c == a).unwrap_or(0);
             let (mut end, mut non) = (s, 0);
@@ -1475,15 +1489,22 @@ fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
                     end = k + 1;
                 }
             }
+            if rest.len() - end <= TAIL_AFTER {
+                return Some((s, end));
+            }
             // A tail is followed only by adapter: an A-run with more of the read after it is
-            // transcript sequence (or internal priming), not the molecule's 3' end.
-            if rest.len() - end > TAIL_AFTER {
+            // transcript sequence (or internal priming), not the molecule's 3' end. The tail
+            // may still come after it; the windows inside the run are part of it.
+            i = end.max(i + 1);
+            other = others(rest.get(i..i + run)?);
+        } else {
+            if i + run >= rest.len() {
                 return None;
             }
-            return Some((s, end));
+            other = other + usize::from(rest[i + run] != a) - usize::from(rest[i] != a);
+            i += 1;
         }
     }
-    None
 }
 
 /// Best score first; equal scores in the order of `tie_key(salt, tx)`, a per-read
@@ -1830,6 +1851,18 @@ mod segmented_tests {
     }
 
     #[test]
+    fn an_a_run_inside_the_read_does_not_hide_its_tail() {
+        // A 3' UTR's A-run, more of the UTR, then the tail and an adapter.
+        let utr = b"CGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCATG".repeat(3);
+        let adapter: &[u8] = b"GTACTCTGCGTTGATACCACTGCTT";
+        let read = [&b"A".repeat(16)[..], &utr, &b"A".repeat(30), adapter].concat();
+        let a = codes(b"A")[0];
+        assert_eq!(tail_start(&codes(&read), a, 15).map(|t| t.0), Some(136));
+        let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
+        assert!(ends_in_tail(&codes(&[&body[..], &read].concat()), 15));
+    }
+
+    #[test]
     fn only_a_poly_a_near_the_read_end_marks_its_orientation() {
         let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT".repeat(10);
         let tail = [b"A".repeat(20), b"GTACTCTGCGTTGATACCACTGCTT".to_vec()].concat();
@@ -1848,22 +1881,26 @@ mod segmented_tests {
         // t1 continues past t0's 3' end; the read stops there and goes on into its tail.
         let body: &[u8] = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
         let t1: Vec<u8> = [body, b"GCTCGTCGTCAGCTCGTCGATCGCT"].concat();
-        let m = mapper(&[body, &t1], true);
         let q: Vec<u8> = [body, b"AAAAAAAAAAAAAAAAAAAAAAAA", b"GTCGCTCGTGCA"].concat();
-        let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &q);
-        let n = 30;
-        let hits = [hit(0, 10., &[(0, 0, n)]), hit(1, 10., &[(0, 0, n)])];
-        let cost = |tail_bonus| {
-            let tb = TieBreak {
-                tail_bonus,
-                ..Default::default()
+        // Without HPC there is no separate raw read: the tail is found in the parsed one.
+        for hpc in [true, false] {
+            let m = mapper(&[body, &t1], hpc);
+            let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &q);
+            assert_eq!(raw.is_some(), hpc);
+            let n = 30;
+            let hits = [hit(0, 10., &[(0, 0, n)]), hit(1, 10., &[(0, 0, n)])];
+            let cost = |tail_bonus| {
+                let tb = TieBreak {
+                    tail_bonus,
+                    ..Default::default()
+                };
+                m.segmented(&tb, &codes(&seq), raw.as_ref(), &hits).unwrap().0
             };
-            m.segmented(&tb, &codes(&seq), raw.as_ref(), &hits).unwrap().0
-        };
-        let (off, on) = (cost(0), cost(10));
-        assert_eq!(off[0], off[1]);
-        assert_eq!(on[0], off[0] - 10);
-        assert_eq!(on[1], off[1]);
+            let (off, on) = (cost(0), cost(10));
+            assert_eq!(off[0], off[1]);
+            assert_eq!(on[0], off[0] - 10);
+            assert_eq!(on[1], off[1]);
+        }
     }
 
     #[test]
