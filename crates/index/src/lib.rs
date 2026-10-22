@@ -31,12 +31,58 @@ fn base_at(words: &[u64], i: u32) -> u8 {
     ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8
 }
 
+/// The 8 bases of a 16-bit packed group, one 2-bit code per byte (base j in byte j).
+#[inline(always)]
+fn spread8(x: u64) -> u64 {
+    let x = (x | (x << 24)) & 0x0000_00ff_0000_00ff;
+    let x = (x | (x << 12)) & 0x000f_000f_000f_000f;
+    (x | (x << 6)) & 0x0303_0303_0303_0303
+}
+
+/// Bases of `words` from `i` into `dst` from `d`, 32 at a time while 32 remain before `hi`: each
+/// group of 8 spread to a code per byte and mapped by `f`. Returns where it stopped.
+#[inline(always)]
+fn decode_words(
+    words: &[u64],
+    mut i: u32,
+    hi: u32,
+    dst: &mut [u8],
+    mut d: usize,
+    f: impl Fn(u64) -> u64,
+) -> (u32, usize) {
+    while i + 32 <= hi {
+        let w = word_at(words, i);
+        for g in 0..4 {
+            let v = f(spread8((w >> (16 * g)) & 0xffff));
+            dst[d + 8 * g..d + 8 * g + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        i += 32;
+        d += 32;
+    }
+    (i, d)
+}
+
 /// Bases `[lo, hi)` of 2-bit packed `words`, through `map`, appended to `out` a word at a time.
 fn decode_into(words: &[u64], lo: u32, hi: u32, map: [u8; 4], out: &mut Vec<u8>) {
     let start = out.len();
     out.resize(start + (hi - lo) as usize, 0);
     let dst = &mut out[start..];
     let (mut i, mut d) = (lo, 0usize);
+    // Whole words 8 bases at a time: codes as they are, and other maps arithmetically, a base
+    // with code bits b1 b0 being m0 + b0 (m1 - m0) + b1 (m2 - m0) + b0 b1 (m3 - m2 - m1 + m0) in
+    // every byte at once. That is exact if no term is negative (no byte carries), as for ACGT.
+    let [m0, m1, m2, m3] = map.map(u64::from);
+    if map == [0, 1, 2, 3] {
+        (i, d) = decode_words(words, i, hi, dst, d, |c| c);
+    } else if m1 >= m0 && m2 >= m0 && m3 + m0 >= m1 + m2 {
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        let (c0, c1, c2, c3) = (m0 * ONES, m1 - m0, m2 - m0, m3 + m0 - m1 - m2);
+        (i, d) = decode_words(words, i, hi, dst, d, |c| {
+            let (b0, b1) = (c & ONES, (c >> 1) & ONES);
+            c0 + b0 * c1 + b1 * c2 + (b0 & b1) * c3
+        });
+    }
+    // The rest (and other maps) a word at a time.
     while i < hi {
         let w = words[(i / 32) as usize] >> (2 * (i % 32));
         let take = ((32 - i % 32).min(hi - i)) as usize;
@@ -788,10 +834,14 @@ mod packed_tests {
             let n = bases.len() as u32;
             let (lo, hi) = ((a as u32).min(n), (b as u32).min(n));
             let (lo, hi) = (lo.min(hi), lo.max(hi));
-            let mut got = Vec::new();
-            decode_into(&w, lo, hi, *b"ACGT", &mut got);
-            let want: Vec<u8> = (lo..hi).map(|i| b"ACGT"[base_at(&w, i) as usize]).collect();
-            prop_assert_eq!(got, want);
+            // Codes, ASCII (both decoded 32 at a time) and a map decoded base by base, appended.
+            for map in [[0, 1, 2, 3], *b"ACGT", [3, 2, 1, 0]] {
+                let mut got = b"xyz".to_vec();
+                decode_into(&w, lo, hi, map, &mut got);
+                let want: Vec<u8> =
+                    b"xyz".iter().copied().chain((lo..hi).map(|i| map[base_at(&w, i) as usize])).collect();
+                prop_assert_eq!(got, want);
+            }
             // A run start: position 0 or a change.
             let starts: Vec<u32> =
                 (0..n).filter(|&i| i == 0 || bases[i as usize] != bases[i as usize - 1]).collect();
