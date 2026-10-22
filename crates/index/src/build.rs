@@ -1,4 +1,4 @@
-//! Index construction (design doc, "Construction"), over any base-level seed scheme.
+//! Index construction, over any base-level seed scheme.
 //!
 //! 1. Seed every transcript (parallel).
 //! 2. Nodes are distinct seed labels; node id = rank of the label in sorted order.
@@ -198,10 +198,6 @@ fn raw_packing(raw: &[u8], h: &lcp_core::hpc::Hpc) -> (Vec<u64>, Vec<u32>) {
     (crate::pack2(raw), ck)
 }
 
-/// Transcript groups from shared seed runs: union-find over transcripts, linking all
-/// transcripts that hold a run unless more than `max_tx` do. Groups are named `group<k>`,
-/// numbered in order of their first transcript. Returns (group per transcript, names, largest
-/// group size).
 /// (run hash, transcript) for every run of `span` consecutive seeds, sorted and deduplicated.
 fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
     let span = span.max(1);
@@ -228,9 +224,9 @@ fn seed_runs(seeded: &[Seeded], span: usize) -> Vec<(u64, u32)> {
 /// The attach-only pass of [`InferGenes`]: each group of at most `attach_max` transcripts joins
 /// the larger group holding the most of its `attach_span`-seed runs (runs in at most `max_tx`
 /// transcripts), if that group holds at least twice as many as any other.
-fn attach_small(seeded: &[Seeded], parent: &mut [u32], inf: InferGenes, find: fn(&mut [u32], u32) -> u32) {
-    let n = parent.len();
-    let root: Vec<u32> = (0..n as u32).map(|t| find(parent, t)).collect();
+fn attach_small(seeded: &[Seeded], uf: &mut Uf, inf: InferGenes) {
+    let n = uf.0.len();
+    let root: Vec<u32> = (0..n as u32).map(|t| uf.find(t)).collect();
     let mut size: HashMap<u32, usize> = HashMap::new();
     for &r in &root {
         *size.entry(r).or_default() += 1;
@@ -268,23 +264,16 @@ fn attach_small(seeded: &[Seeded], parent: &mut [u32], inf: InferGenes, find: fn
     }
     for (a, (b, top, second)) in best {
         if top >= 2 * second.max(1) {
-            parent[a as usize] = b;
+            uf.0[a as usize] = b;
         }
     }
 }
 
-fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
-    let n = txs.len();
-    let max_tx = inf.max_tx;
-    let pairs = seed_runs(seeded, inf.span);
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            parent[x as usize] = parent[parent[x as usize] as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
+/// Union-find over `n` transcripts linking all transcripts that hold a run (`pairs` as
+/// [`seed_runs`] gives them) unless more than `max_tx` do. Union by smaller index keeps roots
+/// at a group's first transcript.
+fn link_runs(n: usize, pairs: &[(u64, u32)], max_tx: u32) -> Uf {
+    let mut uf = Uf((0..n as u32).collect());
     let mut i = 0;
     while i < pairs.len() {
         let mut j = i + 1;
@@ -292,27 +281,31 @@ fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>
             j += 1;
         }
         if j - i > 1 && j - i <= max_tx as usize {
-            let r0 = find(&mut parent, pairs[i].1);
             for &(_, t) in &pairs[i + 1..j] {
-                let r = find(&mut parent, t);
-                if r != r0 {
-                    // Union by smaller index keeps roots at a group's first transcript.
-                    let (a, b) = if r < r0 { (r, r0) } else { (r0, r) };
-                    parent[b as usize] = a;
-                }
+                uf.union(pairs[i].1, t);
             }
         }
         i = j;
     }
+    uf
+}
+
+/// Transcript groups from shared seed runs ([`link_runs`], then [`attach_small`]). Groups are
+/// named `group<k>`, numbered in order of their first transcript. Returns (group per
+/// transcript, names, largest group size).
+fn infer_genes(txs: &[TxInput], seeded: &[Seeded], inf: InferGenes) -> (Vec<u32>, Vec<String>, usize) {
+    let n = txs.len();
+    let pairs = seed_runs(seeded, inf.span);
+    let mut uf = link_runs(n, &pairs, inf.max_tx);
     drop(pairs);
     if inf.attach_span > 0 {
-        attach_small(seeded, &mut parent, inf, find);
+        attach_small(seeded, &mut uf, inf);
     }
     let mut group_of_root: HashMap<u32, u32> = HashMap::new();
     let mut size: Vec<usize> = Vec::new();
     let tx_gene: Vec<u32> = (0..n as u32)
         .map(|t| {
-            let r = find(&mut parent, t);
+            let r = uf.find(t);
             let g = *group_of_root.entry(r).or_insert_with(|| {
                 size.push(0);
                 size.len() as u32 - 1
@@ -768,4 +761,24 @@ pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, Build
     rep.tx_gene = data.tx_gene.clone();
     rep.gene_names = gene_names;
     Ok((data, rep))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every transcript holding a run joins one group, however the groups it links were rooted.
+    #[test]
+    fn runs_link_all_their_groups() {
+        // Runs 1 and 2 make groups {0, 10} and {1, 11}; run 3, held by 5, 10 and 11, joins
+        // both with {5}.
+        let pairs = [(1, 0), (1, 10), (2, 1), (2, 11), (3, 5), (3, 10), (3, 11)];
+        let mut uf = link_runs(12, &pairs, 64);
+        let roots: Vec<u32> = [0, 1, 5, 10, 11].iter().map(|&t| uf.find(t)).collect();
+        assert_eq!(roots, [0; 5]);
+        // Runs held by more than max_tx transcripts link nothing.
+        let mut uf = link_runs(12, &pairs, 2);
+        assert_ne!(uf.find(5), uf.find(10));
+        assert_eq!(uf.find(11), 1);
+    }
 }

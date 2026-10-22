@@ -1,5 +1,4 @@
-//! spearfish as a library: build or load an index, map long reads to the transcriptome,
-//! and quantify.
+//! spearfish as a library: build or load an index and map long reads to the transcriptome.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -34,7 +33,7 @@ pub mod settings;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use index::{BuildParams, Collapse, TxInput};
 use lcp_core::hpc::Hpc;
 use map::{AnyChainer, OracleChainer, RefineChainer};
@@ -43,14 +42,13 @@ use serde::{Deserialize, Serialize};
 pub use index::{BuildReport, InferGenes};
 pub use map::align::Affine;
 pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands, TieBreak};
-pub use quant;
 pub use settings::{MapSettings, RescueWindow};
 
 /// Scale of score differences: a hit scoring `d` below its read's best is `exp(-d /
-/// SCORE_DENOM)` times as likely. spearfish's scores are on minimap2's alignment-score scale;
-/// D = 1 was the sharpest weighting tried with oarfish's EM on simulated reads and gave the
-/// most accurate estimates (minimap2 alignments do best with a wider D, e.g. oarfish's 3).
-/// RAD output records it, and oarfish's spearfish backend uses it.
+/// SCORE_DENOM)` times as likely. spearfish's scores are on minimap2's alignment-score scale.
+/// RAD output records it. oarfish's spearfish backend weighs hits with this D = 1, in-process
+/// and from RAD files alike (it scales scores by 10 and uses a denominator of 10); for
+/// minimap2 alignments, oarfish uses its own default.
 pub const SCORE_DENOM: f32 = 1.0;
 
 /// Read technology / protocol presets.
@@ -69,12 +67,10 @@ pub enum Preset {
 impl std::str::FromStr for Preset {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        Ok(match s {
-            "ont" => Preset::Ont,
-            "drna" => Preset::Drna,
-            "hifi" => Preset::Hifi,
-            x => bail!("unknown preset {x:?} (ont, drna, hifi)"),
-        })
+        Preset::ALL
+            .into_iter()
+            .find(|p| p.name() == s)
+            .ok_or_else(|| anyhow::anyhow!("unknown preset {s:?} (ont, drna, hifi)"))
     }
 }
 
@@ -197,16 +193,6 @@ impl MapOptions {
             chainer: ChainerKind::Oracle,
         }
     }
-
-    /// Mutable access to the tie-break options (None if disabled).
-    pub fn tiebreak_mut(&mut self) -> Option<&mut TieBreak> {
-        self.params.tiebreak.as_mut()
-    }
-
-    /// Mutable access to the chaining parameters.
-    pub fn chain_mut(&mut self) -> &mut ChainParams {
-        &mut self.params.chain
-    }
 }
 
 impl Default for MapOptions {
@@ -222,6 +208,7 @@ impl Default for MapOptions {
 /// assert!(opts.hpc);
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct IndexOptions {
     /// Base seed scheme (its highest level is used), e.g. `lcp:K=3` or `minimizer:k=19,w=23`.
     #[builder(into, default = "lcp:K=3".to_string())]
@@ -254,6 +241,7 @@ impl Default for IndexOptions {
 /// at most `attach_max` transcripts join the one larger group they share runs of
 /// `attach_span` seeds with (0: no attach pass).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct InferGenesOptions {
     /// Ignore runs held by more than this many transcripts (repeats).
     #[builder(default = 64)]
@@ -404,7 +392,7 @@ impl Index {
     }
 
     /// What built the index and from what (see [`provenance::IndexManifest`]); `None` for
-    /// an index written before manifests were recorded.
+    /// an index written before manifests were recorded, or whose manifest can't be read.
     pub fn manifest(&self) -> Option<provenance::IndexManifest> {
         provenance::IndexManifest::of(&self.inner)
     }
@@ -416,23 +404,21 @@ impl Index {
     }
 }
 
-/// Name and gene from a FASTA ID: GENCODE-style `tx|gene|...`, else the ID (up to
-/// whitespace) for both.
+/// Name and gene from a FASTA ID, up to the first whitespace (a description is ignored):
+/// GENCODE-style `tx|gene|...`; with no gene field, or an empty one, the name for both.
 pub fn name_and_gene(id: &str) -> (String, String) {
+    let id = id.split_whitespace().next().unwrap_or("");
     let mut f = id.split('|');
-    let name = f
+    let name = f.next().unwrap_or("").to_string();
+    let gene = f
         .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let gene = f.next().map_or_else(|| name.clone(), String::from);
+        .filter(|g| !g.is_empty())
+        .map_or_else(|| name.clone(), String::from);
     (name, gene)
 }
 
 /// Read transcripts from a (optionally compressed) FASTA as (name, gene, sequence), names
-/// and genes as [`name_and_gene`] splits the IDs.
+/// and genes as [`name_and_gene`] splits the IDs (bytes that are not UTF-8 become U+FFFD).
 #[cfg(feature = "fasta")]
 pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     use paraseq::{ReaderBuilder, Record};
@@ -442,7 +428,7 @@ pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
             let rec = rec?;
-            let (name, gene) = name_and_gene(rec.id_str());
+            let (name, gene) = name_and_gene(&String::from_utf8_lossy(rec.id()));
             txs.push((name, gene, rec.seq().into_owned()));
         }
     }
@@ -610,5 +596,35 @@ impl Mapper {
             low_coverage: r.low_coverage,
             rescued: r.rescued,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_and_genes_from_headers() {
+        for (id, name, gene) in [
+            ("ENST1.1|ENSG1.2|-|-|A-201|A|100|lncRNA|", "ENST1.1", "ENSG1.2"),
+            ("tx1", "tx1", "tx1"),
+            // A description is not part of the ID, even when it holds a '|'.
+            ("tx1 desc", "tx1", "tx1"),
+            ("tx1 product a|b", "tx1", "tx1"),
+            ("tx1|g1 some desc", "tx1", "g1"),
+            // An empty gene field is no gene field.
+            ("tx1|", "tx1", "tx1"),
+            ("tx1||x", "tx1", "tx1"),
+        ] {
+            assert_eq!(name_and_gene(id), (name.into(), gene.into()), "{id}");
+        }
+    }
+
+    #[test]
+    fn presets_parse_by_name() {
+        for p in Preset::ALL {
+            assert_eq!(p.name().parse::<Preset>().unwrap(), p);
+        }
+        assert!("clr".parse::<Preset>().is_err());
     }
 }

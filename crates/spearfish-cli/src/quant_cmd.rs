@@ -11,7 +11,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::map_args::MapArgs;
-use crate::map_cmd::{Codec, Job, execute};
+use crate::map_cmd::{Codec, DEFAULT_BATCH_SIZE, Job, execute};
+use crate::runinfo::with_suffix;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -65,16 +66,10 @@ fn find_oarfish(given: Option<PathBuf>) -> Result<PathBuf> {
     Ok(bin)
 }
 
-fn with_suffix(prefix: &std::path::Path, suffix: &str) -> PathBuf {
-    let mut s = prefix.as_os_str().to_owned();
-    s.push(suffix);
-    s.into()
-}
-
 pub fn run(args: Args) -> Result<()> {
     let oarfish = find_oarfish(args.oarfish.clone())?;
     if let Some(dir) = args.output.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let threads = crate::runinfo::threads(args.threads);
     let rad = with_suffix(&args.output, ".rad");
@@ -85,9 +80,9 @@ pub fn run(args: Args) -> Result<()> {
         output: None,
         paf: None,
         rad: Some(rad.clone()),
-        rad_codec: Codec::Lz4,
+        rad_codec: Codec::default(),
         meta: Some(with_suffix(&args.output, ".map.meta.json")),
-        batch_size: 32,
+        batch_size: DEFAULT_BATCH_SIZE,
         settings: args.settings.settings(),
     })?;
     let mut cmd = Command::new(&oarfish);
@@ -105,7 +100,9 @@ pub fn run(args: Args) -> Result<()> {
     let log_path = with_suffix(&args.output, ".oarfish.log");
     let to_file = log::max_level() < log::LevelFilter::Debug;
     if to_file {
-        cmd.stderr(std::fs::File::create(&log_path)?);
+        cmd.stderr(
+            std::fs::File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?,
+        );
     }
     if to_file || !std::io::stderr().is_terminal() {
         cmd.env("NO_COLOR", "1");
@@ -114,18 +111,24 @@ pub fn run(args: Args) -> Result<()> {
     let status = cmd
         .status()
         .with_context(|| format!("running {}", oarfish.display()))?;
-    if !args.keep_rad {
-        let _ = std::fs::remove_file(&rad);
-    }
+    // The RAD file is kept if oarfish fails, so it can be rerun without mapping again.
     if !status.success() {
+        let mut log = String::new();
         if to_file {
             let text = std::fs::read_to_string(&log_path).unwrap_or_default();
             let tail: Vec<&str> = text.lines().rev().take(20).collect();
             for l in tail.into_iter().rev() {
                 eprintln!("  oarfish: {l}");
             }
+            log = format!("; its log is {}", log_path.display());
         }
-        bail!("oarfish failed ({status}); its log is {}", log_path.display());
+        bail!(
+            "oarfish failed ({status}){log}; the mapping is kept in {} (quantify it with `oarfish -a`)",
+            rad.display()
+        );
+    }
+    if !args.keep_rad {
+        let _ = std::fs::remove_file(&rad);
     }
     log::info!(
         "quant: estimates in {}",

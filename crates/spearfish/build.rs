@@ -18,13 +18,19 @@ fn main() {
         .or_else(|| git(&["describe", "--always", "--dirty", "--abbrev=12"]))
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=SPEARFISH_GIT={rev}");
-    // Rebuild when HEAD moves or the working tree's index changes (commits, checkouts).
-    // (Only existing files: Cargo reruns the script on every build for a missing one.)
+    // Rebuild when HEAD moves or the working tree's index changes (commits, checkouts), and
+    // when the workspace's sources change, which may make the tree dirty without touching
+    // the git index. (Only existing paths: Cargo reruns the script on every build for a
+    // missing one.)
     let watch = |p: String| {
         if std::path::Path::new(&p).exists() {
             println!("cargo:rerun-if-changed={p}");
         }
     };
+    let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    for p in ["crates", "Cargo.toml", "Cargo.lock"] {
+        watch(format!("{crate_dir}/../../{p}"));
+    }
     if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
         watch(format!("{dir}/HEAD"));
         watch(format!("{dir}/index"));
