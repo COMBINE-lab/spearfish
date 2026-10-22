@@ -71,6 +71,12 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- Less work per read outside the alignment and chaining kernels: the read is compressed once
+  (the library reuses the mapper's homopolymer runs for query spans), TSV and PAF lines are
+  written without `core::fmt`, packed bases are decoded 8 at a time, LCP core ends and the
+  first DCT step skip redundant work, and one orientation's hits are sorted by cached keys.
+  9-12% fewer instructions (ONT cDNA, direct RNA, PacBio and simulated reads) and 4-8% fewer
+  cycles single-threaded, with identical output.
 
 ### Fixes
 
