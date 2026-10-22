@@ -28,6 +28,11 @@ pub trait SeedScheme: Send + Sync {
             out.extend(l.cores.iter().map(|c| (c.label, c.start, c.end)));
         }
     }
+    /// [`Self::top_into`] of a sequence given as 2-bit codes (A=0, C=1, G=2, T=3).
+    fn top_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32, u32)>) {
+        let seq: Vec<u8> = codes.iter().map(|&c| b"ACGT"[c as usize]).collect();
+        self.top_into(&seq, out)
+    }
     /// Canonical spec string; `from_spec(&s.name())` rebuilds the scheme.
     fn name(&self) -> String;
 }
@@ -51,6 +56,13 @@ impl SeedScheme for LcpSeeds {
         PARSE.with(|sc| {
             self.parser
                 .top_cores(seq, self.max_level, &mut sc.borrow_mut(), out)
+        });
+    }
+
+    fn top_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32, u32)>) {
+        PARSE.with(|sc| {
+            self.parser
+                .top_cores_codes(codes, self.max_level, &mut sc.borrow_mut(), out)
         });
     }
 

@@ -89,6 +89,7 @@ struct Scratch {
     read_next: Vec<u32>,
     tx: Vec<Seed>,
     tmp: Vec<(u64, u32, u32)>,
+    /// A transcript window, as 2-bit codes.
     tseq: Vec<u8>,
     /// One window's points as (seed index in `read` << 32 | window start).
     keys: Vec<u64>,
@@ -187,10 +188,10 @@ impl Rescuer {
     }
 
     /// Points of the read's rescue seeds (`sc.read`, see [`Self::seed_read`]) against one
-    /// transcript window sequence, sorted by (qs, ts), appended to `sc.pool`. Seeds have
-    /// distinct starts on either side, so (qs, ts) is unique and fixes the order.
+    /// transcript window `tseq` (2-bit codes), sorted by (qs, ts), appended to `sc.pool`.
+    /// Seeds have distinct starts on either side, so (qs, ts) is unique and fixes the order.
     fn points_in(&self, tseq: &[u8], sc: &mut Scratch) {
-        self.seeder.seed_parsed_into(tseq, &mut sc.tx, &mut sc.tmp);
+        self.seeder.seed_codes_into(tseq, &mut sc.tx, &mut sc.tmp);
         // Hash join on labels: each window seed probes the read's label table. A point is
         // packed as its read seed's index and its window start: read seeds are in start order,
         // so sorting the keys sorts the points by (qs, ts), and the rest comes from the seed.
@@ -288,7 +289,7 @@ impl Rescuer {
                     None => (0, tlen),
                 };
                 sc.tseq.clear();
-                idx.tx_codes_into(t, lo, hi, &mut sc.tseq, true);
+                idx.tx_codes_into(t, lo, hi, &mut sc.tseq, false);
                 let key = (xxhash_rust::xxh3::xxh3_64(&sc.tseq), sc.tseq.len() as u32);
                 let r = match sc.seen.get(&key) {
                     Some(&r) => r,
@@ -396,7 +397,8 @@ mod tests {
                 len: 2,
                 w: 2.0,
             });
-            r.points_in(&tseq, &mut sc);
+            let codes: Vec<u8> = tseq.iter().map(|&b| lcp_core::encode::CODE[b as usize]).collect();
+            r.points_in(&codes, &mut sc);
             let got: Vec<_> = sc
                 .pool
                 .iter()

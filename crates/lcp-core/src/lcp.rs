@@ -183,32 +183,69 @@ impl LcpParser {
     /// identical to `parse(seq, k).level(k)` but without building the hierarchy, reusing the
     /// buffers in `sc`.
     pub fn top_cores(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
+        self.top::<false>(seq, k, sc, out)
+    }
+
+    /// [`Self::top_cores`] of a sequence given as 2-bit codes (A=0, C=1, G=2, T=3; one run,
+    /// no other bases): the same cores as for its ACGT spelling, without encoding it.
+    pub fn top_cores_codes(
+        &self,
+        codes: &[u8],
+        k: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+    ) {
+        debug_assert!(codes.iter().all(|&c| c < 4));
+        self.top::<true>(codes, k, sc, out)
+    }
+
+    /// `top_cores` (`seq` is ACGT text) or `top_cores_codes` (`CODES`: `seq` is codes).
+    #[inline(always)]
+    fn top<const CODES: bool>(
+        &self,
+        seq: &[u8],
+        k: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+    ) {
         match simd::active() {
             #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx512 => unsafe { self.top_cores_avx512(seq, k, sc, out) },
+            SimdLevel::Avx512 => unsafe { self.top_cores_avx512::<CODES>(seq, k, sc, out) },
             #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx2 => unsafe { self.top_cores_avx2(seq, k, sc, out) },
+            SimdLevel::Avx2 => unsafe { self.top_cores_avx2::<CODES>(seq, k, sc, out) },
             // NEON is part of the aarch64 baseline: no entry point of its own.
             #[cfg(target_arch = "aarch64")]
-            SimdLevel::Neon => self.top_cores_at(SimdLevel::Neon, seq, k, sc, out),
-            _ => self.top_cores_at(SimdLevel::Scalar, seq, k, sc, out),
+            SimdLevel::Neon => self.top_cores_at::<CODES>(SimdLevel::Neon, seq, k, sc, out),
+            _ => self.top_cores_at::<CODES>(SimdLevel::Scalar, seq, k, sc, out),
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-    fn top_cores_avx512(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
-        self.top_cores_at(SimdLevel::Avx512, seq, k, sc, out)
+    fn top_cores_avx512<const CODES: bool>(
+        &self,
+        seq: &[u8],
+        k: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+    ) {
+        self.top_cores_at::<CODES>(SimdLevel::Avx512, seq, k, sc, out)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-    fn top_cores_avx2(&self, seq: &[u8], k: u8, sc: &mut ParseScratch, out: &mut Vec<(u64, u32, u32)>) {
-        self.top_cores_at(SimdLevel::Avx2, seq, k, sc, out)
+    fn top_cores_avx2<const CODES: bool>(
+        &self,
+        seq: &[u8],
+        k: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+    ) {
+        self.top_cores_at::<CODES>(SimdLevel::Avx2, seq, k, sc, out)
     }
 
     #[inline(always)]
-    fn top_cores_at(
+    fn top_cores_at<const CODES: bool>(
         &self,
         simd: SimdLevel,
         seq: &[u8],
@@ -219,7 +256,12 @@ impl LcpParser {
         if k == 0 {
             return;
         }
-        let d = self.cfg.dct_iters as usize;
+        if CODES {
+            if !seq.is_empty() {
+                self.segment_cores(simd, seq, 0, k, sc, out);
+            }
+            return;
+        }
         let mut i = 0;
         while i < seq.len() {
             // Next maximal ACGT segment.
@@ -239,88 +281,104 @@ impl LcpParser {
             if sc.codes.is_empty() {
                 continue;
             }
-            // Level 1.
-            sc.spans.clear();
-            parse_spans(simd, &sc.codes, 0, &mut sc.spans);
-            let seed1 = self.level_seed(1);
-            let cur = &mut sc.lv[0];
-            cur.0.clear();
-            cur.1.clear();
-            cur.2.clear();
-            sc.bits[0].clear();
-            // Bit strings feed the next level's DCT: none needed for the top level.
-            let bits = &mut sc.bits[0];
-            let codes = &sc.codes;
-            if k > 1 {
-                cur.0.extend(
-                    sc.spans
-                        .iter()
-                        .map(|&(lo, hi)| level1(&codes[lo..hi], seed1, bits)),
-                );
-            } else {
-                let mut none = BitArena::default();
-                cur.0.extend(sc.spans.iter().map(|&(lo, hi)| {
-                    let l = level1(&codes[lo..hi], seed1, &mut none);
-                    none.clear();
-                    l
-                }));
-            }
-            cur.1.extend(sc.spans.iter().map(|s| s.0 as u32));
-            cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
-            let mut ci = 0; // index of the current level's buffers
-            for level in 2..=k {
-                let n = sc.lv[ci].0.len();
-                let ni = 1 - ci;
-                if n < d + 1 {
-                    sc.lv[ni].0.clear();
-                    sc.lv[ni].1.clear();
-                    sc.lv[ni].2.clear();
-                    ci = ni;
-                    break;
-                }
-                dct_into(&sc.bits[ci], d, &mut sc.vals);
-                sc.spans.clear();
-                parse_spans(simd, &sc.vals[d..], d, &mut sc.spans);
-                let seed = self.level_seed(level);
-                let (a, b) = sc.lv.split_at_mut(1);
-                let (prev, next) = if ci == 0 {
-                    (&a[0], &mut b[0])
-                } else {
-                    (&b[0], &mut a[0])
-                };
-                next.0.clear();
-                next.1.clear();
-                next.2.clear();
-                let (ba, bb) = sc.bits.split_at_mut(1);
-                let nbits = if ci == 0 { &mut bb[0] } else { &mut ba[0] };
-                nbits.clear();
-                next.0.extend(sc.spans.iter().map(|&(lo, hi)| {
-                    let s0 = prev.1[lo];
-                    label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed)
-                }));
-                next.1.extend(sc.spans.iter().map(|&(lo, _)| prev.1[lo]));
-                next.2.extend(
-                    sc.spans
-                        .iter()
-                        .map(|&(lo, hi)| prev.2[lo..hi].iter().copied().max().unwrap()),
-                );
-                if level < k {
-                    for &(lo, hi) in &sc.spans {
-                        nbits.push_values(&sc.vals[lo..hi]);
-                    }
-                }
-                ci = ni;
-            }
-            let top = &sc.lv[ci];
-            let o = off as u32;
-            out.extend(
-                top.0
-                    .iter()
-                    .zip(&top.1)
-                    .zip(&top.2)
-                    .map(|((&l, &s), &e)| (l, s + o, e + o)),
-            );
+            let codes = std::mem::take(&mut sc.codes);
+            self.segment_cores(simd, &codes, off as u32, k, sc, out);
+            sc.codes = codes;
         }
+    }
+
+    /// The level-`k` cores (`k >= 1`) of one non-empty run of 2-bit codes that starts at `o` in
+    /// the sequence, appended to `out`.
+    #[inline(always)]
+    fn segment_cores(
+        &self,
+        simd: SimdLevel,
+        codes: &[u8],
+        o: u32,
+        k: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+    ) {
+        let d = self.cfg.dct_iters as usize;
+        // Level 1.
+        sc.spans.clear();
+        parse_spans(simd, codes, 0, &mut sc.spans);
+        let seed1 = self.level_seed(1);
+        let cur = &mut sc.lv[0];
+        cur.0.clear();
+        cur.1.clear();
+        cur.2.clear();
+        sc.bits[0].clear();
+        // Bit strings feed the next level's DCT: none needed for the top level.
+        let bits = &mut sc.bits[0];
+        if k > 1 {
+            cur.0.extend(
+                sc.spans
+                    .iter()
+                    .map(|&(lo, hi)| level1(&codes[lo..hi], seed1, bits)),
+            );
+        } else {
+            let mut none = BitArena::default();
+            cur.0.extend(sc.spans.iter().map(|&(lo, hi)| {
+                let l = level1(&codes[lo..hi], seed1, &mut none);
+                none.clear();
+                l
+            }));
+        }
+        cur.1.extend(sc.spans.iter().map(|s| s.0 as u32));
+        cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
+        let mut ci = 0; // index of the current level's buffers
+        for level in 2..=k {
+            let n = sc.lv[ci].0.len();
+            let ni = 1 - ci;
+            if n < d + 1 {
+                sc.lv[ni].0.clear();
+                sc.lv[ni].1.clear();
+                sc.lv[ni].2.clear();
+                ci = ni;
+                break;
+            }
+            dct_into(&sc.bits[ci], d, &mut sc.vals);
+            sc.spans.clear();
+            parse_spans(simd, &sc.vals[d..], d, &mut sc.spans);
+            let seed = self.level_seed(level);
+            let (a, b) = sc.lv.split_at_mut(1);
+            let (prev, next) = if ci == 0 {
+                (&a[0], &mut b[0])
+            } else {
+                (&b[0], &mut a[0])
+            };
+            next.0.clear();
+            next.1.clear();
+            next.2.clear();
+            let (ba, bb) = sc.bits.split_at_mut(1);
+            let nbits = if ci == 0 { &mut bb[0] } else { &mut ba[0] };
+            nbits.clear();
+            next.0.extend(sc.spans.iter().map(|&(lo, hi)| {
+                let s0 = prev.1[lo];
+                label_k((lo..hi).map(|j| (prev.0[j], prev.1[j] - s0)), seed)
+            }));
+            next.1.extend(sc.spans.iter().map(|&(lo, _)| prev.1[lo]));
+            next.2.extend(
+                sc.spans
+                    .iter()
+                    .map(|&(lo, hi)| prev.2[lo..hi].iter().copied().max().unwrap()),
+            );
+            if level < k {
+                for &(lo, hi) in &sc.spans {
+                    nbits.push_values(&sc.vals[lo..hi]);
+                }
+            }
+            ci = ni;
+        }
+        let top = &sc.lv[ci];
+        out.extend(
+            top.0
+                .iter()
+                .zip(&top.1)
+                .zip(&top.2)
+                .map(|((&l, &s), &e)| (l, s + o, e + o)),
+        );
     }
 }
 
@@ -1064,6 +1122,25 @@ mod top_cores_tests {
             let mut again = Vec::new();
             p.top_cores(&seq, k, &mut sc, &mut again);
             prop_assert_eq!(again, want);
+        }
+
+        /// Parsing 2-bit codes equals parsing their ACGT spelling, also on scratch left over
+        /// from another parse.
+        #[test]
+        fn top_cores_codes_equal_ascii(
+            codes in prop::collection::vec(prop::sample::select(vec![0u8, 0, 1, 2, 3, 3, 3, 2]), 0..3000),
+            other in prop::collection::vec(prop::sample::select(b"AACGTTTGN".to_vec()), 0..500),
+            k in 1u8..=5,
+        ) {
+            let p = LcpParser::default();
+            let ascii: Vec<u8> = codes.iter().map(|&c| b"ACGT"[c as usize]).collect();
+            let mut want = Vec::new();
+            p.top_cores(&ascii, k, &mut ParseScratch::default(), &mut want);
+            let mut sc = ParseScratch::default();
+            p.top_cores(&other, k, &mut sc, &mut Vec::new());
+            let mut got = Vec::new();
+            p.top_cores_codes(&codes, k, &mut sc, &mut got);
+            prop_assert_eq!(got, want);
         }
     }
 }
