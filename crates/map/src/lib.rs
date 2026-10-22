@@ -1479,6 +1479,109 @@ fn tie_key(salt: u64, tx: u32) -> u64 {
 }
 
 #[cfg(test)]
+mod banded_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The sequential definition of [`Mapper::banded`]: one `distance_with` per distinct text,
+    /// in order, at the threshold `k` = best so far + `cap`; a repeated text takes its first
+    /// occurrence's distance re-capped at the current `k`.
+    fn sequential(read: &[u8], texts: &[Vec<u8>], mode: align::Mode, cap: u32) -> Vec<u32> {
+        let pat = align::Pattern::new(read);
+        let mut seen: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
+        let mut best = u32::MAX;
+        texts
+            .iter()
+            .map(|t| {
+                let k = best.saturating_add(cap);
+                if let Some(&d) = seen.get(t.as_slice()) {
+                    return if d <= k { d } else { k.saturating_add(1) };
+                }
+                let d = align::distance_with(&pat, t, mode, k).unwrap_or(k.saturating_add(1));
+                best = best.min(d);
+                seen.insert(t.as_slice(), d);
+                d
+            })
+            .collect()
+    }
+
+    /// `s` with substitutions (kind 0), insertions (1) and deletions (2) at positions taken
+    /// modulo its length.
+    fn mutate(s: &[u8], edits: &[(usize, u8, u8)]) -> Vec<u8> {
+        let mut v = s.to_vec();
+        for &(pos, b, kind) in edits {
+            if v.is_empty() {
+                if kind == 1 {
+                    v.push(b);
+                }
+                continue;
+            }
+            let i = pos % v.len();
+            match kind {
+                0 => v[i] = b,
+                1 => v.insert(i, b),
+                _ => {
+                    v.remove(i);
+                }
+            }
+        }
+        v
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// `banded` (distinct texts in batches, re-capped in order) equals the sequential
+        /// definition in every mode at every SIMD level: texts are mutated excerpts of the
+        /// read's source (as isoform regions are), some empty or unrelated, with repeats, and
+        /// caps range from 0 to near `u32::MAX` (where `k` saturates).
+        #[test]
+        fn banded_matches_sequential(
+            base in prop::collection::vec(0u8..4, 0..300),
+            read_edits in prop::collection::vec((0usize..300, 0u8..4, 0u8..3), 0..30),
+            variants in prop::collection::vec(
+                (
+                    prop::collection::vec((0usize..300, 0u8..4, 0u8..3), 0..40),
+                    0usize..40,
+                    0usize..40,
+                    any::<bool>(),
+                ),
+                1..24,
+            ),
+            repeats in prop::collection::vec((0usize..64, 0usize..64), 0..8),
+            cap in prop_oneof![0u32..6, 6u32..40, (u32::MAX - 3)..=u32::MAX],
+        ) {
+            let read = mutate(&base, &read_edits);
+            let mut texts: Vec<Vec<u8>> = variants
+                .iter()
+                .map(|(edits, a, b, unrelated)| {
+                    if *unrelated {
+                        edits.iter().map(|e| e.1).collect()
+                    } else {
+                        let t = mutate(&base, edits);
+                        let lo = (*a).min(t.len());
+                        let hi = t.len().saturating_sub(*b).max(lo);
+                        t[lo..hi].to_vec()
+                    }
+                })
+                .collect();
+            for (from, to) in repeats {
+                let t = texts[from % texts.len()].clone();
+                texts.insert(to % (texts.len() + 1), t);
+            }
+            for mode in [align::Mode::Global, align::Mode::Prefix, align::Mode::Infix] {
+                let want = sequential(&read, &texts, mode, cap);
+                for level in lcp_core::simd::supported() {
+                    let got =
+                        align::at_level(level, || Mapper::<OracleChainer>::banded(&read, &texts, mode, cap));
+                    prop_assert_eq!(&got, &want, "{:?} at {}", mode, level);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod segmented_tests {
     use super::*;
 
