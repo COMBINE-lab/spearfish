@@ -941,6 +941,37 @@ impl Rows for ScalarRows {
     }
 }
 
+/// Cells `k0..w` of a row one at a time: [`row_scalar`]'s steps fused per cell (no row
+/// buffers), with `carry` the horizontal-gap maximum entering cell `k0` and `m` the row's
+/// maximum so far, which it returns updated. The vector kernels' short rows and tails.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn cells_scalar(
+    hprev: &[i32],
+    fu: &[i32],
+    tx: &[u8],
+    nh: &mut [i32],
+    nf: &mut [i32],
+    c: u8,
+    (mat, mis, go, ext): (i32, i32, i32, i32),
+    k0: usize,
+    mut carry: i32,
+    mut m: i32,
+) -> i32 {
+    for k in k0..fu.len() {
+        let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
+        let s = if c == tx[k] & 3 { mat } else { -mis };
+        let x = (hprev[k] + s).max(fj).max(NEG);
+        let v = x.max(carry - ext * k as i32);
+        carry = carry.max(x - go + ext * (k as i32 + 1));
+        nh[k] = v;
+        nf[k] = fj;
+        m = m.max(v);
+    }
+    m
+}
+
 #[cfg(target_arch = "x86_64")]
 struct Avx512Rows;
 
@@ -1112,19 +1143,7 @@ unsafe fn row_avx2(
     assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
     (nh[w], nf[w]) = (NEG, NEG);
     if w < 8 {
-        // The scalar steps (`row_scalar` without its row buffers).
-        let (mut m, mut carry) = (NEG, e);
-        for k in 0..w {
-            let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
-            let s = if c == tx[k] & 3 { mat } else { -mis };
-            let x = (hprev[k] + s).max(fj).max(NEG);
-            let v = x.max(carry - ext * k as i32);
-            carry = carry.max(x - go + ext * (k as i32 + 1));
-            nh[k] = v;
-            nf[k] = fj;
-            m = m.max(v);
-        }
-        return m;
+        return cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), 0, e, NEG);
     }
     let neg = _mm256_set1_epi32(NEG);
     let (vgo, vext) = (_mm256_set1_epi32(go), _mm256_set1_epi32(ext));
@@ -1294,19 +1313,8 @@ unsafe fn row_neon(
         ek = vaddq_s32(ek, step);
         k += 4;
     }
-    let mut m = vmaxvq_s32(mx);
-    let mut g = vgetq_lane_s32::<0>(cv);
-    for k in k..w {
-        let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
-        let s = if c == tx[k] & 3 { mat } else { -mis };
-        let x = (hprev[k] + s).max(fj).max(NEG);
-        let v = x.max(g - ext * k as i32);
-        g = g.max(x - go + ext * (k as i32 + 1));
-        nh[k] = v;
-        nf[k] = fj;
-        m = m.max(v);
-    }
-    m
+    let (m, g) = (vmaxvq_s32(mx), vgetq_lane_s32::<0>(cv));
+    cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), k, g, m)
 }
 
 /// [`row_neon`] (NEON is part of the aarch64 baseline).
