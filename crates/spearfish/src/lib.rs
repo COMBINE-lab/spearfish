@@ -416,18 +416,16 @@ impl Index {
     }
 }
 
-/// Name and gene from a FASTA ID: GENCODE-style `tx|gene|...`, else the ID (up to
-/// whitespace) for both.
+/// Name and gene from a FASTA ID, up to the first whitespace (a description is ignored):
+/// GENCODE-style `tx|gene|...`; with no gene field, or an empty one, the name for both.
 pub fn name_and_gene(id: &str) -> (String, String) {
+    let id = id.split_whitespace().next().unwrap_or("");
     let mut f = id.split('|');
-    let name = f
+    let name = f.next().unwrap_or("").to_string();
+    let gene = f
         .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let gene = f.next().map_or_else(|| name.clone(), String::from);
+        .filter(|g| !g.is_empty())
+        .map_or_else(|| name.clone(), String::from);
     (name, gene)
 }
 
@@ -609,6 +607,28 @@ impl Mapper {
             hits,
             low_coverage: r.low_coverage,
             rescued: r.rescued,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_and_genes_from_headers() {
+        for (id, name, gene) in [
+            ("ENST1.1|ENSG1.2|-|-|A-201|A|100|lncRNA|", "ENST1.1", "ENSG1.2"),
+            ("tx1", "tx1", "tx1"),
+            // A description is not part of the ID, even when it holds a '|'.
+            ("tx1 desc", "tx1", "tx1"),
+            ("tx1 product a|b", "tx1", "tx1"),
+            ("tx1|g1 some desc", "tx1", "g1"),
+            // An empty gene field is no gene field.
+            ("tx1|", "tx1", "tx1"),
+            ("tx1||x", "tx1", "tx1"),
+        ] {
+            assert_eq!(name_and_gene(id), (name.into(), gene.into()), "{id}");
         }
     }
 }
