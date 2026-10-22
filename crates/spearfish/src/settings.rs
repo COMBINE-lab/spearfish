@@ -592,137 +592,45 @@ mod tests {
         assert!("10".parse::<RescueWindow>().is_err());
     }
 
+    /// The field names serde's derive passes to `deserialize_struct`, in declaration order.
+    fn serde_fields<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
+        use serde::de::{Error, Visitor, value};
+        struct Fields(&'static [&'static str]);
+        impl<'de> serde::Deserializer<'de> for &mut Fields {
+            type Error = value::Error;
+            fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, value::Error> {
+                Err(value::Error::custom("not a struct"))
+            }
+            fn deserialize_struct<V: Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, value::Error> {
+                self.0 = fields;
+                Err(value::Error::custom("recorded"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+                identifier ignored_any
+            }
+        }
+        let mut f = Fields(&[]);
+        let _ = T::deserialize(&mut f);
+        f.0
+    }
+
     #[test]
     fn field_list_is_complete() {
-        // An exhaustive pattern: adding a field without listing it in FIELDS fails here.
-        let MapSettings {
-            preset: _,
-            strands: _,
-            report_within: _,
-            min_coverage: _,
-            extend_ends: _,
-            extend_within: _,
-            keep_genes: _,
-            keep_genes_tie: _,
-            max_genes: _,
-            max_seed_genes: _,
-            min_gene_frac: _,
-            seed_span_cap: _,
-            seed_gene_weight_max: _,
-            chain_alpha: _,
-            chain_window: _,
-            chain_max_gap: _,
-            chain_max_overlap: _,
-            chain_beta: _,
-            merge_anchors: _,
-            chainer: _,
-            tiebreak: _,
-            tie_margin: _,
-            tie_margin_rel: _,
-            tie_cands: _,
-            tie_kappa: _,
-            tie_lambda: _,
-            tie_affine_within: _,
-            tie_group: _,
-            tie_cap: _,
-            tie_unit_cost: _,
-            tie_whole_read: _,
-            tie_whole_trim: _,
-            tie_orient_edit: _,
-            tie_flank_min: _,
-            clip_ends: _,
-            end_bonus: _,
-            xdrop: _,
-            band: _,
-            pad: _,
-            pad_div: _,
-            end_diagonal: _,
-            raw_ends: _,
-            tail_trim: _,
-            tail_run: _,
-            tail_bonus: _,
-            orient_tail: _,
-            orient_margin_rel: _,
-            rescue: _,
-            rescue_scheme: _,
-            rescue_genes: _,
-            rescue_genes_len: _,
-            rescue_tx: _,
-            rescue_alpha: _,
-            rescue_window: _,
-            rescue_other_margin: _,
-            rescue_other_always: _,
-            rescue_max_tx_len: _,
-        } = MapSettings::default();
-        assert_eq!(
-            MapSettings::FIELDS,
-            [
-                stringify!(preset),
-                stringify!(strands),
-                stringify!(report_within),
-                stringify!(min_coverage),
-                stringify!(extend_ends),
-                stringify!(extend_within),
-                stringify!(keep_genes),
-                stringify!(keep_genes_tie),
-                stringify!(max_genes),
-                stringify!(max_seed_genes),
-                stringify!(min_gene_frac),
-                stringify!(seed_span_cap),
-                stringify!(seed_gene_weight_max),
-                stringify!(chain_alpha),
-                stringify!(chain_window),
-                stringify!(chain_max_gap),
-                stringify!(chain_max_overlap),
-                stringify!(chain_beta),
-                stringify!(merge_anchors),
-                stringify!(chainer),
-                stringify!(tiebreak),
-                stringify!(tie_margin),
-                stringify!(tie_margin_rel),
-                stringify!(tie_cands),
-                stringify!(tie_kappa),
-                stringify!(tie_lambda),
-                stringify!(tie_affine_within),
-                stringify!(tie_group),
-                stringify!(tie_cap),
-                stringify!(tie_unit_cost),
-                stringify!(tie_whole_read),
-                stringify!(tie_whole_trim),
-                stringify!(tie_orient_edit),
-                stringify!(tie_flank_min),
-                stringify!(clip_ends),
-                stringify!(end_bonus),
-                stringify!(xdrop),
-                stringify!(band),
-                stringify!(pad),
-                stringify!(pad_div),
-                stringify!(end_diagonal),
-                stringify!(raw_ends),
-                stringify!(tail_trim),
-                stringify!(tail_run),
-                stringify!(tail_bonus),
-                stringify!(orient_tail),
-                stringify!(orient_margin_rel),
-                stringify!(rescue),
-                stringify!(rescue_scheme),
-                stringify!(rescue_genes),
-                stringify!(rescue_genes_len),
-                stringify!(rescue_tx),
-                stringify!(rescue_alpha),
-                stringify!(rescue_window),
-                stringify!(rescue_other_margin),
-                stringify!(rescue_other_always),
-                stringify!(rescue_max_tx_len)
-            ]
-        );
-        let mut j = serde_json::to_value(MapSettings::preset(Preset::Ont)).unwrap();
+        // FIELDS lists every field of the struct, in order: adding a field fails here until
+        // it is listed.
+        assert_eq!(MapSettings::FIELDS, serde_fields::<MapSettings>());
+        // Unset settings are left out of the JSON (the CLI's flag test relies on it).
+        let j = serde_json::to_value(MapSettings::preset(Preset::Ont)).unwrap();
         for f in MapSettings::FIELDS.iter().filter(|f| **f != "preset") {
-            assert!(j.get(*f).is_none());
-            j[*f] = serde_json::Value::Null;
+            assert!(j.get(*f).is_none(), "{f}");
         }
-        // Every listed name is a real field (unknown fields are rejected).
-        assert!(serde_json::from_value::<MapSettings>(j).is_ok());
     }
 
     #[test]
