@@ -95,23 +95,33 @@ Environment variables:
 ## Releasing
 
 Every crate shares the workspace version (`[workspace.package] version`), and the Python
-package takes it too. For a release `X.Y.Z`:
+package takes it too. `bump_and_publish.sh` cuts a release from a clean `main` that is in sync
+with `origin`:
 
-1. Set the version in the workspace `Cargo.toml` (and in its `version = "..."` entries for the
-   workspace's own crates), date its section in `CHANGELOG.md`, and merge.
-2. From that commit, publish the crates. Cargo publishes them in dependency order and skips
-   the two that are not for crates.io (`lcp-oracle-sys`, `py-spearfish`):
+1. Write the release notes in `CHANGELOG.md` under `## X.Y.Z (unreleased)`, and merge them.
+2. Log in to crates.io once (`cargo login`, with an API token), and check the plan:
 
    ```sh
-   cargo publish --workspace --dry-run    # every crate builds from its own package
-   cargo publish --workspace
+   ./bump_and_publish.sh X.Y.Z --publish --github-release --dry-run
    ```
 
-3. Tag the commit `vX.Y.Z`, push the tag, and make a GitHub release from it with the
-   changelog section. Its source tarball is what the bioconda recipe builds; update the
-   recipe's version and `sha256` (bioconda's bot proposes the bump for later releases).
-4. For the Python package, push a `py-spearfish-vX.Y.Z` tag
-   (`.github/workflows/publish-python.yml` builds, tests and publishes the wheels).
+3. Release:
+
+   ```sh
+   ./bump_and_publish.sh X.Y.Z --publish --github-release
+   ```
+
+   This sets the workspace version and the workspace's own dependency versions, dates the
+   CHANGELOG section, commits (`chore(release): spearfish vX.Y.Z`), checks that every crate
+   builds from its own package, publishes the crates to crates.io in dependency order, tags
+   `vX.Y.Z`, pushes the commit and the tag, and makes the GitHub release from the CHANGELOG
+   section. Crates already on crates.io at X.Y.Z are left out, so an interrupted release can
+   be re-run. If the workspace is already at X.Y.Z (as for 0.1.0), add `--allow-same-version`.
+   `--python` also tags `py-spearfish-vX.Y.Z`, which publishes the Python package to PyPI
+   (`.github/workflows/publish-python.yml`).
+
+4. The script prints the release tarball's URL and `sha256` for the bioconda recipe. bioconda's
+   bot proposes the version bump for later releases.
 
 oarfish's spearfish backend depends on `spearfish` and `long-read-rad` from crates.io, so an
 oarfish release that needs a new spearfish follows the crates.
