@@ -419,6 +419,10 @@ pub fn name_and_gene(id: &str) -> (String, String) {
 /// Open a FASTA/FASTQ file for reading (`None` or `-`: standard input), plain or compressed
 /// with gzip (BGZF included), bzip2 or zstd. `batch_size` sets the records per record set.
 ///
+/// Compressed input is decompressed on a thread of its own, ahead of the reader, so that
+/// decompression overlaps parsing and whatever consumes the records instead of running inside
+/// the reader (where paraseq's parallel processor serializes it).
+///
 /// xz-compressed input is an error that says so: xz support was dropped, since it needed a C
 /// library for a format reads rarely come in.
 #[cfg(feature = "fasta")]
@@ -426,17 +430,114 @@ pub fn open_fastx(
     path: Option<&Path>,
     batch_size: Option<usize>,
 ) -> Result<paraseq::fastx::Reader<paraseq::BoxedReader>> {
-    let mut b = paraseq::ReaderBuilder::optional_path(path.filter(|p| p.as_os_str() != "-"));
-    if let Some(n) = batch_size {
-        b = b.batch_size(n);
-    }
-    b.build().map_err(|e| match e {
+    use niffler::send::compression::Format;
+    let src: paraseq::BoxedReader = match path.filter(|p| p.as_os_str() != "-") {
+        Some(p) => Box::new(std::io::BufReader::new(std::fs::File::open(p)?)),
+        None => Box::new(std::io::stdin()),
+    };
+    let (stream, format) = niffler::send::get_reader(src).map_err(|e| match e {
         // The one format spearfish's build leaves out.
-        paraseq::Error::Niffler(niffler::Error::FeatureDisabled) => anyhow::anyhow!(
+        niffler::Error::FeatureDisabled => anyhow::anyhow!(
             "xz-compressed input is not supported: decompress it (xz -d), or recompress it with gzip or zstd"
         ),
         e => e.into(),
-    })
+    })?;
+    let stream: paraseq::BoxedReader = match format {
+        Format::No => stream,
+        _ => Box::new(ReadAhead::spawn(stream)?),
+    };
+    let mut reader = paraseq::fastx::Reader::new(stream)?;
+    if let Some(n) = batch_size {
+        reader.set_batch_size(n)?;
+    }
+    Ok(reader)
+}
+
+/// A reader fed by a thread that reads `inner` ahead in blocks (a bounded number in flight).
+/// The thread stops at the end of `inner`, after an error (passed on), or when this is dropped.
+#[cfg(feature = "fasta")]
+struct ReadAhead {
+    blocks: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    block: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+#[cfg(feature = "fasta")]
+impl ReadAhead {
+    /// Bytes per block.
+    const BLOCK: usize = 1 << 20;
+    /// Blocks read ahead.
+    const AHEAD: usize = 4;
+
+    fn spawn(mut inner: paraseq::BoxedReader) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(Self::AHEAD);
+        std::thread::Builder::new()
+            .name("spearfish-decompress".into())
+            .spawn(move || {
+                loop {
+                    let mut block = vec![0u8; Self::BLOCK];
+                    let mut n = 0;
+                    let res = loop {
+                        match inner.read(&mut block[n..]) {
+                            Ok(0) => break Ok(()),
+                            Ok(k) => {
+                                n += k;
+                                if n == block.len() {
+                                    break Ok(());
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    block.truncate(n);
+                    let last = n < Self::BLOCK || res.is_err();
+                    if n > 0 && tx.send(Ok(block)).is_err() {
+                        return;
+                    }
+                    if let Err(e) = res {
+                        let _ = tx.send(Err(e));
+                    }
+                    if last {
+                        return;
+                    }
+                }
+            })?;
+        Ok(ReadAhead {
+            blocks: rx,
+            block: Vec::new(),
+            pos: 0,
+            done: false,
+        })
+    }
+}
+
+#[cfg(feature = "fasta")]
+impl std::io::Read for ReadAhead {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.block.len() {
+            if self.done {
+                return Ok(0);
+            }
+            match self.blocks.recv() {
+                Ok(Ok(b)) => {
+                    self.block = b;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                // The thread is done: the end of the input.
+                Err(_) => self.done = true,
+            }
+        }
+        let n = out.len().min(self.block.len() - self.pos);
+        out[..n].copy_from_slice(&self.block[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 /// Read transcripts from a (optionally compressed) FASTA as (name, gene, sequence), names
