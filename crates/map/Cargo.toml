@@ -1,10 +1,12 @@
 [package]
-name = "map"
+name = "spearfish-map"
+description = "Long-read mapping for spearfish: seeding, candidate genes, exact chaining shared across isoforms, and base-level tie-breaking"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true

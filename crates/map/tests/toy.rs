@@ -1,6 +1,7 @@
 //! End-to-end mapping on the toy transcriptome: reads from each transcript, on both strands,
 //! must map with their own transcript on top (exon skip, alternative 3' site, paralogs).
 
+extern crate spearfish_map as map;
 use std::path::PathBuf;
 
 use index::{BuildParams, Collapse, Index, TxInput, build};

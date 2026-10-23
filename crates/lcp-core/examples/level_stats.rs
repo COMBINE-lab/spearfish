@@ -1,5 +1,8 @@
 //! Per-level core counts and mean lengths for a random sequence, compared with lcptools,
 //! plus single-thread parse throughput. Usage: level_stats [len] [max_level]
+
+extern crate spearfish_lcp as lcp_core;
+
 use lcp_core::{LcpParser, Parser};
 
 fn main() {

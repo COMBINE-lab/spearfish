@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["bioinformatics", "rna-seq", "long-reads", "transcriptome", "mapping"]
+categories = ["science::bioinformatics", "command-line-utilities"]
 
 [[bin]]
 name = "spearfish"
@@ -25,7 +29,6 @@ rustc-hash.workspace = true
 rayon.workspace = true
 index.workspace = true
 map.workspace = true
-quant.workspace = true
 seeds.workspace = true
 xxhash-rust.workspace = true
 serde.workspace = true

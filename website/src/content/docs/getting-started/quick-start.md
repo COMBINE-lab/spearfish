@@ -41,10 +41,12 @@ Use `--preset drna` for ONT direct RNA and `--preset hifi` for PacBio HiFi
 ([Mapping reads](/spearfish/guide/mapping/)). Add `--paf sample.paf` for PAF output, or
 `--rad sample.rad` for oarfish.
 
-To go from reads to transcript abundances in one step, with oarfish installed:
+For transcript abundances, quantify the RAD file with
+[oarfish](https://github.com/COMBINE-lab/oarfish), or let oarfish map with spearfish itself:
 
 ```sh
-spearfish quant gencode_v50.sfi sample.fastq.gz --preset ont -t 16 -o sample
+spearfish map gencode_v50.sfi sample.fastq.gz --preset ont -t 16 --rad sample.rad
+oarfish -a sample.rad -j 16 -o sample
 ```
 
 This writes oarfish's estimates to `sample.quant` ([Quantification](/spearfish/guide/quantification/)).

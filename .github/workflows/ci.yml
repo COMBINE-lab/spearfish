@@ -47,6 +47,10 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked --workspace
       - run: python3 fixtures/toy/make_toy.py && git diff --exit-code fixtures/toy
+      # The crates as crates.io would get them: each builds from its own package (files outside
+      # a crate, such as fixtures, must be linked into it).
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo package --workspace --exclude lcp-oracle-sys --exclude py-spearfish
       # The SIMD level the tests ran at depends on the runner's CPU (hosted x86-64 runners may
       # lack AVX-512): the job summary shows it.
       - name: doctor

@@ -10,17 +10,17 @@ edition = "2024"
 rust-version = "1.89"
 version = "0.1.0"
 license = "BSD-3-Clause"
-publish = false
+repository = "https://github.com/COMBINE-lab/spearfish"
+homepage = "https://combine-lab.github.io/spearfish/"
 
 [workspace.dependencies]
-lcp-core = { path = "crates/lcp-core" }
+lcp-core = { package = "spearfish-lcp", path = "crates/lcp-core", version = "0.1.0" }
 lcp-oracle-sys = { path = "crates/lcp-oracle-sys" }
-seeds = { path = "crates/seeds" }
-index = { path = "crates/index" }
-map = { path = "crates/map" }
-quant = { path = "crates/quant" }
-spearfish = { path = "crates/spearfish" }
-long-read-rad = { path = "crates/rad" }
+seeds = { package = "spearfish-seeds", path = "crates/seeds", version = "0.1.0" }
+index = { package = "spearfish-index", path = "crates/index", version = "0.1.0" }
+map = { package = "spearfish-map", path = "crates/map", version = "0.1.0" }
+spearfish = { path = "crates/spearfish", version = "0.1.0" }
+long-read-rad = { path = "crates/rad", version = "0.1.0" }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 proptest = "1.11"
 cc = "1.5"

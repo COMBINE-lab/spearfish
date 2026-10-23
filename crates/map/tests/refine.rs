@@ -2,6 +2,7 @@
 //! exactly, on random multi-isoform genes (alternative exons, repeated exons) and reads drawn
 //! from them with errors.
 
+extern crate spearfish_map as map;
 use std::collections::BTreeMap;
 
 use index::{BuildParams, Collapse, Index, TxInput, build};

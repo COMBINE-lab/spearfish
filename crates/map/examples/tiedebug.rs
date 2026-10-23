@@ -2,6 +2,9 @@
 //! the full parsed transcript (infix) and against the transcript's suffix/prefix around the
 //! chain, to see where tied isoforms gain or lose edits.
 //! Usage: tiedebug <index> <reads.fa|fq> <read name> [max hits]
+
+extern crate spearfish_map as map;
+
 use std::sync::Arc;
 
 use index::Index;

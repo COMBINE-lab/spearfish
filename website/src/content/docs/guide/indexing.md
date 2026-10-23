@@ -28,17 +28,17 @@ transcripts belong together. There are three ways to tell it:
 
 If your transcripts carry no gene IDs and you have no table, use `--infer-genes`: on human
 GENCODE, inferred groups do as well as the annotated genes. On simulated ONT reads (95%
-accuracy), 98.5% of reads rank their true transcript first and 99.3% keep it among the reported
+accuracy), 98.7% of reads rank their true transcript first and 99.4% keep it among the reported
 transcripts with either, and the index is the same size (1.3 GB).
 
 Without any of these, every transcript is its own gene and `spearfish index` prints a warning.
 Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB, mapping takes more
-time and memory, and fewer reads are assigned to the right transcript (top-1 falls from 98.5% to
-97.2% on the same reads, and the true transcript is among those reported for 97.9% instead of
-99.3%), because the per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
+time and memory, and fewer reads are assigned to the right transcript (top-1 falls from 98.7% to
+97.6% on the same reads, and the true transcript is among those reported for 98.2% instead of
+99.4%), because the per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
 writes the grouping that was used.
 
-For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in about 8 seconds on
+For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in about 4 seconds on
 32 threads. Map against an index built from the same transcript FASTA you quantify against.
 
 ## What the index holds

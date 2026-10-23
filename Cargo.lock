@@ -550,20 +550,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "index"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "lcp-core",
- "memmap2",
- "proptest",
- "rayon",
- "seeds",
- "xxhash-rust",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -636,15 +622,6 @@ name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
-
-[[package]]
-name = "lcp-core"
-version = "0.1.0"
-dependencies = [
- "lcp-oracle-sys",
- "proptest",
- "xxhash-rust",
-]
 
 [[package]]
 name = "lcp-oracle-sys"
@@ -749,20 +726,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
-]
-
-[[package]]
-name = "map"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "index",
- "lcp-core",
- "proptest",
- "rustc-hash",
- "seeds",
- "serde",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1134,13 +1097,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quant"
-version = "0.1.0"
-dependencies = [
- "rayon",
-]
-
-[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1325,14 +1281,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1257cd4248b4132760d6524d6dda4e053bc648c9070b960929bf50cfb1e7add"
 
 [[package]]
-name = "seeds"
-version = "0.1.0"
-dependencies = [
- "lcp-core",
- "xxhash-rust",
-]
-
-[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1401,15 +1349,15 @@ dependencies = [
  "bon",
  "bzip2",
  "flate2",
- "index",
- "lcp-core",
  "log",
  "long-read-rad",
- "map",
  "niffler",
  "paraseq",
  "serde",
  "serde_json",
+ "spearfish-index",
+ "spearfish-lcp",
+ "spearfish-map",
  "xxhash-rust",
 ]
 
@@ -1421,21 +1369,65 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
- "index",
- "lcp-core",
  "libc",
  "log",
  "long-read-rad",
- "map",
  "mimalloc",
  "paraseq",
- "quant",
  "rayon",
  "rustc-hash",
- "seeds",
  "serde",
  "serde_json",
  "spearfish",
+ "spearfish-index",
+ "spearfish-lcp",
+ "spearfish-map",
+ "spearfish-seeds",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "spearfish-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "memmap2",
+ "proptest",
+ "rayon",
+ "spearfish-lcp",
+ "spearfish-seeds",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "spearfish-lcp"
+version = "0.1.0"
+dependencies = [
+ "lcp-oracle-sys",
+ "proptest",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "spearfish-map"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "proptest",
+ "rustc-hash",
+ "serde",
+ "spearfish-index",
+ "spearfish-lcp",
+ "spearfish-seeds",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "spearfish-seeds"
+version = "0.1.0"
+dependencies = [
+ "spearfish-lcp",
  "xxhash-rust",
 ]
 
