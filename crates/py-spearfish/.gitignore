@@ -1,0 +1,5 @@
+# The extension module `maturin develop` builds into the package, and build/test leftovers.
+/python/spearfish/*.so
+/python/spearfish/*.pyd
+/dist
+/.pytest_cache
