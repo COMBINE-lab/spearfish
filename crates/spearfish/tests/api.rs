@@ -160,6 +160,11 @@ fn compressed_input() {
     }
     drop(f);
     assert_eq!(read_transcripts(&gz).unwrap(), read_transcripts(&fa).unwrap());
+    // A truncated file is an error, not a shorter input (it decompresses on another thread).
+    let cut = dir.join("cut.fa.gz");
+    let bytes = std::fs::read(&gz).unwrap();
+    std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(read_transcripts(&cut).is_err());
     // The xz magic number, then anything.
     let xz = dir.join("tx.fa.xz");
     std::fs::write(&xz, b"\xfd7zXZ\x00\x00\x04 not really xz").unwrap();

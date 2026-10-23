@@ -80,6 +80,9 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- Compressed input decompresses on a thread of its own, ahead of the reader, instead of
+  inside paraseq's reader lock, where it held up the mapping threads. zstd input now maps
+  about as fast as plain input; gzip and bzip2 are limited by their single-threaded decoding.
 - `spearfish index` builds about a third faster with about a third less peak memory
   (GENCODE with spike-ins, 32 threads): node keys are deduplicated within genes before the
   global sort, unitig chains are followed in parallel, and the transcript sequences are freed
