@@ -117,6 +117,12 @@ const START: u64 = ((u32::MAX - 2) as u64) << 32;
 const END: u64 = ((u32::MAX - 3) as u64) << 32;
 const MAX_NODES: usize = (u32::MAX - 4) as usize;
 
+/// Add one field to an identity hash: its length (little-endian u64), then its bytes.
+fn hash_field(h: &mut xxhash_rust::xxh3::Xxh3, bytes: &[u8]) {
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
 #[inline]
 fn enc(node: u32, delta: u32) -> u64 {
     ((node as u64) << 32) | delta as u64
@@ -362,11 +368,12 @@ pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, Build
         .collect();
     // Past seeding, the raw sequences are needed only for their lengths and the input hash.
     let tx_len: Vec<u32> = txs.iter().map(|t| t.seq.len() as u32).collect();
+    // Each field length-prefixed, so that no two different inputs concatenate alike.
     let input_xxh3 = {
         let mut h = xxhash_rust::xxh3::Xxh3::new();
         for t in &txs {
-            h.update(t.name.as_bytes());
-            h.update(&t.seq);
+            hash_field(&mut h, t.name.as_bytes());
+            hash_field(&mut h, &t.seq);
         }
         h.digest()
     };
@@ -401,6 +408,15 @@ pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, Build
         }
     };
     rep.genes = gene_names.len();
+    // The grouping changes the graph and the mapping, so it is part of the index's identity
+    // (`meta`, which the index id hashes) along with the input: each transcript's gene name.
+    let genes_xxh3 = {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        for &g in &tx_gene {
+            hash_field(&mut h, gene_names[g as usize].as_bytes());
+        }
+        h.digest()
+    };
     lap(&mut rep, "genes");
     let scope = |t: usize| {
         if p.collapse == Collapse::Gene {
@@ -722,6 +738,7 @@ pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, Build
                 format!("{:#x}", lcp_core::LcpConfig::default().seed),
             ),
             ("input_xxh3".into(), format!("{input_xxh3:016x}")),
+            ("genes_xxh3".into(), format!("{genes_xxh3:016x}")),
         ],
         labels,
         node_unitig,

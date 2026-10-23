@@ -47,6 +47,10 @@
 - RAD files record the parameters as JSON, the spearfish version with its git revision, and an
   `index_id` tag.
 - `--version` shows the git revision, target and SIMD level.
+- The index id now covers the gene grouping: indexes built from the same transcripts with
+  different genes (headers, `--t2g` or `--infer-genes`) used to share an id. The input hash
+  also length-prefixes names and sequences, so moving bases between a name and its sequence
+  changes it. Existing indexes keep their recorded id; a rebuild gets a new one.
 
 ### Library
 

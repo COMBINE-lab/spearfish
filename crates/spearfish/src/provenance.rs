@@ -62,7 +62,8 @@ pub struct InputInfo {
     pub transcripts: usize,
     /// Genes (given, from a table, or inferred).
     pub genes: usize,
-    /// xxh3-64 over every transcript's name and sequence, in order.
+    /// xxh3-64 over every transcript's name and sequence, in order, each prefixed with its
+    /// length (little-endian u64).
     pub xxh3: String,
     /// Where the genes came from: `fasta` (headers), `t2g` (a table), `inferred`, or `none`
     /// (every transcript its own gene).
@@ -191,8 +192,9 @@ impl IndexManifest {
 }
 
 /// A short identifier of an index's contents: xxh3-64 of its `meta` section, which holds the
-/// input transcripts' hash and every build parameter. Rebuilding from the same inputs with the
-/// same parameters gives the same identifier; outputs record it to name their index.
+/// input transcripts' hash, the hash of their gene grouping (given or inferred), and every
+/// build parameter. Rebuilding from the same inputs and grouping with the same parameters gives
+/// the same identifier; outputs record it to name their index.
 pub fn index_id(idx: &index::Index) -> String {
     id_of_meta(idx.meta_text())
 }
