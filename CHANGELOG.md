@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (unreleased)
+
+The first release.
+
+- **Crates.** The library is `spearfish`, and the `spearfish` binary is `spearfish-cli`
+  (`cargo install --locked spearfish-cli`). They build on `spearfish-lcp`, `spearfish-seeds`,
+  `spearfish-index`, `spearfish-map` and `long-read-rad`, which are published with them; the
+  first four were renamed from `lcp-core`, `seeds`, `index` and `map`, which other crates own on
+  crates.io (the code still imports them by their old names).
+- **Python.** The `spearfish` package (`crates/py-spearfish`).
+- **Quantification is oarfish's.** oarfish either maps with spearfish in process
+  (`oarfish --mapper spearfish`) or quantifies a RAD file from `spearfish map --rad`
+  (`oarfish -a`).
+- **Removed before release: `spearfish quant`.** It mapped to a temporary RAD file and ran an
+  external `oarfish -a`: a third route to the same estimates, which left the mapping settings
+  oarfish's models need to the user. It was last present in commit
+  [`2bf22ad`](https://github.com/COMBINE-lab/spearfish/tree/2bf22ad) (`crates/spearfish-cli/src/quant_cmd.rs`),
+  from which it can be restored. spearfish's own EM stays as the hidden `spearfish em`, a
+  baseline for method development; its crate (`quant`) is now a module of the command-line
+  crate.
+
+## Development before 0.1.0
+
+The changes below were made during development, before any release, and are kept for the record.
 
 ### Command line
 

@@ -14,8 +14,9 @@ use anyhow::{Result, bail};
 use spearfish::provenance::BuildInfo;
 use spearfish::{Index, IndexOptions, MapSettings, Preset};
 
-/// The toy transcripts (`fixtures/toy/transcripts.fa`).
-const TOY: &str = include_str!("../../../fixtures/toy/transcripts.fa");
+/// The toy transcripts (`fixtures/toy/transcripts.fa`, linked into the crate so that it is
+/// packaged with it).
+const TOY: &str = include_str!("toy_transcripts.fa");
 
 /// Digest of the self-test's output, per preset (see [`self_test`]).
 pub const EXPECTED: [(Preset, &str); 3] = [

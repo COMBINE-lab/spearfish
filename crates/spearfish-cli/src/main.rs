@@ -2,6 +2,7 @@
 
 mod annot;
 mod doctor_cmd;
+mod em;
 mod em_cmd;
 mod halo_cmd;
 mod hist;
@@ -11,7 +12,6 @@ mod locality_cmd;
 mod logging;
 mod map_args;
 mod map_cmd;
-mod quant_cmd;
 mod rng;
 mod runinfo;
 mod seeding;
@@ -69,8 +69,6 @@ enum Command {
     Index(index_cmd::Args),
     /// Map long reads to the indexed transcriptome (TSV, PAF and/or RAD output).
     Map(map_cmd::Args),
-    /// Reads to transcript abundances: map to RAD and quantify with oarfish.
-    Quant(quant_cmd::Args),
     /// Show what an index holds and what built it.
     #[command(alias = "index-stats")]
     Inspect(index_cmd::InspectArgs),
@@ -152,7 +150,6 @@ fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Index(args) => index_cmd::run(args),
         Command::Map(args) => map_cmd::run(args),
-        Command::Quant(args) => quant_cmd::run(args),
         Command::Inspect(args) => index_cmd::inspect(args),
         Command::Doctor(args) => doctor_cmd::run(args),
         Command::Completions { shell } => {

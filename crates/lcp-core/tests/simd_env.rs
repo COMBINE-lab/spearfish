@@ -1,6 +1,7 @@
 //! The dispatcher honours `SPEARFISH_SIMD`: each case re-runs this test binary with the
 //! variable set, and the child checks the level `active()` resolved (it is fixed per process).
 
+extern crate spearfish_lcp as lcp_core;
 use std::process::Command;
 
 use lcp_core::simd::{self, Level};

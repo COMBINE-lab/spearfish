@@ -7,9 +7,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::em::{EqBuilder, QuantParams, em};
 use anyhow::{Context, Result};
 use paraseq::Record;
-use quant::{EqBuilder, QuantParams, em};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {

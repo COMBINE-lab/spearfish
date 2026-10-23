@@ -19,14 +19,15 @@ alignment is restricted to the read segments where tied isoforms differ.
 Documentation: https://combine-lab.github.io/spearfish/ (source in `website/`; preview locally
 with `cd website && npm install && npm run dev`).
 
-**Status:** pre-release. Interfaces may still change; see [CHANGELOG.md](CHANGELOG.md).
+**Status:** 0.1.0, the first release. Interfaces may change before 1.0; see
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
-Rust 1.89 or newer ([rustup](https://rustup.rs)):
+With Rust 1.89 or newer ([rustup](https://rustup.rs)), from crates.io or from a checkout:
 
 ```sh
-cargo install --locked --path crates/spearfish-cli
+cargo install --locked spearfish-cli              # or: cargo install --locked --path crates/spearfish-cli
 spearfish doctor          # build, CPU, SIMD kernels, and a mapping self-test
 ```
 
@@ -39,14 +40,12 @@ choice gives the same output.
 ```sh
 spearfish index transcripts.fa.gz -o transcripts.sfi             # also writes transcripts.sfi.json
 spearfish map transcripts.sfi reads.fq.gz --preset ont -o reads.tsv   # and/or --paf, --rad
-spearfish quant transcripts.sfi reads.fq.gz --preset ont -o sample     # abundances via oarfish
 ```
 
 | Command | Does |
 | --- | --- |
 | `index` | Build the index from a transcript FASTA (gene IDs from headers, `--t2g`, or `--infer-genes`). |
 | `map` | Map reads: TSV (`-o`), PAF (`--paf`) and/or RAD (`--rad`) output, plus a run record. |
-| `quant` | Map to RAD and quantify with [oarfish](https://github.com/COMBINE-lab/oarfish). |
 | `inspect` | Show what an index holds, what built it, and whether this build can use it. |
 | `doctor` | Report the build and machine and run a self-test; `--index` also checks an index. |
 | `completions`, `man` | Shell completions and man pages. |
@@ -59,7 +58,26 @@ Every index records how it was built (`<index>.json`, and `spearfish inspect`), 
 mapping run writes `<output>.meta.json`: the build, command line, index, settings, every
 parameter used, and run statistics.
 
+## Quantification
+
+spearfish maps; [oarfish](https://github.com/COMBINE-lab/oarfish) turns its mappings into
+transcript abundances. With an oarfish that has spearfish support (its `--help` lists
+`spearfish` as a `--mapper`), either let oarfish map with spearfish in process:
+
+```sh
+oarfish --reads reads.fq.gz --annotated transcripts.fa.gz --seq-tech ont-cdna --mapper spearfish -o sample
+```
+
+or map once to a RAD file and quantify that (to keep the mappings, or quantify them several ways):
+
+```sh
+spearfish map transcripts.sfi reads.fq.gz --preset ont --rad sample.rad
+oarfish -a sample.rad -o sample
+```
+
 ## As a library
+
+`spearfish = "0.1"` in `Cargo.toml`:
 
 ```rust
 use std::sync::Arc;
@@ -74,17 +92,17 @@ for hit in mapper.map(b"ACGT...").hits {
 
 ## Layout
 
-| Path | Contents |
+| Path (crate) | Contents |
 | --- | --- |
-| `crates/lcp-core` | LCP parser (lcptools-compatible boundaries, 64-bit content labels, hierarchy) |
-| `crates/lcp-oracle-sys` | test-only build of [lcptools](https://github.com/BilkentCompGen/lcptools) (BSD-3-Clause) |
-| `crates/seeds` | seed-scheme trait: LCP, and minimizers, syncmers and strobemers for ablations |
-| `crates/index` | core-graph index and its on-disk container |
-| `crates/map` | read mapping: anchoring, chaining, tie-break, rescue, span extension |
-| `crates/quant` | spearfish's own EM (a baseline for method development) |
-| `crates/rad` | `bulk_long_read` RAD records, shared with oarfish |
-| `crates/spearfish` | the library: index, settings, mapper, provenance |
-| `crates/spearfish-cli` | the `spearfish` binary |
+| `crates/lcp-core` (`spearfish-lcp`) | LCP parser (lcptools-compatible boundaries, 64-bit content labels, hierarchy) |
+| `crates/lcp-oracle-sys` | test-only build of [lcptools](https://github.com/BilkentCompGen/lcptools) (BSD-3-Clause; not published) |
+| `crates/seeds` (`spearfish-seeds`) | seed-scheme trait: LCP, and minimizers, syncmers and strobemers for ablations |
+| `crates/index` (`spearfish-index`) | core-graph index and its on-disk container |
+| `crates/map` (`spearfish-map`) | read mapping: anchoring, chaining, tie-break, rescue, span extension |
+| `crates/rad` (`long-read-rad`) | `bulk_long_read` RAD records, shared with oarfish |
+| `crates/spearfish` (`spearfish`) | the library: index, settings, mapper, output formats, provenance |
+| `crates/spearfish-cli` (`spearfish-cli`) | the `spearfish` binary |
+| `crates/py-spearfish` | the Python package (`spearfish` on PyPI; built with maturin) |
 | `fixtures/toy` | toy transcriptome with an exon skip, an alternative 3′ site and a paralog pair |
 
 ## Development

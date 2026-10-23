@@ -2376,7 +2376,7 @@ mod tests {
             .fold(f64::INFINITY, f64::min)
     }
 
-    /// Isolated kernel timings per SIMD level (`cargo test --release -p map -- --ignored
+    /// Isolated kernel timings per SIMD level (`cargo test --release -p spearfish-map -- --ignored
     /// --nocapture kernel_timings`).
     #[test]
     #[ignore]

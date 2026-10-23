@@ -3,6 +3,9 @@
 //! equal the oracle's exactly. Also times both chainers and counts identical hits (chain paths
 //! can differ only on score ties).
 //! Usage: refine_check <index> <reads.fa> [max_reads] [beam]
+
+extern crate spearfish_map as map;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;

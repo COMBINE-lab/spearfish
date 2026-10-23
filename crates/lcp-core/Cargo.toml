@@ -1,10 +1,12 @@
 [package]
-name = "lcp-core"
+name = "spearfish-lcp"
+description = "Locally consistent parsing (LCP) of DNA with SIMD kernels, the seeding parser of the spearfish long-read mapper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 xxhash-rust.workspace = true

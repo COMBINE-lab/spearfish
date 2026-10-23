@@ -2,6 +2,7 @@
 //! order, bit-identical scores, the same anchors, and the same anchor count. Genes share a
 //! repeat element so that seeds hit several families.
 
+extern crate spearfish_map as map;
 use index::{BuildParams, Collapse, Index, TxInput, build};
 use map::{AnchorParams, MapParams, Mapper, OracleChainer, anchor};
 use proptest::prelude::*;

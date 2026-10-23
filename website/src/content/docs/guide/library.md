@@ -3,7 +3,9 @@ title: Using the library
 description: Build an index, set up a mapper and map reads from Rust.
 ---
 
-The `spearfish` crate is the library behind the command line.
+The `spearfish` crate is the library behind the command line (`spearfish = "0.1"` in
+`Cargo.toml`). Its default features read FASTA/FASTQ (`fasta`) and write RAD files (`rad`); an
+embedding that needs neither, such as oarfish's, can turn them off.
 
 ```rust
 use std::sync::Arc;

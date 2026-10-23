@@ -1,4 +1,5 @@
-//! Transcript quantification by EM over per-read compatibility records.
+//! Transcript quantification by EM over per-read compatibility records (`spearfish em`, a
+//! baseline for method development; formerly the `quant` crate).
 //!
 //! A read compatible with transcripts `j` with scores `s_j` contributes the conditional
 //! likelihood `P(r | j) ∝ exp((s_j - s_max) / D)` (optionally divided by an effective

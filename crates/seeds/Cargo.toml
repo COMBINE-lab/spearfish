@@ -1,10 +1,12 @@
 [package]
-name = "seeds"
+name = "spearfish-seeds"
+description = "Seed schemes (LCP cores, minimizers, syncmers, strobemers) behind one interface, for the spearfish long-read mapper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 lcp-core.workspace = true

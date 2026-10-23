@@ -1,6 +1,7 @@
 //! Index construction tests: the round trip (every transcript's seeds are reconstructed
 //! exactly from the serialized index) on the toy fixture and on random transcriptomes.
 
+extern crate spearfish_index as index;
 use std::collections::HashSet;
 use std::path::PathBuf;
 

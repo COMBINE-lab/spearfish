@@ -1,9 +1,9 @@
 ---
 title: Installation
-description: Build spearfish from source, and check the build.
+description: Install spearfish, and check the build.
 ---
 
-spearfish is written in Rust. Until the first release, it is installed from source.
+spearfish is written in Rust and installs with Cargo, from crates.io or from a checkout.
 
 ## Requirements
 
@@ -12,7 +12,13 @@ spearfish is written in Rust. Until the first release, it is installed from sour
   AVX-512, AVX2 or scalar code at run time on x86-64, and NEON or scalar code on arm64, and
   every choice gives exactly the same output.
 
-## Build
+## Install
+
+```sh
+cargo install --locked spearfish-cli
+```
+
+This puts the `spearfish` binary in `~/.cargo/bin`. From a checkout instead:
 
 ```sh
 git clone https://github.com/COMBINE-lab/spearfish.git
@@ -20,7 +26,7 @@ cd spearfish
 cargo install --locked --path crates/spearfish-cli
 ```
 
-This puts the `spearfish` binary in `~/.cargo/bin`. To build without installing:
+To build without installing:
 
 ```sh
 cargo build --release
@@ -51,6 +57,6 @@ spearfish man -o ~/.local/share/man/man1                 # spearfish.1, spearfis
 
 ## For quantification
 
-`spearfish quant` runs [oarfish](https://github.com/COMBINE-lab/oarfish), which must be a build
-with spearfish support (its `--help` lists `spearfish` as a `--mapper`). spearfish looks for it
-on the `PATH`, in `$OARFISH`, or where `--oarfish` points.
+Abundances come from [oarfish](https://github.com/COMBINE-lab/oarfish), installed separately: a
+build with spearfish support (its `--help` lists `spearfish` as a `--mapper`). See
+[Quantification](/spearfish/guide/quantification/).

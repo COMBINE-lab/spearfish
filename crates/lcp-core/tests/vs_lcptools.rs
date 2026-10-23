@@ -1,6 +1,7 @@
 //! Differential test: lcp-core's core boundaries equal lcptools' at every level.
 //! lcptools reports DCT-extended starts above level 1, which we expose as `ctx_start`.
 
+extern crate spearfish_lcp as lcp_core;
 use lcp_core::{LcpParser, Parser};
 use lcp_oracle_sys::lcptools_boundaries;
 use proptest::prelude::*;

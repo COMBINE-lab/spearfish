@@ -1,5 +1,8 @@
 //! Single-thread seeding throughput per scheme on random 2 kb sequences.
 //! Usage: throughput [spec ...]
+
+extern crate spearfish_seeds as seeds;
+
 use seeds::from_spec;
 
 fn main() {

@@ -1021,7 +1021,7 @@ mod tests {
         }
     }
 
-    /// Isolated block-scan timings per SIMD level (`cargo test --release -p lcp-core --
+    /// Isolated block-scan timings per SIMD level (`cargo test --release -p spearfish-lcp --
     /// --ignored --nocapture scan_timings`).
     #[test]
     #[ignore]

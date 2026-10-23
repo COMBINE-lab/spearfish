@@ -633,7 +633,7 @@ pub struct MappedRead {
     pub len: u32,
     /// The reported hits, best first.
     pub hits: Vec<Hit>,
-    /// The best chain spans less than half the read (spearfish quant skips such reads).
+    /// The best chain spans less than half the read (`spearfish em` skips such reads).
     pub low_coverage: bool,
     /// Hits came from the lower-level rescue.
     pub rescued: bool,
