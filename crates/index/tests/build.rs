@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use index::{BuildParams, Collapse, Index, InferGenes, TxInput, build};
+use index::{BuildParams, Collapse, Index, IndexData, InferGenes, TxInput, build};
 use proptest::prelude::*;
 use seeds::BaseSeeder;
 
@@ -36,10 +36,12 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
         collapse,
         infer_genes: None,
     };
-    let (data, rep) = build(txs, &p).unwrap();
+    let (data, rep) = build(txs.to_vec(), &p).unwrap();
     assert_eq!(rep.inconsistent_lengths, 0, "{spec}");
     let idx = Index::from_bytes(&data.to_bytes()).unwrap();
     assert_eq!(idx.meta("spec"), Some(spec));
+    let direct = Index::from_data(&data).unwrap();
+    assert_eq!(direct.section_checksums(), idx.section_checksums());
     let seeder = BaseSeeder::new(spec, hpc).unwrap();
     let got = idx.transcript_seeds();
     for (t, tx) in txs.iter().enumerate() {
@@ -82,11 +84,7 @@ fn check_roundtrip(txs: &[TxInput], spec: &str, hpc: bool, collapse: Collapse) -
             continue;
         };
         let n = idx.tx_plen()[t];
-        let raw: Vec<u8> = tx
-            .seq
-            .iter()
-            .map(|&b| lcp_core::encode::CODE[b as usize] & 3)
-            .collect();
+        let raw = lcp_core::encode::codes(&tx.seq);
         for (lo, hi) in [
             (0, n),
             (0, 0),
@@ -162,10 +160,38 @@ fn toy_roundtrip_and_structure() {
 }
 
 #[test]
+fn mismatched_sections_fail_to_load() {
+    let p = BuildParams {
+        spec: "lcp:K=3".into(),
+        hpc: true,
+        f_max: 20,
+        allow_collisions: false,
+        collapse: Collapse::Gene,
+        infer_genes: None,
+    };
+    let (data, _) = build(toy(), &p).unwrap();
+    assert!(Index::from_data(&data).unwrap().has_raw());
+    let fails = |d: &IndexData, section: &str| match Index::from_data(d) {
+        Ok(_) => panic!("{section}: loaded"),
+        Err(e) => assert!(e.to_string().contains(section), "{section}: {e}"),
+    };
+    let mut d = data.clone();
+    d.occ_tx.pop();
+    fails(&d, "occ_tx");
+    let mut d = data.clone();
+    d.node_len.push(0);
+    fails(&d, "node_len");
+    // A damaged raw section is an error, not an index without raw sequence.
+    let mut d = data.clone();
+    d.tx_raw_ck.1.pop();
+    fails(&d, "tx_raw_ck");
+}
+
+#[test]
 fn file_roundtrip() {
     let txs = toy();
     let (data, _) = build(
-        &txs,
+        txs,
         &BuildParams {
             spec: "lcp:K=3".into(),
             hpc: true,
@@ -176,8 +202,19 @@ fn file_roundtrip() {
         },
     )
     .unwrap();
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("toy.sfi");
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("index_file_roundtrip");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The write stages next to the output without touching other files there.
+    std::fs::write(dir.join("toy.tmp"), "unrelated").unwrap();
+    let path = dir.join("toy.sfi");
     data.write(&path).unwrap();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["toy.sfi", "toy.tmp"]);
+    assert_eq!(std::fs::read_to_string(dir.join("toy.tmp")).unwrap(), "unrelated");
     let idx = Index::open(&path).unwrap();
     assert_eq!(idx.labels(), &data.labels[..]);
     assert_eq!(idx.occ_pos(), &data.occ_pos[..]);
@@ -248,7 +285,7 @@ fn inferred_genes_follow_shared_exons() {
                 attach_max: 3,
             }),
         };
-        build(&txs, &p).unwrap().1.tx_gene
+        build(txs.clone(), &p).unwrap().1.tx_gene
     };
     // Same partition as the annotation: same group iff same annotated gene.
     let g = groups(12, 64);
@@ -292,7 +329,7 @@ fn raw_sequence_skipped_where_non_acgt_merges_runs() {
         collapse: Collapse::Gene,
         infer_genes: None,
     };
-    let idx = Index::from_bytes(&build(&txs, &p).unwrap().0.to_bytes()).unwrap();
+    let idx = Index::from_data(&build(txs, &p).unwrap().0).unwrap();
     assert_eq!(idx.tx_raw_codes(0, 0, 3), None);
     assert_eq!(idx.tx_raw_codes(1, 0, 3), Some(vec![0, 1, 2]));
 }

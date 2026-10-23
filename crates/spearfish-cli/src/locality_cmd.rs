@@ -239,5 +239,6 @@ pub fn run(args: Args) -> Result<()> {
             )?;
         }
     }
+    out.flush()?;
     Ok(())
 }

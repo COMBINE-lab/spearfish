@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use index::{BuildParams, Collapse, TxInput};
-use lcp_core::hpc::Hpc;
 use map::{AnyChainer, OracleChainer, RefineChainer};
 use serde::{Deserialize, Serialize};
 
@@ -208,6 +207,7 @@ impl Default for MapOptions {
 /// assert!(opts.hpc);
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct IndexOptions {
     /// Base seed scheme (its highest level is used), e.g. `lcp:K=3` or `minimizer:k=19,w=23`.
     #[builder(into, default = "lcp:K=3".to_string())]
@@ -240,6 +240,7 @@ impl Default for IndexOptions {
 /// at most `attach_max` transcripts join the one larger group they share runs of
 /// `attach_span` seeds with (0: no attach pass).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct InferGenesOptions {
     /// Ignore runs held by more than this many transcripts (repeats).
     #[builder(default = 64)]
@@ -302,7 +303,7 @@ impl Index {
         let (data, rep, _) = Self::build_data(txs, opts, Default::default(), Vec::new())?;
         Ok((
             Index {
-                inner: Arc::new(index::Index::from_bytes(&data.to_bytes())?),
+                inner: Arc::new(index::Index::from_data(&data)?),
             },
             rep,
         ))
@@ -347,7 +348,7 @@ impl Index {
             .into_iter()
             .map(|(name, gene, seq)| TxInput { name, gene, seq })
             .collect();
-        let (mut data, rep) = index::build(&txs, &opts.build_params())?;
+        let (mut data, rep) = index::build(txs, &opts.build_params())?;
         let mut manifest = provenance::IndexManifest::new(&data, opts, &rep, input);
         manifest.command_line = command_line;
         manifest.working_directory = std::env::current_dir()
@@ -390,7 +391,7 @@ impl Index {
     }
 
     /// What built the index and from what (see [`provenance::IndexManifest`]); `None` for
-    /// an index written before manifests were recorded.
+    /// an index written before manifests were recorded, or whose manifest can't be read.
     pub fn manifest(&self) -> Option<provenance::IndexManifest> {
         provenance::IndexManifest::of(&self.inner)
     }
@@ -402,23 +403,21 @@ impl Index {
     }
 }
 
-/// Name and gene from a FASTA ID: GENCODE-style `tx|gene|...`, else the ID (up to
-/// whitespace) for both.
+/// Name and gene from a FASTA ID, up to the first whitespace (a description is ignored):
+/// GENCODE-style `tx|gene|...`; with no gene field, or an empty one, the name for both.
 pub fn name_and_gene(id: &str) -> (String, String) {
+    let id = id.split_whitespace().next().unwrap_or("");
     let mut f = id.split('|');
-    let name = f
+    let name = f.next().unwrap_or("").to_string();
+    let gene = f
         .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let gene = f.next().map_or_else(|| name.clone(), String::from);
+        .filter(|g| !g.is_empty())
+        .map_or_else(|| name.clone(), String::from);
     (name, gene)
 }
 
 /// Read transcripts from a (optionally compressed) FASTA as (name, gene, sequence), names
-/// and genes as [`name_and_gene`] splits the IDs.
+/// and genes as [`name_and_gene`] splits the IDs (bytes that are not UTF-8 become U+FFFD).
 #[cfg(feature = "fasta")]
 pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     use paraseq::{ReaderBuilder, Record};
@@ -428,7 +427,7 @@ pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
             let rec = rec?;
-            let (name, gene) = name_and_gene(rec.id_str());
+            let (name, gene) = name_and_gene(&String::from_utf8_lossy(rec.id()));
             txs.push((name, gene, rec.seq().into_owned()));
         }
     }
@@ -503,7 +502,6 @@ pub struct MappedRead {
 pub struct Mapper {
     index: Arc<Index>,
     inner: map::Mapper<AnyChainer>,
-    hpc: bool,
     opts: MapOptions,
 }
 
@@ -526,11 +524,9 @@ impl Mapper {
             ChainerKind::Refine { beam } => AnyChainer::Refine(RefineChainer { p: chain, beam }),
         };
         let inner = map::Mapper::new(index.inner.clone(), chainer, opts.params.clone())?;
-        let hpc = inner.seeder.hpc;
         Ok(Mapper {
             index,
             inner,
-            hpc,
             opts: opts.clone(),
         })
     }
@@ -555,11 +551,12 @@ impl Mapper {
         let r = self.inner.map(seq);
         let len = seq.len() as u32;
         let plen = r.plen;
-        let hpc = self.hpc.then(|| Hpc::new(seq));
+        // The read's runs as the mapper compressed it (U read as T).
+        let hpc = r.hpc.as_ref();
         // Parsed query span in the hit's orientation -> raw span on the forward strand.
         let q_raw = |s: u32, e: u32, rev: bool| -> (u32, u32) {
             let (fs, fe) = if rev { (plen - e, plen - s) } else { (s, e) };
-            match &hpc {
+            match hpc {
                 Some(h) => h.to_raw(fs, fe),
                 None => (fs, fe),
             }
@@ -575,14 +572,15 @@ impl Mapper {
                     idx.tx_plen()[h.tx as usize].max(1) as u64,
                 );
                 let scale = |x: u32| idx.tx_raw_pos(h.tx, x).unwrap_or(((x as u64 * tl) / tpl) as u32);
+                let ts = scale(h.tstart);
                 Hit {
                     tx: h.tx,
                     reverse: h.reverse,
                     score: h.score,
                     query_start: qs,
                     query_end: qe,
-                    target_start: scale(h.tstart),
-                    target_end: scale(h.tend).max(scale(h.tstart)),
+                    target_start: ts,
+                    target_end: scale(h.tend).max(ts),
                     anchors: h.anchors,
                     anchored: h.anchored,
                     max_discrepancy: h.max_discrepancy,
@@ -602,6 +600,23 @@ impl Mapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_and_genes_from_headers() {
+        for (id, name, gene) in [
+            ("ENST1.1|ENSG1.2|-|-|A-201|A|100|lncRNA|", "ENST1.1", "ENSG1.2"),
+            ("tx1", "tx1", "tx1"),
+            // A description is not part of the ID, even when it holds a '|'.
+            ("tx1 desc", "tx1", "tx1"),
+            ("tx1 product a|b", "tx1", "tx1"),
+            ("tx1|g1 some desc", "tx1", "g1"),
+            // An empty gene field is no gene field.
+            ("tx1|", "tx1", "tx1"),
+            ("tx1||x", "tx1", "tx1"),
+        ] {
+            assert_eq!(name_and_gene(id), (name.into(), gene.into()), "{id}");
+        }
+    }
 
     #[test]
     fn presets_parse_by_name() {

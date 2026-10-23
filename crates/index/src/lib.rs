@@ -31,17 +31,35 @@ fn base_at(words: &[u64], i: u32) -> u8 {
     ((words[(i / 32) as usize] >> (2 * (i % 32))) & 3) as u8
 }
 
-/// Bases `[lo, hi)` of 2-bit packed `words`, through `map`, appended to `out` a word at a time.
-fn decode_into(words: &[u64], lo: u32, hi: u32, map: [u8; 4], out: &mut Vec<u8>) {
+/// The 8 bases of a 16-bit packed group, one 2-bit code per byte (base j in byte j).
+#[inline(always)]
+fn spread8(x: u64) -> u64 {
+    let x = (x | (x << 24)) & 0x0000_00ff_0000_00ff;
+    let x = (x | (x << 12)) & 0x000f_000f_000f_000f;
+    (x | (x << 6)) & 0x0303_0303_0303_0303
+}
+
+/// Bases `[lo, hi)` of 2-bit packed `words`, appended to `out` as codes: whole words 8 bases at
+/// a time (each 16-bit group spread to a code per byte), the rest a word at a time.
+fn decode_into(words: &[u64], lo: u32, hi: u32, out: &mut Vec<u8>) {
     let start = out.len();
     out.resize(start + (hi - lo) as usize, 0);
     let dst = &mut out[start..];
     let (mut i, mut d) = (lo, 0usize);
+    while i + 32 <= hi {
+        let w = word_at(words, i);
+        for g in 0..4 {
+            let v = spread8((w >> (16 * g)) & 0xffff);
+            dst[d + 8 * g..d + 8 * g + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        i += 32;
+        d += 32;
+    }
     while i < hi {
         let w = words[(i / 32) as usize] >> (2 * (i % 32));
         let take = ((32 - i % 32).min(hi - i)) as usize;
         for (k, x) in dst[d..d + take].iter_mut().enumerate() {
-            *x = map[((w >> (2 * k)) & 3) as usize];
+            *x = ((w >> (2 * k)) & 3) as u8;
         }
         i += take as u32;
         d += take;
@@ -100,7 +118,7 @@ impl PackedRange<'_> {
 
     pub fn decode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        decode_into(self.words, self.lo, self.hi, [0, 1, 2, 3], &mut out);
+        decode_into(self.words, self.lo, self.hi, &mut out);
         out
     }
 
@@ -194,14 +212,17 @@ pub(crate) fn pack2(seq: &[u8]) -> Vec<u64> {
     words
 }
 
-fn pool(strings: &[String]) -> (Vec<u64>, Vec<u8>) {
-    let mut off = vec![0u64];
-    let mut bytes = Vec::new();
-    for s in strings {
-        bytes.extend_from_slice(s.as_bytes());
-        off.push(bytes.len() as u64);
+/// Concatenate `parts` with offsets: part `i` is `data[off[i]..off[i + 1]]`.
+pub(crate) fn concat<'a, T: Copy + 'a>(parts: impl Iterator<Item = &'a [T]> + Clone) -> (Vec<u64>, Vec<T>) {
+    let (n, total) = parts.clone().fold((0, 0), |(n, t), p| (n + 1, t + p.len()));
+    let mut off = Vec::with_capacity(n + 1);
+    let mut data = Vec::with_capacity(total);
+    off.push(0);
+    for p in parts {
+        data.extend_from_slice(p);
+        off.push(data.len() as u64);
     }
-    (off, bytes)
+    (off, data)
 }
 
 impl IndexData {
@@ -241,10 +262,10 @@ impl IndexData {
             w.add("tx_raw_ck_off", &self.tx_raw_ck.0);
             w.add("tx_raw_ck", &self.tx_raw_ck.1);
         }
-        let (o, b) = pool(&self.tx_names);
+        let (o, b) = concat(self.tx_names.iter().map(|s| s.as_bytes()));
         w.add_owned("tx_name_off", o);
         w.add_owned("tx_names", b);
-        let (o, b) = pool(&self.gene_names);
+        let (o, b) = concat(self.gene_names.iter().map(|s| s.as_bytes()));
         w.add_owned("gene_name_off", o);
         w.add_owned("gene_names", b);
         if let Some(m) = &self.manifest {
@@ -415,6 +436,12 @@ impl Index {
         Self::from_store(Store::from_bytes(bytes)?)
     }
 
+    /// An index built in memory, laid out once (`from_bytes(&data.to_bytes())` copies twice).
+    pub fn from_data(data: &IndexData) -> Result<Self> {
+        let (words, len) = data.writer().to_words();
+        Self::from_store(Store::from_words(words, len)?)
+    }
+
     fn from_store(store: Store) -> Result<Self> {
         let text = std::str::from_utf8(store.get::<u8>("meta")?)?;
         let meta = text
@@ -423,20 +450,22 @@ impl Index {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let s = Sections::load(&store)?;
-        let raw = (|| -> Result<RawSections> {
-            Ok(RawSections {
+        let raw = if store.has("tx_raw_off") {
+            Some(RawSections {
                 off: Raw::of(store.get::<u64>("tx_raw_off")?),
                 words: Raw::of(store.get::<u64>("tx_raw")?),
                 ck_off: Raw::of(store.get::<u64>("tx_raw_ck_off")?),
                 ck: Raw::of(store.get::<u32>("tx_raw_ck")?),
             })
-        })()
-        .ok();
+        } else {
+            None
+        };
         let bits = label_dir_bits(s.labels.len);
         anyhow::ensure!(
             s.label_dir.len == (1usize << bits) + 1,
             "label directory has the wrong size"
         );
+        Self::check_sizes(&s, raw.as_ref())?;
         Ok(Index {
             store,
             s,
@@ -444,6 +473,49 @@ impl Index {
             meta,
             dir_shift: 64 - bits,
         })
+    }
+
+    /// Check that the sections' sizes agree with each other, so that a truncated or mismatched
+    /// index fails to load instead of panicking while mapping. Values are not checked.
+    fn check_sizes(s: &Sections, raw: Option<&RawSections>) -> Result<()> {
+        // The last entry of an offsets section (None if it is empty).
+        // SAFETY: borrowed from the store, which outlives this call.
+        let end = |r: Raw<u64>| unsafe { r.slice() }.last().map(|&x| x as usize);
+        let (nn, nu, nt) = (s.labels.len, s.unitig_span.len, s.tx_gene.len);
+        let mut checks = vec![
+            ("node_unitig", s.node_unitig.len == nn),
+            ("node_offset", s.node_offset.len == nn),
+            ("node_len", s.node_len.len == nn),
+            ("node_flags", s.node_flags.len == nn),
+            ("unitig_off", s.unitig_off.len == nu + 1),
+            ("unitig_nodes", Some(s.unitig_nodes.len) == end(s.unitig_off)),
+            ("unitig_color", s.unitig_color.len == nu),
+            ("unitig_family", s.unitig_family.len == nu),
+            ("occ_off", s.occ_off.len == nu + 1),
+            ("occ_tx", Some(s.occ_tx.len) == end(s.occ_off)),
+            ("occ_pos", Some(s.occ_pos.len) == end(s.occ_off)),
+            ("color_tx", Some(s.color_tx.len) == end(s.color_off)),
+            ("tx_family", s.tx_family.len == nt),
+            ("tx_len", s.tx_len.len == nt),
+            ("tx_plen", s.tx_plen.len == nt),
+            ("tx_seq_off", s.tx_seq_off.len == nt + 1),
+            ("tx_seq", Some(s.tx_seq.len) == end(s.tx_seq_off)),
+            ("tx_name_off", s.tx_name_off.len == nt + 1),
+            ("tx_names", Some(s.tx_names.len) == end(s.tx_name_off)),
+            ("gene_names", Some(s.gene_names.len) == end(s.gene_name_off)),
+        ];
+        if let Some(r) = raw {
+            checks.extend([
+                ("tx_raw_off", r.off.len == nt + 1),
+                ("tx_raw", Some(r.words.len) == end(r.off)),
+                ("tx_raw_ck_off", r.ck_off.len == nt + 1),
+                ("tx_raw_ck", Some(r.ck.len) == end(r.ck_off)),
+            ]);
+        }
+        for (name, ok) in checks {
+            anyhow::ensure!(ok, "index section {name} has the wrong size; rebuild the index");
+        }
+        Ok(())
     }
 
     pub fn meta(&self, key: &str) -> Option<&str> {
@@ -463,9 +535,7 @@ impl Index {
 
     /// The index holds raw (uncompressed) transcript sequence.
     pub fn has_raw(&self) -> bool {
-        self.raw
-            .as_ref()
-            .is_some_and(|r| r.off.len > self.n_transcripts())
+        self.raw.is_some()
     }
 
     /// Check that this build parses sequence as the index was built: an index built with
@@ -564,7 +634,7 @@ impl Index {
     /// 2-bit codes (A=0, C=1, G=2, T=3) of the parsed transcript `t` over `[lo, hi)`.
     pub fn tx_codes(&self, t: u32, lo: u32, hi: u32) -> Vec<u8> {
         let mut v = Vec::new();
-        self.tx_codes_into(t, lo, hi, &mut v, false);
+        self.tx_codes_into(t, lo, hi, &mut v);
         v
     }
 
@@ -587,12 +657,10 @@ impl Index {
         }
     }
 
-    /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes or (if
-    /// `ascii`) as ACGT.
-    pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>, ascii: bool) {
+    /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes.
+    pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>) {
         let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
-        let map: [u8; 4] = if ascii { *b"ACGT" } else { [0, 1, 2, 3] };
-        decode_into(words, lo, hi, map, out);
+        decode_into(words, lo, hi, out);
     }
 
     /// Whether the parsed transcripts `t` from `lo` and `u` from `ulo` agree on `len` bases,
@@ -614,21 +682,8 @@ impl Index {
         let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
         let (words, _) = self.raw_words(t)?;
         let mut v = Vec::new();
-        decode_into(words, a, b, [0, 1, 2, 3], &mut v);
+        decode_into(words, a, b, &mut v);
         Some(v)
-    }
-
-    /// Whether the raw bases under parsed `[lo, hi)` of transcript `t` equal those under parsed
-    /// `[ulo, uhi)` of `u` (homopolymer run lengths included), compared on the packed sequence.
-    /// None if the index lacks either raw sequence.
-    pub fn tx_raw_eq(&self, t: u32, lo: u32, hi: u32, u: u32, ulo: u32, uhi: u32) -> Option<bool> {
-        let (a, b) = (self.tx_raw_pos(t, lo)?, self.tx_raw_pos(t, hi)?);
-        let (ua, ub) = (self.tx_raw_pos(u, ulo)?, self.tx_raw_pos(u, uhi)?);
-        if b - a != ub - ua {
-            return Some(false);
-        }
-        let ((tw, _), (uw, _)) = (self.raw_words(t)?, self.raw_words(u)?);
-        Some(packed_eq(tw, a, uw, ua, b - a))
     }
 
     /// Raw position of transcript `t` where parsed base `p` starts (the raw length at the
@@ -788,9 +843,10 @@ mod packed_tests {
             let n = bases.len() as u32;
             let (lo, hi) = ((a as u32).min(n), (b as u32).min(n));
             let (lo, hi) = (lo.min(hi), lo.max(hi));
-            let mut got = Vec::new();
-            decode_into(&w, lo, hi, *b"ACGT", &mut got);
-            let want: Vec<u8> = (lo..hi).map(|i| b"ACGT"[base_at(&w, i) as usize]).collect();
+            // Codes (whole words 8 at a time, then the rest), appended after earlier bytes.
+            let mut got = b"xyz".to_vec();
+            decode_into(&w, lo, hi, &mut got);
+            let want: Vec<u8> = b"xyz".iter().copied().chain((lo..hi).map(|i| base_at(&w, i))).collect();
             prop_assert_eq!(got, want);
             // A run start: position 0 or a change.
             let starts: Vec<u32> =

@@ -2,11 +2,11 @@
 //!
 //! `OracleChainer` runs one DP per candidate transcript. Transcripts are visited in order of
 //! their placement lists (shifted to the first placement), and each DP resumes where its list
-//! diverges from the previous transcript's: identical prefixes give identical DP values, so
-//! this is exact and shares the work of isoforms that agree over a read's anchors. It defines
-//! the scores the multi-transcript refinement chainer (`RefineChainer`) must reproduce exactly
-//! with an unbounded beam, so the window, validity rule, gain and cost here are the
-//! specification:
+//! diverges from the previous transcript's (an equal list reuses its chain): identical prefixes
+//! give identical DP values, so this is exact and shares the work of isoforms that agree over a
+//! read's anchors. It defines the scores the multi-transcript refinement chainer
+//! (`RefineChainer`) must reproduce exactly with an unbounded beam, so the window, validity
+//! rule, gain and cost here are the specification:
 //!
 //! - Anchors of a candidate are indexed in their family order (sorted by query start);
 //!   anchor `i'` may extend a chain ending at anchor `i` only if `i' - h <= i < i'`.
@@ -44,6 +44,28 @@ impl Default for ChainParams {
             g_max: 5000,
             h: 50,
         }
+    }
+}
+
+impl ChainParams {
+    /// Errors unless the gap limits fit the i32 kernels (coordinates are below 2^31) and the
+    /// window arithmetic (`2 * h`, `anchor + h`) can't overflow.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let lim = i32::MAX as i64;
+        anyhow::ensure!(
+            (-lim..=lim).contains(&self.g_max),
+            "chain_max_gap must be within ±{lim}"
+        );
+        anyhow::ensure!(
+            (-lim..=lim).contains(&self.o_max),
+            "chain_max_overlap must be within ±{lim}"
+        );
+        anyhow::ensure!(
+            (1..=u32::MAX as usize).contains(&self.h),
+            "chain_window must be in 1..={}",
+            u32::MAX
+        );
+        Ok(())
     }
 }
 
@@ -109,12 +131,15 @@ pub trait Chainer {
     fn chain(&self, idx: &Index, cand: &Candidate) -> Vec<TxHit>;
 }
 
-/// An anchor placed in one transcript.
-#[derive(Clone, Copy)]
+/// An anchor placed in one transcript, ordered as placement lists are compared: by anchor,
+/// then relative target start.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Placed {
     /// Index of the anchor in the candidate's family order.
     a: u32,
-    ts: u32,
+    /// Target start relative to the transcript's first placement, plus `REL_BIAS` (as the DP
+    /// takes it).
+    rel: i32,
 }
 
 pub struct OracleChainer {
@@ -284,20 +309,24 @@ fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Ve
         });
         crate::stats::add(&crate::stats::RESCUE_PTS, n as u64);
         crate::stats::add(&crate::stats::RESCUE_PTS_DP, (n - lcp) as u64);
+        // Points from `n` on are `dp_beta0`'s padding: identity u32::MAX, so never valid
+        // predecessors (their other fields may be an earlier list's).
+        let np = n + LANES - 1;
         for v in [&mut sc.qs, &mut sc.qe, &mut sc.ts, &mut sc.te] {
-            if v.len() < n {
-                v.resize(n, 0);
+            if v.len() < np {
+                v.resize(np, 0);
             }
         }
         for v in [&mut sc.w, &mut sc.f, &mut sc.disc, &mut sc.cs, &mut sc.cd] {
-            if v.len() < n {
-                v.resize(n, 0.0);
+            if v.len() < np {
+                v.resize(np, 0.0);
             }
         }
-        if sc.a.len() < n {
-            sc.a.resize(n, 0);
-            sc.back.resize(n, u32::MAX);
+        if sc.a.len() < np {
+            sc.a.resize(np, 0);
+            sc.back.resize(np, u32::MAX);
         }
+        sc.a[n..np].fill(u32::MAX);
         let ts0 = pts[0].ts as i64;
         for (i, x) in pts.iter().enumerate().skip(lcp) {
             let ts = (x.ts as i64 - ts0) as i32;
@@ -312,14 +341,14 @@ fn best_chains_beta0(p: &ChainParams, lists: &[&[Pt]], sc: &mut DpScratch) -> Ve
             level,
             &wp,
             (
-                &sc.a[..n],
-                &sc.qs[..n],
-                &sc.qe[..n],
-                &sc.ts[..n],
-                &sc.te[..n],
-                &sc.w[..n],
+                &sc.a[..np],
+                &sc.qs[..np],
+                &sc.qe[..np],
+                &sc.ts[..np],
+                &sc.te[..np],
+                &sc.w[..np],
             ),
-            &mut sc.f[..n],
+            &mut sc.f[..np],
             &mut sc.back[..n],
             &mut sc.disc[..n],
             lcp,
@@ -360,6 +389,8 @@ struct DpScratch {
     /// order.
     bucket_of: Vec<u32>,
     tx: Vec<u32>,
+    /// Per bucket, the target start of its first placement.
+    ts0: Vec<u32>,
     buckets: Vec<Vec<Placed>>,
     // Structure-of-arrays for one transcript's placements.
     a: Vec<u32>,
@@ -384,9 +415,33 @@ thread_local! {
     static DP: std::cell::RefCell<DpScratch> = std::cell::RefCell::new(DpScratch::default());
 }
 
-/// Scores of extending each predecessor `m` in `lo..k` with `y` (`-inf` if invalid) and the
-/// gap discrepancies, branch-free so it vectorizes; the arithmetic is exactly `transition`'s
-/// (with β = 0), so results are bit-identical.
+/// The score of extending predecessor `x` (identity, query start and end, relative target
+/// start and end, DP value) with `y` (`-inf` if invalid) and the gap discrepancy, branch-free
+/// so it vectorizes; the arithmetic is exactly `transition`'s (with β = 0), so results are
+/// bit-identical.
+#[inline(always)]
+fn pred_score(
+    alpha: f32,
+    rho: f32,
+    o_max: i32,
+    g_max: i32,
+    (xa, xqs, xqe, xts, xte, xf): (u32, i32, i32, i32, i32, f32),
+    (ya, yqs, yqe, yts, yw): (u32, i32, i32, i32, f32),
+) -> (f32, f32) {
+    let dq = yqs - xqe;
+    let dt = yts - xte;
+    let valid =
+        xa < ya && yqs > xqs && yts > xts && dq >= -o_max && dq <= g_max && dt >= -o_max && dt <= g_max;
+    let d = (dq as f32 - rho * dt as f32).abs();
+    let gamma = alpha * d;
+    let overlap = (xqe - yqs).max(0).min(yqe - yqs) as f32;
+    let qlen = (yqe - yqs) as f32;
+    let delta = yw * (1.0 - overlap / qlen) - gamma;
+    (if valid { xf + delta } else { f32::NEG_INFINITY }, d)
+}
+
+/// [`pred_score`] of each predecessor `m` in `lo..k`, with the gap discrepancies.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn pred_scores(
@@ -400,27 +455,13 @@ fn pred_scores(
     xts: &[i32],
     xte: &[i32],
     xf: &[f32],
-    (ya, yqs, yqe, yts, yw): (u32, i32, i32, i32, f32),
+    y: (u32, i32, i32, i32, f32),
     cs: &mut [f32],
     cd: &mut [f32],
 ) {
-    let qlen = (yqe - yqs) as f32;
     for m in 0..cs.len() {
-        let dq = yqs - xqe[m];
-        let dt = yts - xte[m];
-        let valid = xa[m] < ya
-            && yqs > xqs[m]
-            && yts > xts[m]
-            && dq >= -o_max
-            && dq <= g_max
-            && dt >= -o_max
-            && dt <= g_max;
-        let d = (dq as f32 - rho * dt as f32).abs();
-        let gamma = alpha * d;
-        let overlap = (xqe[m] - yqs).max(0).min(yqe - yqs) as f32;
-        let delta = yw * (1.0 - overlap / qlen) - gamma;
-        cs[m] = if valid { xf[m] + delta } else { f32::NEG_INFINITY };
-        cd[m] = d;
+        let x = (xa[m], xqs[m], xqe[m], xts[m], xte[m], xf[m]);
+        (cs[m], cd[m]) = pred_score(alpha, rho, o_max, g_max, x, y);
     }
 }
 
@@ -516,10 +557,10 @@ unsafe fn pred_scores_neon(
     );
 }
 
-/// [`max_score`] of `xs` and the first position equal to it, in one NEON pass: each lane keeps
-/// its maximum and where it first reached it (strictly greater values replace it), and the
-/// lowest position among the lanes at the overall maximum is the first one. The maximum is
-/// [`max_score`]'s up to the sign of a zero, which `==` ignores.
+/// The maximum of `xs` (never NaN) and the first position equal to it, in one NEON pass: each
+/// lane keeps its maximum and where it first reached it (strictly greater values replace it),
+/// and the lowest position among the lanes at the overall maximum is the first one. The
+/// maximum is the in-order maximum up to the sign of a zero, which `==` ignores.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn max_first_neon(xs: &[f32]) -> (f32, usize) {
@@ -553,8 +594,8 @@ unsafe fn max_first_neon(xs: &[f32]) -> (f32, usize) {
 
 /// Maximum of `xs` (never NaN; equal to the in-order maximum up to the sign of a zero).
 /// Long windows reduce in 16 independent lanes; a single running maximum is one dependent
-/// step per element.
-#[inline(always)]
+/// step per element. (The reference of [`max_first_neon`]'s test.)
+#[cfg(all(test, target_arch = "aarch64"))]
 fn max_score(xs: &[f32]) -> f32 {
     // Comparison form: one max instruction per step (scores are never NaN).
     let max = |a: f32, v: f32| if v > a { v } else { a };
@@ -571,58 +612,114 @@ fn max_score(xs: &[f32]) -> f32 {
     rest.iter().chain(&acc).fold(f32::NEG_INFINITY, |a, &v| max(a, v))
 }
 
-/// The per-anchor kernels of [`dp_beta0_core`]: the scalar loops (autovectorized for the
-/// entry point's level), or NEON.
-trait Preds {
-    /// [`pred_scores`].
-    #[allow(clippy::too_many_arguments)]
-    fn scores(
-        alpha: f32,
-        rho: f32,
-        o_max: i32,
-        g_max: i32,
-        xa: &[u32],
-        xqs: &[i32],
-        xqe: &[i32],
-        xts: &[i32],
-        xte: &[i32],
-        xf: &[f32],
-        y: (u32, i32, i32, i32, f32),
-        cs: &mut [f32],
-        cd: &mut [f32],
-    );
-    /// The first position of the maximum of `xs` (never NaN), if that maximum exceeds `best`.
-    fn first_max_above(xs: &[f32], best: f32) -> Option<usize>;
+/// Most predecessors a kernel scores at once: windows are scored in whole blocks of the
+/// kernel's [`Preds::BLOCK`] (at most this), so [`dp_beta0`]'s inputs carry `LANES - 1`
+/// points of padding.
+const LANES: usize = 16;
+
+/// Maximum of `acc` by halving (never NaN; equal to the in-order maximum up to the sign of a
+/// zero).
+#[inline(always)]
+fn max_lanes<const B: usize>(mut acc: [f32; B]) -> f32 {
+    let mut w = B / 2;
+    while w > 0 {
+        for l in 0..w {
+            acc[l] = if acc[l + w] > acc[l] { acc[l + w] } else { acc[l] };
+        }
+        w /= 2;
+    }
+    acc[0]
 }
 
-/// [`pred_scores`] and [`max_score`].
-struct ScalarPreds;
+/// The first position of `mx` in `xs` (whole blocks of `B`, `mx` among them): the lowest
+/// position at it in each lane, then over the lanes, so it vectorizes (no early exit).
+#[inline(always)]
+fn first_at<const B: usize>(xs: &[f32], mx: f32) -> usize {
+    let mut first = [u32::MAX; B];
+    let mut at: [u32; B] = std::array::from_fn(|l| l as u32);
+    for c in xs.as_chunks::<B>().0 {
+        for l in 0..B {
+            first[l] = first[l].min(if c[l] == mx { at[l] } else { u32::MAX });
+            at[l] += B as u32;
+        }
+    }
+    first.iter().fold(u32::MAX, |j, &i| j.min(i)) as usize
+}
 
-impl Preds for ScalarPreds {
-    #[inline(always)]
-    fn scores(
+/// The per-anchor kernel of [`dp_beta0_core`]: the scalar loops (autovectorized for the
+/// entry point's level), or NEON.
+trait Preds {
+    /// Windows are scored in whole blocks of this many predecessors (at most [`LANES`]).
+    const BLOCK: usize;
+    /// The best predecessor of `y` in the window `x` (whole blocks): the first position of the
+    /// maximum [`pred_score`] (never NaN), that score and its discrepancy, if the score exceeds
+    /// `best`. `cs` and `cd` (the window's length) are scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn best_pred(
         alpha: f32,
         rho: f32,
         o_max: i32,
         g_max: i32,
-        xa: &[u32],
-        xqs: &[i32],
-        xqe: &[i32],
-        xts: &[i32],
-        xte: &[i32],
-        xf: &[f32],
+        x: Soa,
         y: (u32, i32, i32, i32, f32),
+        best: f32,
         cs: &mut [f32],
         cd: &mut [f32],
-    ) {
-        pred_scores(alpha, rho, o_max, g_max, xa, xqs, xqe, xts, xte, xf, y, cs, cd)
-    }
+    ) -> Option<(usize, f32, f32)>;
+}
+
+/// [`pred_score`] and the first maximum in `B` lanes: one pass scores the window and keeps
+/// each lane's maximum.
+struct ScalarPreds<const B: usize>;
+
+impl<const B: usize> Preds for ScalarPreds<B> {
+    const BLOCK: usize = B;
     #[inline(always)]
-    fn first_max_above(xs: &[f32], best: f32) -> Option<usize> {
-        let mx = max_score(xs);
+    fn best_pred(
+        alpha: f32,
+        rho: f32,
+        o_max: i32,
+        g_max: i32,
+        (xa, xqs, xqe, xts, xte, xf): Soa,
+        y: (u32, i32, i32, i32, f32),
+        best: f32,
+        cs: &mut [f32],
+        cd: &mut [f32],
+    ) -> Option<(usize, f32, f32)> {
+        let (xa, xqs, xqe) = (
+            xa.as_chunks::<B>().0,
+            xqs.as_chunks::<B>().0,
+            xqe.as_chunks::<B>().0,
+        );
+        let (xts, xte, xf) = (
+            xts.as_chunks::<B>().0,
+            xte.as_chunks::<B>().0,
+            xf.as_chunks::<B>().0,
+        );
+        let (bs, bd) = (cs.as_chunks_mut::<B>().0, cd.as_chunks_mut::<B>().0);
+        let mut acc = [f32::NEG_INFINITY; B];
+        for b in 0..bs.len() {
+            let (xa, xqs, xqe, xts, xte, xf) = (&xa[b], &xqs[b], &xqe[b], &xts[b], &xte[b], &xf[b]);
+            let (bs, bd) = (&mut bs[b], &mut bd[b]);
+            for l in 0..B {
+                let x = (xa[l], xqs[l], xqe[l], xts[l], xte[l], xf[l]);
+                let (c, d) = pred_score(alpha, rho, o_max, g_max, x, y);
+                (bs[l], bd[l]) = (c, d);
+                // Comparison form: one max instruction per step (scores are never NaN).
+                acc[l] = if c > acc[l] { c } else { acc[l] };
+            }
+        }
+        let mx = max_lanes(acc);
+        // An early return, not `then`: a closure borrowing `cs` costs the loop above its
+        // vectorization. Candidate scores are never NaN, so this is exactly `!(mx > best)`,
+        // NeonPreds' test: every level keeps the same predecessors.
+        if mx <= best {
+            return None;
+        }
         // The first predecessor at the maximum (its own value is what the in-order maximum
         // would return, whatever the sign of a zero).
-        (mx > best).then(|| xs.iter().position(|&v| v == mx).unwrap())
+        let j = first_at::<B>(cs, mx);
+        Some((j, cs[j], cd[j]))
     }
 }
 
@@ -633,31 +730,25 @@ struct NeonPreds;
 
 #[cfg(target_arch = "aarch64")]
 impl Preds for NeonPreds {
+    const BLOCK: usize = 4;
     #[inline(always)]
-    fn scores(
+    fn best_pred(
         alpha: f32,
         rho: f32,
         o_max: i32,
         g_max: i32,
-        xa: &[u32],
-        xqs: &[i32],
-        xqe: &[i32],
-        xts: &[i32],
-        xte: &[i32],
-        xf: &[f32],
+        (xa, xqs, xqe, xts, xte, xf): Soa,
         y: (u32, i32, i32, i32, f32),
+        best: f32,
         cs: &mut [f32],
         cd: &mut [f32],
-    ) {
+    ) -> Option<(usize, f32, f32)> {
         // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe { pred_scores_neon(alpha, rho, o_max, g_max, xa, xqs, xqe, xts, xte, xf, y, cs, cd) }
-    }
-    #[inline(always)]
-    fn first_max_above(xs: &[f32], best: f32) -> Option<usize> {
+        unsafe { pred_scores_neon(alpha, rho, o_max, g_max, xa, xqs, xqe, xts, xte, xf, y, cs, cd) };
         // As the scalar one, the position found in the same pass.
-        // SAFETY: NEON is part of the aarch64 baseline.
-        let (mx, j) = unsafe { max_first_neon(xs) };
-        (mx > best).then_some(j)
+        // SAFETY: as above.
+        let (mx, j) = unsafe { max_first_neon(cs) };
+        if mx > best { Some((j, cs[j], cd[j])) } else { None }
     }
 }
 
@@ -670,6 +761,10 @@ type Soa<'a> = (&'a [u32], &'a [i32], &'a [i32], &'a [i32], &'a [i32], &'a [f32]
 /// a whole so the per-anchor work (predecessor scores, their maximum) stays in one vectorized
 /// loop without dispatch. The arithmetic is the same at every level (no FMA contraction), so
 /// results are bit-identical.
+///
+/// `n` is `back.len()`; `soa` and `f` hold `n + LANES - 1` points, those from `n` on padding
+/// with identity `u32::MAX` (never a valid predecessor; its other fields any point's, or 0),
+/// so windows can be scored in whole blocks.
 #[allow(clippy::too_many_arguments)]
 fn dp_beta0(
     level: Level,
@@ -692,7 +787,9 @@ fn dp_beta0(
         // NEON is part of the aarch64 baseline: no entry point of its own.
         #[cfg(target_arch = "aarch64")]
         Level::Neon => dp_beta0_core::<NeonPreds>(p, soa, f, back, disc, lcp, cs, cd),
-        _ => dp_beta0_core::<ScalarPreds>(p, soa, f, back, disc, lcp, cs, cd),
+        // Pairs: with only the baseline vector instructions, wider blocks cost more in
+        // padding on short windows than they save (measured).
+        _ => dp_beta0_core::<ScalarPreds<2>>(p, soa, f, back, disc, lcp, cs, cd),
     }
 }
 
@@ -709,7 +806,7 @@ fn dp_beta0_avx512(
     cs: &mut [f32],
     cd: &mut [f32],
 ) {
-    dp_beta0_core::<ScalarPreds>(p, soa, f, back, disc, lcp, cs, cd)
+    dp_beta0_core::<ScalarPreds<16>>(p, soa, f, back, disc, lcp, cs, cd)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -725,7 +822,7 @@ fn dp_beta0_avx2(
     cs: &mut [f32],
     cd: &mut [f32],
 ) {
-    dp_beta0_core::<ScalarPreds>(p, soa, f, back, disc, lcp, cs, cd)
+    dp_beta0_core::<ScalarPreds<16>>(p, soa, f, back, disc, lcp, cs, cd)
 }
 
 #[inline(always)]
@@ -740,7 +837,10 @@ fn dp_beta0_core<K: Preds>(
     cs: &mut [f32],
     cd: &mut [f32],
 ) {
-    let n = a.len();
+    // A window rounded up to whole blocks ends within the `LANES - 1` points of padding.
+    const { assert!(K::BLOCK <= LANES) };
+    let n = back.len();
+    debug_assert!(a.len() >= n + LANES - 1 && f.len() >= n + LANES - 1);
     let mut lo = 0;
     for k in lcp..n {
         let ya = a[k];
@@ -750,24 +850,22 @@ fn dp_beta0_core<K: Preds>(
         let y = (ya, qs[k], qe[k], ts[k], w[k]);
         let (mut best, mut arg, mut bd) = (y.4, u32::MAX, 0.0f32);
         if k > lo {
-            let m = k - lo;
-            K::scores(
-                p.alpha,
-                p.rho,
-                p.o_max as i32,
-                p.g_max as i32,
-                &a[lo..k],
-                &qs[lo..k],
-                &qe[lo..k],
-                &ts[lo..k],
-                &te[lo..k],
-                &f[lo..k],
-                y,
-                &mut cs[..m],
-                &mut cd[..m],
+            // The window in whole blocks: the points from `k` on have identities from `ya`
+            // on (identities never decrease), so they are invalid like the padding.
+            let m = (k - lo).next_multiple_of(K::BLOCK);
+            let e = lo + m;
+            let x = (
+                &a[lo..e],
+                &qs[lo..e],
+                &qe[lo..e],
+                &ts[lo..e],
+                &te[lo..e],
+                &f[lo..e],
             );
-            if let Some(j) = K::first_max_above(&cs[..m], best) {
-                (best, arg, bd) = (cs[j], (lo + j) as u32, cd[j]);
+            let (cs, cd) = (&mut cs[..m], &mut cd[..m]);
+            let (alpha, rho, o_max, g_max) = (p.alpha, p.rho, p.o_max as i32, p.g_max as i32);
+            if let Some((j, c, d)) = K::best_pred(alpha, rho, o_max, g_max, x, y, best, cs, cd) {
+                (best, arg, bd) = (c, (lo + j) as u32, d);
             }
         }
         f[k] = best;
@@ -797,6 +895,7 @@ impl OracleChainer {
             sc.bucket_of.resize(idx.n_transcripts(), 0);
         }
         sc.tx.clear();
+        sc.ts0.clear();
         let mut used = 0;
         // Occurrence lookups miss in cache twice (offsets, then lists): issue them ahead.
         const AHEAD: usize = 4;
@@ -817,14 +916,13 @@ impl OracleChainer {
                     }
                     sc.buckets[used].clear();
                     sc.tx.push(t);
+                    sc.ts0.push(p + off);
                     used += 1;
                     b = used as u32;
                     sc.bucket_of[t as usize] = b;
                 }
-                sc.buckets[b as usize - 1].push(Placed {
-                    a: i as u32,
-                    ts: p + off,
-                });
+                let rel = (i64::from(p + off) - i64::from(sc.ts0[b as usize - 1]) + REL_BIAS) as i32;
+                sc.buckets[b as usize - 1].push(Placed { a: i as u32, rel });
             }
         }
         for &t in &sc.tx {
@@ -844,21 +942,10 @@ impl OracleChainer {
         sc.order.extend(0..used as u32);
         {
             let b = &sc.buckets;
-            sc.order.sort_unstable_by(|&x, &y| {
-                let (u, v) = (&b[x as usize], &b[y as usize]);
-                let (u0, v0) = (u[0].ts as i64, v[0].ts as i64);
-                for (pu, pv) in u.iter().zip(v) {
-                    let c =
-                        pu.a.cmp(&pv.a)
-                            .then((pu.ts as i64 - u0).cmp(&(pv.ts as i64 - v0)));
-                    if c.is_ne() {
-                        return c;
-                    }
-                }
-                u.len().cmp(&v.len())
-            });
+            sc.order
+                .sort_unstable_by(|&x, &y| b[x as usize].cmp(&b[y as usize]));
         }
-        let mut hits = Vec::with_capacity(used);
+        let mut hits: Vec<TxHit> = Vec::with_capacity(used);
         let mut prev: Option<usize> = None;
         for oi in 0..used {
             let bi = sc.order[oi] as usize;
@@ -867,15 +954,29 @@ impl OracleChainer {
             let n = el.len();
             // Target positions are stored relative to the first placement (plus a bias that
             // keeps them positive); transitions only use their differences.
-            let base = el[0].ts as i64 - REL_BIAS;
-            let lcp = prev.map_or(0, |pb| {
+            let base = sc.ts0[bi] as i64 - REL_BIAS;
+            // The common prefix with the previous transcript's list, that list's length, and
+            // the offset between their target positions.
+            let (lcp, pn, shift) = prev.map_or((0, 0, 0), |pb| {
                 let pe = &sc.buckets[pb];
-                let pbase = pe[0].ts as i64 - REL_BIAS;
-                el.iter()
-                    .zip(pe)
-                    .take_while(|(x, y)| x.a == y.a && x.ts as i64 - base == y.ts as i64 - pbase)
-                    .count()
+                let lcp = el.iter().zip(pe).take_while(|(x, y)| x == y).count();
+                (lcp, pe.len(), base - (sc.ts0[pb] as i64 - REL_BIAS))
             });
+            if lcp == n && pn == n {
+                // The previous transcript's list (isoforms that agree over the read): the DP
+                // values and the buffers stay, and the hit is its chain shifted by the offset.
+                let sh = |ts: u32| (ts as i64 + shift) as u32;
+                let mut h = hits.last().unwrap().clone();
+                h.tx = t;
+                (h.tstart, h.tend) = (sh(h.tstart), sh(h.tend));
+                for c in &mut h.chain {
+                    c.1 = sh(c.1);
+                }
+                hits.push(h);
+                prev = Some(bi);
+                sc.buckets[bi] = el;
+                continue;
+            }
             sc.a.truncate(lcp);
             sc.qs.truncate(lcp);
             sc.qe.truncate(lcp);
@@ -884,7 +985,7 @@ impl OracleChainer {
             sc.w.truncate(lcp);
             for x in &el[lcp..] {
                 let an = &cand.anchors[x.a as usize];
-                let rel = (x.ts as i64 - base) as i32;
+                let rel = x.rel;
                 sc.a.push(x.a);
                 sc.qs.push(an.qs as i32);
                 sc.qe.push(an.qe as i32);
@@ -892,16 +993,24 @@ impl OracleChainer {
                 sc.te.push(rel + len(x.a as usize) as i32);
                 sc.w.push(an.weight);
             }
+            // Padding for `dp_beta0`, truncated again with the shared prefix.
+            let np = n + LANES - 1;
+            sc.a.resize(np, u32::MAX);
+            sc.qs.resize(np, 0);
+            sc.qe.resize(np, 0);
+            sc.ts.resize(np, 0);
+            sc.te.resize(np, 0);
+            sc.w.resize(np, 0.0);
             sc.f.truncate(lcp);
-            sc.f.resize(n, 0.0);
+            sc.f.resize(np, 0.0);
             sc.back.truncate(lcp);
             sc.back.resize(n, u32::MAX);
             sc.disc.truncate(lcp);
             sc.disc.resize(n, 0.0);
             if p.beta == 0.0 {
-                if sc.cs.len() < n {
-                    sc.cs.resize(n, 0.0);
-                    sc.cd.resize(n, 0.0);
+                if sc.cs.len() < np {
+                    sc.cs.resize(np, 0.0);
+                    sc.cd.resize(np, 0.0);
                 }
                 dp_beta0(
                     level,
@@ -950,7 +1059,7 @@ impl OracleChainer {
             }
             // Best chain end (ties: earliest element), then trace back.
             let (mut end, mut score) = (0, f32::NEG_INFINITY);
-            for (k, &s) in sc.f.iter().enumerate() {
+            for (k, &s) in sc.f[..n].iter().enumerate() {
                 if s > score {
                     (end, score) = (k, s);
                 }
@@ -1081,6 +1190,55 @@ mod best_chain_tests {
                 prop_assert_eq!(j, xs.iter().position(|&v| v == want).unwrap());
                 prop_assert_eq!(xs[j].to_bits(), xs[xs.iter().position(|&v| v == want).unwrap()].to_bits());
             }
+        }
+
+        /// The scalar kernel (at each block size in use) returns the first predecessor whose
+        /// score exceeds every earlier one and `best`, as `best_chain_scalar`'s loop takes it:
+        /// with ties (the list repeats), signed zeros, invalid predecessors and padding.
+        #[test]
+        fn scalar_best_pred_is_first_max(
+            raw in prop::collection::vec((0u32..60, -50i32..600, 0i32..80, -50i32..600, 0i32..80, prop_oneof![
+                Just(f32::NEG_INFINITY), Just(0.0f32), Just(-0.0f32), Just(1.5f32), (-20i32..20).prop_map(|v| v as f32),
+            ]), 0..65),
+            cut in 0usize..130,
+            y in (0u32..60, 0i32..600, 1i32..80, 0i32..600, prop_oneof![Just(0.0f32), Just(-0.0f32), 0.0f32..100.0]),
+            best in prop_oneof![Just(f32::NEG_INFINITY), Just(0.0f32), Just(-0.0f32), (-5i32..20).prop_map(|v| v as f32)],
+            alpha in prop_oneof![Just(1.5f32), Just(0.0f32), 0.0f32..4.0],
+        ) {
+            let xs: Vec<_> = raw.iter().chain(&raw).take(cut).copied().collect();
+            let y = (y.0, y.1, y.1 + y.2, y.3, y.4);
+            let pt = |x: &(u32, i32, i32, i32, i32, f32)| (x.0, x.1, x.1 + x.2, x.3, x.3 + x.4, x.5);
+            let mut want = None;
+            let mut top = best;
+            for (i, x) in xs.iter().enumerate() {
+                let (c, d) = pred_score(alpha, 1.0, 30, 500, pt(x), y);
+                if c > top {
+                    (top, want) = (c, Some((i, c.to_bits(), d.to_bits())));
+                }
+            }
+            fn run<const B: usize>(
+                xs: &[(u32, i32, i32, i32, i32, f32)],
+                alpha: f32,
+                y: (u32, i32, i32, i32, f32),
+                best: f32,
+            ) -> Option<(usize, u32, u32)> {
+                // The window padded to whole blocks.
+                let m = xs.len().next_multiple_of(B);
+                let pad = (u32::MAX, 0, 0, 0, 0, 0.0);
+                let x: Vec<_> = xs.iter().copied().chain(std::iter::repeat(pad)).take(m).collect();
+                let xa: Vec<u32> = x.iter().map(|x| x.0).collect();
+                let xqs: Vec<i32> = x.iter().map(|x| x.1).collect();
+                let xqe: Vec<i32> = x.iter().map(|x| x.1 + x.2).collect();
+                let xts: Vec<i32> = x.iter().map(|x| x.3).collect();
+                let xte: Vec<i32> = x.iter().map(|x| x.3 + x.4).collect();
+                let xf: Vec<f32> = x.iter().map(|x| x.5).collect();
+                let (mut cs, mut cd) = (vec![0.0; m], vec![0.0; m]);
+                let soa = (&xa[..], &xqs[..], &xqe[..], &xts[..], &xte[..], &xf[..]);
+                ScalarPreds::<B>::best_pred(alpha, 1.0, 30, 500, soa, y, best, &mut cs, &mut cd)
+                    .map(|(j, c, d)| (j, c.to_bits(), d.to_bits()))
+            }
+            prop_assert_eq!(run::<2>(&xs, alpha, y, best), want);
+            prop_assert_eq!(run::<16>(&xs, alpha, y, best), want);
         }
 
         /// Shared-prefix chaining of several lists equals one call per list: lists are

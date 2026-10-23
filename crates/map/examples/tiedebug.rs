@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use index::Index;
-use lcp_core::encode::{CODE, revcomp};
+use lcp_core::encode::{codes, revcomp};
 use map::{MapParams, Mapper, OracleChainer, align};
 
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
             .seeder
             .parsed(&oriented)
             .map_or(oriented.clone(), |x| x.seq);
-        let codes: Vec<u8> = seq.iter().map(|&c| CODE[c as usize] & 3).collect();
+        let codes = codes(&seq);
         let tlen = idx.tx_plen()[h.tx as usize];
         let full = idx.tx_codes(h.tx, 0, tlen);
         let d_full = align::infix_distance(&codes, &full);

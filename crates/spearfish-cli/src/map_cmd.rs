@@ -67,7 +67,8 @@ pub struct Args {
     /// PAF output (`-`: stdout).
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     paf: Option<PathBuf>,
-    /// RAD output (`bulk_long_read` records, which oarfish quantifies with `-a`).
+    /// RAD output, a file and not `-` (`bulk_long_read` records, which oarfish quantifies with
+    /// `-a`).
     #[arg(long, value_name = "FILE", help_heading = "Input and output")]
     rad: Option<PathBuf>,
     /// RAD chunk compression.
@@ -199,6 +200,47 @@ struct Processor {
     batch_reads: u64,
 }
 
+/// Append `x` in decimal (as `{}` would).
+fn push_uint(buf: &mut Vec<u8>, mut x: u64) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// Append `v` with `dec` (at most 4) decimals, digit for digit as `{:.dec$}` would: `v * 10^dec`
+/// is exact in an `f64`, and std rounds the exact value half to even. Values that are not finite
+/// or not below 1e9 go through `write!`.
+fn push_fixed(buf: &mut Vec<u8>, v: f32, dec: u32) {
+    debug_assert!(dec <= 4);
+    if !v.is_finite() || v.abs() >= 1e9 {
+        let _ = write!(buf, "{:.*}", dec as usize, v);
+        return;
+    }
+    if v.is_sign_negative() {
+        buf.push(b'-');
+    }
+    let p = 10u64.pow(dec);
+    let a = ((v as f64).abs() * p as f64).round_ties_even() as u64;
+    push_uint(buf, a / p);
+    if dec > 0 {
+        buf.push(b'.');
+        let f = a % p;
+        let mut d = p / 10;
+        while d > 0 {
+            buf.push(b'0' + ((f / d) % 10) as u8);
+            d /= 10;
+        }
+    }
+}
+
 /// TSV lines of one read.
 fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
     if r.hits.is_empty() {
@@ -211,22 +253,33 @@ fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
     }
     let read_flags = read_flags(r);
     for (rank, h) in r.hits.iter().enumerate() {
-        let strand = if h.reverse { '-' } else { '+' };
-        let _ = writeln!(
-            buf,
-            "{name}\t{}\t{strand}\t{rank}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{}",
-            r.len,
-            idx.tx_name(h.tx),
-            h.score,
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(b'\t');
+        push_uint(buf, r.len as u64);
+        buf.extend_from_slice(if h.reverse { b"\t-\t" } else { b"\t+\t" });
+        push_uint(buf, rank as u64);
+        buf.push(b'\t');
+        buf.extend_from_slice(idx.tx_name(h.tx).as_bytes());
+        buf.push(b'\t');
+        push_fixed(buf, h.score, 2);
+        for x in [
             h.query_start,
             h.query_end,
             h.target_start,
             h.target_end,
             h.anchors,
             h.anchored,
-            h.max_discrepancy,
-            hit_flags(read_flags, h.extended)
-        );
+        ] {
+            buf.push(b'\t');
+            push_uint(buf, x as u64);
+        }
+        buf.push(b'\t');
+        push_fixed(buf, h.max_discrepancy, 0);
+        buf.push(b'\t');
+        if !push_hit_flags(buf, read_flags, h.extended) {
+            buf.push(b'-');
+        }
+        buf.push(b'\n');
     }
 }
 
@@ -239,12 +292,17 @@ fn read_flags(r: &MappedRead) -> &'static str {
     }
 }
 
-fn hit_flags(read_flags: &str, extended: bool) -> std::borrow::Cow<'_, str> {
-    match (extended, read_flags) {
-        (true, f) => f.into(),
-        (false, "-") => "anchor_span".into(),
-        (false, f) => format!("{f},anchor_span").into(),
+/// Append a hit's flags (the read's, then `anchor_span` if the span was not extended); false
+/// (nothing written) if it has none.
+fn push_hit_flags(buf: &mut Vec<u8>, read_flags: &str, extended: bool) -> bool {
+    let has_read = read_flags != "-";
+    if has_read {
+        buf.extend_from_slice(read_flags.as_bytes());
     }
+    if !extended {
+        buf.extend_from_slice(if has_read { b",anchor_span" } else { b"anchor_span" });
+    }
+    has_read || !extended
 }
 
 /// PAF lines of one read (none if unmapped). Columns as minimap2 writes them without `-c`:
@@ -256,27 +314,40 @@ fn hit_flags(read_flags: &str, extended: bool) -> std::borrow::Cow<'_, str> {
 pub fn paf_line(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
     let read_flags = read_flags(r);
     for (rank, h) in r.hits.iter().enumerate() {
-        let strand = if h.reverse { '-' } else { '+' };
         let block = (h.query_end - h.query_start).max(h.target_end - h.target_start);
-        let _ = write!(
-            buf,
-            "{name}\t{}\t{}\t{}\t{strand}\t{}\t{}\t{}\t{}\t{}\t{block}\t255\ttp:A:{}\tAS:i:{:.0}\tsc:f:{:.2}\tcm:i:{}\trk:i:{rank}",
-            r.len,
-            h.query_start,
-            h.query_end,
-            idx.tx_name(h.tx),
+        buf.extend_from_slice(name.as_bytes());
+        for x in [r.len, h.query_start, h.query_end] {
+            buf.push(b'\t');
+            push_uint(buf, x as u64);
+        }
+        buf.extend_from_slice(if h.reverse { b"\t-\t" } else { b"\t+\t" });
+        buf.extend_from_slice(idx.tx_name(h.tx).as_bytes());
+        for x in [
             idx.tx_len(h.tx),
             h.target_start,
             h.target_end,
             h.anchored.min(block),
-            if rank == 0 { 'P' } else { 'S' },
-            h.score,
-            h.score,
-            h.anchors,
-        );
-        let f = hit_flags(read_flags, h.extended);
-        if f != "-" {
-            let _ = write!(buf, "\tfl:Z:{f}");
+            block,
+        ] {
+            buf.push(b'\t');
+            push_uint(buf, x as u64);
+        }
+        buf.extend_from_slice(if rank == 0 {
+            b"\t255\ttp:A:P\tAS:i:"
+        } else {
+            b"\t255\ttp:A:S\tAS:i:"
+        });
+        push_fixed(buf, h.score, 0);
+        buf.extend_from_slice(b"\tsc:f:");
+        push_fixed(buf, h.score, 2);
+        buf.extend_from_slice(b"\tcm:i:");
+        push_uint(buf, h.anchors as u64);
+        buf.extend_from_slice(b"\trk:i:");
+        push_uint(buf, rank as u64);
+        let mark = buf.len();
+        buf.extend_from_slice(b"\tfl:Z:");
+        if !push_hit_flags(buf, read_flags, h.extended) {
+            buf.truncate(mark);
         }
         buf.push(b'\n');
     }
@@ -317,7 +388,9 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         if self.tsv.is_none() && self.paf.is_none() {
             return Ok(());
         }
-        let name = record.id_str().split_whitespace().next().unwrap_or("");
+        // Lossy: a header that is not UTF-8 gets U+FFFD instead of failing the run.
+        let id = String::from_utf8_lossy(record.id());
+        let name = id.split_whitespace().next().unwrap_or("");
         let idx = self.mapper.index();
         if let Some((_, buf)) = &mut self.tsv {
             tsv_lines(buf, name, &r, idx);
@@ -503,6 +576,11 @@ pub fn execute(args: Job) -> Result<Counts> {
     if stdout_outputs > 1 {
         bail!("only one output can go to stdout");
     }
+    if args.rad.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+        bail!(
+            "RAD output needs a file (its read counts are written when it is finished); `-` (stdout) is not supported"
+        );
+    }
     let tsv_path = match (&args.output, &args.paf, &args.rad) {
         (None, None, None) => Some(PathBuf::from("-")),
         (o, _, _) => o.clone(),
@@ -545,7 +623,7 @@ pub fn execute(args: Job) -> Result<Counts> {
         None => None,
     };
     let rad = match &args.rad {
-        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings)?),
+        Some(p) => Some(rad_writer(p, args.rad_codec, &mapper, &settings, &invocation)?),
         None => None,
     };
     let total = Arc::new(Mutex::new(Counts::default()));
@@ -653,6 +731,7 @@ fn rad_writer(
     codec: Codec,
     mapper: &Mapper,
     settings: &MapSettings,
+    invocation: &Invocation,
 ) -> Result<long_read_rad::RadWriter> {
     let codec = match codec {
         Codec::Lz4 => long_read_rad::ChunkCodec::Lz4,
@@ -667,7 +746,7 @@ fn rad_writer(
     let meta = long_read_rad::Meta {
         mapper: "spearfish".into(),
         mapper_version: spearfish::provenance::BuildInfo::current().short(),
-        cmdline: std::env::args().collect::<Vec<_>>().join(" "),
+        cmdline: invocation.command_line.join(" "),
         params: serde_json::to_string(&serde_json::json!({
             "settings": settings,
             "parameters": opts,
@@ -680,4 +759,74 @@ fn rad_writer(
         index_id: idx.id(),
     };
     long_read_rad::RadWriter::create(path, &refs, &meta, codec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::SplitMix64;
+
+    /// `push_fixed` writes what `{:.0}` and `{:.2}` write (checked offline on every f32), and
+    /// `push_uint` what `{}` writes.
+    #[test]
+    fn digits_match_std_formatting() {
+        let mut buf = Vec::new();
+        let mut check = |v: f32| {
+            for dec in [0, 2] {
+                buf.clear();
+                push_fixed(&mut buf, v, dec);
+                let want = format!("{:.*}", dec as usize, v);
+                assert_eq!(
+                    std::str::from_utf8(&buf).unwrap(),
+                    want,
+                    "{v:e} ({:#x}) to {dec} decimals",
+                    v.to_bits()
+                );
+            }
+        };
+        let mut rng = SplitMix64::for_record(7, 0);
+        // Any bit pattern, scores and discrepancies in their usual ranges, every 4093rd bit
+        // pattern, and exact ties at both precisions.
+        for _ in 0..200_000 {
+            check(f32::from_bits(rng.next_u64() as u32));
+            check((rng.unit() * 2e5 - 1e5) as f32);
+            check((rng.unit() * 2.0 - 1.0) as f32);
+        }
+        for b in (0..=u32::MAX).step_by(4093) {
+            check(f32::from_bits(b));
+        }
+        for k in 0..20_000 {
+            for f in [0.125, 0.375, 0.5, 0.625, 0.875] {
+                check(k as f32 + f);
+                check(-(k as f32 + f));
+            }
+        }
+        for v in [
+            0.0,
+            -0.0,
+            -0.001,
+            -0.4,
+            0.005,
+            9.995,
+            f32::MIN_POSITIVE,
+            1e-40,
+            999_999_940.0,
+            1e9,
+            f32::MAX,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            check(v);
+        }
+        let mut buf = Vec::new();
+        for x in [0, 1, 9, 10, 99, 100, u32::MAX as u64, u64::MAX]
+            .into_iter()
+            .chain((0..10_000).map(|_| rng.next_u64() >> rng.below(64)))
+        {
+            buf.clear();
+            push_uint(&mut buf, x);
+            assert_eq!(buf, x.to_string().as_bytes());
+        }
+    }
 }

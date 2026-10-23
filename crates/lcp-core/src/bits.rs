@@ -144,10 +144,23 @@ impl BitArena {
     }
 
     /// One DCT step for item `i` (`i >= 1`) against item `i - 1`: [`dct_value`] of the two.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn dct(&self, i: usize) -> u64 {
-        let (lh, rh) = (self.head[i - 1], self.head[i]);
-        let (ll, rl) = (self.len[i - 1], self.len[i]);
+        self.dct_with(i, self.head[i - 1], self.head[i], self.len[i - 1], self.len[i])
+    }
+
+    /// The DCT step of every item `i >= 1` against item `i - 1`, into `out[i - 1]`
+    /// (`out.len() == self.len() - 1`).
+    pub(crate) fn dct_all(&self, out: &mut [u64]) {
+        let pairs = self.head.windows(2).zip(self.len.windows(2));
+        for (i, (v, (h, l))) in out.iter_mut().zip(pairs).enumerate() {
+            *v = self.dct_with(i + 1, h[0], h[1], l[0], l[1]);
+        }
+    }
+
+    /// The DCT step for item `i` given its and item `i - 1`'s low words and lengths.
+    #[inline(always)]
+    fn dct_with(&self, i: usize, lh: u64, rh: u64, ll: u32, rl: u32) -> u64 {
         let m = ll.min(rl);
         let x = lh ^ rh;
         let p = if x != 0 {
@@ -296,12 +309,15 @@ mod tests {
                         .collect()
                 })
                 .collect();
+            let mut all = vec![0; items.len() - 1];
+            a.dct_all(&mut all);
             for i in 1..items.len() {
                 let (l, r) = (&bits[i - 1], &bits[i]);
                 let m = l.len().min(r.len());
                 let p = (0..m).find(|&k| l[k] != r[k]).unwrap_or(m);
                 let want = 2 * p as u64 + r.get(p).copied().unwrap_or(0) as u64;
                 assert_eq!(a.dct(i), want, "{:?}", items);
+                assert_eq!(all[i - 1], want, "{:?}", items);
             }
         }
     }

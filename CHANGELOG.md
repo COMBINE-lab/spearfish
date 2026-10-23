@@ -73,6 +73,31 @@
   distances (four texts in lockstep), the LCP scan of the bases, and the chaining predecessor
   scores with their maximum.
 - `SPEARFISH_SIMD` lowers the SIMD level used; `spearfish doctor` reports it.
+- `spearfish index` builds about a third faster with about a third less peak memory
+  (GENCODE with spike-ins, 32 threads): node keys are deduplicated within genes before the
+  global sort, unitig chains are followed in parallel, and the transcript sequences are freed
+  once seeded. Building an index in memory (`Index::build`, as oarfish does from a FASTA) lays
+  the image out once instead of copying it twice. Index sections are byte-identical.
+- Rescue does less work per candidate window: genes come from the strand's anchor selection,
+  window seeds probe a table of the read's seed labels instead of being sorted and merged,
+  points are sorted as packed keys, and windows are parsed straight from their 2-bit codes,
+  for labels and starts only. 11-14% fewer instructions on ONT cDNA and simulated 90%-accuracy
+  ONT reads, 6% on direct RNA, 2% on simulated 95%-accuracy ONT reads and under 1% where little
+  is rescued (HiFi, PacBio), with identical output.
+- The tie-break's Global and Prefix edit distances (direct RNA's segment costs) run in the
+  batched SIMD kernels, as infix ones already did, and the affine DP rows write their own band
+  sentinel and run whole AVX-512 vectors: 17% fewer instructions on direct RNA and 0.5-3% on
+  the other read types, with identical output.
+- Chaining does less work per transcript: the DP scores predecessor windows in whole vector
+  blocks and finds the best one in the same pass, a transcript whose placements match the
+  previous transcript's reuses its chain, and placements are stored relative to their
+  transcript's first. 6-13% fewer instructions across read types, with identical output.
+- Less work per read outside the alignment and chaining kernels: the read is compressed once
+  (the library reuses the mapper's homopolymer runs for query spans), TSV and PAF lines are
+  written without `core::fmt`, packed bases are decoded 8 at a time, LCP core ends and the
+  first DCT step skip redundant work, and one orientation's hits are sorted by cached keys.
+  9-12% fewer instructions (ONT cDNA, direct RNA, PacBio and simulated reads) and 4-8% fewer
+  cycles single-threaded, with identical output.
 
 ### Fixes
 
@@ -104,6 +129,28 @@
   within ±0.001 Spearman. Mapping cost rises 0.4-1.8% in instructions (largest on ONT cDNA)
   and at most 1.5% in wall time.
 
+- `--orient-edit` and `--unit-tiebreak` (experimental): near-tied read orientations were
+  compared by edit distance over the leading orientation's anchored span but over the other
+  orientation's whole read, adapters and primers included, so the chain-score leader almost
+  always stayed. Both are now scored over the whole read: on the simulated ONT 90% set, top-1
+  95.75% -> 96.07% (`--orient-edit`) and 95.74% -> 96.05% (`--unit-tiebreak`). The presets
+  don't use this comparison.
+- A poly(A) tail after an A-run inside the read (an A-rich 3' UTR, a genomic A-stretch) was
+  missed: only the first A-run was looked at, and with more than 80 read bases after it the
+  read had no tail. The search now goes on past such runs, for tail trimming, `--tail-bonus`
+  and `--orient-tail`. 0.1-0.35% of real reads change mapping; simulated and spike-in accuracy
+  are unchanged.
+- On indexes built with `--no-hpc`, poly(A) tails were never found, so `--tail-trim`,
+  `--tail-bonus` and `--orient-tail` did nothing. On such an index, simulated ONT reads with
+  tails and adapters now reach 99.01% top-1 instead of 98.35%, and SIRV E2 Spearman on ONT
+  PCR-cDNA rises from 0.706 to 0.758. HPC indexes are unaffected.
+- With raw read ends (`ont`), a read end's band was laid out for a window computed from the
+  raw read end, while the candidate transcript windows are sized in compressed bases and are
+  often longer in raw ones: isoforms that agree near the read end got different bands and
+  could not share DP rows. Every candidate now gets the band of the longest window. About 0.1%
+  of ONT reads change mapping, accuracy is unchanged, and ONT mapping takes 0.4-2% fewer
+  instructions.
+
 - `spearfish map -o /dev/null` (or any output that is a device or pipe) no longer fails at the
   end trying to write `/dev/null.meta.json`: the run record goes next to the first output that
   is a regular file, and is skipped if there is none and `--meta` is not given.
@@ -121,6 +168,16 @@
 - `spearfish quant` keeps the RAD file when oarfish fails and names it, so `oarfish -a` can be
   rerun without mapping again; with `-v` the error no longer points to a log file that was not
   written (oarfish logs to stderr then).
+- A damaged raw-sequence section made an index load as one without raw sequence (which
+  changes mapping output), and sections of mismatched sizes loaded and then panicked while
+  mapping. Loading now fails with the section's name.
+- Index writing staged the file at the output's name with its extension replaced by `.tmp`, so
+  builds to `x.lcp` and `x.mm` at the same time shared one temporary file, and an unrelated
+  `x.tmp` was moved away. It now stages to `<output>.partial-<pid>` and removes it on failure.
+- Reads that spell T both as T and as U got wrong query coordinates. The mapper reads U as T,
+  so a T next to a U is one homopolymer run, but the query span was converted back to raw
+  bases with the runs of the read as given. Basecallers write one spelling per read, so
+  mapping real reads is unchanged.
 
 ### Other
 

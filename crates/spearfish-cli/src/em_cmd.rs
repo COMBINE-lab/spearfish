@@ -13,7 +13,8 @@ use quant::{EqBuilder, QuantParams, em};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Transcript FASTA (names and lengths; GENCODE `tx|...` headers are cut at '|').
+    /// Transcript FASTA (names and lengths; IDs are cut at the first '|' or whitespace, as
+    /// `spearfish index` cuts them).
     transcripts: PathBuf,
     /// Mapping TSV.
     mapping: PathBuf,
@@ -58,7 +59,7 @@ pub fn run(args: Args) -> Result<()> {
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {
             let rec = rec?;
-            names.push(rec.id_str().split('|').next().unwrap().to_string());
+            names.push(spearfish::name_and_gene(&String::from_utf8_lossy(rec.id())).0);
             lens.push(rec.seq().len() as u32);
         }
     }
@@ -131,7 +132,7 @@ pub fn run(args: Args) -> Result<()> {
         writeln!(out, "{n}\t{l}\t{c:.4}")?;
     }
     out.flush()?;
-    eprintln!(
+    log::info!(
         "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
         classes.len(),
         t0.elapsed().as_secs_f64()
