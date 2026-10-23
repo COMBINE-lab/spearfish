@@ -29,3 +29,5 @@ test = ["pytest>=7"]
 [tool.maturin]
 python-source = "python"
 module-name = "spearfish._spearfish"
+# Release tooling, not part of the package.
+exclude = [{ path = "ci/**", format = "sdist" }]
