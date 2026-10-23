@@ -77,6 +77,18 @@ fn read_name(id: &[u8]) -> String {
     id.split_whitespace().next().unwrap_or("").to_string()
 }
 
+/// Write `bytes` to a Python file object: as `bytes` to a binary file, as `str` to a text one
+/// (anything with an `encoding`).
+fn write_to(file: &Bound<'_, PyAny>, bytes: Vec<u8>) -> PyResult<()> {
+    if file.hasattr("encoding")? {
+        let text = String::from_utf8(bytes).map_err(value_err)?;
+        file.call_method1("write", (text,))?;
+    } else {
+        file.call_method1("write", (PyBytes::new(file.py(), &bytes),))?;
+    }
+    Ok(())
+}
+
 // ─── Index ──────────────────────────────────────────────────────────────────────────────────
 
 /// A spearfish transcriptome index.
@@ -813,6 +825,38 @@ struct PyBatch {
 }
 
 impl PyBatch {
+    /// The batch as `spearfish map` writes it: TSV (or PAF) lines of every read, in order.
+    /// Reads without names are named by their position in the batch.
+    fn lines(&self, paf: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut pos;
+        for (i, r) in self.reads.iter().enumerate() {
+            let name = match &self.names {
+                Some(n) => n[i].as_str(),
+                None => {
+                    pos = i.to_string();
+                    pos.as_str()
+                }
+            };
+            if paf {
+                spearfish::output::paf_lines(&mut buf, name, r, &self.index);
+            } else {
+                spearfish::output::tsv_lines(&mut buf, name, r, &self.index);
+            }
+        }
+        buf
+    }
+
+    fn formatted(&self, py: Python<'_>, paf: bool, header: bool) -> Vec<u8> {
+        let mut out = if header {
+            spearfish::output::TSV_HEADER.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        out.extend(py.detach(|| self.lines(paf)));
+        out
+    }
+
     fn read_at(&self, py: Python<'_>, i: usize) -> PyResult<PyMappedRead> {
         let name = self.names.as_ref().map(|n| n[i].clone());
         to_py_read(py, &self.index, name, &self.reads[i])
@@ -948,6 +992,32 @@ impl PyBatch {
         d.set_item("rescued", resc.into_pyarray(py))?;
         d.set_item("hit_offset", off.into_pyarray(py))?;
         Ok(d)
+    }
+
+    /// The batch as ``spearfish map``'s TSV, as ``bytes``: one line per hit, best first, and one
+    /// ``*`` line per unmapped read. Reads given without names are named by their position in
+    /// the batch.
+    ///
+    /// :param header: Start with the header line (:data:`TSV_HEADER`).
+    #[pyo3(signature = (*, header=false))]
+    fn to_tsv<'py>(&self, py: Python<'py>, header: bool) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.formatted(py, false, header))
+    }
+
+    /// The batch as ``spearfish map``'s PAF, as ``bytes`` (unmapped reads omitted).
+    fn to_paf<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.formatted(py, true, false))
+    }
+
+    /// Write :meth:`to_tsv` to ``file``, an open file (binary or text).
+    #[pyo3(signature = (file, *, header=false))]
+    fn write_tsv(&self, py: Python<'_>, file: &Bound<'_, PyAny>, header: bool) -> PyResult<()> {
+        write_to(file, self.formatted(py, false, header))
+    }
+
+    /// Write :meth:`to_paf` to ``file``, an open file (binary or text).
+    fn write_paf(&self, py: Python<'_>, file: &Bound<'_, PyAny>) -> PyResult<()> {
+        write_to(file, self.formatted(py, true, false))
     }
 
     /// One row per hit as a :class:`pandas.DataFrame`, like ``spearfish map``'s TSV: read
@@ -1479,6 +1549,177 @@ impl PyRecordBatches {
     }
 }
 
+// ─── RAD ────────────────────────────────────────────────────────────────────────────────────
+
+struct RadState {
+    writer: spearfish::rad::RadWriter,
+    sink: spearfish::rad::Sink,
+    rec: spearfish::rad::ReadRecord,
+}
+
+/// Writes mapped batches to a RAD file (``bulk_long_read``), which ``oarfish -a`` quantifies,
+/// as ``spearfish map --rad`` does.
+///
+/// ``with spearfish.RadWriter("reads.rad", mapper) as rad: rad.write(batch)``. The file is
+/// written under a temporary name and moved into place when the writer is closed (leaving the
+/// ``with`` block without an exception, or :meth:`close`), with the read counts; a writer that
+/// is abandoned, or left with an exception, leaves no file.
+///
+/// :param path: The RAD file.
+/// :param mapper: The :class:`Mapper` the batches come from (its preset, settings and index
+///     go into the file's header).
+/// :param codec: Chunk compression: ``"lz4"`` (default), ``"zstd"`` or ``"none"``.
+#[pyclass(name = "RadWriter", module = "spearfish", frozen)]
+struct PyRadWriter {
+    path: PathBuf,
+    index: Arc<Index>,
+    state: Mutex<Option<RadState>>,
+    /// Reads written so far; kept after closing.
+    counts: Mutex<spearfish::rad::Counts>,
+}
+
+impl PyRadWriter {
+    fn closed_err(&self) -> PyErr {
+        PyValueError::new_err(format!("RadWriter for {} is closed", self.path.display()))
+    }
+}
+
+#[pymethods]
+impl PyRadWriter {
+    #[new]
+    #[pyo3(signature = (path, mapper, *, codec="lz4"))]
+    fn new(py: Python<'_>, path: PathBuf, mapper: &Bound<'_, PyMapper>, codec: &str) -> PyResult<Self> {
+        use spearfish::rad::ChunkCodec;
+        let codec = match codec {
+            "lz4" => ChunkCodec::Lz4,
+            "zstd" => ChunkCodec::Zstd,
+            "none" => ChunkCodec::None,
+            c => {
+                return Err(PyValueError::new_err(format!(
+                    "codec must be \"lz4\", \"zstd\" or \"none\", not {c:?}"
+                )));
+            }
+        };
+        // The Python process's command line, as `spearfish map` records its own.
+        let argv: Vec<String> = py.import("sys")?.getattr("argv")?.extract()?;
+        let m = mapper.get();
+        let writer =
+            spearfish::output::rad_writer(&path, &m.inner, Some(&m.settings), &argv.join(" "), codec)
+                .map_err(|e| io_err(&format!("creating {}", path.display()), e))?;
+        let sink = writer.sink();
+        Ok(PyRadWriter {
+            path,
+            index: m.inner.index().clone(),
+            state: Mutex::new(Some(RadState {
+                writer,
+                sink,
+                rec: Default::default(),
+            })),
+            counts: Default::default(),
+        })
+    }
+
+    /// Append a batch's reads (unmapped reads are counted but, as RAD holds mapped reads only,
+    /// not written).
+    ///
+    /// :raises ValueError: If the batch was mapped against another index, or the writer is
+    ///     closed.
+    fn write(&self, py: Python<'_>, batch: &Bound<'_, PyBatch>) -> PyResult<()> {
+        let b = batch.get();
+        if !Arc::ptr_eq(&b.index, &self.index) {
+            return Err(PyValueError::new_err(
+                "the batch was mapped against another index than this RAD file's",
+            ));
+        }
+        let (state, counts) = (&self.state, &self.counts);
+        let res = py.detach(|| -> Result<bool, anyhow::Error> {
+            let mut guard = state.lock().unwrap();
+            let Some(st) = guard.as_mut() else {
+                return Ok(false);
+            };
+            let mut c = counts.lock().unwrap();
+            for r in &b.reads {
+                c.reads += 1;
+                c.bases += r.len as u64;
+                if spearfish::output::rad_record(&mut st.rec, r) {
+                    c.mapped += 1;
+                    st.sink.push(&st.rec)?;
+                }
+            }
+            Ok(true)
+        });
+        match res {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.closed_err()),
+            Err(e) => Err(io_err(&format!("writing {}", self.path.display()), e)),
+        }
+    }
+
+    /// Finish the file: write the last records and the counts, and move it into place.
+    /// Closing a closed writer does nothing.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(mut st) = self.state.lock().unwrap().take() else {
+            return Ok(());
+        };
+        let counts = *self.counts.lock().unwrap();
+        py.detach(move || -> anyhow::Result<()> {
+            st.sink.flush()?;
+            drop(st.sink);
+            st.writer.finish(counts)
+        })
+        .map_err(|e| io_err(&format!("finishing {}", self.path.display()), e))
+    }
+
+    /// Whether the writer is closed.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.state.lock().unwrap().is_none()
+    }
+
+    /// Reads written (mapped or not).
+    #[getter]
+    fn num_reads(&self) -> u64 {
+        self.counts.lock().unwrap().reads
+    }
+
+    /// Mapped reads written (the file's records).
+    #[getter]
+    fn num_mapped(&self) -> u64 {
+        self.counts.lock().unwrap().mapped
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Close on success; on an exception, drop the partial file.
+    #[pyo3(signature = (exc_type=None, _exc=None, _tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        _exc: Option<&Bound<'_, PyAny>>,
+        _tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        if exc_type.is_some_and(|t| !t.is_none()) {
+            self.state.lock().unwrap().take();
+        } else {
+            self.close(py)?;
+        }
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RadWriter(path='{}', reads={}, mapped={}, closed={})",
+            self.path.display(),
+            self.num_reads(),
+            self.num_mapped(),
+            self.closed()
+        )
+    }
+}
+
 // ─── Module ─────────────────────────────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1487,6 +1728,7 @@ fn _spearfish(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = pyo3_log::try_init();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SCORE_DENOM", spearfish::SCORE_DENOM)?;
+    m.add("TSV_HEADER", spearfish::output::TSV_HEADER)?;
     let fields: Vec<&str> = MapSettings::FIELDS
         .iter()
         .copied()
@@ -1500,6 +1742,7 @@ fn _spearfish(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBatch>()?;
     m.add_class::<PyFileBatches>()?;
     m.add_class::<PyRecordBatches>()?;
+    m.add_class::<PyRadWriter>()?;
     m.add_function(wrap_pyfunction!(resolve_settings, m)?)?;
     m.add_function(wrap_pyfunction!(presets, m)?)?;
     Ok(())

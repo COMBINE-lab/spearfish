@@ -1,6 +1,8 @@
 """Tests for the spearfish Python bindings, on the toy transcriptome in fixtures/toy."""
 
 import gzip
+import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -418,3 +420,83 @@ def test_pipelines_can_be_abandoned(mapper, reads, tmp_path):
     # The mapper still works, and full runs still see every read, in order.
     got = [r.name for b in mapper.map_file(path, chunk_size=1) for r in b]
     assert got == [n for n, _, _, _ in reads * 20]
+
+
+# ─── Output (spearfish map's formats) ──────────────────────────────────────────────────────
+
+
+def test_tsv_and_paf(mapper, reads, index, tmp_path):
+    seqs = [s for _, s, _, _ in reads] + ["ACGT" * 10]
+    names = [n for n, _, _, _ in reads] + ["junk"]
+    batch = mapper.map_batch(seqs, names=names)
+    tsv = batch.to_tsv().decode()
+    lines = tsv.splitlines()
+    assert len(lines) == batch.num_hits + 1  # the unmapped read's `*` line
+    assert lines[-1] == "junk\t40\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped"
+    best = batch[0].best
+    f = lines[0].split("\t")
+    assert f[:5] == [names[0], str(len(seqs[0])), best.strand, "0", best.transcript]
+    assert f[5] == f"{best.score:.2f}"
+    assert [int(x) for x in f[6:10]] == [best.query_start, best.query_end, best.target_start,
+                                         best.target_end]
+    assert batch.to_tsv(header=True).decode() == spearfish.TSV_HEADER + tsv
+    assert spearfish.TSV_HEADER.startswith("read\tread_len\t") and spearfish.TSV_HEADER.endswith("\n")
+    paf = batch.to_paf().decode().splitlines()
+    assert len(paf) == batch.num_hits and not any(l.startswith("junk\t") for l in paf)
+    p = paf[0].split("\t")
+    assert p[0] == names[0] and p[5] == best.transcript and "tp:A:P" in p
+    # Files: binary and text, as written by to_tsv / to_paf.
+    with open(tmp_path / "o.tsv", "wb") as fb:
+        batch.write_tsv(fb, header=True)
+    with open(tmp_path / "o.paf", "w") as ft:
+        batch.write_paf(ft)
+    assert (tmp_path / "o.tsv").read_text() == spearfish.TSV_HEADER + tsv
+    assert (tmp_path / "o.paf").read_bytes() == batch.to_paf()
+    # Unnamed reads are named by their position in the batch.
+    assert mapper.map_batch(seqs[:2]).to_tsv().decode().startswith("0\t")
+
+
+@pytest.mark.skipif(not os.environ.get("SPEARFISH_BIN"), reason="SPEARFISH_BIN not set")
+def test_output_matches_cli(mapper, reads, tmp_path):
+    """Byte for byte what `spearfish map` writes (one thread, so reads stay in input order)."""
+    fq = tmp_path / "r.fq"
+    write_reads(fq, reads, True)
+    idx = tmp_path / "toy.sfi"
+    spearfish.Index.build(TOY, idx)
+    cli_tsv, cli_paf = tmp_path / "cli.tsv", tmp_path / "cli.paf"
+    subprocess.run([os.environ["SPEARFISH_BIN"], "map", str(idx), str(fq), "-t", "1", "-q",
+                    "-o", str(cli_tsv), "--paf", str(cli_paf)], check=True)
+    m = spearfish.Mapper(spearfish.Index.load(idx), "ont")
+    batches = list(m.map_file(fq, chunk_size=7))
+    tsv = spearfish.TSV_HEADER.encode() + b"".join(b.to_tsv() for b in batches)
+    assert tsv == cli_tsv.read_bytes()
+    assert b"".join(b.to_paf() for b in batches) == cli_paf.read_bytes()
+
+
+def test_rad_writer(mapper, reads, tmp_path, index):
+    seqs = [s for _, s, _, _ in reads] + ["ACGT" * 10]
+    path = tmp_path / "r.rad"
+    with spearfish.RadWriter(path, mapper) as rad:
+        for b in mapper.map_records(seqs, chunk_size=5):
+            rad.write(b)
+        assert rad.num_reads == len(seqs) and rad.num_mapped == len(seqs) - 1
+        assert not path.exists()  # written under a temporary name until closed
+    assert rad.closed and path.exists() and path.read_bytes()[:8] == b"RAD_FILE"
+    assert (rad.num_reads, rad.num_mapped) == (len(seqs), len(seqs) - 1)
+    with pytest.raises(ValueError, match="closed"):
+        rad.write(mapper.map_batch(seqs[:1]))
+    rad.close()  # closing twice does nothing
+    # An exception inside the block leaves no file.
+    bad = tmp_path / "bad.rad"
+    with pytest.raises(RuntimeError):
+        with spearfish.RadWriter(bad, mapper, codec="zstd") as rad:
+            rad.write(mapper.map_batch(seqs))
+            raise RuntimeError("stop")
+    assert not bad.exists() and not list(tmp_path.glob("bad.rad*"))
+    # A batch from another index can't go into this file.
+    other = spearfish.Mapper(spearfish.Index.build(TOY), "ont")
+    with spearfish.RadWriter(tmp_path / "x.rad", mapper) as rad:
+        with pytest.raises(ValueError, match="another index"):
+            rad.write(other.map_batch(seqs[:2]))
+    with pytest.raises(ValueError, match="codec"):
+        spearfish.RadWriter(tmp_path / "y.rad", mapper, codec="gzip")

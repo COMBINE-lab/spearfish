@@ -104,7 +104,11 @@ jobs:
       - run: python -m pip install maturin pytest pandas
       - run: maturin build --locked --out dist
       - run: python -m pip install --find-links dist spearfish
+      # The CLI, for the test that the package's TSV and PAF are byte for byte spearfish map's.
+      - run: cargo build --locked -p spearfish-cli
       - run: python -m pytest tests
+        env:
+          SPEARFISH_BIN: ${{ github.workspace }}/target/debug/spearfish
 
   msrv:
     runs-on: ubuntu-latest

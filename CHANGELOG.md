@@ -86,6 +86,8 @@
     `map_records`, and `map_file`, which reads the file in Rust).
   - Results as objects, NumPy columns, or a pandas data frame. Output matches
     `spearfish map`'s.
+  - `MappingBatch.to_tsv`/`to_paf`/`write_tsv`/`write_paf` and `RadWriter` write exactly what
+    `spearfish map` writes, through `spearfish::output`.
   - `map_file` and `map_records` map the next chunk while Python works on the current one;
     `map_file` also reads on a thread of its own.
   - Release workflow (`publish-python.yml`): wheels for Linux x86-64/arm64 and macOS, tested
