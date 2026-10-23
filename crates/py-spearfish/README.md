@@ -115,17 +115,33 @@ A `MappingBatch` keeps its results in Rust until you ask for them:
 
 Mapping one long read costs far more than one call from Python into Rust, so calling `map` per
 read costs little *on one thread*. The difference is parallelism:
-- **Batch calls** (`map_batch`, `map_records`, `map_file`) map on the mapper's own thread pool (`threads=`, default every CPU), with the GIL released, and run at close to `spearfish map`'s speed. `map_file` also reads and decompresses the next chunk while it maps the current one.
+- **Batch calls** (`map_batch`, `map_records`, `map_file`) map on the mapper's own thread pool (`threads=`, default every CPU), with the GIL released, and run at close to `spearfish map`'s speed.
+- **The iterators work ahead.** While your code works on one batch from `map_file` or `map_records`, the next chunk is already mapping in the background. `map_file` also reads and decompresses on a thread of its own. Time spent on each batch in Python (`to_pandas`, filtering, writing) is therefore hidden behind mapping, as long as it takes less time than mapping a chunk.
 - **`map` from several Python threads** also releases the GIL while it maps, and a mapper can be shared between threads. But building each result's Python objects needs the GIL, so this stops scaling after a few threads.
 
-For more than a few thousand reads, use a batch call. To keep memory flat, process one batch's
-results before asking for the next. Columnar results (`hit_columns`, `to_pandas`) are the
-cheapest to consume.
+For more than a few thousand reads, use a batch call. The iterators hold a few chunks at a
+time: the one you are using, the one mapping, and for `map_file` one being read. So memory
+stays flat as long as you drop each batch when you are done with it; `chunk_size` sets the
+scale. Columnar results (`hit_columns`, `to_pandas`) are the cheapest to consume.
 
 ## Thread safety
 
 `Index` and `Mapper` are immutable and thread-safe; share one of each across threads. The
-iterators returned by `map_file` and `map_records` are meant for one consumer.
+iterators returned by `map_file` and `map_records` are meant for one consumer: if a second
+thread calls `next()` on a `map_records` iterator while the first is in it, it raises
+`RuntimeError` rather than wait.
+
+## Releases
+
+`.github/workflows/publish-python.yml` builds abi3 wheels and an sdist:
+- wheels for Linux x86-64 and arm64 (manylinux) and macOS (universal2);
+- every wheel is tested on the platforms it serves before anything is published.
+
+To release:
+1. Push a tag `py-spearfish-vX.Y.Z`, where `X.Y.Z` is the workspace version.
+2. The workflow publishes to PyPI by trusted publishing.
+
+Run by hand, the workflow builds and tests, and publishes to TestPyPI if asked.
 
 ## Development
 
