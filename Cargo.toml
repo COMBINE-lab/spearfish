@@ -26,7 +26,16 @@ proptest = "1.11"
 cc = "1.5"
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
-paraseq = "0.6.1"
+# Without its default features paraseq would read only plain files: niffler (below) picks the
+# compressed formats.
+paraseq = { version = "0.6.1", default-features = false, features = ["anyhow", "niffler"] }
+# The compressed input formats: niffler's defaults without xz (lzma), which only added a C
+# library (liblzma) for a format reads rarely come in, and without bgzip, which serves only
+# niffler's seekable readers (BGZF reads as multi-member gzip). gzip and bzip2 decode in Rust;
+# zstd stays on the C library until a pure-Rust decoder is as fast and as established.
+niffler = { version = "3.0.1", default-features = false, features = ["gz", "bz2", "zstd"] }
+# bzip2's pure-Rust backend (niffler takes bzip2 without one).
+bzip2 = "0.6"
 rustc-hash = "2.1"
 rayon = "1.12"
 memmap2 = "0.9"

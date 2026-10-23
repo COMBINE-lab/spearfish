@@ -14,8 +14,8 @@ use anyhow::Result;
 use lcp_core::hpc::Hpc;
 use lcp_core::locality::{Edit, Placement, edit_effects};
 use lcp_core::{LcpParser, Parser};
+use paraseq::Record;
 use paraseq::prelude::*;
-use paraseq::{ReaderBuilder, Record};
 
 use crate::hist::Hist;
 use crate::rng::SplitMix64;
@@ -184,7 +184,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
 
 pub fn run(args: Args) -> Result<()> {
     let input = args.input.clone().filter(|p| p.as_os_str() != "-");
-    let reader = ReaderBuilder::optional_path(input).build()?;
+    let reader = spearfish::open_fastx(input.as_deref(), None)?;
     let k = args.max_level;
     let threads = args.threads;
     let args = Arc::new(args);

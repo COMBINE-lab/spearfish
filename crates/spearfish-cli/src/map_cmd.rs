@@ -30,8 +30,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use paraseq::Record;
 use paraseq::prelude::*;
-use paraseq::{ReaderBuilder, Record};
 use serde::Serialize;
 use spearfish::{Index, MapOptions, MapSettings, MappedRead, Mapper};
 
@@ -55,7 +55,7 @@ pub struct Args {
     /// Index built by `spearfish index`.
     #[arg(required_unless_present = "print_params")]
     index: Option<PathBuf>,
-    /// Reads (FASTA/FASTQ, optionally gzip/bzip2/xz/zstd-compressed); `-` reads stdin.
+    /// Reads (FASTA/FASTQ, optionally gzip/bzip2/zstd-compressed); `-` reads stdin.
     #[arg(required_unless_present = "print_params")]
     reads: Option<PathBuf>,
     /// Worker threads (0: every available CPU).
@@ -639,9 +639,7 @@ pub fn execute(args: Job) -> Result<Counts> {
         local: Counts::default(),
         batch_reads: 0,
     };
-    let reader = ReaderBuilder::optional_path(input)
-        .batch_size(args.batch_size)
-        .build()
+    let reader = spearfish::open_fastx(input.as_deref(), Some(args.batch_size))
         .with_context(|| format!("reading {}", reads.display()))?;
     let t1 = Instant::now();
     {
