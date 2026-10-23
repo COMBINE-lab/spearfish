@@ -112,8 +112,19 @@ done
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [[ "$BRANCH" == "main" ]] || die "releases are cut from main (on: $BRANCH)"
 git fetch -q origin main
-[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] ||
-    die "main is not at origin/main; pull (or push) first"
+RESUMING=false
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+    # An interrupted release leaves its release commit unpushed: main is then exactly that
+    # commit ahead of origin/main, and the release resumes from it.
+    if git merge-base --is-ancestor origin/main HEAD &&
+        [[ "$(git rev-list --count origin/main..HEAD)" == 1 ]] &&
+        [[ "$(git log -1 --format=%s)" == "chore(release): spearfish v${VERSION}" ]]; then
+        RESUMING=true
+        echo "Resuming the release of v${VERSION} from its unpushed release commit"
+    else
+        die "main is not at origin/main; pull (or push) first"
+    fi
+fi
 
 for t in "$TAG" $([[ "$PYTHON" == true ]] && echo "$PY_TAG"); do
     if git rev-parse -q --verify "refs/tags/$t" >/dev/null ||
@@ -144,7 +155,9 @@ CURRENT_VERSION="$(workspace_version)"
 
 SAME_VERSION=false
 if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
-    if [[ "$ALLOW_SAME_VERSION" == true ]]; then
+    if [[ "$RESUMING" == true ]]; then
+        SAME_VERSION=true
+    elif [[ "$ALLOW_SAME_VERSION" == true ]]; then
         SAME_VERSION=true
         echo "Workspace already at $VERSION; skipping the version edits (--allow-same-version)"
     else
@@ -244,27 +257,70 @@ on_crates_io() {
     [[ "$code" == "200" ]]
 }
 
-# Crates already on crates.io at this version (an interrupted release being re-run) are left out
-# of the check and the upload.
+# Crates already on crates.io at this version (published by an interrupted release, or by an
+# earlier attempt below) are left out of the check and the upload.
 EXCLUDE=()
 TO_PUBLISH=0
-for c in $PUBLISHABLE; do
-    if on_crates_io "$c"; then
-        echo "$c v${VERSION} is already on crates.io; leaving it out"
-        EXCLUDE+=(--exclude "$c")
-    else
-        TO_PUBLISH=$((TO_PUBLISH + 1))
-    fi
-done
+pending_crates() {
+    EXCLUDE=()
+    TO_PUBLISH=0
+    for c in $PUBLISHABLE; do
+        if on_crates_io "$c"; then
+            EXCLUDE+=(--exclude "$c")
+        else
+            TO_PUBLISH=$((TO_PUBLISH + 1))
+        fi
+    done
+}
 
+# How long to wait before trying again after a failed `cargo publish` whose output is in $1, in
+# seconds; fails for errors that waiting does not fix. crates.io answers 429 when an account
+# creates many new crates in a short time ("Please try again after <date> GMT"), and cargo gives
+# up when a just-published dependency is slow to appear in the index.
+retry_wait() {
+    local after now until
+    if grep -q "429 Too Many Requests" "$1"; then
+        after="$(grep -o 'try again after [^.]* GMT' "$1" | head -1 | sed 's/^try again after //')"
+        now="$(date +%s)"
+        if [[ -n "$after" ]] && until="$(date -d "$after" +%s 2>/dev/null ||
+            TZ=UTC date -j -f '%a, %d %b %Y %H:%M:%S GMT' "$after" +%s 2>/dev/null)"; then
+            echo $((until > now ? until - now + 15 : 15))
+        else
+            echo 600
+        fi
+    elif grep -q -E "timed out waiting|timeout while waiting" "$1"; then
+        echo 60
+    else
+        return 1
+    fi
+}
+
+pending_crates
 if [[ "$TO_PUBLISH" -eq 0 ]]; then
     echo "Every crate is already on crates.io at v${VERSION}"
 else
+    for c in $PUBLISHABLE; do
+        if [[ " ${EXCLUDE[*]-} " == *" $c "* ]]; then
+            echo "$c v${VERSION} is already on crates.io; leaving it out"
+        fi
+    done
     # Every crate must build from its own package, as crates.io will build it.
     run cargo publish --workspace ${EXCLUDE[@]+"${EXCLUDE[@]}"} --dry-run
     if [[ "$PUBLISH" == true ]]; then
-        # Cargo publishes in dependency order and waits for each crate to be indexed.
-        run cargo publish --workspace ${EXCLUDE[@]+"${EXCLUDE[@]}"}
+        LOG="$(mktemp)"
+        for attempt in 1 2 3 4 5 6; do
+            # Cargo publishes in dependency order and waits for each crate to be indexed.
+            if run cargo publish --workspace ${EXCLUDE[@]+"${EXCLUDE[@]}"} 2>&1 | tee "$LOG"; then
+                break
+            fi
+            WAIT="$(retry_wait "$LOG")" || die "cargo publish failed (see above)"
+            [[ "$attempt" -lt 6 ]] || die "cargo publish still failing after $attempt attempts"
+            echo "crates.io is not ready (attempt $attempt); trying again in ${WAIT}s"
+            sleep "$WAIT"
+            pending_crates
+            [[ "$TO_PUBLISH" -gt 0 ]] || break
+        done
+        rm -f "$LOG"
     fi
 fi
 

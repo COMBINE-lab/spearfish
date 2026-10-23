@@ -115,8 +115,12 @@ with `origin`:
    CHANGELOG section, commits (`chore(release): spearfish vX.Y.Z`), checks that every crate
    builds from its own package, publishes the crates to crates.io in dependency order, tags
    `vX.Y.Z`, pushes the commit and the tag, and makes the GitHub release from the CHANGELOG
-   section. Crates already on crates.io at X.Y.Z are left out, so an interrupted release can
-   be re-run. If the workspace is already at X.Y.Z (as for 0.1.0), add `--allow-same-version`.
+   section. If the workspace is already at X.Y.Z, add `--allow-same-version`.
+
+   If it stops partway (crates.io is slow to index a new crate, or rate-limits new crate
+   names), run the same command again from the same checkout. It resumes from the unpushed
+   release commit and leaves out the crates already on crates.io. While publishing, it also
+   waits and retries by itself when crates.io asks it to.
    `--python` also tags `py-spearfish-vX.Y.Z`, which publishes the Python package to PyPI
    (`.github/workflows/publish-python.yml`).
 

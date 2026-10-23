@@ -13,7 +13,8 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SPEARFI
 pub struct BuildInfo {
     /// Crate version.
     pub version: String,
-    /// `git describe` of the source tree (`unknown` outside a checkout).
+    /// `git describe` of the source tree, the commit a published crate was packaged from, or
+    /// `unknown` (see the crate's build script).
     pub git: String,
     /// Target triple.
     pub target: String,
