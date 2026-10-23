@@ -23,6 +23,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      # The release script (shellcheck is preinstalled on the runner).
+      - run: shellcheck bump_and_publish.sh
 
   test:
     strategy:
