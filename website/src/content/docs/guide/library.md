@@ -36,5 +36,9 @@ for hit in &read.hits {
   `exp(-d / spearfish::SCORE_DENOM)`.
 - `Index::manifest()` and `Index::id()` give an index's provenance and identifier;
   `spearfish::provenance::BuildInfo::current()` the library's version and git revision.
+- `spearfish::output` writes mapped reads as `spearfish map` does: TSV (`TSV_HEADER`,
+  `tsv_lines`), PAF (`paf_lines`) and, with the default `rad` feature, RAD records for oarfish
+  (`rad_writer`, `rad_record`). The text writers append to a byte buffer, so each thread can
+  format its own batch.
 
 The API documentation is `cargo doc -p spearfish --open`.

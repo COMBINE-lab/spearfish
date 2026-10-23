@@ -1404,6 +1404,7 @@ dependencies = [
  "index",
  "lcp-core",
  "log",
+ "long-read-rad",
  "map",
  "niffler",
  "paraseq",

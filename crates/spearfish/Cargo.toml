@@ -17,6 +17,7 @@ serde_json.workspace = true
 bon.workspace = true
 log.workspace = true
 xxhash-rust.workspace = true
+long-read-rad = { workspace = true, optional = true }
 paraseq = { workspace = true, optional = true }
 # Not used directly: switches paraseq's gzip decoding to zlib-rs (see the workspace manifest).
 flate2 = { workspace = true, optional = true }
@@ -26,9 +27,11 @@ niffler = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
 
 [features]
-default = ["fasta"]
+default = ["fasta", "rad"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
 fasta = ["dep:paraseq", "dep:flate2", "dep:niffler", "dep:bzip2"]
+# RAD output for oarfish (output::rad_writer, output::rad_record).
+rad = ["dep:long-read-rad"]
 
 # Reads transcripts from FASTA; skipped in builds without the feature.
 [[test]]

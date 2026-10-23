@@ -57,6 +57,10 @@
 
 ### Library
 
+- `spearfish::output`: the TSV and PAF writers (`TSV_HEADER`, `tsv_lines`, `paf_lines`,
+  `read_flags`) and, with the new default `rad` feature, RAD output for oarfish (`rad_writer`,
+  `rad_meta`, `rad_record`; the format crate is re-exported as `spearfish::rad`), moved from
+  the CLI so that other front ends write exactly what `spearfish map` writes.
 - `MapSettings`: a preset plus the settings changed, with a builder
   (`MapSettings::builder(Preset::Hifi).extend_ends(true).mapper(index)`) and `resolve()` to
   the complete `MapOptions`. `IndexOptions` has a builder and now covers gene inference.

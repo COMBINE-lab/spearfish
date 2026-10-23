@@ -24,11 +24,19 @@
 //! to the complete [`MapOptions`] (see [`settings`]). Index construction takes
 //! [`IndexOptions`], also with a builder. Score differences between a read's hits convert to
 //! probabilities as `exp(-d / SCORE_DENOM)` ([`SCORE_DENOM`]).
+//!
+//! Output: [`output`] formats mapped reads as `spearfish map` writes them (TSV, PAF and, with
+//! the `rad` feature, RAD for oarfish).
 
 #![warn(missing_docs)]
 
+pub mod output;
 pub mod provenance;
 pub mod settings;
+
+/// The RAD format crate (feature `rad`), as [`output`] writes it.
+#[cfg(feature = "rad")]
+pub use long_read_rad as rad;
 
 use std::path::Path;
 use std::sync::Arc;
