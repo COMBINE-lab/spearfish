@@ -1017,10 +1017,39 @@ struct PyMapper {
 /// Reads `map_batch` maps between checks for Python signals.
 const SIGNAL_CHECK_READS: usize = 1 << 16;
 
+/// Map `seqs` in parallel on `pool`, results in input order.
+fn map_on(mapper: &spearfish::Mapper, pool: &rayon::ThreadPool, seqs: &[&[u8]]) -> Vec<MappedRead> {
+    pool.install(|| seqs.par_iter().map(|s| mapper.map(s)).collect())
+}
+
 impl PyMapper {
     fn map_seqs(&self, seqs: &[&[u8]]) -> Vec<MappedRead> {
-        self.pool
-            .install(|| seqs.par_iter().map(|s| self.inner.map(s)).collect())
+        map_on(&self.inner, &self.pool, seqs)
+    }
+
+    /// A thread that maps chunks in the order they are sent, one at a time on the mapper's
+    /// pool, so that a chunk maps while Python works on the one before. Closing the job
+    /// channel ends it, as does dropping the results.
+    fn spawn_pipeline(&self) -> std::io::Result<(JobSender, ResultReceiver)> {
+        let (jobs_tx, jobs_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<Job>>(1);
+        let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<Mapped>(1);
+        let (mapper, pool) = (self.inner.clone(), self.pool.clone());
+        std::thread::Builder::new()
+            .name("spearfish-mapper".into())
+            .spawn(move || {
+                for job in jobs_rx {
+                    let out = job.map(|j| {
+                        let seqs: Vec<&[u8]> = j.seqs.iter().map(Vec::as_slice).collect();
+                        let reads = map_on(&mapper, &pool, &seqs);
+                        (j.names, reads)
+                    });
+                    let failed = out.is_err();
+                    if res_tx.send(out).is_err() || failed {
+                        break;
+                    }
+                }
+            })?;
+        Ok((jobs_tx, res_rx))
     }
 
     fn batch(&self, py: Python<'_>, names: Option<Vec<String>>, reads: Vec<MappedRead>) -> PyBatch {
@@ -1141,11 +1170,15 @@ impl PyMapper {
             .py()
             .detach(|| builder.build())
             .map_err(|e| io_err(&format!("opening {}", path.display()), e))?;
-        let rx = spawn_reader(reader, chunk_size).map_err(|e| io_err("starting the reader thread", e))?;
+        let (jobs, results) = slf
+            .get()
+            .spawn_pipeline()
+            .map_err(|e| io_err("starting the mapping thread", e))?;
+        spawn_reader(reader, chunk_size, jobs).map_err(|e| io_err("starting the reader thread", e))?;
         Ok(PyFileBatches {
             mapper: slf.clone().unbind(),
             path,
-            state: Mutex::new(FileState { rx, done: false }),
+            results: Mutex::new(results),
         })
     }
 
@@ -1165,10 +1198,20 @@ impl PyMapper {
         if chunk_size == 0 {
             return Err(PyValueError::new_err("chunk_size must be at least 1"));
         }
+        let records = records.try_iter()?.unbind();
+        let (jobs, results) = slf
+            .get()
+            .spawn_pipeline()
+            .map_err(|e| io_err("starting the mapping thread", e))?;
         Ok(PyRecordBatches {
             mapper: slf.clone().unbind(),
-            records: records.try_iter()?.unbind(),
+            records,
             chunk_size,
+            feed: Mutex::new(Feed {
+                jobs: Some(jobs),
+                outstanding: 0,
+            }),
+            results: Mutex::new(results),
         })
     }
 
@@ -1230,17 +1273,25 @@ impl PyMapper {
     }
 }
 
-/// Reads as (name, sequence).
-type Chunk = Vec<(String, Vec<u8>)>;
+/// A chunk of reads to map: their names (if known) and sequences.
+struct Job {
+    names: Option<Vec<String>>,
+    seqs: Vec<Vec<u8>>,
+}
 
-/// Reads `reader` in chunks of `n` records on a thread of its own, one chunk ahead of the
-/// mapper, so reading (and decompressing) overlaps mapping. An empty chunk ends the file; the
-/// thread stops early when the receiver is dropped.
+/// A mapped chunk: the names it came with and the results, in order.
+type Mapped = anyhow::Result<(Option<Vec<String>>, Vec<MappedRead>)>;
+type JobSender = std::sync::mpsc::SyncSender<anyhow::Result<Job>>;
+type ResultReceiver = std::sync::mpsc::Receiver<Mapped>;
+
+/// Reads `reader` in chunks of `n` records on a thread of its own and sends them to `jobs`,
+/// so reading (and decompressing) overlaps mapping. The thread ends at the end of the file,
+/// after an error (which it sends), or when the mapping side hangs up.
 fn spawn_reader(
     mut reader: paraseq::fastx::Reader<paraseq::BoxedReader>,
     n: usize,
-) -> std::io::Result<std::sync::mpsc::Receiver<anyhow::Result<Chunk>>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    jobs: JobSender,
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("spearfish-reader".into())
         .spawn(move || {
@@ -1249,7 +1300,7 @@ fn spawn_reader(
             let mut pending: std::collections::VecDeque<(String, Vec<u8>)> = Default::default();
             let mut eof = false;
             loop {
-                let chunk = (|| -> anyhow::Result<Chunk> {
+                let chunk = (|| -> anyhow::Result<Vec<(String, Vec<u8>)>> {
                     while pending.len() < n && !eof {
                         if !rset.fill(&mut reader)? {
                             eof = true;
@@ -1263,18 +1314,43 @@ fn spawn_reader(
                     let k = n.min(pending.len());
                     Ok(pending.drain(..k).collect())
                 })();
-                let last = chunk.as_ref().map_or(true, |c| c.is_empty());
-                if tx.send(chunk).is_err() || last {
+                let job = match chunk {
+                    Ok(c) if c.is_empty() => break,
+                    Ok(c) => {
+                        let (names, seqs) = c.into_iter().unzip();
+                        Ok(Job {
+                            names: Some(names),
+                            seqs,
+                        })
+                    }
+                    Err(e) => Err(e),
+                };
+                let failed = job.is_err();
+                if jobs.send(job).is_err() || failed {
                     break;
                 }
             }
         })?;
-    Ok(rx)
+    Ok(())
 }
 
-struct FileState {
-    rx: std::sync::mpsc::Receiver<anyhow::Result<Chunk>>,
-    done: bool,
+/// The next mapped chunk, waiting without the GIL but checking for signals (Ctrl-C) every
+/// 100 ms; `None` once the pipeline has finished.
+fn next_mapped(py: Python<'_>, results: &Mutex<ResultReceiver>) -> PyResult<Option<Mapped>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        let got = py.detach(|| {
+            results
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_millis(100))
+        });
+        match got {
+            Ok(m) => return Ok(Some(m)),
+            Err(RecvTimeoutError::Timeout) => py.check_signals()?,
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
 }
 
 /// Batches of a mapped read file (see :meth:`Mapper.map_file`).
@@ -1282,7 +1358,7 @@ struct FileState {
 struct PyFileBatches {
     mapper: Py<PyMapper>,
     path: PathBuf,
-    state: Mutex<FileState>,
+    results: Mutex<ResultReceiver>,
 }
 
 #[pymethods]
@@ -1292,36 +1368,24 @@ impl PyFileBatches {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyBatch>> {
-        let mapper = self.mapper.get();
-        let state = &self.state;
-        let res = py.detach(|| -> anyhow::Result<Option<(Vec<String>, Vec<MappedRead>)>> {
-            let mut st = state.lock().unwrap();
-            if st.done {
-                return Ok(None);
-            }
-            let recs = match st.rx.recv() {
-                Ok(Ok(recs)) if !recs.is_empty() => recs,
-                Ok(Err(e)) => {
-                    st.done = true;
-                    return Err(e);
-                }
-                // The end of the file (or a reader thread that is gone).
-                _ => {
-                    st.done = true;
-                    return Ok(None);
-                }
-            };
-            drop(st);
-            let seqs: Vec<&[u8]> = recs.iter().map(|(_, s)| s.as_slice()).collect();
-            let reads = mapper.map_seqs(&seqs);
-            Ok(Some((recs.into_iter().map(|(n, _)| n).collect(), reads)))
-        });
-        match res.map_err(|e| io_err(&format!("reading {}", self.path.display()), e))? {
-            Some((names, reads)) => Ok(Some(mapper.batch(py, Some(names), reads))),
+        match next_mapped(py, &self.results)? {
+            Some(Ok((names, reads))) => Ok(Some(self.mapper.get().batch(py, names, reads))),
+            Some(Err(e)) => Err(io_err(&format!("reading {}", self.path.display()), e)),
             None => Ok(None),
         }
     }
 }
+
+/// The Python side of a `map_records` pipeline: where to send chunks, and how many are being
+/// mapped or wait to be collected.
+struct Feed {
+    /// `None` once the input is exhausted (or failed).
+    jobs: Option<JobSender>,
+    outstanding: usize,
+}
+
+/// Chunks `map_records` keeps in the pipeline: one returned to Python while the next maps.
+const RECORDS_AHEAD: usize = 2;
 
 /// Batches of mapped records from an iterable (see :meth:`Mapper.map_records`).
 #[pyclass(name = "RecordBatches", module = "spearfish", frozen)]
@@ -1329,6 +1393,43 @@ struct PyRecordBatches {
     mapper: Py<PyMapper>,
     records: Py<pyo3::types::PyIterator>,
     chunk_size: usize,
+    feed: Mutex<Feed>,
+    results: Mutex<ResultReceiver>,
+}
+
+impl PyRecordBatches {
+    /// The next chunk of the input, copied out of Python (it is mapped on another thread);
+    /// `None` at the end.
+    fn pull(&self, py: Python<'_>) -> PyResult<Option<Job>> {
+        let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(self.chunk_size);
+        let mut names: Vec<Option<String>> = Vec::with_capacity(self.chunk_size);
+        let mut it = self.records.bind(py).clone();
+        for item in it.by_ref().take(self.chunk_size) {
+            let item = item?;
+            match item.cast::<PyTuple>() {
+                Ok(t) if t.len() >= 2 => {
+                    let name: String = t.get_item(0)?.extract()?;
+                    names.push(Some(read_name(name.as_bytes())));
+                    seqs.push(seq_bytes(&t.get_item(1)?)?.as_bytes().to_vec());
+                }
+                Ok(_) => {
+                    return Err(PyTypeError::new_err(
+                        "a record tuple needs at least (name, sequence)",
+                    ));
+                }
+                Err(_) => {
+                    names.push(None);
+                    seqs.push(seq_bytes(&item)?.as_bytes().to_vec());
+                }
+            }
+        }
+        if seqs.is_empty() {
+            return Ok(None);
+        }
+        // Names only if every read in the chunk has one.
+        let names = names.into_iter().collect::<Option<Vec<String>>>();
+        Ok(Some(Job { names, seqs }))
+    }
 }
 
 #[pymethods]
@@ -1338,37 +1439,46 @@ impl PyRecordBatches {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyBatch>> {
-        let mut seqs: Vec<Bound<'_, PyBytes>> = Vec::with_capacity(self.chunk_size);
-        let mut names: Vec<Option<String>> = Vec::with_capacity(self.chunk_size);
-        let mut it = self.records.bind(py).clone();
-        for item in it.by_ref().take(self.chunk_size) {
-            let item = item?;
-            match item.cast::<PyTuple>() {
-                Ok(t) if t.len() >= 2 => {
-                    let name: String = t.get_item(0)?.extract()?;
-                    names.push(Some(read_name(name.as_bytes())));
-                    seqs.push(seq_bytes(&t.get_item(1)?)?);
-                }
-                Ok(_) => {
-                    return Err(PyTypeError::new_err(
-                        "a record tuple needs at least (name, sequence)",
-                    ));
-                }
-                Err(_) => {
-                    names.push(None);
-                    seqs.push(seq_bytes(&item)?);
+        {
+            // Held while Python code runs (the input) and while the GIL is released, so a
+            // second consumer must not wait for it: that could deadlock on the GIL.
+            let mut feed = self.feed.try_lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "this RecordBatches is already being iterated (from another thread)",
+                )
+            })?;
+            // Keep the pipeline full: the chunk returned now, and the next one mapping.
+            while feed.outstanding < RECORDS_AHEAD && feed.jobs.is_some() {
+                match self.pull(py) {
+                    Ok(Some(job)) => {
+                        let tx = feed.jobs.as_ref().unwrap();
+                        // Never blocks for long: at most RECORDS_AHEAD chunks are in flight,
+                        // fewer than the pipeline holds.
+                        if py.detach(|| tx.send(Ok(job))).is_err() {
+                            feed.jobs = None;
+                        } else {
+                            feed.outstanding += 1;
+                        }
+                    }
+                    Ok(None) => feed.jobs = None,
+                    Err(e) => {
+                        // A failed input ends the iteration; chunks already sent are dropped.
+                        feed.jobs = None;
+                        feed.outstanding = 0;
+                        return Err(e);
+                    }
                 }
             }
+            if feed.outstanding == 0 {
+                return Ok(None);
+            }
+            feed.outstanding -= 1;
         }
-        if seqs.is_empty() {
-            return Ok(None);
+        match next_mapped(py, &self.results)? {
+            Some(Ok((names, reads))) => Ok(Some(self.mapper.get().batch(py, names, reads))),
+            Some(Err(e)) => Err(value_err(format!("{e:#}"))),
+            None => Ok(None),
         }
-        let mapper = self.mapper.get();
-        let slices: Vec<&[u8]> = seqs.iter().map(|b| b.as_bytes()).collect();
-        let reads = py.detach(|| mapper.map_seqs(&slices));
-        // Names only if every read in the chunk has one.
-        let names = names.into_iter().collect::<Option<Vec<String>>>();
-        Ok(Some(mapper.batch(py, names, reads)))
     }
 }
 

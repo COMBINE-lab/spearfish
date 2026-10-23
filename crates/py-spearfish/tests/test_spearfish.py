@@ -364,3 +364,53 @@ def test_settings_change_results(index, reads):
     assert any(h.reverse for h in spearfish.Mapper(index, "ont").map(seq).hits)
     ext = spearfish.Mapper(index, "hifi", extend_ends=True).map(seq)
     assert ext.best.extended
+
+
+# ─── Pipelines (map_file / map_records map one chunk ahead) ────────────────────────────────
+
+
+def test_records_read_ahead_is_bounded(mapper, reads):
+    pulled = []
+
+    def gen():
+        for r in reads * 4:
+            pulled.append(r)
+            yield r[0], r[1]
+
+    it = mapper.map_records(gen(), chunk_size=4)
+    first = next(it)
+    assert len(first) == 4
+    # The returned chunk and the one mapping behind it, no more.
+    assert len(pulled) == 8
+    rest = list(it)
+    assert sum(len(b) for b in rest) + 4 == len(reads) * 4 == len(pulled)
+    names = [r.name for b in [first, *rest] for r in b]
+    assert names == [r[0] for r in reads * 4]
+
+
+def test_records_input_error(mapper, reads):
+    def gen():
+        for i, r in enumerate(reads):
+            if i == 5:
+                raise RuntimeError("bad input")
+            yield r[0], r[1]
+
+    it = mapper.map_records(gen(), chunk_size=2)
+    with pytest.raises(RuntimeError, match="bad input"):
+        list(it)
+    assert list(it) == []
+
+
+def test_pipelines_can_be_abandoned(mapper, reads, tmp_path):
+    path = tmp_path / "r.fq"
+    write_reads(path, reads * 20, True)
+    for _ in range(5):
+        it = mapper.map_file(path, chunk_size=2)
+        next(it)
+        del it
+        it = mapper.map_records(((n, s) for n, s, _, _ in reads * 20), chunk_size=2)
+        next(it)
+        del it
+    # The mapper still works, and full runs still see every read, in order.
+    got = [r.name for b in mapper.map_file(path, chunk_size=1) for r in b]
+    assert got == [n for n, _, _, _ in reads * 20]
