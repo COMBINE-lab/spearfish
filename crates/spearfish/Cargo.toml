@@ -20,11 +20,15 @@ xxhash-rust.workspace = true
 paraseq = { workspace = true, optional = true }
 # Not used directly: switches paraseq's gzip decoding to zlib-rs (see the workspace manifest).
 flate2 = { workspace = true, optional = true }
+# The compressed formats paraseq reads (see the workspace manifest).
+niffler = { workspace = true, optional = true }
+# Not used directly: bzip2's pure-Rust backend.
+bzip2 = { workspace = true, optional = true }
 
 [features]
 default = ["fasta"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
-fasta = ["dep:paraseq", "dep:flate2"]
+fasta = ["dep:paraseq", "dep:flate2", "dep:niffler", "dep:bzip2"]
 
 # Reads transcripts from FASTA; skipped in builds without the feature.
 [[test]]

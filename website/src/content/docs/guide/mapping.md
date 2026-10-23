@@ -7,7 +7,7 @@ description: Map long reads with spearfish map, choose the preset for your read 
 spearfish map transcripts.sfi reads.fastq.gz --preset ont -t 16 -o reads.tsv
 ```
 
-Reads can be FASTA or FASTQ, plain or compressed (gzip, bzip2, xz, zstd); `-` reads standard
+Reads can be FASTA or FASTQ, plain or compressed (gzip, bzip2, zstd); `-` reads standard
 input. Direct RNA reads that spell uracil as `U` are handled directly.
 
 ## Outputs

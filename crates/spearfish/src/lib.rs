@@ -416,13 +416,36 @@ pub fn name_and_gene(id: &str) -> (String, String) {
     (name, gene)
 }
 
+/// Open a FASTA/FASTQ file for reading (`None` or `-`: standard input), plain or compressed
+/// with gzip (BGZF included), bzip2 or zstd. `batch_size` sets the records per record set.
+///
+/// xz-compressed input is an error that says so: xz support was dropped, since it needed a C
+/// library for a format reads rarely come in.
+#[cfg(feature = "fasta")]
+pub fn open_fastx(
+    path: Option<&Path>,
+    batch_size: Option<usize>,
+) -> Result<paraseq::fastx::Reader<paraseq::BoxedReader>> {
+    let mut b = paraseq::ReaderBuilder::optional_path(path.filter(|p| p.as_os_str() != "-"));
+    if let Some(n) = batch_size {
+        b = b.batch_size(n);
+    }
+    b.build().map_err(|e| match e {
+        // The one format spearfish's build leaves out.
+        paraseq::Error::Niffler(niffler::Error::FeatureDisabled) => anyhow::anyhow!(
+            "xz-compressed input is not supported: decompress it (xz -d), or recompress it with gzip or zstd"
+        ),
+        e => e.into(),
+    })
+}
+
 /// Read transcripts from a (optionally compressed) FASTA as (name, gene, sequence), names
 /// and genes as [`name_and_gene`] splits the IDs (bytes that are not UTF-8 become U+FFFD).
 #[cfg(feature = "fasta")]
 pub fn read_transcripts(path: &Path) -> Result<Vec<(String, String, Vec<u8>)>> {
-    use paraseq::{ReaderBuilder, Record};
+    use paraseq::Record;
     let mut txs = Vec::new();
-    let mut reader = ReaderBuilder::path(path).build()?;
+    let mut reader = open_fastx(Some(path), None)?;
     let mut rset = reader.new_record_set();
     while rset.fill(&mut reader)? {
         for rec in rset.iter() {

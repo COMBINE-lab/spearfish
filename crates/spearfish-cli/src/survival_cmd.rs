@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use paraseq::Record;
 use paraseq::prelude::*;
-use paraseq::{ReaderBuilder, Record};
 use rustc_hash::FxHashMap;
 
 use crate::rng::SplitMix64;
@@ -268,7 +268,7 @@ pub fn run(args: Args) -> Result<()> {
     });
 
     let input = args.input.clone().filter(|p| p.as_os_str() != "-");
-    let reader = ReaderBuilder::optional_path(input).build()?;
+    let reader = spearfish::open_fastx(input.as_deref(), None)?;
     let shared = Arc::new(Mutex::new(Stats::new(&cfg)));
     let mut proc = Processor {
         cfg: cfg.clone(),

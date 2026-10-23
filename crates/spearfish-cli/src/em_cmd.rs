@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use paraseq::{ReaderBuilder, Record};
+use paraseq::Record;
 use quant::{EqBuilder, QuantParams, em};
 
 #[derive(clap::Args, Debug)]
@@ -52,8 +52,7 @@ pub fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let mut names: Vec<String> = Vec::new();
     let mut lens: Vec<u32> = Vec::new();
-    let mut reader = ReaderBuilder::path(&args.transcripts)
-        .build()
+    let mut reader = spearfish::open_fastx(Some(&args.transcripts), None)
         .with_context(|| format!("reading {}", args.transcripts.display()))?;
     let mut rset = reader.new_record_set();
     while rset.fill(&mut reader)? {

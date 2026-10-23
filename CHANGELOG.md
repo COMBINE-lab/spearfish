@@ -33,6 +33,9 @@
 - The research commands (`simulate`, `lcp-stats`, `locality`, `survival`, `halo`) and the
   experimental mapping flags are hidden from help; they still work.
 - Errors from a reader closing the pipe (`| head`) no longer fail the run.
+- Reads and transcripts can be plain or gzip- (BGZF included), bzip2- or zstd-compressed.
+  xz is no longer read: it needed a C library (liblzma) for a format reads rarely come in, and
+  an xz file now fails with a message saying so.
 
 ### Provenance
 

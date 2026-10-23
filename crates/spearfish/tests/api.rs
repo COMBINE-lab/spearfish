@@ -141,3 +141,29 @@ fn index_id_covers_inputs_and_genes() {
     let no_hpc = IndexOptions::builder().hpc(false).build();
     assert_ne!(id(&txs, &no_hpc), base);
 }
+
+/// Compressed input: multi-member gzip (as BGZF writes it) reads like the plain file, and xz,
+/// which spearfish no longer reads, is an error that says so.
+#[test]
+fn compressed_input() {
+    use std::io::Write;
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let plain = std::fs::read(&fa).unwrap();
+    let dir = std::env::temp_dir().join(format!("spearfish-api-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gz = dir.join("tx.fa.gz");
+    let mut f = std::fs::File::create(&gz).unwrap();
+    for block in plain.chunks(1000) {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(block).unwrap();
+        f.write_all(&e.finish().unwrap()).unwrap();
+    }
+    drop(f);
+    assert_eq!(read_transcripts(&gz).unwrap(), read_transcripts(&fa).unwrap());
+    // The xz magic number, then anything.
+    let xz = dir.join("tx.fa.xz");
+    std::fs::write(&xz, b"\xfd7zXZ\x00\x00\x04 not really xz").unwrap();
+    let err = format!("{:#}", read_transcripts(&xz).unwrap_err());
+    assert!(err.contains("xz-compressed input is not supported"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

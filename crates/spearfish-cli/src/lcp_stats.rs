@@ -11,8 +11,8 @@ use std::time::Instant;
 use anyhow::Result;
 use lcp_core::hpc::Hpc;
 use lcp_core::{LcpParser, Parser};
+use paraseq::Record;
 use paraseq::prelude::*;
-use paraseq::{ReaderBuilder, Record};
 use rustc_hash::FxHashMap;
 
 use crate::hist::Hist;
@@ -161,7 +161,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
 
 pub fn run(args: Args) -> Result<()> {
     let input = args.input.filter(|p| p.as_os_str() != "-");
-    let reader = ReaderBuilder::optional_path(input).build()?;
+    let reader = spearfish::open_fastx(input.as_deref(), None)?;
     let shared = Arc::new(Mutex::new(Stats::new(args.max_level)));
     let mut proc = Processor {
         parser: LcpParser::default(),
