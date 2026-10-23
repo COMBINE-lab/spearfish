@@ -64,8 +64,9 @@ spearfish inspect transcripts.sfi --json    # everything, as JSON
 spearfish inspect transcripts.sfi --sections  # plus each section's size and checksum
 ```
 
-The index's identifier (`index_id`) is a hash of its input transcripts and build parameters: a
-rebuild from the same inputs gets the same identifier. Mapping outputs record it, so a mapping
+The index's identifier (`index_id`) is a hash of its input transcripts, their gene grouping
+(from the headers, `--t2g` or `--infer-genes`) and the build parameters: a rebuild from the
+same inputs and grouping gets the same identifier. Mapping outputs record it, so a mapping
 can always be traced to the index it came from. If an index was built by a spearfish whose
 sequence parser differs from the running one, mapping stops and asks for a rebuild instead of
 giving wrong results.

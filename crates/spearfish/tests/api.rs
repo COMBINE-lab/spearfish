@@ -100,3 +100,44 @@ fn builder_matches_presets() {
     assert!(m.options().params.ends.is_some());
     assert_eq!(m.score_denom(), spearfish::SCORE_DENOM);
 }
+
+/// The index id names what was indexed: the transcripts, their gene grouping and the build
+/// parameters. Rebuilding the same gives the same id; changing any of them changes it.
+#[test]
+fn index_id_covers_inputs_and_genes() {
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let txs = read_transcripts(&fa).unwrap();
+    let opts = IndexOptions::default();
+    let id = |txs: &[(String, String, Vec<u8>)], opts: &IndexOptions| {
+        Index::build(txs.to_vec(), opts).unwrap().0.id()
+    };
+    let base = id(&txs, &opts);
+    assert_eq!(id(&txs, &opts), base, "a rebuild keeps the id");
+
+    // Regrouped genes: one gene, every transcript its own, or inferred.
+    let one: Vec<_> = txs
+        .iter()
+        .map(|(n, _, s)| (n.clone(), "G".into(), s.clone()))
+        .collect();
+    let own: Vec<_> = txs
+        .iter()
+        .map(|(n, _, s)| (n.clone(), n.clone(), s.clone()))
+        .collect();
+    let inferred = IndexOptions::builder().infer_genes(Default::default()).build();
+    let ids = [id(&one, &opts), id(&own, &opts), id(&own, &inferred)];
+    for (i, x) in ids.iter().enumerate() {
+        assert_ne!(*x, base, "grouping {i}");
+    }
+    assert_ne!(ids[0], ids[1]);
+
+    // Fields are delimited: moving the first base of a sequence onto the end of its name
+    // concatenates to the same bytes, and must still change the id.
+    let mut moved = txs.clone();
+    let b = moved[0].2.remove(0);
+    moved[0].0.push(b as char);
+    assert_ne!(id(&moved, &opts), base);
+
+    // Build parameters are part of it too.
+    let no_hpc = IndexOptions::builder().hpc(false).build();
+    assert_ne!(id(&txs, &no_hpc), base);
+}
