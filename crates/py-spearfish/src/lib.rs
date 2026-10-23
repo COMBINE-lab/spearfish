@@ -1161,14 +1161,11 @@ impl PyMapper {
         if chunk_size == 0 {
             return Err(PyValueError::new_err("chunk_size must be at least 1"));
         }
-        let builder = if path.as_os_str() == "-" {
-            paraseq::ReaderBuilder::stdin()
-        } else {
-            paraseq::ReaderBuilder::path(&path)
-        };
+        // As `spearfish map` opens its reads: compressed input decompresses on a thread of its
+        // own (ahead of the reader thread below), and xz input is refused with a clear message.
         let reader = slf
             .py()
-            .detach(|| builder.build())
+            .detach(|| spearfish::open_fastx(Some(&path), None))
             .map_err(|e| io_err(&format!("opening {}", path.display()), e))?;
         let (jobs, results) = slf
             .get()

@@ -277,6 +277,10 @@ def test_map_file_errors(mapper, tmp_path):
     bad.write_text("@r1\nACGT\n+\nII\n")
     with pytest.raises(OSError):
         list(mapper.map_file(bad))
+    xz = tmp_path / "r.fq.xz"
+    xz.write_bytes(b"\xfd7zXZ\x00\x00\x04 not really xz")
+    with pytest.raises(OSError, match="xz-compressed input is not supported"):
+        mapper.map_file(xz)
 
 
 def test_map_records(mapper, reads):
