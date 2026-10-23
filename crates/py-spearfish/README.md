@@ -111,6 +111,26 @@ A `MappingBatch` keeps its results in Rust until you ask for them:
 - `batch.hit_columns()` and `batch.read_columns()` give whole columns as NumPy arrays, without creating a Python object per hit;
 - `batch.to_pandas(unmapped=False)` gives one row per hit, with transcripts as a categorical column.
 
+### Writing spearfish map's formats
+
+A batch writes exactly what `spearfish map` writes, through the same library code:
+
+```python
+with open("reads.tsv", "wb") as tsv, open("reads.paf", "wb") as paf, \
+        spearfish.RadWriter("reads.rad", mapper) as rad:
+    tsv.write(spearfish.TSV_HEADER.encode())
+    for batch in mapper.map_file("reads.fq.gz"):
+        batch.write_tsv(tsv)          # or batch.to_tsv() -> bytes
+        batch.write_paf(paf)          # or batch.to_paf()
+        rad.write(batch)              # RAD for `oarfish -a`
+```
+
+- **TSV:** one line per hit, plus one `*` line per unmapped read.
+- **PAF:** unmapped reads are left out.
+- **Read names:** reads without names are named by their position in the batch.
+- **Files:** binary and text files both work.
+- **RAD:** `RadWriter` records the mapper's preset, settings and index in the file's header. It moves the file into place, with its read counts, when the `with` block ends. On an exception, or if the writer is never closed, no file is left. The codec is `"lz4"` (default), `"zstd"` or `"none"`.
+
 ### Why batches
 
 Mapping one long read costs far more than one call from Python into Rust, so calling `map` per
