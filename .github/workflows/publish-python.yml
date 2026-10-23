@@ -73,6 +73,10 @@ jobs:
           command: sdist
           working-directory: crates/py-spearfish
           args: --out dist
+      # maturin keeps the workspace layout in the sdist, so the declared License-File is not at
+      # the archive root, where PyPI looks for it (and rejects the upload otherwise).
+      - name: License files at the sdist's root
+        run: python3 crates/py-spearfish/ci/sdist_license.py crates/py-spearfish/dist
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
@@ -130,9 +134,14 @@ jobs:
           name: sdist
           path: dist
       - run: ls -l dist
+      # skip-existing: a re-run completes a partly uploaded release instead of failing on the
+      # files already there (an index never accepts a file name twice).
       - if: github.event_name == 'push'
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
       - if: github.event_name != 'push'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
