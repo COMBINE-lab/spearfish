@@ -300,7 +300,16 @@ impl Index {
 
     /// Build an index in memory from transcripts given as (name, gene, sequence).
     pub fn build(txs: Vec<(String, String, Vec<u8>)>, opts: &IndexOptions) -> Result<(Self, BuildReport)> {
-        let (data, rep, _) = Self::build_data(txs, opts, Default::default(), Vec::new())?;
+        Self::build_with(txs, opts, Default::default())
+    }
+
+    /// [`Index::build`], recording where the input came from in the manifest.
+    pub fn build_with(
+        txs: Vec<(String, String, Vec<u8>)>,
+        opts: &IndexOptions,
+        input: provenance::InputInfo,
+    ) -> Result<(Self, BuildReport)> {
+        let (data, rep, _) = Self::build_data(txs, opts, input, Vec::new())?;
         Ok((
             Index {
                 inner: Arc::new(index::Index::from_data(&data)?),

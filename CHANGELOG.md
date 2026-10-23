@@ -68,6 +68,20 @@
   unchanged.
 - Removed: `MapOptions::tiebreak_mut` and `chain_mut` (use the public `params` fields), and
   the `spearfish::quant` re-export (the EM crate serves `spearfish em` only).
+- `Index::build_with`: an in-memory build that records its input in the manifest, as
+  `Index::build_to_file_with` does.
+
+### Python
+
+- Python bindings (`crates/py-spearfish`, built with maturin; one abi3 wheel for CPython
+  3.9+):
+  - `Index.load` / `Index.build`, the latter from a FASTA, a dict, or tuples, with `t2g` or
+    `infer_genes`.
+  - `Mapper(index, preset, **settings)`: every `MapSettings` field as a keyword.
+  - Mapping one read (`map`) or many in parallel with the GIL released (`map_batch`,
+    `map_records`, and `map_file`, which reads the file in Rust).
+  - Results as objects, NumPy columns, or a pandas data frame. Output matches
+    `spearfish map`'s.
 
 ### Performance
 

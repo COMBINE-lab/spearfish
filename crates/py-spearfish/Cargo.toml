@@ -1,0 +1,30 @@
+[package]
+name = "py-spearfish"
+description = "Python bindings for spearfish (built with maturin; see pyproject.toml)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_spearfish"
+crate-type = ["cdylib"]
+# An extension module has no libpython to link a test harness against; the tests are in Python
+# (tests/), run against the built module.
+test = false
+doctest = false
+
+[dependencies]
+spearfish.workspace = true
+anyhow.workspace = true
+log.workspace = true
+paraseq.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+# Not used directly: switches paraseq's gzip decoding to zlib-rs (see the workspace manifest).
+flate2.workspace = true
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+pythonize = "0.29"
+numpy = "0.29"
+pyo3-log = "0.13.4"

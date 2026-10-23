@@ -83,6 +83,29 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo run --locked --release -q -p spearfish-cli -- doctor
 
+  # The Python bindings (crates/py-spearfish): build the wheel and run its tests, on the oldest
+  # and the newest CPython the wheel serves.
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: crates/py-spearfish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install maturin pytest pandas
+      - run: maturin build --locked --out dist
+      - run: python -m pip install --find-links dist spearfish
+      - run: python -m pytest tests
+
   msrv:
     runs-on: ubuntu-latest
     steps:
