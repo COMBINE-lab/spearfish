@@ -172,3 +172,78 @@ fn compressed_input() {
     assert!(err.contains("xz-compressed input is not supported"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The output writers: TSV and PAF lines as `spearfish map` writes them, and RAD records.
+#[test]
+fn output_formats() {
+    use spearfish::output;
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let txs = read_transcripts(&fa).unwrap();
+    let index = Arc::new(Index::build(txs.clone(), &IndexOptions::default()).unwrap().0);
+    let mapper = Mapper::new(index.clone(), &MapOptions::preset(Preset::Ont)).unwrap();
+    let seq = &txs[0].2;
+    let r = mapper.map(&seq[100..900]);
+    assert!(!r.hits.is_empty());
+
+    assert_eq!(output::TSV_HEADER.matches('\t').count(), 13);
+    assert!(output::TSV_HEADER.ends_with("flags\n"));
+    let mut buf = Vec::new();
+    output::tsv_lines(&mut buf, "r1", &r, &index);
+    let text = String::from_utf8(buf).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), r.hits.len());
+    for (rank, (line, h)) in lines.iter().zip(&r.hits).enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 14);
+        assert_eq!(f[0], "r1");
+        assert_eq!(f[1], "800");
+        assert_eq!(f[2], if h.reverse { "-" } else { "+" });
+        assert_eq!(f[3], rank.to_string());
+        assert_eq!(f[4], index.tx_name(h.tx));
+        assert_eq!(f[5], format!("{:.2}", h.score));
+        assert_eq!(
+            f[6..10],
+            [h.query_start, h.query_end, h.target_start, h.target_end].map(|x| x.to_string())
+        );
+    }
+    let mut buf = Vec::new();
+    let unmapped = mapper.map(b"ACGTACGTAC");
+    output::tsv_lines(&mut buf, "u", &unmapped, &index);
+    assert_eq!(
+        String::from_utf8(buf).unwrap(),
+        "u\t10\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped\n"
+    );
+
+    let mut buf = Vec::new();
+    output::paf_lines(&mut buf, "r1", &r, &index);
+    let text = String::from_utf8(buf).unwrap();
+    let first: Vec<&str> = text.lines().next().unwrap().split('\t').collect();
+    assert_eq!(
+        first[..6],
+        [
+            "r1",
+            "800",
+            &r.hits[0].query_start.to_string(),
+            &r.hits[0].query_end.to_string(),
+            "+",
+            index.tx_name(r.hits[0].tx)
+        ]
+    );
+    assert_eq!(first[6], index.tx_len(r.hits[0].tx).to_string());
+    assert!(first.contains(&"tp:A:P") && first.contains(&"rk:i:0"));
+    let mut buf = Vec::new();
+    output::paf_lines(&mut buf, "u", &unmapped, &index);
+    assert!(buf.is_empty());
+
+    #[cfg(feature = "rad")]
+    {
+        let mut rec = spearfish::rad::ReadRecord::default();
+        assert!(output::rad_record(&mut rec, &r));
+        assert_eq!((rec.read_len, rec.len()), (800, r.hits.len()));
+        assert_eq!(rec.refs, r.hits.iter().map(|h| h.tx).collect::<Vec<_>>());
+        assert_eq!(rec.fw, r.hits.iter().map(|h| !h.reverse).collect::<Vec<_>>());
+        assert!(!output::rad_record(&mut rec, &unmapped) && rec.is_empty());
+        let meta = output::rad_meta(&mapper, None, "test").unwrap();
+        assert_eq!((meta.preset.as_str(), meta.index_id), ("ont", index.id()));
+    }
+}
