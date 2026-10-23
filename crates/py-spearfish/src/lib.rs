@@ -1150,7 +1150,7 @@ impl PyMapper {
         Ok(self.batch(py, names, reads))
     }
 
-    /// Map a FASTA/FASTQ file (optionally gzip/bzip2/xz/zstd-compressed; ``"-"`` reads stdin)
+    /// Map a FASTA/FASTQ file (optionally gzip/bzip2/zstd-compressed; ``"-"`` reads stdin)
     /// in chunks, read and mapped in Rust.
     ///
     /// :param path: The reads.

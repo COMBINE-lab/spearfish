@@ -92,7 +92,7 @@ Most settings are numbers or booleans. A few take strings:
 | `mapper.map(seq, name=None)` | one sequence (`str` or `bytes`) | `MappedRead` | interactive use, a few reads |
 | `mapper.map_batch(seqs, names=None)` | an iterable of sequences | `MappingBatch` | reads already in memory |
 | `mapper.map_records(records, chunk_size=20000)` | an iterable of sequences or `(name, seq, ...)` tuples, as `mappy.fastx_read` and `pyfastx` give them | iterator of `MappingBatch` | streams from other readers |
-| `mapper.map_file(path, chunk_size=20000)` | a FASTA/FASTQ file (gzip, bzip2, xz, zstd; `"-"` for stdin) | iterator of `MappingBatch` | whole files |
+| `mapper.map_file(path, chunk_size=20000)` | a FASTA/FASTQ file (plain, gzip, bzip2 or zstd; `"-"` for stdin) | iterator of `MappingBatch` | whole files |
 
 Results come back in input order. A `MappedRead` has the following fields:
 - `name` and `length`;
