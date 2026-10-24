@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 (unreleased)
+
+- `spearfish --version` and every output's provenance name the commit a crates.io build was
+  packaged from (`.cargo_vcs_info.json`), where they said `unknown`.
+- `bump_and_publish.sh` resumes an interrupted release: run it again from the same checkout,
+  and it continues from the unpushed release commit. While publishing, it waits and retries
+  when crates.io is slow to index a new crate or rate-limits new crate names.
+
 ## 0.1.0 (2026-10-23)
 
 The first release.
