@@ -3,16 +3,27 @@ title: Installation
 description: Install spearfish, and check the build.
 ---
 
-spearfish is written in Rust and installs with Cargo, from crates.io or from a checkout.
+spearfish installs from bioconda, or with Cargo from crates.io or from a checkout.
 
 ## Requirements
 
-- Rust 1.89 or newer, installed with [rustup](https://rustup.rs).
 - Linux or macOS, on x86-64 or arm64 (Apple Silicon). The alignment and parsing kernels pick
   AVX-512, AVX2 or scalar code at run time on x86-64, and NEON or scalar code on arm64, and
   every choice gives exactly the same output.
 
-## Install
+## Install with conda
+
+```sh
+conda install -c bioconda -c conda-forge spearfish
+```
+
+[bioconda](https://bioconda.github.io/recipes/spearfish/README.html) has builds for Linux and macOS,
+on x86-64 and arm64. They are generic builds: the SIMD kernels are still chosen at run time, so a
+conda build is as fast as one compiled for your CPU.
+
+## Install with Cargo
+
+With Rust 1.89 or newer, installed with [rustup](https://rustup.rs):
 
 ```sh
 cargo install --locked spearfish-cli
@@ -57,6 +68,11 @@ spearfish man -o ~/.local/share/man/man1                 # spearfish.1, spearfis
 
 ## For quantification
 
-Abundances come from [oarfish](https://github.com/COMBINE-lab/oarfish), installed separately: a
-build with spearfish support (its `--help` lists `spearfish` as a `--mapper`). See
-[Quantification](/spearfish/guide/quantification/).
+Abundances come from [oarfish](https://github.com/COMBINE-lab/oarfish), installed separately:
+version 0.11.0 or newer has spearfish support (its `--help` lists `spearfish` as a `--mapper`).
+
+```sh
+conda install -c bioconda -c conda-forge oarfish
+```
+
+See [Quantification](/spearfish/guide/quantification/).
