@@ -5,7 +5,8 @@ description: Estimate transcript abundances from spearfish's mappings with oarfi
 
 spearfish reports scored transcript sets; an EM turns them into abundances.
 [oarfish](https://github.com/COMBINE-lab/oarfish) does this, with coverage and positional models.
-It needs a build with spearfish support: its `--help` lists `spearfish` as a `--mapper`.
+It needs a build with spearfish support, which oarfish 0.11.0 and newer have (`conda install -c bioconda
+-c conda-forge oarfish`): its `--help` lists `spearfish` as a `--mapper`.
 
 ## In one step: oarfish maps with spearfish
 

@@ -24,10 +24,22 @@ with `cd website && npm install && npm run dev`).
 
 ## Install
 
-With Rust 1.89 or newer ([rustup](https://rustup.rs)), from crates.io or from a checkout:
+From [bioconda](https://bioconda.github.io/recipes/spearfish/README.html) (Linux and macOS,
+x86-64 and arm64):
+
+```sh
+conda install -c bioconda -c conda-forge spearfish
+```
+
+Or with Rust 1.89 or newer ([rustup](https://rustup.rs)), from crates.io or from a checkout:
 
 ```sh
 cargo install --locked spearfish-cli              # or: cargo install --locked --path crates/spearfish-cli
+```
+
+Then check the build:
+
+```sh
 spearfish doctor          # build, CPU, SIMD kernels, and a mapping self-test
 ```
 
@@ -61,8 +73,8 @@ parameter used, and run statistics.
 ## Quantification
 
 spearfish maps; [oarfish](https://github.com/COMBINE-lab/oarfish) turns its mappings into
-transcript abundances. With an oarfish that has spearfish support (its `--help` lists
-`spearfish` as a `--mapper`), either let oarfish map with spearfish in process:
+transcript abundances. With an oarfish that has spearfish support (0.11.0 or newer, e.g.
+`conda install -c bioconda -c conda-forge oarfish`; its `--help` lists `spearfish` as a `--mapper`), either let oarfish map with spearfish in process:
 
 ```sh
 oarfish --reads reads.fq.gz --annotated transcripts.fa.gz --seq-tech ont-cdna --mapper spearfish -o sample
