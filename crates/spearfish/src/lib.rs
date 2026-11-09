@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 
 pub use index::{BuildReport, InferGenes};
 pub use map::align::Affine;
-pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands, TieBreak};
+pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands, TailFirst, TieBreak};
 pub use settings::{MapSettings, RescueWindow};
 
 /// Scale of score differences: a hit scoring `d` below its read's best is `exp(-d /
@@ -67,7 +67,7 @@ pub enum Preset {
     Ont,
     /// ONT direct RNA: sense orientation only, cheaper tie-break.
     Drna,
-    /// PacBio HiFi: both orientations, minimap2 map-hifi scores.
+    /// PacBio HiFi: both orientations (the poly(A) tail's first), minimap2 map-hifi scores.
     Hifi,
 }
 
@@ -192,6 +192,10 @@ impl MapOptions {
                 // HiFi anchors already end within a few bases of the read's ends: extending
                 // spans changes no spike-in estimate. Positional models turn it on.
                 params.ends = None;
+                // A HiFi read with its poly(A) tail maps well in the tail's orientation almost
+                // always, and the other orientation is then half the work for nothing. Noisier
+                // reads fall below the span more often and then pay for both anyway.
+                params.tail_first = Some(Default::default());
             }
         }
         MapOptions {

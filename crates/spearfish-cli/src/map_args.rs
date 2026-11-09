@@ -15,7 +15,7 @@ pub enum PresetArg {
     Ont,
     /// ONT direct RNA (sense orientation only).
     Drna,
-    /// PacBio HiFi (minimap2 map-hifi scores).
+    /// PacBio HiFi (minimap2 map-hifi scores; the poly(A)-tailed orientation first).
     Hifi,
 }
 
@@ -79,6 +79,21 @@ pub struct MapArgs {
     /// Read orientations to map [default: drna fwd, others both].
     #[arg(long, value_enum, help_heading = "Settings")]
     pub strands: Option<StrandsArg>,
+    /// Map first the read orientation that ends in a poly(A) tail, and the other only if the
+    /// first maps poorly [default: hifi].
+    #[arg(long, overrides_with = "no_tail_first", help_heading = "Settings")]
+    pub tail_first: bool,
+    /// Always map both read orientations.
+    #[arg(long, overrides_with = "tail_first", help_heading = "Settings")]
+    pub no_tail_first: bool,
+    /// With --tail-first: map the other orientation when the tailed one's best hit spans less
+    /// than this fraction of the read [default: 0.8].
+    #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Settings")]
+    pub tail_first_span: Option<f32>,
+    /// With --tail-first: shortest poly(A) tail that orders the orientations, in bases
+    /// [default: 20].
+    #[arg(long, hide_short_help = true, help_heading = "Settings")]
+    pub tail_first_run: Option<usize>,
     /// Report transcripts scoring within this fraction of the read's best [default: 0.3].
     #[arg(long, alias = "delta-rep", value_name = "FRAC", help_heading = "Settings")]
     pub report_within: Option<f32>,
@@ -390,6 +405,9 @@ impl MapArgs {
         });
         MapSettings::builder(self.preset.into())
             .maybe_strands(self.strands.map(Into::into))
+            .maybe_tail_first(onoff!(self.tail_first / no_tail_first))
+            .maybe_tail_first_span(self.tail_first_span)
+            .maybe_tail_first_run(self.tail_first_run)
             .maybe_report_within(self.report_within)
             .maybe_min_coverage(self.min_coverage)
             .maybe_extend_ends(onoff!(self.extend_ends / no_extend_ends))
@@ -577,6 +595,9 @@ mod tests {
     fn every_setting_has_a_flag() {
         let s = settings(&[
             "--strands=fwd",
+            "--tail-first",
+            "--tail-first-span=0.7",
+            "--tail-first-run=20",
             "--report-within=0.2",
             "--min-coverage=0.4",
             "--no-extend-ends",

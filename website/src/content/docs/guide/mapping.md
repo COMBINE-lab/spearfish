@@ -32,7 +32,7 @@ setting.
 | --- | --- | --- |
 | `ont` (default) | ONT cDNA (PCR-cDNA and direct cDNA) | Both orientations; minimap2 `map-ont` scores; read ends aligned in uncompressed sequence; spans extended to the read ends; low-coverage rescue. |
 | `drna` | ONT direct RNA | Sense orientation only; read ends in compressed sequence (no template-switch Gs to correct); shorter poly(A) tails recognized (10 bases); spans end at the outermost anchors. |
-| `hifi` | PacBio HiFi (Kinnex, Iso-Seq) | minimap2 `map-hifi` scores; tied hits without a shared anchor grouped by the anchors they share; read-end bands kept on the anchor diagonal; no rescue, since accurate reads rarely need it; spans end at the outermost anchors. |
+| `hifi` | PacBio HiFi (Kinnex, Iso-Seq) | Both orientations, the one ending in a poly(A) tail first; minimap2 `map-hifi` scores; tied hits without a shared anchor grouped by the anchors they share; read-end bands kept on the anchor diagonal; no rescue, since accurate reads rarely need it; spans end at the outermost anchors. |
 
 With every preset, a poly(A) tail at a read's 3′ end is found (a run of A's with at most one
 other base) and trimmed before the read end is aligned, and isoforms whose annotated 3′ end lies
@@ -42,6 +42,16 @@ another gene), the orientation that ends in the poly(A) tail is preferred (`--or
 LCP parsing is not strand-symmetric, so a read's two orientations draw different seeds; both are
 compared whenever the other orientation's best chain scores within 35% of the chosen one's
 (`--orient-margin-rel`).
+
+The `hifi` preset also uses the tail to save work (`--tail-first`). A read that ends in a
+poly(A) tail of 20 bases or more in one orientation, and not in the other, is mapped in that
+orientation first, and the other orientation is mapped only if the first one's best hit spans
+less than 80% of the read. Most reads of a library that keeps its tails then need one
+orientation, which is about a fifth less mapping work, and well under 1% of reads report a
+different set of transcripts. Reads without such a tail are mapped in both orientations as
+before, so a library whose tails were trimmed loses nothing and gains nothing; if its reads were
+also oriented (Iso-Seq FLNC reads, for example), `--strands fwd` maps the one orientation
+directly. `--no-tail-first` always maps both.
 
 ## Changing settings
 
@@ -66,6 +76,7 @@ Settings you may want to change:
 | `--extend-ends`, `--no-extend-ends` | preset | Extend each reported span past its outermost anchors to where the read's alignment ends. Needed by models that use read positions, such as oarfish's truncation model. |
 | `--extend-within` | `0.05` | Extend only hits within this fraction of the best score. |
 | `--strands` | preset | Orientations mapped: `both`, `fwd` or `rev`. |
+| `--tail-first`, `--no-tail-first` | preset | Map the orientation that ends in a poly(A) tail first, and the other only when the first one's best hit spans less than `--tail-first-span` (0.8) of the read. |
 | `--rescue`, `--no-rescue` | preset | Re-seed reads whose best chain covers less than half the read at a lower LCP level. Reads shorter than `--rescue-genes-len` (350 compressed bases) re-seed proportionally more candidate genes. |
 | `--tail-trim`, `--no-tail-trim` | on | Trim poly(A) tails before aligning read ends. |
 | `--tail-run` | preset | Shortest poly(A) tail recognized. |

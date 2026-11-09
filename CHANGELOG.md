@@ -2,6 +2,17 @@
 
 ## 0.1.1 (unreleased)
 
+- **`hifi` preset: the poly(A) tail orders the two orientations** (`--tail-first`, on for
+  `hifi`). A read that ends in a tail of 20 bases or more in exactly one orientation is mapped
+  in that orientation first, and in the other only when the first one's best hit spans less
+  than 80% of the read (`--tail-first-span`, `--tail-first-run`). On HiFi libraries that keep
+  their tails this is about 20% fewer instructions per mapped read; about 0.2% of reads report
+  a different (nearly always smaller) hit set and 0.01% a different top hit, with mapping
+  accuracy on simulated reads and spike-in quantification unchanged. Reads without such a tail
+  are mapped as before. `--no-tail-first` restores the previous behaviour; the other presets
+  are unchanged, and `--tail-first` turns it on for them.
+- Finding a read's poly(A) tail skips ahead over sequence that cannot hold one instead of
+  testing every window, which is slightly faster with every preset and gives the same tails.
 - `spearfish --version` and every output's provenance name the commit a crates.io build was
   packaged from (`.cargo_vcs_info.json`), where they said `unknown`.
 - `bump_and_publish.sh` resumes an interrupted release: run it again from the same checkout,

@@ -73,6 +73,37 @@ fn mixed_t_and_u_map_as_t() {
     }
 }
 
+/// Tail-first staging: a read ending in a poly(A) tail (or starting with its reverse
+/// complement) that maps well in the tail's orientation is mapped in that orientation only;
+/// one that doesn't, or a read without a tail, is mapped as without staging.
+#[test]
+fn tail_first_maps_the_tailed_orientation() {
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let txs = read_transcripts(&fa).unwrap();
+    let index = Arc::new(Index::build(txs.clone(), &IndexOptions::default()).unwrap().0);
+    let hifi = || spearfish::MapSettings::builder(Preset::Hifi);
+    let staged = hifi().mapper(index.clone()).unwrap();
+    assert!(staged.options().params.tail_first.is_some());
+    let both = hifi().tail_first(false).mapper(index.clone()).unwrap();
+    let only = |s| hifi().strands(s).mapper(index.clone()).unwrap();
+    let (fwd, rev) = (
+        only(spearfish::Strands::Forward),
+        only(spearfish::Strands::Reverse),
+    );
+    for (_, _, seq) in &txs {
+        let tailed = [&seq[..], &[b'A'; 30][..]].concat();
+        // The tail names the orientation, which maps the whole transcript.
+        assert_eq!(staged.map(&tailed), fwd.map(&tailed));
+        assert_eq!(staged.map(&revcomp(&tailed)), rev.map(&revcomp(&tailed)));
+        // A tail on the antisense strand: its orientation maps nothing, so the other is mapped.
+        let anti = [&revcomp(seq)[..], &[b'A'; 30][..]].concat();
+        assert_eq!(staged.map(&anti), both.map(&anti));
+        assert!(staged.map(&anti).hits[0].reverse);
+        // No tail: both orientations, as without staging.
+        assert_eq!(staged.map(seq), both.map(seq));
+    }
+}
+
 /// The settings builder gives the same mapper as the preset's options, and records what it
 /// resolved to.
 #[test]
