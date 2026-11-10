@@ -58,6 +58,13 @@
   chance match by itself (`--min-score`), not only when it scores within
   `--rescue-other-margin` of the chosen orientation's. When neither chain covers the read, the
   chosen orientation's lead says little.
+- `SCORE_DENOM`, the scale RAD output suggests for turning score differences into
+  probabilities (`score_denom`), is 3, where it was 1: a hit `d` below its read's best counts
+  `exp(-d / 3)` times as much. 1 was chosen on simulated sets in which every transcript is
+  expressed. When most are not, as in real samples, it hands too many reads to unexpressed
+  relatives of the expressed transcripts; 3, which is also oarfish's default for minimap2
+  alignments, gave the most accurate abundances on such sets at every error rate tried, and
+  slightly less accurate ones than 1 when every transcript is expressed.
 - `spearfish simulate` can make harder read sets: `--expressed` (fraction of transcripts with
   any abundance), `--fragment` and `--min-fragment` (internal fragments), `--rate-sd` (per-read
   error rates), `--junk` (random sequence at the read ends) and `--unmappable` (reads of random

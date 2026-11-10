@@ -13,8 +13,8 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub struct QuantParams {
     /// Score denominator D in exp((s - s_max) / D). The default, 2, is `spearfish em`'s.
-    /// oarfish weighs spearfish's hits with D = 1 (`spearfish::SCORE_DENOM`, in spearfish's
-    /// units) and minimap2 alignments with its own default.
+    /// The scale spearfish suggests to quantifiers such as oarfish is
+    /// `spearfish::SCORE_DENOM`.
     pub score_denom: f64,
     /// Keep transcripts scoring at least this fraction of the read's best score.
     pub min_frac: f64,
