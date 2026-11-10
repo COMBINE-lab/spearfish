@@ -410,6 +410,14 @@ struct AntiSeed {
     nodes: (u32, u32),
 }
 
+/// Transcript -> (weight, lowest and highest diagonal), while a hit's antisense mates are
+/// gathered.
+type Mates = rustc_hash::FxHashMap<u32, (u32, i64, i64)>;
+
+thread_local! {
+    static MATES: std::cell::RefCell<Mates> = std::cell::RefCell::new(Mates::default());
+}
+
 /// A read orientation's raw bases (2-bit codes) and HPC run map, for raw-space read ends.
 struct RawRead {
     codes: Vec<u8>,
@@ -1578,28 +1586,25 @@ impl<C: Chainer> Mapper<C> {
         )
     }
 
-    /// The transcripts of `found` (transcript, weight, a diagonal) with their weights and
-    /// diagonal ranges, largest weight first.
-    fn mates(found: &mut [(u32, u32, i64)]) -> Vec<(u32, u32, i64, i64)> {
-        found.sort_unstable();
-        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
-        for &(t, w, d) in found.iter() {
-            match out.last_mut() {
-                Some(l) if l.0 == t => {
-                    l.1 += w;
-                    l.2 = l.2.min(d);
-                    l.3 = l.3.max(d);
-                }
-                _ => out.push((t, w, d, d)),
-            }
+    /// The transcripts of `found` (transcript -> weight and diagonal range): the `k` of
+    /// largest weight first, in that order, then the others in no order.
+    fn mates(found: &mut Mates, k: usize) -> Vec<(u32, u32, i64, i64)> {
+        let mut out: Vec<(u32, u32, i64, i64)> =
+            found.drain().map(|(t, (w, lo, hi))| (t, w, lo, hi)).collect();
+        let key = |&(t, w, _, _): &(u32, u32, i64, i64)| (std::cmp::Reverse(w), t);
+        if k > 0 && out.len() > k {
+            out.select_nth_unstable_by_key(k - 1, key);
+            out[..k].sort_unstable_by_key(key);
+        } else {
+            out.sort_unstable_by_key(key);
         }
-        out.sort_unstable_by_key(|&(t, w, _, _)| (std::cmp::Reverse(w), t));
         out
     }
 
-    /// Transcripts sharing sequence with the region of hit `h` on the opposite strand, those
-    /// sharing most first, with the diagonals the read's other orientation would lie on.
-    fn antisense_mates(&self, h: &TxHit, plen: u32) -> Vec<(u32, u32, i64, i64)> {
+    /// Transcripts sharing sequence with the region of hit `h` on the opposite strand, with
+    /// the diagonals the read's other orientation would lie on: the `k` sharing most first,
+    /// in that order, then the others in no order.
+    fn antisense_mates(&self, h: &TxHit, plen: u32, k: usize) -> Vec<(u32, u32, i64, i64)> {
         let seeds = self.anti_seeds(h.tx);
         if seeds.is_empty() {
             return Vec::new();
@@ -1609,17 +1614,22 @@ impl<C: Chainer> Mapper<C> {
         // A seed at read position q of this orientation lies at plen - q - len of the other;
         // its position here + its first base in the mate + its length is constant along one
         // antisense match.
-        let mut found: Vec<(u32, u32, i64)> = Vec::new();
-        for a in seeds {
-            self.node_occurrences(a.nodes.0..a.nodes.1, |t, p| {
-                if t != h.tx {
-                    let d = i64::from(a.x + p + a.len) - i64::from(plen);
-                    found.extend([(t, a.len, d - dhi), (t, 0, d - dlo)]);
-                }
-                false
-            });
-        }
-        Self::mates(&mut found)
+        MATES.with(|found| {
+            let found = &mut *found.borrow_mut();
+            for a in seeds {
+                self.node_occurrences(a.nodes.0..a.nodes.1, |t, p| {
+                    if t != h.tx {
+                        let d = i64::from(a.x + p + a.len) - i64::from(plen);
+                        let e = found.entry(t).or_insert((0, d - dhi, d - dlo));
+                        e.0 += a.len;
+                        e.1 = e.1.min(d - dhi);
+                        e.2 = e.2.max(d - dlo);
+                    }
+                    false
+                });
+            }
+            Self::mates(found, k)
+        })
     }
 
     fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>), salt: u64) -> Strand {
@@ -1937,7 +1947,7 @@ impl<C: Chainer> Mapper<C> {
                         && other.hits.first().is_none_or(|o| o.score < s.other * top.score)
                 });
             let mates = if r.p.antisense > 0 && matches!(self.p.strands, Strands::Both) && !settled {
-                self.antisense_mates(&top, plen)
+                self.antisense_mates(&top, plen, r.p.antisense)
             } else {
                 Vec::new()
             };
@@ -1968,11 +1978,12 @@ impl<C: Chainer> Mapper<C> {
                     r.rescue_txs(&self.idx, &other.seq, &txs, &self.p.chain),
                 );
                 // The other orientation's best hit shares sequence with this one's region:
-                // the two are compared by alignment, however far apart their chains score.
+                // the two are compared by alignment, beyond the tie-break's orientation margin.
+                let floor = r.p.antisense_min * st.hits.first().map_or(0.0, |a| a.score);
                 anti = other
                     .hits
                     .first()
-                    .is_some_and(|o| mates.iter().any(|m| m.0 == o.tx));
+                    .is_some_and(|o| o.score >= floor && mates.iter().any(|m| m.0 == o.tx));
             }
             // The other orientation, if it competes, gets what this one got: its best hits
             // chained at the rescue level, then the transcripts its candidates left out.

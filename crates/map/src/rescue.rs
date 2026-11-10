@@ -61,6 +61,11 @@ pub struct RescueParams {
     /// transcripts sharing sequence; 0: off).
     #[serde(default)]
     pub antisense: usize,
+    /// The other orientation's best hit, when it is one of those transcripts, is compared
+    /// with this one's by alignment if it scores at least this fraction of it, whatever the
+    /// tie-break's orientation margin (0: always).
+    #[serde(default)]
+    pub antisense_min: f32,
     /// Keep every transcript's rescue seeds in memory, made once when the mapper is built,
     /// instead of parsing each transcript window again for every read that needs it. Costs
     /// eight bytes per rescue seed of the transcriptome; without it only the occasional
@@ -103,7 +108,7 @@ impl Default for Settled {
         Settled {
             anchored: 0.3,
             anchors: 3,
-            other: 0.4,
+            other: 0.5,
         }
     }
 }
@@ -166,6 +171,7 @@ impl Default for RescueParams {
             other_margin: Some(30.0),
             alpha: 0.5,
             antisense: 16,
+            antisense_min: 0.5,
             store: true,
             rechain: Some(0.5),
             settled: Some(Settled::default()),
@@ -214,11 +220,153 @@ struct StorePiece {
 }
 
 impl Store {
-    /// The seeds of transcript `t` that start in `[lo, hi)`.
-    fn window(&self, t: u32, lo: u32, hi: u32) -> &[(u32, u32)] {
+    /// The seeds of transcript `t` (of `tlen` parsed bases) that start in `[lo, hi)`.
+    fn window(&self, t: u32, tlen: u32, lo: u32, hi: u32) -> &[(u32, u32)] {
         let (p, i) = (&self.pieces[t as usize / PIECE_TX], t as usize % PIECE_TX);
         let s = &p.seeds[p.off[i] as usize..p.off[i + 1] as usize];
-        &s[s.partition_point(|x| x.1 < lo)..s.partition_point(|x| x.1 < hi)]
+        let a = first_from(s, lo, Self::guess(s.len(), tlen, lo));
+        let b = first_from(s, hi, Self::guess(s.len(), tlen, hi).max(a));
+        &s[a..b]
+    }
+
+    /// About where, among a transcript's `n` seeds, those starting at `pos` are: seeds are
+    /// spread nearly evenly along a transcript.
+    fn guess(n: usize, tlen: u32, pos: u32) -> usize {
+        (u64::from(pos) * n as u64 / u64::from(tlen.max(1))) as usize
+    }
+
+    /// Ask the caches for what [`Self::prefetch_window`] and [`Self::window`] of `t` read
+    /// first.
+    fn prefetch_tx(&self, t: u32) {
+        let (p, i) = (&self.pieces[t as usize / PIECE_TX], t as usize % PIECE_TX);
+        index::prefetch(p.off.as_ptr().wrapping_add(i));
+    }
+
+    /// Ask the caches for the seeds [`Self::window`] searches from (reads the transcript's
+    /// offsets: call it after [`Self::prefetch_tx`] has had time to land).
+    fn prefetch_window(&self, t: u32, tlen: u32, lo: u32) {
+        let (p, i) = (&self.pieces[t as usize / PIECE_TX], t as usize % PIECE_TX);
+        let (a, b) = (p.off[i] as usize, p.off[i + 1] as usize);
+        let at = p.seeds.as_ptr().wrapping_add(a + Self::guess(b - a, tlen, lo));
+        index::prefetch(at);
+        index::prefetch(at.wrapping_add(8));
+    }
+}
+
+/// The first of the seeds `s` (in start order) that starts at `x` or later, searched outward
+/// from index `g`: a few probes next to each other when the guess is close, where a binary
+/// search of a long transcript's seeds misses the caches at every step.
+fn first_from(s: &[(u32, u32)], x: u32, g: usize) -> usize {
+    let n = s.len();
+    let g = g.min(n);
+    // The answer is in `lo..=hi`.
+    let (mut lo, mut hi) = (0, n);
+    let mut step = 1;
+    if g < n && s[g].1 < x {
+        lo = g + 1;
+        while lo + step - 1 < n {
+            let k = lo + step - 1;
+            if s[k].1 < x {
+                lo = k + 1;
+                step *= 2;
+            } else {
+                hi = k;
+                break;
+            }
+        }
+    } else {
+        hi = g;
+        while step <= hi {
+            let k = hi - step;
+            if s[k].1 < x {
+                lo = k + 1;
+                break;
+            }
+            hi = k;
+            step *= 2;
+        }
+    }
+    lo + s[lo..hi].partition_point(|y| y.1 < x)
+}
+
+/// A hash of the seeds `w` of a transcript window that windows with the same seeds elsewhere
+/// along a transcript share: starts count from the first seed's. Four interleaved chains, so
+/// that the multiplications of one seed do not wait for those of the last.
+fn window_hash(w: &[(u32, u32)]) -> u64 {
+    let s0 = w.first().map_or(0, |x| x.1);
+    let mut h = [
+        0x9e37_79b9_7f4a_7c15u64,
+        0xc2b2_ae3d_27d4_eb4f,
+        0x1656_67b1_9e37_79f9,
+        0x27d4_eb2f_1656_67c5,
+    ];
+    let step = |h: u64, x: &(u32, u32)| {
+        (h ^ (u64::from(x.0) << 32 | u64::from(x.1 - s0)))
+            .wrapping_mul(0xff51_afd7_ed55_8ccd)
+            .rotate_left(29)
+    };
+    let (quads, rest) = w.as_chunks::<4>();
+    for q in quads {
+        for (h, x) in h.iter_mut().zip(q) {
+            *h = step(*h, x);
+        }
+    }
+    for (h, x) in h.iter_mut().zip(rest) {
+        *h = step(*h, x);
+    }
+    h.iter().fold(w.len() as u64, |a, &b| {
+        (a.rotate_left(23) ^ b).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    })
+}
+
+/// Read seed label -> its first seed in the read: an open-addressing table sized for the
+/// read (a transcript window probes it once per seed).
+#[derive(Default)]
+struct LabelTable {
+    /// (label, first seed), `u32::MAX` for an empty slot; a power of two of them.
+    slots: Vec<(u64, u32)>,
+    shift: u32,
+}
+
+impl LabelTable {
+    /// Empty the table, for `n` labels.
+    fn reset(&mut self, n: usize) {
+        let cap = (2 * n).next_power_of_two().max(16);
+        self.slots.clear();
+        self.slots.resize(cap, (0, u32::MAX));
+        self.shift = 64 - cap.trailing_zeros();
+    }
+
+    fn slot(&self, label: u64) -> usize {
+        (label.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+    }
+
+    /// The first seed of `label` (`u32::MAX`: none).
+    #[inline]
+    fn get(&self, label: u64) -> u32 {
+        let mask = self.slots.len() - 1;
+        let mut i = self.slot(label);
+        loop {
+            let (l, first) = self.slots[i];
+            if first == u32::MAX || l == label {
+                return first;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Make `first` the first seed of `label`; returns the one it replaces (`u32::MAX`: none).
+    fn insert(&mut self, label: u64, first: u32) -> u32 {
+        let mask = self.slots.len() - 1;
+        let mut i = self.slot(label);
+        loop {
+            let (l, was) = self.slots[i];
+            if was == u32::MAX || l == label {
+                self.slots[i] = (label, first);
+                return was;
+            }
+            i = (i + 1) & mask;
+        }
     }
 }
 
@@ -256,7 +404,7 @@ struct Bucket {
 }
 
 const BUCKETS: usize = 256;
-const DIR_BITS: u32 = 12;
+const DIR_BITS: u32 = 16;
 /// Buckets sorted at a time while the table is built: the unsorted postings of that many
 /// are all the build holds beyond its input and the table.
 const GROUP: usize = 32;
@@ -265,10 +413,19 @@ const GROUP: usize = 32;
 type Run = (u64, u32, u32);
 
 impl Bucket {
-    /// The bucket of `runs`, all of its keys.
+    /// The bucket of `runs`, all of its keys. A directory cell holds a handful of runs: they
+    /// are dealt out by cell first, in place and in two steps (each to few enough places for
+    /// the caches), which leaves little for the comparison sort.
     fn new(runs: &mut [Run]) -> Self {
         assert!(runs.len() < u32::MAX as usize, "too many rescue seed postings");
-        runs.sort_unstable();
+        let low = DIR_BITS / 2;
+        deal(runs, 1 << (DIR_BITS - low), |k| Self::dir_of(k) >> low);
+        for part in runs.chunk_by_mut(|a, b| Self::dir_of(a.0) >> low == Self::dir_of(b.0) >> low) {
+            deal(part, 1 << low, |k| Self::dir_of(k) & ((1 << low) - 1));
+            for cell in part.chunk_by_mut(|a, b| Self::dir_of(a.0) == Self::dir_of(b.0)) {
+                cell.sort_unstable();
+            }
+        }
         let (mut keys, mut first) = (Vec::new(), Vec::new());
         let mut dir = vec![0u32; (1 << DIR_BITS) + 1];
         let mut at = 0u32;
@@ -297,22 +454,91 @@ impl Bucket {
     }
 }
 
+/// Reorder `runs` by `digit` of their keys (below `n`), in place: each run is swapped to the
+/// next free place of its digit until the one that belongs here turns up.
+fn deal(runs: &mut [Run], n: usize, digit: impl Fn(u64) -> usize) {
+    let mut end = vec![0usize; n];
+    for r in runs.iter() {
+        end[digit(r.0)] += 1;
+    }
+    let mut at = Vec::with_capacity(n);
+    let mut sum = 0;
+    for e in &mut end {
+        at.push(sum);
+        sum += *e;
+        *e = sum;
+    }
+    for d in 0..n {
+        while at[d] < end[d] {
+            let mut r = runs[at[d]];
+            loop {
+                let k = digit(r.0);
+                if k == d {
+                    break;
+                }
+                std::mem::swap(&mut r, &mut runs[at[k]]);
+                at[k] += 1;
+            }
+            runs[at[d]] = r;
+            at[d] += 1;
+        }
+    }
+}
+
+/// Table keys looked up side by side ([`Global::get_batch`]).
+const LOOKUPS: usize = 32;
+
 impl Global {
-    /// The postings of `key`.
-    fn get(&self, key: u64) -> &[(u32, u32)] {
-        let b = &self.buckets[(key >> 56) as usize];
-        let d = Bucket::dir_of(key);
-        let (lo, hi) = (b.dir[d] as usize, b.dir[d + 1] as usize);
-        match b.keys[lo..hi].binary_search(&key) {
-            Ok(i) => &b.posts[b.first[lo + i] as usize..b.first[lo + i + 1] as usize],
-            Err(_) => &[],
+    /// The postings of each of `keys` (at most [`LOOKUPS`]) to `f`, with the key's index. A
+    /// lookup reads four places in turn, each of them rarely in the caches; taking every
+    /// step for all the keys before the next lets the caches fetch them side by side.
+    fn get_batch<'a>(&'a self, keys: &[u64], mut f: impl FnMut(usize, &'a [(u32, u32)])) {
+        debug_assert!(keys.len() <= LOOKUPS);
+        let bucket = |k: u64| &self.buckets[(k >> 56) as usize];
+        for &k in keys {
+            index::prefetch(bucket(k).dir.as_ptr().wrapping_add(Bucket::dir_of(k)));
+        }
+        // Each key's range of `keys`, then of `posts` (empty: no such key).
+        let mut at = [(0u32, 0u32); LOOKUPS];
+        for (&k, at) in keys.iter().zip(&mut at) {
+            let (b, d) = (bucket(k), Bucket::dir_of(k));
+            *at = (b.dir[d], b.dir[d + 1]);
+            index::prefetch(b.keys.as_ptr().wrapping_add(at.0 as usize));
+            index::prefetch(b.keys.as_ptr().wrapping_add((at.1 as usize).saturating_sub(1)));
+        }
+        for (&k, at) in keys.iter().zip(&mut at) {
+            let b = bucket(k);
+            *at = match b.keys[at.0 as usize..at.1 as usize].binary_search(&k) {
+                Ok(i) => {
+                    let i = at.0 as usize + i;
+                    index::prefetch(b.first.as_ptr().wrapping_add(i));
+                    index::prefetch(b.first.as_ptr().wrapping_add(i + 1));
+                    (i as u32, 1)
+                }
+                Err(_) => (0, 0),
+            };
+        }
+        for (&k, at) in keys.iter().zip(&mut at) {
+            if at.1 != 0 {
+                let b = bucket(k);
+                *at = (b.first[at.0 as usize], b.first[at.0 as usize + 1]);
+                // The first lines of the postings; a longer list is read in order.
+                for i in (at.0..at.1).step_by(8).take(4) {
+                    index::prefetch(b.posts.as_ptr().wrapping_add(i as usize));
+                }
+            }
+        }
+        for (i, (&k, at)) in keys.iter().zip(&at).enumerate() {
+            f(i, &bucket(k).posts[at.0 as usize..at.1 as usize]);
         }
     }
 
     /// The table of the runs of `tk` seeds in the store's `pieces` (`hist`: each piece's runs
-    /// per bucket), on `nt` threads. Buckets are made [`GROUP`] at a time: the seeds are
-    /// read once per group, and only one group's postings are ever held unsorted.
-    fn build(pieces: &[StorePiece], hist: &[Vec<u32>], tk: usize, nt: usize) -> Self {
+    /// per bucket; `tops`: the bucket of each of its runs, in order), on `nt` threads. Buckets
+    /// are made [`GROUP`] at a time: the seeds are read once per group, and only one group's
+    /// postings are ever held unsorted.
+    fn build(pieces: &[StorePiece], hist: &[Vec<u32>], tops: Vec<Vec<u8>>, tk: usize, nt: usize) -> Self {
+        let mut tops = Some(tops);
         let size = |b: usize| hist.iter().map(|h| h[b] as usize).sum::<usize>();
         let most = (0..BUCKETS)
             .step_by(GROUP)
@@ -340,6 +566,7 @@ impl Global {
                 }
             }
             let work = std::sync::Mutex::new(parts.into_iter().enumerate());
+            let of_piece = tops.as_deref().unwrap();
             std::thread::scope(|sc| {
                 for _ in 0..nt {
                     sc.spawn(|| {
@@ -348,13 +575,14 @@ impl Global {
                                 break;
                             };
                             let sp = &pieces[p];
+                            let mut top = of_piece[p].iter();
                             let mut fill = [0usize; GROUP];
                             for (i, o) in sp.off.windows(2).enumerate() {
                                 let t = (p * PIECE_TX + i) as u32;
                                 for w in sp.seeds[o[0] as usize..o[1] as usize].windows(tk) {
-                                    let key = tuple(w.iter().map(|x| x.0));
-                                    let b = ((key >> 56) as usize).wrapping_sub(b0);
+                                    let b = usize::from(*top.next().unwrap()).wrapping_sub(b0);
                                     if b < GROUP {
+                                        let key = tuple(w.iter().map(|x| x.0));
                                         part[b][fill[b]] = (key, t, w[0].1);
                                         fill[b] += 1;
                                     }
@@ -364,6 +592,10 @@ impl Global {
                     });
                 }
             });
+            if b0 + GROUP >= BUCKETS {
+                // Read for the last time: gone before the last buckets take their memory.
+                tops = None;
+            }
             let work = std::sync::Mutex::new(of_bucket.into_iter().enumerate());
             let made: Vec<(usize, Bucket)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = (0..nt.min(GROUP))
@@ -401,13 +633,20 @@ struct Session {
     read: Vec<Seed>,
     /// Read seed label -> its first seed in `read`; `read_next` links each seed to the next one
     /// with its label (`u32::MAX`: none).
-    read_at: rustc_hash::FxHashMap<u64, u32>,
+    read_at: LabelTable,
     read_next: Vec<u32>,
-    /// Distinct window (hash, length) -> its index in `results`.
+    /// Distinct window (hash of its points, their number) -> its index in `results`.
     seen: rustc_hash::FxHashMap<(u64, u32), u32>,
-    /// Transcript -> the windows requested (start, end, the transcript position its chain's
-    /// target coordinates are relative to, index in `results`).
-    by_tx: rustc_hash::FxHashMap<u32, Vec<(u32, u32, u32, u32)>>,
+    /// With stored seeds: a window's seeds ([`window_hash`], their number) -> its index in
+    /// `results`, and where its points' transcript positions count from, relative to its
+    /// first seed. Isoforms mostly repeat a window seed for seed, and then need no join.
+    seen_seeds: rustc_hash::FxHashMap<(u64, u32), (u32, i64)>,
+    /// Transcript -> the first and last of its windows in `tx_wins`.
+    by_tx: rustc_hash::FxHashMap<u32, (u32, u32)>,
+    /// The windows requested (start, end, the transcript position its chain's target
+    /// coordinates are relative to, index in `results`), each with the next one requested of
+    /// its transcript (`u32::MAX`: none).
+    tx_wins: Vec<((u32, u32, u32, u32), u32)>,
     /// The best chain of each distinct window (those of the pending batch follow).
     results: Vec<Option<WindowChain>>,
 }
@@ -433,7 +672,14 @@ struct Scratch {
     wins: Vec<(u32, u32)>,
     /// Per (transcript, window start, distinct window), in visiting order.
     reqs: Vec<(u32, u32, u32)>,
+    /// The postings of a read's table keys ([`Rescuer::votes`]), and how many fell to each
+    /// value of a hash of their transcripts.
+    votes: Vec<u64>,
+    counts: Vec<u8>,
 }
+
+/// Most postings (eight bytes each) a thread keeps room for between reads.
+const VOTES_KEEP: usize = 1 << 16;
 
 /// A rescue chain in one transcript window: (score, max discrepancy, anchored bases, chain
 /// as (qs, qe, ts relative to the window, len)).
@@ -516,7 +762,7 @@ impl Rescuer {
         // holds more memory than its seeds.
         let next = std::sync::atomic::AtomicUsize::new(0);
         let n_pieces = n.div_ceil(PIECE_TX);
-        let mut made: Vec<(usize, StorePiece, Vec<u32>)> = std::thread::scope(|sc| {
+        let mut made: Vec<(usize, StorePiece, Vec<u32>, Vec<u8>)> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..nt)
                 .map(|_| {
                     sc.spawn(|| {
@@ -532,6 +778,7 @@ impl Rescuer {
                             seeds.clear();
                             off.push(0);
                             let mut hist = vec![0u32; BUCKETS];
+                            let mut top = Vec::new();
                             for t in p * PIECE_TX..((p + 1) * PIECE_TX).min(n) {
                                 codes.clear();
                                 idx.tx_codes_into(t as u32, 0, idx.tx_plen()[t], &mut codes);
@@ -543,7 +790,9 @@ impl Rescuer {
                                 seeds.extend(sd.iter().map(|&(l, s)| (mix(l), s)));
                                 if let Some(tk) = tuple_k {
                                     for w in seeds[from..].windows(tk) {
-                                        hist[(tuple(w.iter().map(|x| x.0)) >> 56) as usize] += 1;
+                                        let b = (tuple(w.iter().map(|x| x.0)) >> 56) as u8;
+                                        hist[usize::from(b)] += 1;
+                                        top.push(b);
                                     }
                                 }
                                 off.push(seeds.len() as u32);
@@ -552,7 +801,8 @@ impl Rescuer {
                                 off: off.clone(),
                                 seeds: seeds.clone(),
                             };
-                            out.push((p, piece, hist));
+                            top.shrink_to_fit();
+                            out.push((p, piece, hist, top));
                         }
                         out
                     })
@@ -561,10 +811,14 @@ impl Rescuer {
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         made.sort_unstable_by_key(|x| x.0);
-        let (pieces, hist): (Vec<StorePiece>, Vec<Vec<u32>>) =
-            made.into_iter().map(|(_, sp, h)| (sp, h)).unzip();
+        let (mut pieces, mut hist, mut tops) = (Vec::new(), Vec::new(), Vec::new());
+        for (_, sp, h, top) in made {
+            pieces.push(sp);
+            hist.push(h);
+            tops.push(top);
+        }
         if let Some(tk) = tuple_k {
-            self.global = Some(Global::build(&pieces, &hist, tk, nt.min(32)));
+            self.global = Some(Global::build(&pieces, &hist, tops, tk, nt.min(32)));
         }
         if store {
             self.store = Some(Store { pieces });
@@ -584,65 +838,115 @@ impl Rescuer {
         RESCUE.with(|sc| {
             let sc = &mut *sc.borrow_mut();
             self.begin(seq, sc);
-            let mut cand = Self::votes(g, table, seq.len(), sc);
-            cand.truncate(n);
+            let cand = Self::votes(g, table, seq.len(), n, sc);
             crate::stats::add(&crate::stats::RESCUE_STRANDS, 1);
-            for &(_, t, lo, hi) in &cand {
+            for (k, &(_, t, lo, hi)) in cand.iter().enumerate() {
+                let next = cand.get(k + 1).map(|&(_, t, lo, hi)| (t, lo, hi));
+                self.ahead(idx, seq.len(), next.as_ref(), cand.get(k + 2).map(|x| x.1));
                 self.request(idx, cp, seq.len(), (t, lo, hi), sc);
             }
             self.finish(cp, sc)
         })
     }
 
-    /// Transcripts sharing table keys with a read of `plen` parsed bases (`sc.s.read` holds
-    /// its seeds): (keys within one diagonal window, transcript, lowest and highest diagonal),
-    /// most keys first.
-    fn votes(g: &GlobalParams, table: &Global, plen: usize, sc: &mut Scratch) -> Vec<(u32, u32, i64, i64)> {
-        {
-            const OFF: i64 = 1 << 30;
-            let mut keys: Vec<u64> = Vec::new();
-            for w in sc.s.read.windows(g.tuple.max(1)) {
-                let posts = table.get(tuple(w.iter().map(|x| mix(x.label))));
-                if posts.len() <= g.max_occ as usize {
-                    let start = w[0].start;
+    /// The `n` transcripts sharing the most table keys with a read of `plen` parsed bases
+    /// (`sc.s.read` holds its seeds): (keys within one diagonal window, transcript, lowest and
+    /// highest diagonal), most keys first.
+    fn votes(
+        g: &GlobalParams,
+        table: &Global,
+        plen: usize,
+        n: usize,
+        sc: &mut Scratch,
+    ) -> Vec<(u32, u32, i64, i64)> {
+        const OFF: i64 = 1 << 30;
+        let max_occ = g.max_occ as usize;
+        let (read, tk) = (&sc.s.read, g.tuple.max(1));
+        // Every posting of the read's keys, as transcript << 32 | diagonal.
+        let keys = &mut sc.votes;
+        keys.clear();
+        let mut batch = [0u64; LOOKUPS];
+        for from in (0..(read.len() + 1).saturating_sub(tk)).step_by(LOOKUPS) {
+            let m = LOOKUPS.min(read.len() + 1 - tk - from);
+            for (k, w) in batch.iter_mut().zip(read[from..].windows(tk)) {
+                *k = tuple(w.iter().map(|x| mix(x.label)));
+            }
+            table.get_batch(&batch[..m], |i, posts| {
+                if posts.len() <= max_occ {
+                    let start = read[from + i].start;
                     keys.extend(
                         posts
                             .iter()
                             .map(|&(t, p)| (u64::from(t) << 32) | (p as i64 - start as i64 + OFF) as u64),
                     );
                 }
-            }
-            keys.sort_unstable();
-            let w = 32 + plen as u64 / 8;
-            // Per transcript: the most seeds within `w` diagonals.
-            let mut cand: Vec<(u32, u32, i64, i64)> = Vec::new();
-            let mut i = 0;
-            while i < keys.len() {
-                let t = keys[i] >> 32;
-                let mut j = i;
-                while j < keys.len() && keys[j] >> 32 == t {
-                    j += 1;
-                }
-                let (mut bestc, mut lo, mut hi) = (0u32, 0, 0);
-                let mut a = i;
-                for b in i..j {
-                    while keys[b] - keys[a] > w {
-                        a += 1;
-                    }
-                    if (b - a + 1) as u32 > bestc {
-                        bestc = (b - a + 1) as u32;
-                        lo = (keys[a] & 0xffff_ffff) as i64 - OFF;
-                        hi = (keys[b] & 0xffff_ffff) as i64 - OFF;
-                    }
-                }
-                if bestc >= g.min_shared {
-                    cand.push((bestc, t as u32, lo, hi));
-                }
-                i = j;
-            }
-            cand.sort_unstable_by_key(|&(c, t, _, _)| (std::cmp::Reverse(c), t));
-            cand
+            });
         }
+        // Most postings are the only one of their transcript, which then cannot be a
+        // candidate: count postings by a hash of the transcript, and sort only those that
+        // have, or may have, enough company.
+        if g.min_shared > 1 && !keys.is_empty() {
+            let bits = (4 * keys.len())
+                .next_power_of_two()
+                .trailing_zeros()
+                .clamp(10, 20);
+            let slot = |k: u64| ((k >> 32).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - bits)) as usize;
+            let count = &mut sc.counts;
+            count.clear();
+            count.resize(1 << bits, 0u8);
+            for &k in keys.iter() {
+                let c = &mut count[slot(k)];
+                *c = c.saturating_add(1);
+            }
+            let need = g.min_shared.min(255) as u8;
+            let mut kept = 0;
+            for i in 0..keys.len() {
+                let k = keys[i];
+                keys[kept] = k;
+                kept += usize::from(count[slot(k)] >= need);
+            }
+            keys.truncate(kept);
+        }
+        keys.sort_unstable();
+        let w = 32 + plen as u64 / 8;
+        // Per transcript: the most seeds within `w` diagonals.
+        let mut cand: Vec<(u32, u32, i64, i64)> = Vec::new();
+        let mut i = 0;
+        while i < keys.len() {
+            let t = keys[i] >> 32;
+            let mut j = i;
+            while j < keys.len() && keys[j] >> 32 == t {
+                j += 1;
+            }
+            let (mut bestc, mut lo, mut hi) = (0u32, 0, 0);
+            let mut a = i;
+            for b in i..j {
+                while keys[b] - keys[a] > w {
+                    a += 1;
+                }
+                if (b - a + 1) as u32 > bestc {
+                    bestc = (b - a + 1) as u32;
+                    lo = (keys[a] & 0xffff_ffff) as i64 - OFF;
+                    hi = (keys[b] & 0xffff_ffff) as i64 - OFF;
+                }
+            }
+            if bestc >= g.min_shared {
+                cand.push((bestc, t as u32, lo, hi));
+            }
+            i = j;
+        }
+        if keys.capacity() > VOTES_KEEP {
+            *keys = Vec::new();
+            sc.counts = Vec::new();
+        }
+        // Transcripts are distinct, so the order is total: the best `n`, then those in order.
+        let by = |&(c, t, _, _): &(u32, u32, i64, i64)| (std::cmp::Reverse(c), t);
+        if cand.len() > n {
+            cand.select_nth_unstable_by_key(n - 1, by);
+            cand.truncate(n);
+        }
+        cand.sort_unstable_by_key(by);
+        cand
     }
 
     /// Rescue hits for one orientation of a read: `seq` is the parsed read, `base` its
@@ -675,14 +979,12 @@ impl Rescuer {
         let s = &mut sc.s;
         self.seeder.seed_parsed_into(seq, &mut s.read, &mut sc.tmp);
         debug_assert!(s.read.windows(2).all(|w| w[0].start < w[1].start));
-        s.read_at.clear();
+        s.read_at.reset(s.read.len());
         s.read_next.clear();
         s.read_next.resize(s.read.len(), u32::MAX);
         // Back to front, so that each label's chain runs in start order.
         for (i, x) in s.read.iter().enumerate().rev() {
-            if let Some(next) = s.read_at.insert(self.label_key(x.label), i as u32) {
-                s.read_next[i] = next;
-            }
+            s.read_next[i] = s.read_at.insert(self.label_key(x.label), i as u32);
         }
     }
 
@@ -696,7 +998,7 @@ impl Rescuer {
         // Hash join on labels: each window seed probes the read's label table.
         sc.keys.clear();
         for &(label, start) in &sc.tx {
-            let mut i = sc.s.read_at.get(&label).copied().unwrap_or(u32::MAX);
+            let mut i = sc.s.read_at.get(label);
             while i != u32::MAX {
                 sc.keys.push((u64::from(i) << 32) | u64::from(start));
                 i = sc.s.read_next[i as usize];
@@ -705,11 +1007,11 @@ impl Rescuer {
         sc.keys.sort_unstable();
     }
 
-    /// [`Self::point_keys`] of the window `[lo, hi)` of transcript `t`, by its stored seeds.
-    fn stored_point_keys(&self, store: &Store, t: u32, lo: u32, hi: u32, sc: &mut Scratch) {
+    /// [`Self::point_keys`] of a transcript window starting at `lo`, by its stored seeds `win`.
+    fn stored_point_keys(win: &[(u32, u32)], lo: u32, sc: &mut Scratch) {
         sc.keys.clear();
-        for &(label, start) in store.window(t, lo, hi) {
-            let mut i = sc.s.read_at.get(&u64::from(label)).copied().unwrap_or(u32::MAX);
+        for &(label, start) in win {
+            let mut i = sc.s.read_at.get(u64::from(label));
             while i != u32::MAX {
                 sc.keys.push((u64::from(i) << 32) | u64::from(start - lo));
                 i = sc.s.read_next[i as usize];
@@ -791,6 +1093,8 @@ impl Rescuer {
             sc.txs.truncate(self.p.max_tx_per_gene);
             for i in 0..sc.txs.len() {
                 let (t, _, dlo, dhi) = sc.txs[i];
+                let next = sc.txs.get(i + 1).map(|&(t, _, lo, hi)| (t, lo, hi));
+                self.ahead(idx, seq.len(), next.as_ref(), sc.txs.get(i + 2).map(|x| x.0));
                 self.request(idx, cp, seq.len(), (t, dlo, dhi), sc);
             }
         }
@@ -813,7 +1117,8 @@ impl Rescuer {
         RESCUE.with(|sc| {
             let sc = &mut *sc.borrow_mut();
             self.begin(seq, sc);
-            for &tx in txs {
+            for (k, &tx) in txs.iter().enumerate() {
+                self.ahead(idx, seq.len(), txs.get(k + 1), txs.get(k + 2).map(|x| x.0));
                 self.request(idx, cp, seq.len(), tx, sc);
             }
             self.finish(cp, sc)
@@ -832,52 +1137,84 @@ impl Rescuer {
             let s = &mut sc.s;
             s.key = key;
             s.seen.clear();
+            s.seen_seeds.clear();
             s.by_tx.clear();
+            s.tx_wins.clear();
             s.results.clear();
         }
         debug_assert!(sc.pool.is_empty() && sc.wins.is_empty());
         sc.reqs.clear();
     }
 
-    /// Queue the window of transcript `t` that a read of `plen` parsed bases on the diagonals
-    /// `dlo..=dhi` can occupy, chaining a full batch of windows.
-    fn request(
-        &self,
-        idx: &Index,
-        cp: &ChainParams,
-        plen: usize,
-        (t, dlo, dhi): (u32, i64, i64),
-        sc: &mut Scratch,
-    ) {
+    /// The transcript window `(length of t, lo, hi)` that a read of `plen` parsed bases on
+    /// the diagonals `dlo..=dhi` of transcript `t` can occupy.
+    fn window_of(&self, idx: &Index, plen: usize, (t, dlo, dhi): (u32, i64, i64)) -> (u32, u32, u32) {
         let plen = plen as i64;
         let tlen = idx.tx_plen()[t as usize];
-        let (lo, hi) = match self.p.window {
+        match self.p.window {
             Some((pad, div)) => {
                 let slack = pad as i64 + plen / div.max(1) as i64;
                 (
+                    tlen,
                     (dlo - slack).clamp(0, tlen as i64) as u32,
                     (dhi + plen + slack).clamp(0, tlen as i64) as u32,
                 )
             }
-            None => (0, tlen),
+            None => (tlen, 0, tlen),
+        }
+    }
+
+    /// Ask the caches for the stored seeds of the windows requested next (`next`) and after
+    /// it (`after`): a request's first reads are of memory no earlier one touched.
+    fn ahead(&self, idx: &Index, plen: usize, next: Option<&(u32, i64, i64)>, after: Option<u32>) {
+        let Some(store) = &self.store else {
+            return;
         };
+        if let Some(t) = after {
+            store.prefetch_tx(t);
+        }
+        if let Some(&w) = next {
+            let (tlen, lo, _) = self.window_of(idx, plen, w);
+            store.prefetch_window(w.0, tlen, lo);
+        }
+    }
+
+    /// Queue the window of transcript `t` that a read of `plen` parsed bases on the diagonals
+    /// `dlo..=dhi` can occupy, chaining a full batch of windows.
+    fn request(&self, idx: &Index, cp: &ChainParams, plen: usize, w: (u32, i64, i64), sc: &mut Scratch) {
+        let t = w.0;
+        let (tlen, lo, hi) = self.window_of(idx, plen, w);
         // The cap bounds the bases re-seeded: a window of a longer transcript is within it.
         if hi - lo > self.p.max_tx_len {
             return;
         }
         // A window within one already chained for this transcript has no better chain.
-        if let Some(&(_, _, base, r)) =
-            sc.s.by_tx
-                .get(&t)
-                .and_then(|w| w.iter().find(|w| w.0 <= lo && hi <= w.1))
-        {
-            sc.reqs.push((t, base, r));
-            return;
+        let mut k = sc.s.by_tx.get(&t).map_or(u32::MAX, |x| x.0);
+        while k != u32::MAX {
+            let (w, next) = sc.s.tx_wins[k as usize];
+            if w.0 <= lo && hi <= w.1 {
+                sc.reqs.push((t, w.2, w.3));
+                return;
+            }
+            k = next;
         }
         // The window's key, and the transcript position its points are relative to.
+        let mut seeds = None;
         let (key, base) = match &self.store {
             Some(store) => {
-                self.stored_point_keys(store, t, lo, hi, sc);
+                let win = store.window(t, tlen, lo, hi);
+                // The same seeds as an earlier window's make the same points.
+                let (skey, s0) = (
+                    (window_hash(win), win.len() as u32),
+                    win.first().map_or(lo, |x| x.1),
+                );
+                if let Some(&(r, d)) = sc.s.seen_seeds.get(&skey) {
+                    let base = (i64::from(s0) + d).max(0) as u32;
+                    Self::note(t, (lo, hi, base, r), sc);
+                    return;
+                }
+                seeds = Some((skey, s0));
+                Self::stored_point_keys(win, lo, sc);
                 // Equal points up to a shift along the transcript have equal chains: the
                 // points are kept relative to the first one's transcript position.
                 let first = sc.keys.iter().map(|&k| k as u32).min().unwrap_or(0);
@@ -915,8 +1252,28 @@ impl Rescuer {
                 r
             }
         };
-        sc.s.by_tx.entry(t).or_default().push((lo, hi, base, r));
-        sc.reqs.push((t, base, r));
+        if let Some((skey, s0)) = seeds {
+            sc.s.seen_seeds.insert(skey, (r, i64::from(base) - i64::from(s0)));
+        }
+        Self::note(t, (lo, hi, base, r), sc);
+    }
+
+    /// Record the window `w` of transcript `t` (see [`Session::tx_wins`]) as requested.
+    fn note(t: u32, w: (u32, u32, u32, u32), sc: &mut Scratch) {
+        let s = &mut sc.s;
+        let k = s.tx_wins.len() as u32;
+        s.tx_wins.push((w, u32::MAX));
+        match s.by_tx.entry(t) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let last = &mut e.get_mut().1;
+                s.tx_wins[*last as usize].1 = k;
+                *last = k;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((k, k));
+            }
+        }
+        sc.reqs.push((t, w.2, w.3));
     }
 
     /// Chain the pending batch of windows.

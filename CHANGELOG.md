@@ -31,10 +31,10 @@
 
   On simulated ONT reads, correctly placed reads rise by about 0.4 points at 5% error and 1.5
   points at 10%, and transcript abundances from oarfish follow the truth more closely at
-  every error rate from 3% to 14%. The cost: mapping ONT reads takes two to three times the
-  instructions (more at higher error rates), and the table and the transcripts' rescue seeds
-  (`--rescue-store`) are made at startup, in under a second on 64 threads and about 4.5 GB
-  more memory for a human transcriptome.
+  every error rate from 3% to 14%. The cost: mapping ONT reads takes about one and a half
+  times the instructions at 5% error and nearly twice at 10%, and the table and the
+  transcripts' rescue seeds (`--rescue-store`) are made at startup, in under a second on 64
+  threads and about 4.5 GB more memory for a human transcriptome.
   `--no-rescue-global --no-rescue-store --rescue-rechain 0 --rescue-antisense 0` maps as
   before. The `hifi` preset, which has no rescue, is unchanged in cost.
 - Tie-break (all presets unless noted):

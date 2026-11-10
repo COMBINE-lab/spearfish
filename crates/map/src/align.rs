@@ -728,57 +728,98 @@ pub fn affine_extend(
     d.clip_best.max(d.score.saturating_add(end_bonus))
 }
 
-/// Best affine local score of `read` in `text` over the diagonals `dlo..=dhi`
-/// (text position minus read position), both read ends free to clip: the best global
-/// alignment of a piece of the read with a piece of the text, plus `end_bonus` for each read
-/// end the piece reaches (0 if nothing scores above it).
+/// Best affine local score of `read` in `text` (2-bit codes; a read base of 4 or more matches
+/// nothing) over the diagonals `dlo..=dhi` (text position minus read position), both read
+/// ends free to clip: the best global alignment of a piece of the read with a piece of the
+/// text, plus `end_bonus` for each read end the piece reaches (0 if nothing scores above it).
 pub fn local_band(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+    debug_assert!(text.iter().all(|&b| b < 4));
+    match simd_level() {
+        // SAFETY: the CPU has the active level's features.
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 => unsafe { local_band_avx512(read, text, sc, dlo, dhi, end_bonus) },
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 => unsafe { local_band_avx2(read, text, sc, dlo, dhi, end_bonus) },
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => local_band_core::<NeonRows>(read, text, sc, dlo, dhi, end_bonus),
+        _ => local_band_core::<ScalarRows>(read, text, sc, dlo, dhi, end_bonus),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn local_band_avx512(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+    local_band_core::<Avx512Rows>(read, text, sc, dlo, dhi, end_bonus)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
+fn local_band_avx2(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+    local_band_core::<Avx2Rows>(read, text, sc, dlo, dhi, end_bonus)
+}
+
+/// [`local_band`] by the row kernel `R`, whose features the caller is compiled for.
+#[inline(always)]
+fn local_band_core<R: Rows>(
+    read: &[u8],
+    text: &[u8],
+    sc: &Affine,
+    dlo: i64,
+    dhi: i64,
+    end_bonus: i32,
+) -> i32 {
     let (m, n) = (read.len(), text.len());
     if m == 0 || dlo > dhi {
         return 0;
     }
-    let go = sc.open + sc.ext;
+    let (go, ext) = (sc.open + sc.ext, sc.ext);
+    // Columns 0..=n and the band's right sentinel.
     let w = n + 2;
     let (mut hp, mut fp, mut h, mut f) = (vec![NEG; w], vec![NEG; w], vec![NEG; w], vec![NEG; w]);
-    // Row `i`'s columns (first, one past the last).
+    let (mut hpv, mut gsv) = (Vec::new(), Vec::new());
+    // Row `i`'s columns (first, one past the last): from one row to the next, each end stays
+    // or moves one column right, so a row reads only what the row above wrote (its cells and
+    // its sentinel).
     let rng = |i: usize| {
         let lo = (i as i64 + dlo).clamp(0, n as i64 + 1) as usize;
         let hi = (i as i64 + dhi + 1).clamp(0, n as i64 + 1) as usize;
         (lo, hi.max(lo))
     };
-    let (mut plo, mut phi) = rng(0);
-    for x in &mut hp[plo..phi] {
-        *x = end_bonus;
-    }
+    let (lo, hi) = rng(0);
+    hp[lo..hi].fill(end_bonus);
     let mut best = 0;
     for i in 1..=m {
         let (lo, hi) = rng(i);
-        let c = read[i - 1];
-        // No alignment starts in the last row: it would hold nothing of the read.
+        // An alignment may start at any cell, but not in the last row: it would hold nothing
+        // of the read.
         let floor = if i < m { 0 } else { NEG };
-        let (mut e, mut left, mut rowmax) = (NEG, NEG, NEG);
-        for j in lo..hi {
-            let fv = if j >= plo && j < phi {
-                (hp[j] - go).max(fp[j] - sc.ext)
-            } else {
-                NEG
+        let (mut start, mut e, mut rowmax) = (lo, NEG, NEG);
+        if lo == 0 && hi > 0 {
+            // Column 0: only a vertical gap reaches it.
+            let fj = (hp[0] - go).max(fp[0] - ext).max(NEG);
+            let v = fj.max(floor);
+            (h[0], f[0]) = (v, fj);
+            (start, e, rowmax) = (1, v - go, v);
+        }
+        if start < hi {
+            // SAFETY: the entry point is compiled for the kernel's features, which the CPU has.
+            let row = unsafe {
+                R::row(
+                    &hp[start - 1..hi],
+                    &fp[start..hi],
+                    &text[start - 1..hi - 1],
+                    &mut h[start..=hi],
+                    &mut f[start..=hi],
+                    read[i - 1],
+                    (sc.mat, sc.mis, go, ext),
+                    e,
+                    floor,
+                    (&mut hpv, &mut gsv),
+                )
             };
-            e = (left - go).max(e - sc.ext);
-            let dg = if j > plo && j <= phi {
-                hp[j - 1]
-                    + if text[j - 1] == c && c < 4 {
-                        sc.mat
-                    } else {
-                        -sc.mis
-                    }
-            } else {
-                NEG
-            };
-            let v = dg.max(e).max(fv).max(floor);
-            h[j] = v;
-            f[j] = fv;
-            left = v;
-            rowmax = rowmax.max(v);
+            rowmax = rowmax.max(row);
+        } else {
+            (h[hi], f[hi]) = (NEG, NEG);
         }
         best = best.max(rowmax);
         if i == m {
@@ -786,7 +827,6 @@ pub fn local_band(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end
         }
         std::mem::swap(&mut hp, &mut h);
         std::mem::swap(&mut fp, &mut f);
-        (plo, phi) = (lo, hi);
     }
     best
 }
@@ -921,6 +961,7 @@ trait Rows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
         scratch: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32;
 }
@@ -928,9 +969,10 @@ trait Rows {
 /// One DP row over `w` cells by three passes over the row (the first and last autovectorize
 /// for the entry point's level): `hprev` is H[i-1][start-1..=hi] (`w + 1` cells), `fu`
 /// F[i-1][start..=hi], `tx` the text bases of columns start..=hi, `c` the pattern base, `e`
-/// the horizontal gap entering column `start`; writes H and F of row i to `nh` and `nf` (`w + 1`
-/// cells: the last gets NEG, the band's right sentinel) and returns the row's maximum. `scratch`
-/// holds two rows of temporaries.
+/// the horizontal gap entering column `start`, `floor` (NEG or above) the least a cell's H is
+/// (NEG: none; 0: an alignment may start at the cell); writes H and F of row i to `nh` and `nf`
+/// (`w + 1` cells: the last gets NEG, the band's right sentinel) and returns the row's maximum.
+/// `scratch` holds two rows of temporaries.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn row_scalar(
@@ -942,6 +984,7 @@ fn row_scalar(
     c: u8,
     (mat, mis, go, ext): (i32, i32, i32, i32),
     e: i32,
+    floor: i32,
     (hpv, gsv): (&mut Vec<i32>, &mut Vec<i32>),
 ) -> i32 {
     let w = fu.len();
@@ -960,7 +1003,7 @@ fn row_scalar(
     for k in 0..w {
         let fj = (hu[k] - go).max(fu[k] - ext).max(NEG);
         let s = if c == tx[k] & 3 { mat } else { -mis };
-        let x = (hd[k] + s).max(fj).max(NEG);
+        let x = (hd[k] + s).max(fj).max(floor);
         hp[k] = x;
         gs[k] = x - go + ext * (k as i32 + 1);
         nf[k] = fj;
@@ -993,9 +1036,10 @@ impl Rows for ScalarRows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
         scratch: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32 {
-        row_scalar(hprev, fu, tx, nh, nf, c, sc, e, scratch)
+        row_scalar(hprev, fu, tx, nh, nf, c, sc, e, floor, scratch)
     }
 }
 
@@ -1013,6 +1057,7 @@ fn cells_scalar(
     nf: &mut [i32],
     c: u8,
     (mat, mis, go, ext): (i32, i32, i32, i32),
+    floor: i32,
     k0: usize,
     mut carry: i32,
     mut m: i32,
@@ -1020,7 +1065,7 @@ fn cells_scalar(
     for k in k0..fu.len() {
         let fj = (hprev[k + 1] - go).max(fu[k] - ext).max(NEG);
         let s = if c == tx[k] & 3 { mat } else { -mis };
-        let x = (hprev[k] + s).max(fj).max(NEG);
+        let x = (hprev[k] + s).max(fj).max(floor);
         let v = x.max(carry - ext * k as i32);
         carry = carry.max(x - go + ext * (k as i32 + 1));
         nh[k] = v;
@@ -1045,10 +1090,11 @@ impl Rows for Avx512Rows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
         _: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32 {
         // SAFETY: as the caller guarantees.
-        unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) }
+        unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e, floor) }
     }
 }
 
@@ -1070,12 +1116,13 @@ unsafe fn row_avx512(
     c: u8,
     (mat, mis, go, ext): (i32, i32, i32, i32),
     e: i32,
+    floor: i32,
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
     assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
     (nh[w], nf[w]) = (NEG, NEG);
-    let neg = _mm512_set1_epi32(NEG);
+    let (neg, vfloor) = (_mm512_set1_epi32(NEG), _mm512_set1_epi32(floor));
     let (vgo, vext) = (_mm512_set1_epi32(go), _mm512_set1_epi32(ext));
     let (vmat, vmis) = (_mm512_set1_epi32(mat), _mm512_set1_epi32(-mis));
     let vc = _mm512_set1_epi32(c as i32);
@@ -1113,7 +1160,7 @@ unsafe fn row_avx512(
         );
         let t = _mm512_and_si512(_mm512_cvtepu8_epi32(t), three);
         let s = _mm512_mask_blend_epi32(_mm512_cmpeq_epi32_mask(t, vc), vmis, vmat);
-        let x = _mm512_max_epi32(_mm512_max_epi32(_mm512_add_epi32(hd, s), fj), neg);
+        let x = _mm512_max_epi32(_mm512_max_epi32(_mm512_add_epi32(hd, s), fj), vfloor);
         // gs[k] = x - go + ext * (k + 1); lanes past the row are NEG (they come after every
         // real lane, so they change no output).
         let g = _mm512_mask_mov_epi32(
@@ -1195,15 +1242,16 @@ unsafe fn row_avx2(
     c: u8,
     (mat, mis, go, ext): (i32, i32, i32, i32),
     e: i32,
+    floor: i32,
 ) -> i32 {
     use std::arch::x86_64::*;
     let w = fu.len();
     assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
     (nh[w], nf[w]) = (NEG, NEG);
     if w < 8 {
-        return cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), 0, e, NEG);
+        return cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), floor, 0, e, NEG);
     }
-    let neg = _mm256_set1_epi32(NEG);
+    let (neg, vfloor) = (_mm256_set1_epi32(NEG), _mm256_set1_epi32(floor));
     let (vgo, vext) = (_mm256_set1_epi32(go), _mm256_set1_epi32(ext));
     let (vmat, vmis) = (_mm256_set1_epi32(mat), _mm256_set1_epi32(-mis));
     let vc = _mm256_set1_epi32(c as i32);
@@ -1235,7 +1283,7 @@ unsafe fn row_avx2(
         );
         let t = _mm256_and_si256(_mm256_cvtepu8_epi32(t), three);
         let s = _mm256_blendv_epi8(vmis, vmat, _mm256_cmpeq_epi32(t, vc));
-        let x = _mm256_max_epi32(_mm256_max_epi32(_mm256_add_epi32(hd, s), fj), neg);
+        let x = _mm256_max_epi32(_mm256_max_epi32(_mm256_add_epi32(hd, s), fj), vfloor);
         // gs[k] = x - go + ext * (k + 1).
         let g = _mm256_add_epi32(_mm256_sub_epi32(x, vgo), _mm256_add_epi32(ek, vext));
         // Inclusive prefix max within the vector: shifts by one, two, four lanes.
@@ -1298,10 +1346,11 @@ impl Rows for Avx2Rows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
         _: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32 {
         // SAFETY: as the caller guarantees.
-        unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e) }
+        unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e, floor) }
     }
 }
 
@@ -1321,12 +1370,13 @@ unsafe fn row_neon(
     c: u8,
     (mat, mis, go, ext): (i32, i32, i32, i32),
     e: i32,
+    floor: i32,
 ) -> i32 {
     use std::arch::aarch64::*;
     let w = fu.len();
     assert!(hprev.len() == w + 1 && tx.len() == w && nh.len() == w + 1 && nf.len() == w + 1);
     (nh[w], nf[w]) = (NEG, NEG);
-    let neg = vdupq_n_s32(NEG);
+    let (neg, vfloor) = (vdupq_n_s32(NEG), vdupq_n_s32(floor));
     let (vgo, vext) = (vdupq_n_s32(go), vdupq_n_s32(ext));
     let (vmat, vmis) = (vdupq_n_s32(mat), vdupq_n_s32(-mis));
     let (vc, three) = (vdupq_n_u32(c as u32), vdupq_n_u32(3));
@@ -1353,7 +1403,7 @@ unsafe fn row_neon(
         let t = vandq_u32(t, three);
         let fj = vmaxq_s32(vmaxq_s32(vsubq_s32(hu, vgo), vsubq_s32(fv, vext)), neg);
         let s = vbslq_s32(vceqq_u32(t, vc), vmat, vmis);
-        let x = vmaxq_s32(vmaxq_s32(vaddq_s32(hd, s), fj), neg);
+        let x = vmaxq_s32(vmaxq_s32(vaddq_s32(hd, s), fj), vfloor);
         // gs[k] = x - go + ext * (k + 1).
         let g = vaddq_s32(vsubq_s32(x, vgo), vaddq_s32(ek, vext));
         // Inclusive prefix max within the block; then the carry, exclusive by one lane.
@@ -1372,7 +1422,7 @@ unsafe fn row_neon(
         k += 4;
     }
     let (m, g) = (vmaxvq_s32(mx), vgetq_lane_s32::<0>(cv));
-    cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), k, g, m)
+    cells_scalar(hprev, fu, tx, nh, nf, c, (mat, mis, go, ext), floor, k, g, m)
 }
 
 /// [`row_neon`] (NEON is part of the aarch64 baseline).
@@ -1391,10 +1441,11 @@ impl Rows for NeonRows {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
         _: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32 {
         // SAFETY: as the caller guarantees.
-        unsafe { row_neon(hprev, fu, tx, nh, nf, c, sc, e) }
+        unsafe { row_neon(hprev, fu, tx, nh, nf, c, sc, e, floor) }
     }
 }
 
@@ -1804,6 +1855,7 @@ fn run_core<R: Rows>(
                     c,
                     (mat, mis, go, ext),
                     e,
+                    NEG,
                     (hpv, gsv),
                 )
             };
@@ -1987,18 +2039,19 @@ mod tests {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
         scratch: (&mut Vec<i32>, &mut Vec<i32>),
     ) -> i32 {
         assert!(simd::detected().includes(level));
         match level {
             // SAFETY: the CPU supports the level (asserted above).
             #[cfg(target_arch = "x86_64")]
-            Level::Avx512 => unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e) },
+            Level::Avx512 => unsafe { row_avx512(hprev, fu, tx, nh, nf, c, sc, e, floor) },
             #[cfg(target_arch = "x86_64")]
-            Level::Avx2 => unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e) },
+            Level::Avx2 => unsafe { row_avx2(hprev, fu, tx, nh, nf, c, sc, e, floor) },
             #[cfg(target_arch = "aarch64")]
-            Level::Neon => unsafe { row_neon(hprev, fu, tx, nh, nf, c, sc, e) },
-            _ => row_scalar(hprev, fu, tx, nh, nf, c, sc, e, scratch),
+            Level::Neon => unsafe { row_neon(hprev, fu, tx, nh, nf, c, sc, e, floor) },
+            _ => row_scalar(hprev, fu, tx, nh, nf, c, sc, e, floor, scratch),
         }
     }
 
@@ -2010,13 +2063,26 @@ mod tests {
         c: u8,
         sc: (i32, i32, i32, i32),
         e: i32,
+        floor: i32,
     ) -> Vec<(Level, Vec<i32>, Vec<i32>, i32)> {
         let w = fu.len();
         let mut out = Vec::new();
         for l in simd::supported() {
             let (mut nh, mut nf) = (vec![7; w + 1], vec![7; w + 1]);
             let (mut a, mut b) = (Vec::new(), Vec::new());
-            let m = row_at(l, hprev, fu, tx, &mut nh, &mut nf, c, sc, e, (&mut a, &mut b));
+            let m = row_at(
+                l,
+                hprev,
+                fu,
+                tx,
+                &mut nh,
+                &mut nf,
+                c,
+                sc,
+                e,
+                floor,
+                (&mut a, &mut b),
+            );
             assert_eq!((nh[w], nf[w]), (NEG, NEG), "sentinel at {l}");
             out.push((l, nh, nf, m));
         }
@@ -2153,8 +2219,8 @@ mod tests {
         // Junk at both read ends is clipped, and earns no bonus.
         let junk = [2, 2, 2, 0, 1, 2, 3, 0, 1, 3, 3, 3];
         assert_eq!(local_band(&junk, &t, &sc, -12, 11, 5), 12);
-        // Ambiguous bases match nothing, each other included.
-        assert_eq!(local_band(&[4, 4, 4], &[4, 4, 4], &sc, -3, 3, 0), 0);
+        // An ambiguous read base matches nothing.
+        assert_eq!(local_band(&[4, 4, 4], &[0, 0, 0], &sc, -3, 3, 0), 0);
         assert_eq!(local_band(&[], &t, &sc, -3, 3, 5), 0);
         assert_eq!(local_band(&p, &t, &sc, 3, 2, 5), 0);
     }
@@ -2168,10 +2234,13 @@ mod tests {
             p in prop::collection::vec(0u8..4, 0..8), t in prop::collection::vec(0u8..4, 0..8),
             bonus in 0i32..8,
         ) {
-            for sc in [Affine::default(), Affine::HIFI] {
-                let (m, n) = (p.len() as i64, t.len() as i64);
-                prop_assert_eq!(local_band(&p, &t, &sc, -m, n, bonus), naive_local(&p, &t, &sc, bonus));
-            }
+            each_level(|l| {
+                for sc in [Affine::default(), Affine::HIFI] {
+                    let (m, n) = (p.len() as i64, t.len() as i64);
+                    prop_assert_eq!(local_band(&p, &t, &sc, -m, n, bonus), naive_local(&p, &t, &sc, bonus), "at {}", l);
+                }
+                Ok(())
+            })?;
         }
 
         /// Within a band, it is the same recurrence over the cells the band keeps, wherever
@@ -2190,11 +2259,40 @@ mod tests {
                 let i = pos % p.len();
                 match kind { 0 => p[i] = b, 1 => p.insert(i, b), _ => { p.remove(i); } }
             }
-            for sc in [Affine::default(), Affine::HIFI] {
-                let got = local_band(&p, &base, &sc, dlo, dlo + width, bonus);
-                prop_assert_eq!(got, naive_local_band(&p, &base, &sc, dlo, dlo + width, bonus));
-                prop_assert!(got <= local_band(&p, &base, &sc, dlo - 3, dlo + width + 5, bonus));
+            each_level(|l| {
+                for sc in [Affine::default(), Affine::HIFI] {
+                    let got = local_band(&p, &base, &sc, dlo, dlo + width, bonus);
+                    prop_assert_eq!(got, naive_local_band(&p, &base, &sc, dlo, dlo + width, bonus), "at {}", l);
+                    prop_assert!(got <= local_band(&p, &base, &sc, dlo - 3, dlo + width + 5, bonus));
+                }
+                Ok(())
+            })?;
+        }
+
+        /// The same over bands of several vectors, on reads with ambiguous bases and junk ends.
+        #[test]
+        fn local_band_matches_matrix_wide(
+            base in prop::collection::vec(0u8..4, 1..300),
+            edits in prop::collection::vec((0usize..300, 0u8..5, 0u8..3), 0..30),
+            cut in (0usize..300, 0usize..100),
+            junk in (prop::collection::vec(0u8..4, 0..30), prop::collection::vec(0u8..4, 0..30)),
+            dlo in -320i64..320, width in 0i64..200, bonus in 0i32..8,
+        ) {
+            let mut p = base[cut.0 % base.len()..].to_vec();
+            p.truncate(p.len().saturating_sub(cut.1));
+            for (pos, b, kind) in edits {
+                if p.is_empty() { break; }
+                let i = pos % p.len();
+                match kind { 0 => p[i] = b, 1 => p.insert(i, b), _ => { p.remove(i); } }
             }
+            let p = [junk.0, p, junk.1].concat();
+            each_level(|l| {
+                for sc in [Affine::default(), Affine::HIFI] {
+                    let got = local_band(&p, &base, &sc, dlo, dlo + width, bonus);
+                    prop_assert_eq!(got, naive_local_band(&p, &base, &sc, dlo, dlo + width, bonus), "at {}", l);
+                }
+                Ok(())
+            })?;
         }
     }
 
@@ -2294,7 +2392,8 @@ mod tests {
 
         /// Every row kernel computes the scalar passes' row exactly, on rows of every length
         /// (whole vectors and partial tails), with cells and the entering gap down at and below
-        /// NEG (unreachable cells and column 0 next to them).
+        /// NEG (unreachable cells and column 0 next to them), and with a floor under the cells
+        /// (local alignment).
         #[test]
         fn row_kernels_match_scalar(
             cells in prop::collection::vec((prop_oneof![-3000i32..3000, (NEG - 300)..(NEG + 300)], prop_oneof![-3000i32..3000, (NEG - 300)..(NEG + 300)]), 1..90),
@@ -2302,13 +2401,14 @@ mod tests {
             c in 0u8..4,
             sc in prop_oneof![Just((2, 4, 4, 2)), Just((1, 4, 6, 2)), (0i32..5, 0i32..9, 0i32..30, 0i32..6)],
             e in prop_oneof![Just(NEG), (NEG - 300)..(NEG + 300), -3000i32..3000],
+            floor in prop_oneof![Just(NEG), Just(0), -50i32..50],
         ) {
             let hprev: Vec<i32> = cells.iter().map(|x| x.0).collect();
             let w = hprev.len() - 1;
             let fu: Vec<i32> = cells[1..].iter().map(|x| x.1).collect();
             let (mat, mis, open, ext) = sc;
             let sc = (mat, mis, open + ext, ext);
-            let all = rows_at_each_level(&hprev, &fu, &tx[..w], c, sc, e);
+            let all = rows_at_each_level(&hprev, &fu, &tx[..w], c, sc, e, floor);
             let want = &all[0];
             prop_assert_eq!(want.0, Level::Scalar);
             for got in &all[1..] {
@@ -2573,6 +2673,7 @@ mod tests {
                             &mut nf,
                             1,
                             sc,
+                            NEG,
                             NEG,
                             (&mut a, &mut b),
                         );
