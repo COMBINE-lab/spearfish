@@ -676,6 +676,16 @@ impl Index {
         )
     }
 
+    /// Borrow transcript `t`'s packed raw bases `[lo, hi)`, given as raw positions (see
+    /// [`Self::tx_raw_pos`]), or None if the index has no raw sequence for `t`.
+    pub fn tx_raw_slice(&self, t: u32, lo: u32, hi: u32) -> Option<PackedRange<'_>> {
+        Some(PackedRange {
+            words: self.raw_words(t)?.0,
+            lo,
+            hi,
+        })
+    }
+
     /// Raw 2-bit codes of transcript `t` over the raw span of its parsed bases `[lo, hi)`
     /// (whole homopolymer runs), or None if the index has no raw sequence for `t`.
     pub fn tx_raw_codes(&self, t: u32, lo: u32, hi: u32) -> Option<Vec<u8>> {

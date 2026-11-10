@@ -146,6 +146,8 @@ pub struct Counts {
     pub multi_mapped: u64,
     pub rescued: u64,
     pub low_coverage: u64,
+    /// Reads whose best chain scored under the minimum (unmapped unless kept).
+    pub low_score: u64,
     pub hits: u64,
     pub bases: u64,
 }
@@ -162,6 +164,7 @@ impl Counts {
         }
         self.rescued += r.rescued as u64;
         self.low_coverage += r.low_coverage as u64;
+        self.low_score += r.low_score as u64;
         self.hits += r.hits.len() as u64;
     }
 
@@ -172,6 +175,7 @@ impl Counts {
         self.multi_mapped += o.multi_mapped;
         self.rescued += o.rescued;
         self.low_coverage += o.low_coverage;
+        self.low_score += o.low_score;
         self.hits += o.hits;
         self.bases += o.bases;
     }
@@ -488,10 +492,11 @@ pub fn execute(args: Job) -> Result<Counts> {
         })?;
     }
     log::info!(
-        "map: {} reads ({:.1}% mapped, {:.1}% rescued), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",
+        "map: {} reads ({:.1}% mapped, {:.1}% rescued, {:.1}% low score), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",
         c.reads,
         100.0 * c.mapped as f64 / c.reads.max(1) as f64,
         100.0 * c.rescued as f64 / c.reads.max(1) as f64,
+        100.0 * c.low_score as f64 / c.reads.max(1) as f64,
         c.bases as f64 / 1e6,
         c.reads as f64 / secs,
         c.bases as f64 / 1e6 / secs

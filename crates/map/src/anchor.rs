@@ -94,14 +94,18 @@ pub fn anchors(idx: &Index, seeds: &[Seed], p: &AnchorParams) -> Vec<Anchor> {
     out
 }
 
-/// Sum of weights over a greedy, query-increasing, non-overlapping subset of anchors (sorted by
-/// query start): a cheap family score.
+/// A cheap family score: the sum of weights over a greedy, query-increasing pass over the
+/// anchors (sorted by query start). An anchor that overlaps the previous one counts for the
+/// part of it that extends past it, so consecutive overlapping seeds score more than one.
 fn greedy_score(anchors: &[Anchor]) -> f32 {
     let mut end = 0;
     let mut score = 0.0;
     for a in anchors {
         if a.qs >= end {
             score += a.weight;
+            end = a.qe;
+        } else if a.qe > end {
+            score += a.weight * (a.qe - end) as f32 / (a.qe - a.qs) as f32;
             end = a.qe;
         }
     }
@@ -305,6 +309,11 @@ fn select_with(
                 st.end = qe;
                 // Comparison form (a single max instruction; scores are never NaN).
                 best = if st.score > best { st.score } else { best };
+            } else if qe > st.end {
+                // Overlaps the family's previous anchor: the part past it counts.
+                st.score += weight * (qe - st.end) as f32 / (qe - qs) as f32;
+                st.end = qe;
+                best = if st.score > best { st.score } else { best };
             }
         }
     }
@@ -424,4 +433,31 @@ fn merge_collinear_with(
     }
     crate::stats::add(&crate::stats::MERGED_ANCHORS, out.len() as u64);
     c.anchors = out;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anchor(qs: u32, qe: u32) -> Anchor {
+        Anchor {
+            qs,
+            qe,
+            node: 0,
+            weight: (qe - qs) as f32,
+        }
+    }
+
+    #[test]
+    fn overlapping_anchors_count_for_what_they_add() {
+        // Disjoint anchors count in full.
+        assert_eq!(greedy_score(&[anchor(0, 10), anchor(10, 30)]), 30.0);
+        // An overlapping one counts for the part past the previous anchor's end.
+        assert_eq!(greedy_score(&[anchor(0, 10), anchor(5, 25)]), 25.0);
+        // A contained one adds nothing.
+        assert_eq!(
+            greedy_score(&[anchor(0, 20), anchor(5, 15), anchor(20, 30)]),
+            30.0
+        );
+    }
 }

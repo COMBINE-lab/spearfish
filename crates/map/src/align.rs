@@ -728,6 +728,69 @@ pub fn affine_extend(
     d.clip_best.max(d.score.saturating_add(end_bonus))
 }
 
+/// Best affine local score of `read` in `text` over the diagonals `dlo..=dhi`
+/// (text position minus read position), both read ends free to clip: the best global
+/// alignment of a piece of the read with a piece of the text, plus `end_bonus` for each read
+/// end the piece reaches (0 if nothing scores above it).
+pub fn local_band(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+    let (m, n) = (read.len(), text.len());
+    if m == 0 || dlo > dhi {
+        return 0;
+    }
+    let go = sc.open + sc.ext;
+    let w = n + 2;
+    let (mut hp, mut fp, mut h, mut f) = (vec![NEG; w], vec![NEG; w], vec![NEG; w], vec![NEG; w]);
+    // Row `i`'s columns (first, one past the last).
+    let rng = |i: usize| {
+        let lo = (i as i64 + dlo).clamp(0, n as i64 + 1) as usize;
+        let hi = (i as i64 + dhi + 1).clamp(0, n as i64 + 1) as usize;
+        (lo, hi.max(lo))
+    };
+    let (mut plo, mut phi) = rng(0);
+    for x in &mut hp[plo..phi] {
+        *x = end_bonus;
+    }
+    let mut best = 0;
+    for i in 1..=m {
+        let (lo, hi) = rng(i);
+        let c = read[i - 1];
+        // No alignment starts in the last row: it would hold nothing of the read.
+        let floor = if i < m { 0 } else { NEG };
+        let (mut e, mut left, mut rowmax) = (NEG, NEG, NEG);
+        for j in lo..hi {
+            let fv = if j >= plo && j < phi {
+                (hp[j] - go).max(fp[j] - sc.ext)
+            } else {
+                NEG
+            };
+            e = (left - go).max(e - sc.ext);
+            let dg = if j > plo && j <= phi {
+                hp[j - 1]
+                    + if text[j - 1] == c && c < 4 {
+                        sc.mat
+                    } else {
+                        -sc.mis
+                    }
+            } else {
+                NEG
+            };
+            let v = dg.max(e).max(fv).max(floor);
+            h[j] = v;
+            f[j] = fv;
+            left = v;
+            rowmax = rowmax.max(v);
+        }
+        best = best.max(rowmax);
+        if i == m {
+            best = best.max(rowmax.saturating_add(end_bonus));
+        }
+        std::mem::swap(&mut hp, &mut h);
+        std::mem::swap(&mut fp, &mut f);
+        (plo, phi) = (lo, hi);
+    }
+    best
+}
+
 /// [`affine`] for each of `texts`, which must be sorted: equal to separate calls, but rows
 /// that read only a prefix shared with the previous text are not recomputed.
 pub fn affine_sorted(pattern: &[u8], texts: &[&[u8]], mode: Mode, sc: &Affine, band: usize) -> Vec<i32> {
@@ -2026,6 +2089,113 @@ mod tests {
             .map(|(i, j)| naive_affine(&p[..i], &t[..j], Mode::Global, sc))
             .max()
             .unwrap()
+    }
+
+    /// [`local_band`] by its definition: the best global alignment of a piece of the read
+    /// with a piece of the text, plus the bonus per read end reached (no band).
+    fn naive_local(p: &[u8], t: &[u8], sc: &Affine, bonus: i32) -> i32 {
+        let mut best = 0;
+        for i0 in 0..p.len() {
+            for i1 in i0 + 1..=p.len() {
+                let ends = (i0 == 0) as i32 + (i1 == p.len()) as i32;
+                for j0 in 0..=t.len() {
+                    for j1 in j0..=t.len() {
+                        let x = naive_affine(&p[i0..i1], &t[j0..j1], Mode::Global, sc);
+                        best = best.max(x + bonus * ends);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// [`local_band`] over whole matrices: cells off the diagonals `dlo..=dhi` do not exist.
+    fn naive_local_band(p: &[u8], t: &[u8], sc: &Affine, dlo: i64, dhi: i64, bonus: i32) -> i32 {
+        let (m, n) = (p.len(), t.len());
+        let go = sc.open + sc.ext;
+        let inside = |i: usize, j: usize| (dlo..=dhi).contains(&(j as i64 - i as i64));
+        let mut h = vec![vec![NEG; n + 1]; m + 1];
+        let mut e = vec![vec![NEG; n + 1]; m + 1];
+        let mut f = vec![vec![NEG; n + 1]; m + 1];
+        for (j, x) in h[0].iter_mut().enumerate() {
+            if inside(0, j) {
+                *x = bonus;
+            }
+        }
+        let mut best = 0;
+        for i in 1..=m {
+            for j in (0..=n).filter(|&j| inside(i, j)) {
+                f[i][j] = (h[i - 1][j] - go).max(f[i - 1][j] - sc.ext);
+                let mut x = f[i][j];
+                if j > 0 {
+                    e[i][j] = (h[i][j - 1] - go).max(e[i][j - 1] - sc.ext);
+                    let s = if p[i - 1] == t[j - 1] { sc.mat } else { -sc.mis };
+                    x = x.max(e[i][j]).max(h[i - 1][j - 1] + s);
+                }
+                h[i][j] = if i < m { x.max(0) } else { x };
+                best = best.max(h[i][j] + if i == m { bonus } else { 0 });
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn local_band_examples() {
+        let sc = Affine::default();
+        let t = [3, 3, 0, 1, 2, 3, 0, 1, 2, 2, 2];
+        let p = [0, 1, 2, 3, 0, 1];
+        // The read lies at text position 2: found on that diagonal, with both end bonuses.
+        assert_eq!(local_band(&p, &t, &sc, 2, 2, 5), 12 + 10);
+        assert_eq!(local_band(&p, &t, &sc, -6, 11, 5), 12 + 10);
+        // Off it, only what matches there: nothing on the main diagonal, three bases at 6.
+        assert_eq!(local_band(&p, &t, &sc, 0, 0, 0), 0);
+        assert_eq!(local_band(&p, &t, &sc, 6, 6, 0), 6);
+        // Junk at both read ends is clipped, and earns no bonus.
+        let junk = [2, 2, 2, 0, 1, 2, 3, 0, 1, 3, 3, 3];
+        assert_eq!(local_band(&junk, &t, &sc, -12, 11, 5), 12);
+        // Ambiguous bases match nothing, each other included.
+        assert_eq!(local_band(&[4, 4, 4], &[4, 4, 4], &sc, -3, 3, 0), 0);
+        assert_eq!(local_band(&[], &t, &sc, -3, 3, 5), 0);
+        assert_eq!(local_band(&p, &t, &sc, 3, 2, 5), 0);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        /// With every diagonal in the band, `local_band` is the best piece-to-piece alignment.
+        #[test]
+        fn local_band_matches_definition(
+            p in prop::collection::vec(0u8..4, 0..8), t in prop::collection::vec(0u8..4, 0..8),
+            bonus in 0i32..8,
+        ) {
+            for sc in [Affine::default(), Affine::HIFI] {
+                let (m, n) = (p.len() as i64, t.len() as i64);
+                prop_assert_eq!(local_band(&p, &t, &sc, -m, n, bonus), naive_local(&p, &t, &sc, bonus));
+            }
+        }
+
+        /// Within a band, it is the same recurrence over the cells the band keeps, wherever
+        /// the band lies (also off the matrix); a wider band never scores less.
+        #[test]
+        fn local_band_matches_matrix(
+            base in prop::collection::vec(0u8..4, 1..60),
+            edits in prop::collection::vec((0usize..60, 0u8..4, 0u8..3), 0..10),
+            cut in (0usize..60, 0usize..60),
+            dlo in -70i64..70, width in 0i64..40, bonus in 0i32..8,
+        ) {
+            let mut p = base[cut.0 % base.len()..].to_vec();
+            p.truncate(p.len().saturating_sub(cut.1 % 20));
+            for (pos, b, kind) in edits {
+                if p.is_empty() { break; }
+                let i = pos % p.len();
+                match kind { 0 => p[i] = b, 1 => p.insert(i, b), _ => { p.remove(i); } }
+            }
+            for sc in [Affine::default(), Affine::HIFI] {
+                let got = local_band(&p, &base, &sc, dlo, dlo + width, bonus);
+                prop_assert_eq!(got, naive_local_band(&p, &base, &sc, dlo, dlo + width, bonus));
+                prop_assert!(got <= local_band(&p, &base, &sc, dlo - 3, dlo + width + 5, bonus));
+            }
+        }
     }
 
     #[test]

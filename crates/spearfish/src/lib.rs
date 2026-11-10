@@ -183,12 +183,16 @@ impl MapOptions {
             }
             Preset::Hifi => {
                 tb.affine = Some(Affine::HIFI);
-                // Accurate reads: tied hits without a common anchor are grouped by shared
-                // anchors rather than aligned whole, and level-2 rescue finds nothing level-3
-                // seeds missed. Half the mapping work at identical accuracy.
-                tb.group_fallback = true;
+                // Accurate reads: level-2 rescue finds nothing level-3 seeds missed, and read
+                // ends align on the diagonal of the last shared anchor. Half the mapping work
+                // at identical accuracy.
                 tb.end_diagonal = true;
                 params.rescue = None;
+                // Raw comparison between shared anchors and exact orientation comparison
+                // settle doubts that noisy reads leave: on HiFi reads they changed no
+                // accuracy figure and cost 40% more instructions.
+                tb.raw_mid = false;
+                tb.orient_exact = 0.0;
                 // HiFi anchors already end within a few bases of the read's ends: extending
                 // spans changes no spike-in estimate. Positional models turn it on.
                 params.ends = None;
@@ -637,6 +641,9 @@ pub struct MappedRead {
     pub low_coverage: bool,
     /// Hits came from the lower-level rescue.
     pub rescued: bool,
+    /// The best chain scored no better than a chance match (under the `min_score` setting):
+    /// the read is reported unmapped, with no hits, unless `keep_low_score` is set.
+    pub low_score: bool,
 }
 
 /// A mapper over one index; `Send + Sync`.
@@ -734,6 +741,7 @@ impl Mapper {
             hits,
             low_coverage: r.low_coverage,
             rescued: r.rescued,
+            low_score: r.low_score,
         }
     }
 }

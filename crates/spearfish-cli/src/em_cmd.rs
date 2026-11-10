@@ -87,7 +87,9 @@ pub fn run(args: Args) -> Result<()> {
         let tx = it.nth(3).unwrap_or("*");
         let score: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
         let flags = line.rsplit('\t').next().unwrap_or("");
-        let low = flags.split(',').any(|f| f == "low_coverage");
+        let has = |flag: &str| flags.split(',').any(|f| f == flag);
+        // Hits kept under the minimum score (`map --keep-low-score`) are never used.
+        let (low, low_score) = (has("low_coverage"), has("low_score"));
         if read != cur {
             if !hits.is_empty() {
                 b.add(&hits, &lens, &p);
@@ -102,7 +104,7 @@ pub fn run(args: Args) -> Result<()> {
             unmapped += 1;
             continue;
         }
-        if low && !args.keep_low_coverage {
+        if low_score || (low && !args.keep_low_coverage) {
             cur_low = true;
             continue;
         }
@@ -132,7 +134,7 @@ pub fn run(args: Args) -> Result<()> {
     }
     out.flush()?;
     log::info!(
-        "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
+        "quant: {reads} reads used ({unmapped} unmapped, {skipped} low-coverage or low-score skipped, {unknown} hits to unknown transcripts), {} classes, {iters} EM iterations, {:.2} s",
         classes.len(),
         t0.elapsed().as_secs_f64()
     );

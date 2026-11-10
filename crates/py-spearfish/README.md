@@ -102,7 +102,7 @@ Most settings are numbers or booleans. A few take strings:
 Results come back in input order. A `MappedRead` has the following fields:
 - `name` and `length`;
 - `hits` (a tuple of `Hit`, best first) and `best`;
-- `is_mapped`, `low_coverage` and `rescued`;
+- `is_mapped`, `low_coverage`, `rescued` and `low_score` (the best chain scored no better than a chance match, so the read is unmapped);
 - `probabilities()`, the hits' relative likelihoods, `exp(-(best - score) / SCORE_DENOM)` normalized to sum to 1.
 
 A `Hit` has the following fields:

@@ -103,6 +103,7 @@ class MappedRead:
     num_hits: int
     low_coverage: bool
     rescued: bool
+    low_score: bool
 
     def probabilities(self) -> list[float]: ...
     def __iter__(self) -> Iterator[Hit]: ...

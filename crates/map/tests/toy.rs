@@ -232,3 +232,76 @@ fn noisy_reads_are_rescued() {
     // level 3, or have no base anchor at all).
     assert!(rescued >= 6, "{rescued} reads rescued");
 }
+
+/// A read whose best chain is no better than a chance match is reported unmapped and flagged;
+/// `keep` leaves its hits, and no `min_score` reports it as before.
+#[test]
+fn chance_matches_are_unmapped() {
+    let txs = toy();
+    let (data, _) = build(
+        txs.clone(),
+        &BuildParams {
+            spec: "lcp:K=3".into(),
+            hpc: true,
+            f_max: 20,
+            allow_collisions: false,
+            collapse: Collapse::Gene,
+            infer_genes: None,
+        },
+    )
+    .unwrap();
+    let idx = std::sync::Arc::new(Index::from_data(&data).unwrap());
+    let mapper = |min_score: Option<map::MinScore>| {
+        Mapper::new(
+            idx.clone(),
+            OracleChainer {
+                p: Default::default(),
+            },
+            MapParams {
+                min_score,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let rule = map::MinScore::default();
+    let (off, on) = (mapper(None), mapper(Some(rule)));
+    let keep = mapper(Some(map::MinScore { keep: true, ..rule }));
+    // Reads foreign to the transcripts but for a short piece of one, as a chance match is.
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x >> 62) as usize]
+            })
+            .collect()
+    };
+    let mut seen = 0;
+    for tx in &txs {
+        for a in (0..tx.seq.len().saturating_sub(60)).step_by(97) {
+            let read = [noise(600), tx.seq[a..a + 60].to_vec(), noise(600)].concat();
+            let r = off.map(&read);
+            let Some(top) = r.hits.first() else { continue };
+            if rule.passes(top, read.len(), r.rescued) {
+                continue;
+            }
+            seen += 1;
+            assert!(!r.low_score);
+            let k = keep.map(&read);
+            assert!(k.low_score);
+            assert_eq!(k.hits.len(), r.hits.len());
+            assert_eq!(k.hits[0].score, top.score);
+            let o = on.map(&read);
+            assert!(o.low_score && o.low_coverage && o.hits.is_empty());
+        }
+    }
+    assert!(seen > 0, "no read with a chance-level best chain");
+    // A read from a transcript is none of that.
+    for m in [&off, &on, &keep] {
+        let r = m.map(&txs[0].seq);
+        assert!(!r.low_score && !r.hits.is_empty());
+    }
+}

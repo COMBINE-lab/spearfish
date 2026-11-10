@@ -6,7 +6,7 @@ description: spearfish map's TSV, PAF and RAD outputs, and the run record next t
 `spearfish map` writes a tab-separated file with a header line and one line per reported
 (read, transcript) pair, best first. A read's lines are contiguous; reads appear in the order
 they finish, not input order. An unmapped read gets one line with transcript `*` and the flag
-`unmapped`.
+`unmapped` (`unmapped,low_score` if a chain was found and rejected).
 
 | Column | Meaning |
 | --- | --- |
@@ -28,9 +28,35 @@ they finish, not input order. An unmapped read gets one line with transcript `*`
 | Flag | Meaning |
 | --- | --- |
 | `rescued` | The hits come from the low-coverage rescue (lower-level LCP seeds). |
-| `low_coverage` | The best chain covers less than half the read (`--min-coverage`). oarfish skips such reads by default. |
+| `low_coverage` | The best chain's anchors span less than half the read (`--min-coverage`), measured before spans are extended to the read ends. Most such reads are correctly placed (short matches inside longer reads, or reads with many errors), so the flag alone is no reason to drop a read. |
+| `low_score` | The best chain is no better than a chance match (`--min-score`): the read is reported unmapped. With `--keep-low-score` its hits are written with this flag. |
 | `anchor_span` | The span runs from the first to the last anchor instead of to the read's ends (extension off, or the hit scores well below the best). |
-| `unmapped` | No transcript was found. |
+| `unmapped` | No transcript was found, or the best one was rejected (`low_score`). |
+
+### Mapped or not
+
+A read that matches nothing in the transcriptome (a read from an unannotated locus, a
+contaminant, an adapter chimera, low-quality sequence) still shares a seed or two with some
+transcript by chance. spearfish reports a read unmapped when its best chain scores under
+`--min-score` + `--min-score-ln-len` · ln(read length / 1000): 36 for a 1,000-base read, 27 for
+100 bases, 45 for 10,000. The threshold grows with the logarithm of the read's length because
+the best chance chain does, as the largest of the chance matches a longer read has more room
+for. Every preset uses the same rule.
+
+The rescue's seeds are denser, and on low-complexity and foreign reads their chance matches
+chain past the threshold more often. A best hit that only the rescue found, and that scores
+within 30 points of the threshold or spans less than half the read, must therefore also align
+around its chain: its clipped alignment score has to reach 40 plus one point per compressed
+read base it spans, or the read is unmapped (`--min-score-verify`).
+
+The defaults were set on a human transcriptome with the default index. Random sequence of 300
+to 8,000 bases all but never passes them (no read in 80,000 with the `ont` preset); reversed
+(not complemented) real ONT cDNA reads, which keep their repeats and low-complexity runs, pass
+about 3 times in 10,000. Nearly every read with a true placement of 150 bases or more passes
+at ONT error rates; the reads that fail are mostly shorter than that, and a few are short
+reads with many errors, which an aligner can still place. Chain scores depend on the index
+scheme, so another scheme needs its own threshold. `--min-score 0` turns the rejection off,
+and the run record counts the reads it removed (`low_score`).
 
 ## PAF output
 
@@ -66,7 +92,7 @@ long-read mappers can write it too:
 | Level | Tag | Type | Meaning |
 | --- | --- | --- | --- |
 | read | `read_len` | u32 | Read length in bases. |
-| read | `read_flags` | u8 | Bit 0: `low_coverage`; bit 1: `rescued`. |
+| read | `read_flags` | u8 | Bit 0: `low_coverage`; bit 1: `rescued`; bit 2: `low_score` (only with `--keep-low-score`; such a read's alignments should not be counted). |
 | alignment | `ref_ori` | u32 | Transcript id in the low 31 bits; bit 31 set if the read maps as given (`+`). |
 | alignment | `ref_start`, `ref_end` | u32 | Span on the transcript (`tstart`, `tend`). |
 | alignment | `query_start`, `query_end` | u32 | Span on the read (`qstart`, `qend`). |
@@ -92,7 +118,7 @@ regular file, as when everything goes to standard output or `/dev/null`). It hol
 - `reads` and `outputs`;
 - `settings`: the preset and the settings given; `parameters`: every parameter used;
   `score_denom`;
-- `stats`: reads, mapped, unmapped, multi-mapped, rescued and low-coverage reads, hits, bases,
+- `stats`: reads, mapped, unmapped, multi-mapped, rescued, low-coverage and low-score reads, hits, bases,
   mean read length, hits per mapped read, index load and mapping time, reads and megabases per
   second, CPU time and peak memory.
 

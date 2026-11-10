@@ -20,9 +20,9 @@ const TOY: &str = include_str!("toy_transcripts.fa");
 
 /// Digest of the self-test's output, per preset (see [`self_test`]).
 pub const EXPECTED: [(Preset, &str); 3] = [
-    (Preset::Ont, "5612907c8a21abe5"),
-    (Preset::Drna, "4328f84a7c92686b"),
-    (Preset::Hifi, "61ac6d16cfab9738"),
+    (Preset::Ont, "2b73a1d041592669"),
+    (Preset::Drna, "4cab8361f51fffd5"),
+    (Preset::Hifi, "f9e1fac086299ae8"),
 ];
 
 #[derive(clap::Args, Debug)]
@@ -79,7 +79,7 @@ pub fn self_test(preset: Preset) -> Result<String> {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     for r in &reads {
         let m = mapper.map(r);
-        h.update(format!("{} {} {}\n", m.len, m.low_coverage, m.rescued).as_bytes());
+        h.update(format!("{} {} {} {}\n", m.len, m.low_coverage, m.rescued, m.low_score).as_bytes());
         for x in &m.hits {
             h.update(
                 format!(

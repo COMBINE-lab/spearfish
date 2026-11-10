@@ -2,10 +2,69 @@
 
 ## 0.1.1 (unreleased)
 
+- **Reads with only a chance match are unmapped.** Every read with a chain used to be
+  reported, so reads from outside the transcriptome (unannotated loci, contaminants, random
+  sequence) were placed on whichever transcript shared a seed with them. `spearfish map` now
+  reports a read unmapped, flagged `low_score`, when its best chain scores under
+  `--min-score` + `--min-score-ln-len` · ln(read length / 1000) (36 and 4 by default, for
+  every preset). A best hit that only the rescue found, and that scores near the threshold or
+  spans little of the read, must also align around its chain (`--min-score-verify`): the
+  rescue's seeds are dense enough to chain past the threshold by chance on low-complexity
+  reads. On simulated reads this removes nearly every placement of a random read and most
+  wrong-gene placements, for under 0.1 points of correctly placed reads. `--keep-low-score`
+  keeps the hits (flagged; RAD `read_flags` bit 2), and `--min-score 0` restores the old
+  behaviour. The library has `MappedRead::low_score` and the settings `min_score`,
+  `min_score_ln_len`, `min_score_anchors`, `min_score_verify` and `keep_low_score`; the run
+  record counts `low_score` reads. Callers no longer need a score filter of their own.
+- **Doubtful reads get rescue-level work (`ont` and `drna` presets).** A read at 10% error or
+  more often has too few base-level seeds on its true transcript: the chain covers a small
+  part of the read, a paralog or pseudogene with one more surviving seed wins, or the wrong
+  orientation does. Reads whose best chain does not cover them well, or that have a rival on
+  the other orientation, are now (`--rescue-settled` sets who is exempt)
+  - chained again at the rescue level in their best transcripts (`--rescue-rechain`);
+  - seeded against the whole transcriptome, by a table of every transcript's runs of three
+    consecutive rescue seeds, which names transcripts the base-level seeds never reached
+    (`--rescue-global`, `--rescue-global-cands`, `--rescue-extra-cands`);
+  - chained on the other orientation in the transcripts that share seeds, reverse-complemented,
+    with the best hit (`--rescue-antisense`), so that an antisense transcript of the same
+    locus competes on equal terms.
+
+  On simulated ONT reads, correctly placed reads rise by about 0.4 points at 5% error and 1.5
+  points at 10%, and transcript abundances from oarfish follow the truth more closely at
+  every error rate from 3% to 14%. The cost: mapping ONT reads takes two to three times the
+  instructions (more at higher error rates), and the table and the transcripts' rescue seeds
+  (`--rescue-store`) are made at startup, in under a second on 64 threads and about 4.5 GB
+  more memory for a human transcriptome.
+  `--no-rescue-global --no-rescue-store --rescue-rechain 0 --rescue-antisense 0` maps as
+  before. The `hifi` preset, which has no rescue, is unchanged in cost.
+- Tie-break (all presets unless noted):
+  - Read orientations that nearly tie are compared by exact local alignment around each
+    chain (`--orient-exact`; off for `hifi`), and an orientation's poly(A) tail counts only
+    for the hits it was trimmed for.
+  - With raw read ends, the stretches between shared anchors are also aligned in raw bases,
+    so that homopolymer-length differences between isoforms and paralogs count
+    (`--raw-mid`; off for `hifi`).
+  - A read's poly(A) tail is trimmed only past the A's its transcript has there
+    (`--tail-templated`): transcripts that end in a templated A-run no longer lose them.
+  - Tied hits without a shared anchor are grouped by the anchors they share (`--tie-group`,
+    now on).
+  - Transcripts within `--report-within-abs` score points of the best (30) are reported even
+    when `--report-within` of a low best score would drop them.
+- Candidate genes: a seed that overlaps the gene's previous seed on the read now counts for the
+  part that extends past it, where it counted for nothing. Reads with many errors, whose few
+  seeds on the true gene are often consecutive overlapping ones, keep that gene as a candidate
+  more often.
+- Rescue: the other orientation is also re-seeded when its base-level chain is more than a
+  chance match by itself (`--min-score`), not only when it scores within
+  `--rescue-other-margin` of the chosen orientation's. When neither chain covers the read, the
+  chosen orientation's lead says little.
 - `spearfish simulate` can make harder read sets: `--expressed` (fraction of transcripts with
   any abundance), `--fragment` and `--min-fragment` (internal fragments), `--rate-sd` (per-read
   error rates), `--junk` (random sequence at the read ends) and `--unmappable` (reads of random
   sequence, named `r<i>|*|*|0|0`). Without them it writes the reads it wrote before.
+- The `low_coverage` flag's documentation said oarfish skips such reads by default; it does
+  not, and most of them are correctly placed.
+
 - `spearfish --version` and every output's provenance name the commit a crates.io build was
   packaged from (`.cargo_vcs_info.json`), where they said `unknown`.
 - `bump_and_publish.sh` resumes an interrupted release: run it again from the same checkout,

@@ -48,6 +48,8 @@ pub mod read_flags {
     pub const LOW_COVERAGE: u8 = 1;
     /// The read was mapped by a rescue pass.
     pub const RESCUED: u8 = 2;
+    /// The read's best alignment scores no better than a chance match.
+    pub const LOW_SCORE: u8 = 4;
 }
 
 /// Bits of the `aln_flags` tag.

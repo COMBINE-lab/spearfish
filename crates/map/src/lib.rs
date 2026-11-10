@@ -105,6 +105,33 @@ pub struct TieBreak {
     /// where transcripts share sequence antisense the true orientation's chain can trail by
     /// seed luck alone. Only the orientation test uses it, not the tie sets within one.
     pub orient_margin_rel: f32,
+    /// Report both read orientations with equal alignment evidence, whatever their chain
+    /// scores, when their best hits are one sequence on opposite strands: the transcript
+    /// bases under the read are reverse complements of each other. Chains and banded
+    /// alignments of such a pair differ only by seed luck and heuristics, yet one read in a
+    /// few would favor the antisense transcript by a decisive margin and abundance estimation
+    /// would follow those reads. With equal scores it follows the transcripts' other reads
+    /// (and `orient_tail`).
+    pub orient_same: bool,
+    /// Near-tied orientations whose clipped alignments leave a lead of at most this many
+    /// points are compared again by exact local alignment: every diagonal within
+    /// [`ORIENT_EXACT_BAND`] (and a twentieth of the read) of each chain's, so the chain only
+    /// places the search and forces none of its anchors into the alignment (0: off). The
+    /// clipped alignment follows the chain, and a chain with a stray anchor or a gap the band
+    /// cannot cross is scored below what the read aligns at.
+    #[serde(default)]
+    pub orient_exact: f32,
+    /// Compare the read between shared blocks in raw bases, cut at the blocks' midpoints
+    /// (with `raw_ends` and an index that stores raw positions). Shared blocks are exact in
+    /// parsed space only: candidates may differ in run lengths inside them, and a difference
+    /// next to a run changes the parsed alignment around it.
+    #[serde(default)]
+    pub raw_mid: bool,
+    /// A candidate with its own A-run where the read's poly(A) tail starts explains the tail
+    /// as well as one that ends there: it gains `tail_bonus` too, and what the read's bases
+    /// after the run gain against its continuation.
+    #[serde(default)]
+    pub tail_templated: bool,
 }
 
 impl TieBreak {
@@ -133,7 +160,7 @@ impl Default for TieBreak {
             end_bonus: 5,
             xdrop: 50,
             end_diagonal: false,
-            group_fallback: false,
+            group_fallback: true,
             whole_trim: true,
             orient_clipped: true,
             raw_ends: true,
@@ -142,6 +169,10 @@ impl Default for TieBreak {
             tail_run: 15,
             orient_tail: 30,
             orient_margin_rel: 0.35,
+            orient_same: true,
+            orient_exact: 150.0,
+            raw_mid: true,
+            tail_templated: true,
             flank_min: 0,
         }
     }
@@ -157,6 +188,11 @@ pub struct MapParams {
     pub rescue: Option<RescueParams>,
     /// Report transcripts scoring within this fraction of the best.
     pub delta_rep: f32,
+    /// Report transcripts scoring within this many points of the best as well: a fraction of
+    /// a low best score is less than the chains of one read's equally good placements differ
+    /// by.
+    #[serde(default)]
+    pub rep_abs: f32,
     /// Flag reads whose best chain spans less than this fraction of the read (cf. oarfish's
     /// minimum aligned fraction, 0.5).
     pub pi_cov: f32,
@@ -168,6 +204,86 @@ pub struct MapParams {
     /// Extend reported spans from the outermost anchors to where the read's alignment ends
     /// (None: spans end at the outermost anchors).
     pub ends: Option<Ends>,
+    /// Reject reads whose best chain scores no better than chance (None: every read with a
+    /// chain is reported).
+    #[serde(default)]
+    pub min_score: Option<MinScore>,
+}
+
+/// The lowest best-chain score a read is reported at. A read that matches nothing still
+/// chains a chance seed or two, and the best chance chain grows with the logarithm of the
+/// read's length (an extreme value over the places a chain can start), so the threshold does
+/// too: `at_1kb + per_ln_len · ln(len / 1000)` for a read of `len` raw bases.
+///
+/// The defaults sit above what random sequence and reads foreign to the reference reach
+/// against a human transcriptome under the default index scheme (about one random read in
+/// 10^4 of up to a kilobase scores higher, a few in 10^3 at several kilobases), and below
+/// nearly all reads with a true placement of 150 bases or more at ONT error rates. Chain
+/// scores depend on the index scheme: recalibrate for another.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MinScore {
+    /// Threshold for a 1,000-base read.
+    pub at_1kb: f32,
+    /// Added per e-fold of read length.
+    pub per_ln_len: f32,
+    /// A chain of this many base-level anchors or more passes at any score (0: none does).
+    /// Separate seeds that line up on one transcript are far rarer by chance than their
+    /// summed weight suggests; the denser seeds of the hierarchical rescue are not.
+    #[serde(default)]
+    pub anchors: u32,
+    /// Keep the hits of a read under the threshold; it is flagged `low_score` either way.
+    pub keep: bool,
+    /// A weak best hit from the rescue must also align (None: its chain score decides).
+    #[serde(default)]
+    pub verify: Option<Verify>,
+}
+
+/// Alignment check of a best hit that comes from the hierarchical rescue and either spans
+/// less than `pi_cov` of the read or scores within `margin` of the threshold. Rescue seeds are
+/// dense enough that chance matches chain past the threshold on low-complexity and foreign
+/// reads; their alignments do not follow. The hit passes if its clipped affine alignment
+/// score (see [`TieBreak::affine`]) reaches `base + per_base` × its parsed read span; without
+/// an affine tie-break nothing is checked.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Verify {
+    pub base: f32,
+    pub per_base: f32,
+    pub margin: f32,
+}
+
+impl Default for Verify {
+    fn default() -> Self {
+        Verify {
+            base: 40.0,
+            per_base: 1.0,
+            margin: 30.0,
+        }
+    }
+}
+
+impl MinScore {
+    /// The threshold for a read of `len` raw bases.
+    pub fn at(&self, len: usize) -> f32 {
+        self.at_1kb + self.per_ln_len * (len.max(1) as f32 / 1000.0).ln()
+    }
+
+    /// Whether `h`, the best chain of a read of `len` raw bases, is more than a chance match
+    /// (`rescued`: it comes from the hierarchical rescue).
+    pub fn passes(&self, h: &TxHit, len: usize, rescued: bool) -> bool {
+        h.score >= self.at(len) || (!rescued && self.anchors > 0 && h.anchors >= self.anchors)
+    }
+}
+
+impl Default for MinScore {
+    fn default() -> Self {
+        MinScore {
+            at_1kb: 36.0,
+            per_ln_len: 4.0,
+            anchors: 0,
+            keep: false,
+            verify: Some(Verify::default()),
+        }
+    }
 }
 
 /// X-drop extension of each reported hit from its first and last anchors toward the read's
@@ -239,10 +355,12 @@ impl Default for MapParams {
             tiebreak: Some(TieBreak::default()),
             rescue: Some(RescueParams::default()),
             delta_rep: 0.3,
+            rep_abs: 30.0,
             pi_cov: 0.5,
             strands: Strands::Both,
             merge_collinear: true,
             ends: Some(Ends::default()),
+            min_score: Some(MinScore::default()),
         }
     }
 }
@@ -261,6 +379,9 @@ pub struct ReadResult {
     pub low_coverage: bool,
     /// The hits come from the hierarchical rescue.
     pub rescued: bool,
+    /// The best chain fails [`MapParams::min_score`] ([`MinScore::passes`]): it is no better
+    /// than a chance match. The read has no hits unless [`MinScore::keep`] is set.
+    pub low_score: bool,
     /// With HPC, the read's homopolymer runs, forward orientation: parsed query positions to
     /// raw ones (`to_raw`; its `seq` is not kept).
     pub hpc: Option<lcp_core::hpc::Hpc>,
@@ -274,6 +395,19 @@ pub struct Mapper<C: Chainer> {
     rescuer: Option<Rescuer>,
     /// [`anchor::node_families`] of `idx`.
     node_fam: Vec<u32>,
+    /// Per transcript, its [`AntiSeed`]s by position (made on first use).
+    anti: Vec<std::sync::OnceLock<Box<[AntiSeed]>>>,
+}
+
+/// A base-level seed of a transcript's reverse complement that occurs in another transcript:
+/// the two share that sequence on opposite strands.
+#[derive(Clone, Copy)]
+struct AntiSeed {
+    /// The seed's first base in the transcript (forward coordinates).
+    x: u32,
+    len: u32,
+    /// The index nodes with the seed's label.
+    nodes: (u32, u32),
 }
 
 /// A read orientation's raw bases (2-bit codes) and HPC run map, for raw-space read ends.
@@ -400,10 +534,14 @@ impl<C: Chainer> Mapper<C> {
         let spec = idx.meta("spec").context("index lacks its seed spec")?;
         let hpc = idx.meta("hpc").context("index lacks its HPC flag")? == "true";
         let seeder = BaseSeeder::new(spec, hpc)?;
-        let rescuer = p.rescue.clone().map(Rescuer::new).transpose()?;
+        let mut rescuer = p.rescue.clone().map(Rescuer::new).transpose()?;
+        if let Some(r) = &mut rescuer {
+            r.build_tables(&idx);
+        }
         let node_fam = anchor::node_families(&idx);
         Ok(Mapper {
             node_fam,
+            anti: (0..idx.n_transcripts()).map(|_| Default::default()).collect(),
             idx,
             seeder,
             chainer,
@@ -631,6 +769,44 @@ impl<C: Chainer> Mapper<C> {
         )
     }
 
+    /// Whether the best hits of the two read orientations, `a` and `b`, are one sequence on
+    /// opposite strands (antisense transcripts sharing sequence): each transcript's bases
+    /// under the read span of both chains occur reverse-complemented in the other's padded
+    /// region. Compared in raw bases where the index has them.
+    fn same_antisense(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit) -> bool {
+        // A hit's transcript interval projected to the read span of both chains, with `pad`
+        // more bases on each side.
+        let region = |h: &TxHit, o: &TxHit, pad: u32| {
+            let tlen = self.idx.tx_plen()[h.tx as usize];
+            let lo = h.qstart.min(plen.saturating_sub(o.qend));
+            let hi = h.qend.max(plen.saturating_sub(o.qstart));
+            (
+                h.tstart.saturating_sub(h.qstart - lo + pad),
+                (h.tend + (hi - h.qend) + pad).min(tlen),
+            )
+        };
+        let raw = self.idx.has_raw();
+        let codes = |h: &TxHit, (lo, hi): (u32, u32)| match raw {
+            true => self.idx.tx_raw_codes(h.tx, lo, hi),
+            false => Some(self.idx.tx_codes(h.tx, lo, hi)),
+        };
+        let within = |h: &TxHit, o: &TxHit| {
+            let (lo, hi) = region(h, o, 0);
+            // Indels in the read move the other chain's projection.
+            let (wlo, whi) = region(o, h, tb.window(hi - lo) - (hi - lo));
+            if hi - lo > whi - wlo {
+                return false;
+            }
+            let (Some(mut needle), Some(text)) = (codes(h, (lo, hi)), codes(o, (wlo, whi))) else {
+                return false;
+            };
+            needle.reverse();
+            needle.iter_mut().for_each(|c| *c = 3 - *c);
+            !needle.is_empty() && text.windows(needle.len()).any(|w| w == &needle[..])
+        };
+        within(a, b) && within(b, a)
+    }
+
     /// A hit's transcript region projected to the ends of the read span `[lo, hi)`, padded.
     fn hit_region(&self, tb: &TieBreak, lo: u32, hi: u32, h: &TxHit) -> Vec<u8> {
         let tlen = self.idx.tx_plen()[h.tx as usize];
@@ -640,12 +816,16 @@ impl<C: Chainer> Mapper<C> {
         self.idx.tx_codes(h.tx, lo, hi)
     }
 
-    /// Affine score of the read against one hit with both read ends clipped: the chained span
-    /// aligned globally, each read end extended from it into the padded transcript flank. With
-    /// raw read ends the span is aligned in raw space too: hits compared by this score (read
-    /// orientations, anchor groups) have different outermost anchors, and a score that counts
-    /// part of the read in parsed bases and part in raw ones would favor whichever hit leaves
-    /// more of the read to its raw ends.
+    /// Affine score of the read against one hit with both read ends clipped: the chain is cut
+    /// at anchors at least two bands apart and each piece aligned globally, the best run of
+    /// consecutive pieces is kept, and each read end is extended from that run into the padded
+    /// transcript flank. The band so follows the chain (one band around the whole span's
+    /// diagonals loses a long read whose indels drift further than the band from them), and
+    /// a stray anchor far out in an unalignable read end is clipped with that end instead of
+    /// being aligned through. With raw read ends the pieces are aligned in raw space too: hits
+    /// compared by this score (read orientations, anchor groups) have different outermost
+    /// anchors, and a score that counts part of the read in parsed bases and part in raw ones
+    /// would favor whichever hit leaves more of the read to its raw ends.
     fn clipped(
         &self,
         tb: &TieBreak,
@@ -656,30 +836,51 @@ impl<C: Chainer> Mapper<C> {
     ) -> i32 {
         let plen = codes.len() as u32;
         let tlen = self.idx.tx_plen()[h.tx as usize];
-        let (qs, qe) = (h.qstart as usize, h.qend as usize);
         let w0 = align::dp_work();
-        let mid = match self.raw_texts(tb, raw, &[(h.tx, h.tstart, h.tend)]) {
-            Some((r, mut t)) => align::affine(
-                &r.codes[r.pos(h.qstart)..r.pos(h.qend)],
-                &t.pop().unwrap(),
-                align::Mode::Global,
-                sc,
-                tb.band,
-            ),
-            None => align::affine(
-                &codes[qs..qe],
-                &self.idx.tx_codes(h.tx, h.tstart, h.tend),
-                align::Mode::Global,
-                sc,
-                tb.band,
-            ),
-        };
+        let mut cuts = vec![(h.qstart, h.tstart)];
+        for &(q, t, _) in &h.chain {
+            let &(pq, pt) = cuts.last().unwrap();
+            if q >= pq + 2 * tb.band as u32 && t > pt && q < h.qend && t < h.tend {
+                cuts.push((q, t));
+            }
+        }
+        cuts.push((h.qend, h.tend));
+        // Best run of consecutive pieces: (score, first cut, last cut).
+        let (mut mid, mut from, mut to) = (i32::MIN, 0, 0);
+        let (mut run, mut start) = (0i32, 0);
+        for (i, w) in cuts.windows(2).enumerate() {
+            let ((q0, t0), (q1, t1)) = (w[0], w[1]);
+            let x = match self.raw_texts(tb, raw, &[(h.tx, t0, t1)]) {
+                Some((r, mut t)) => align::affine(
+                    &r.codes[r.pos(q0)..r.pos(q1)],
+                    &t.pop().unwrap(),
+                    align::Mode::Global,
+                    sc,
+                    tb.band,
+                ),
+                None => align::affine(
+                    &codes[q0 as usize..q1 as usize],
+                    &self.idx.tx_codes(h.tx, t0, t1),
+                    align::Mode::Global,
+                    sc,
+                    tb.band,
+                ),
+            };
+            if run <= 0 {
+                (run, start) = (0, i);
+            }
+            run = run.saturating_add(x);
+            if run > mid {
+                (mid, from, to) = (run, start, i + 1);
+            }
+        }
+        let ((qs, ts), (qe, te)) = (cuts[from], cuts[to]);
         let w1 = align::dp_work();
         let left = if qs > 0 {
-            let span = [(h.tx, h.tstart.saturating_sub(tb.window(h.qstart)), h.tstart)];
+            let span = [(h.tx, ts.saturating_sub(tb.window(qs)), ts)];
             let (read, text) = match self.raw_texts(tb, raw, &span) {
-                Some((r, mut t)) => (&r.codes[..r.pos(h.qstart)], t.pop().unwrap()),
-                None => (&codes[..qs], self.idx.tx_codes(h.tx, span[0].1, h.tstart)),
+                Some((r, mut t)) => (&r.codes[..r.pos(qs)], t.pop().unwrap()),
+                None => (&codes[..qs as usize], self.idx.tx_codes(h.tx, span[0].1, ts)),
             };
             let read: Vec<u8> = read.iter().rev().copied().collect();
             let text: Vec<u8> = text.into_iter().rev().collect();
@@ -687,12 +888,12 @@ impl<C: Chainer> Mapper<C> {
         } else {
             tb.end_bonus
         };
-        let rest = plen - h.qend;
+        let rest = plen - qe;
         let right = if rest > 0 {
-            let span = [(h.tx, h.tend, (h.tend + tb.window(rest)).min(tlen))];
+            let span = [(h.tx, te, (te + tb.window(rest)).min(tlen))];
             let (read, text) = match self.raw_texts(tb, raw, &span) {
-                Some((r, mut t)) => (&r.codes[r.pos(h.qend)..], t.pop().unwrap()),
-                None => (&codes[qe..], self.idx.tx_codes(h.tx, h.tend, span[0].2)),
+                Some((r, mut t)) => (&r.codes[r.pos(qe)..], t.pop().unwrap()),
+                None => (&codes[qe as usize..], self.idx.tx_codes(h.tx, te, span[0].2)),
             };
             align::affine_extend(read, &text, sc, tb.band, tb.end_bonus, tb.xdrop)
         } else {
@@ -706,6 +907,55 @@ impl<C: Chainer> Mapper<C> {
             stats::add(&stats::DP_CLIP_END_ROWS, w2.1 - w1.1);
         }
         mid + left + right
+    }
+
+    /// Local affine score of the whole read (ends free to clip, a bonus per read end reached)
+    /// against one hit's transcript, over every diagonal within `w` of the chain's: the chain
+    /// only places the search, it forces nothing into the alignment.
+    fn local_exact(
+        &self,
+        tb: &TieBreak,
+        sc: &align::Affine,
+        codes: &[u8],
+        raw: Option<&RawRead>,
+        h: &TxHit,
+        w: u32,
+    ) -> i32 {
+        let plen = codes.len() as u32;
+        let tlen = self.idx.tx_plen()[h.tx as usize];
+        let wlo = h.tstart.saturating_sub(tb.window(h.qstart) + w);
+        let whi = (h.tend + tb.window(plen - h.qend) + w).min(tlen);
+        let ends = [(h.qstart, h.tstart), (h.qend, h.tend)];
+        let pts = ends.into_iter().chain(
+            h.chain
+                .iter()
+                .map(|&(q, t, _)| (q, t))
+                .filter(|&(q, t)| q <= plen && t >= wlo && t <= whi),
+        );
+        let rawr = raw.filter(|_| tb.raw_ends && self.idx.tx_raw_pos(h.tx, 0).is_some());
+        let (read, text, d): (&[u8], Vec<u8>, Vec<i64>) = match rawr {
+            Some(r) => {
+                let base = self.idx.tx_raw_pos(h.tx, wlo).unwrap();
+                (
+                    &r.codes[..],
+                    self.idx.tx_raw_codes(h.tx, wlo, whi).unwrap(),
+                    pts.map(|(q, t)| {
+                        i64::from(self.idx.tx_raw_pos(h.tx, t).unwrap() - base) - r.pos(q) as i64
+                    })
+                    .collect(),
+                )
+            }
+            None => (
+                codes,
+                self.idx.tx_codes(h.tx, wlo, whi),
+                pts.map(|(q, t)| i64::from(t - wlo) - i64::from(q)).collect(),
+            ),
+        };
+        let (dlo, dhi) = (
+            d.iter().min().unwrap() - i64::from(w),
+            d.iter().max().unwrap() + i64::from(w),
+        );
+        align::local_band(read, &text, sc, dlo, dhi, tb.end_bonus)
     }
 
     /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
@@ -996,8 +1246,46 @@ impl<C: Chainer> Mapper<C> {
                 }
             }
         };
-        // Strict interior gaps [previous anchor end, next anchor start).
+        // Interior segments in raw bases (`TieBreak::raw_mid`), from each shared block's
+        // midpoint to the next one's: next to a block's edge the candidates differ, and a
+        // boundary there forces the read's bases around it onto one side.
+        let raw_mid = raw.filter(|_| {
+            tb.raw_ends && tb.raw_mid && hits.iter().all(|h| self.idx.tx_raw_pos(h.tx, 0).is_some())
+        });
+        let half = |b: &SharedBlock| -> u32 {
+            if raw_mid.is_some() {
+                (b.query.end - b.query.start) / 2
+            } else {
+                0
+            }
+        };
+        let starts = |b: &SharedBlock| -> Vec<u32> {
+            hits.iter()
+                .zip(&b.targets)
+                .map(|(h, t)| self.idx.tx_raw_pos(h.tx, t.start + half(b)).unwrap())
+                .collect()
+        };
+        let mut prev = raw_mid.map(|_| starts(&blocks[0]));
         for pair in blocks.windows(2) {
+            if let (Some(r), Some(lo)) = (raw_mid, prev.as_mut()) {
+                let hi = starts(&pair[1]);
+                let texts = hits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| self.idx.tx_raw_slice(h.tx, lo[i], hi[i]).unwrap())
+                    .collect();
+                add(seg(
+                    texts,
+                    &r.codes[r.pos(pair[0].query.start + half(&pair[0]))
+                        ..r.pos(pair[1].query.start + half(&pair[1]))],
+                    align::Mode::Global,
+                    false,
+                    None,
+                )
+                .map(|(d, _, _)| d));
+                *lo = hi;
+                continue;
+            }
             let (left, right) = (&pair[0], &pair[1]);
             let lo0 = left.targets[0].end;
             let len0 = right.targets[0].start - lo0;
@@ -1028,12 +1316,13 @@ impl<C: Chainer> Mapper<C> {
         }
         // Left end: read[0, q0) against transcript windows ending at each candidate's anchor.
         let first = &blocks[0];
-        let q0 = first.query.start;
+        let h0 = half(first);
+        let q0 = first.query.start + h0;
         if q0 > 0 {
             let spans: Vec<(u32, u32, u32)> = hits
                 .iter()
                 .zip(&first.targets)
-                .map(|(h, t)| (h.tx, t.start.saturating_sub(tb.window(q0)), t.start))
+                .map(|(h, t)| (h.tx, (t.start + h0).saturating_sub(tb.window(q0)), t.start + h0))
                 .collect();
             let short: Vec<bool> = spans.iter().map(|&(_, lo, _)| lo == 0).collect();
             add(match self.raw_ranges(tb, raw, &spans) {
@@ -1066,14 +1355,27 @@ impl<C: Chainer> Mapper<C> {
                             .is_some_and(|r| !r.sequence_eq(&r0))
                     })
                 });
-        let ql = if through { last.query.start } else { last.query.end };
+        let hl = half(last);
+        let ql = if hl > 0 {
+            last.query.start + hl
+        } else if through {
+            last.query.start
+        } else {
+            last.query.end
+        };
         let rest = plen - ql;
         let spans: Vec<(u32, u32, u32)> = hits
             .iter()
             .zip(&last.targets)
             .map(|(h, t)| {
                 let tlen = self.idx.tx_plen()[h.tx as usize];
-                let s = if through { t.start } else { t.end };
+                let s = if hl > 0 {
+                    t.start + hl
+                } else if through {
+                    t.start
+                } else {
+                    t.end
+                };
                 (h.tx, s, (s + tb.window(rest)).min(tlen))
             })
             .collect();
@@ -1115,7 +1417,60 @@ impl<C: Chainer> Mapper<C> {
                 let rest = &r.codes[r.pos(ql)..];
                 let cut = tail.map_or(rest.len(), |(_, _, c, _)| c);
                 let run_end = tail.map_or(cut, |(_, _, _, e)| e);
-                let at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
+                let mut at_end = tail.map(|_| ends_at_tail(&texts, cut, run_end));
+                // A candidate with its own A-run where the read's tail starts explains the
+                // tail as well as one that ends there. One that ends inside or just after
+                // its run (an annotated tail) ends at the tail; one that continues gains the
+                // bonus too, and what the read's bases after the run gain against its
+                // continuation (if that reaches the bonus: the read went on along it).
+                if let Some(at) = at_end.as_mut()
+                    && tb.tail_templated
+                {
+                    let tol = TAIL_TOL + cut / 10;
+                    let mut d = vec![0i64; texts.len()];
+                    let mut cont = Vec::with_capacity(texts.len());
+                    for (i, (t, &(tx, lo, _))) in texts.iter().zip(&spans).enumerate() {
+                        let raw_lo = self.idx.tx_raw_pos(tx, lo).unwrap();
+                        let n = t.len();
+                        let run = (!t.is_empty())
+                            .then(|| {
+                                own_run(
+                                    &t.decode(),
+                                    a_code,
+                                    tb.tail_run,
+                                    cut.saturating_sub(tol),
+                                    cut + tol,
+                                )
+                            })
+                            .flatten();
+                        let mut from = n;
+                        if let Some((_, e)) = run {
+                            if short[i] && n - e <= TAIL_TOL {
+                                at[i] = true;
+                            } else if !at[i] {
+                                d[i] = -i64::from(tb.tail_bonus);
+                                from = e;
+                            }
+                        }
+                        cont.push(
+                            self.idx
+                                .tx_raw_slice(tx, raw_lo + from as u32, raw_lo + n as u32)
+                                .unwrap(),
+                        );
+                    }
+                    let after = &rest[run_end..];
+                    if tb.tail_trim
+                        && !after.is_empty()
+                        && let Some((g, _, _)) = seg(cont, after, align::Mode::Prefix, false, None)
+                    {
+                        for (x, g) in d.iter_mut().zip(g) {
+                            if -g >= i64::from(tb.tail_bonus) {
+                                *x += g;
+                            }
+                        }
+                    }
+                    add(Some(d));
+                }
                 let read = if tb.tail_trim { &rest[..cut] } else { rest };
                 add(end(texts, read, false, &short));
                 at_end
@@ -1158,6 +1513,113 @@ impl<C: Chainer> Mapper<C> {
         }
         let unit = if tb.affine.is_some() { tb.lambda } else { tb.kappa };
         Some((cost, unit))
+    }
+
+    /// Transcript occurrences (transcript, first base) of the seed at index nodes `nodes`, until
+    /// `f` returns true; whether it did.
+    fn node_occurrences(&self, nodes: std::ops::Range<u32>, mut f: impl FnMut(u32, u32) -> bool) -> bool {
+        let flags = self.idx.node_flags();
+        for node in nodes {
+            if flags[node as usize] & index::FLAG_MASKED != 0 {
+                continue;
+            }
+            let off = self.idx.node_offset()[node as usize];
+            let (ts, ps) = self.idx.occurrences(self.idx.node_unitig()[node as usize]);
+            if ts.iter().zip(ps).any(|(&t, &p)| f(t, p + off)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The [`AntiSeed`]s of transcript `x`, sorted by position.
+    fn anti_seeds(&self, x: u32) -> &[AntiSeed] {
+        self.anti[x as usize].get_or_init(|| {
+            let tlen = self.idx.tx_plen()[x as usize];
+            let mut codes = self.idx.tx_codes(x, 0, tlen);
+            codes.reverse();
+            codes.iter_mut().for_each(|c| *c = 3 - *c);
+            let mut seeds = Vec::new();
+            self.seeder.seed_codes_into(&codes, &mut seeds, &mut Vec::new());
+            let mut out: Vec<AntiSeed> = seeds
+                .iter()
+                .filter_map(|s| {
+                    let r = self.idx.lookup(s.label);
+                    let found = !r.is_empty()
+                        && r.len() <= self.p.anchor.h_max
+                        && self.node_occurrences(r.clone(), |t, _| t != x);
+                    found.then_some(AntiSeed {
+                        x: tlen - s.end,
+                        len: s.end - s.start,
+                        nodes: (r.start, r.end),
+                    })
+                })
+                .collect();
+            out.sort_unstable_by_key(|a| a.x);
+            out.into_boxed_slice()
+        })
+    }
+
+    /// The range of diagonals of `h` and the transcript interval a read of `plen` parsed
+    /// bases on them covers.
+    fn hit_span(&self, h: &TxHit, plen: u32) -> ((i64, i64), (u32, u32)) {
+        let tlen = i64::from(self.idx.tx_plen()[h.tx as usize]);
+        let (d1, d2) = (
+            i64::from(h.tstart) - i64::from(h.qstart),
+            i64::from(h.tend) - i64::from(h.qend),
+        );
+        let d = (d1.min(d2), d1.max(d2));
+        (
+            d,
+            (
+                d.0.clamp(0, tlen) as u32,
+                (d.1 + i64::from(plen)).clamp(0, tlen) as u32,
+            ),
+        )
+    }
+
+    /// The transcripts of `found` (transcript, weight, a diagonal) with their weights and
+    /// diagonal ranges, largest weight first.
+    fn mates(found: &mut [(u32, u32, i64)]) -> Vec<(u32, u32, i64, i64)> {
+        found.sort_unstable();
+        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
+        for &(t, w, d) in found.iter() {
+            match out.last_mut() {
+                Some(l) if l.0 == t => {
+                    l.1 += w;
+                    l.2 = l.2.min(d);
+                    l.3 = l.3.max(d);
+                }
+                _ => out.push((t, w, d, d)),
+            }
+        }
+        out.sort_unstable_by_key(|&(t, w, _, _)| (std::cmp::Reverse(w), t));
+        out
+    }
+
+    /// Transcripts sharing sequence with the region of hit `h` on the opposite strand, those
+    /// sharing most first, with the diagonals the read's other orientation would lie on.
+    fn antisense_mates(&self, h: &TxHit, plen: u32) -> Vec<(u32, u32, i64, i64)> {
+        let seeds = self.anti_seeds(h.tx);
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+        let ((dlo, dhi), (lo, hi)) = self.hit_span(h, plen);
+        let seeds = &seeds[seeds.partition_point(|a| a.x < lo)..seeds.partition_point(|a| a.x < hi)];
+        // A seed at read position q of this orientation lies at plen - q - len of the other;
+        // its position here + its first base in the mate + its length is constant along one
+        // antisense match.
+        let mut found: Vec<(u32, u32, i64)> = Vec::new();
+        for a in seeds {
+            self.node_occurrences(a.nodes.0..a.nodes.1, |t, p| {
+                if t != h.tx {
+                    let d = i64::from(a.x + p + a.len) - i64::from(plen);
+                    found.extend([(t, a.len, d - dhi), (t, 0, d - dlo)]);
+                }
+                false
+            });
+        }
+        Self::mates(&mut found)
     }
 
     fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>), salt: u64) -> Strand {
@@ -1306,6 +1768,11 @@ impl<C: Chainer> Mapper<C> {
             Strands::Reverse => (skip(pf), self.map_strand(pr, salt)),
         };
         let best = |h: &[TxHit]| h.first().map_or(f32::NEG_INFINITY, |x| x.score);
+        // Whether a best chain is more than a chance match (no `min_score`: `none` says).
+        let passes = |h: Option<&TxHit>, rescued: bool, none: bool| {
+            h.is_some_and(|t| self.p.min_score.map_or(none, |m| m.passes(t, raw.len(), rescued)))
+        };
+        let low = |h: &[TxHit], rescued: bool| !h.is_empty() && !passes(h.first(), rescued, true);
         let (mut reverse, mut st, mut other) = if best(&rc.hits) > best(&fwd.hits) {
             (true, rc, fwd)
         } else {
@@ -1316,34 +1783,31 @@ impl<C: Chainer> Mapper<C> {
         if let Some(r) = &self.rescuer
             && Self::span_frac(st.hits.first(), st.seq.len()) < self.p.pi_cov
         {
-            let mut a = r.rescue(
-                &self.idx,
-                &self.node_fam,
-                &st.seq,
-                &st.seeds,
-                &self.p.anchor,
-                &self.p.chain,
-            );
-            // The other orientation is re-seeded only if its base-level best comes within
-            // `other_margin` of this one's (None: always).
-            let try_other = match r.p.other_margin {
-                None => true,
-                Some(m) => other.hits.first().is_some_and(|o| o.score >= best(&st.hits) - m),
-            };
-            let mut b = if try_other {
-                r.rescue(
+            let rescue = |s: &Strand| {
+                let mut h = r.rescue(
                     &self.idx,
                     &self.node_fam,
-                    &other.seq,
-                    &other.seeds,
+                    &s.seq,
+                    &s.seeds,
                     &self.p.anchor,
                     &self.p.chain,
-                )
-            } else {
-                Vec::new()
+                );
+                sort_hits(&mut h, salt);
+                h
             };
-            sort_hits(&mut a, salt);
-            sort_hits(&mut b, salt);
+            let a = rescue(&st);
+            // The other orientation is re-seeded only if its base-level best comes within
+            // `other_margin` of this one's (None: always) or is, by `min_score`, more than
+            // a chance match itself: this one's lead means little when neither chain
+            // covers the read.
+            let try_other = match r.p.other_margin {
+                None => true,
+                Some(m) => other
+                    .hits
+                    .first()
+                    .is_some_and(|o| o.score >= best(&st.hits) - m || passes(Some(o), false, false)),
+            };
+            let b = if try_other { rescue(&other) } else { Vec::new() };
             let (rev, hits, alt, seq) = if best(&b) > best(&a) {
                 (!reverse, b, a, &other.seq)
             } else {
@@ -1359,7 +1823,192 @@ impl<C: Chainer> Mapper<C> {
                 rescued = true;
             }
         }
+        // The rescue level's table of every transcript, if the mapper has one.
+        let global = self
+            .rescuer
+            .as_ref()
+            .and_then(|r| r.p.global.filter(|_| r.has_global()).map(|g| (r, g)));
+        // A read both steps leave weak (a short best chain, or a rescued one scoring near the
+        // threshold) is seeded against every transcript: the candidate genes of the rescue
+        // come from the read's base-level seeds, and a read with few of those may not name
+        // its own gene.
+        if let Some((r, g)) = global {
+            let t = self.p.min_score.unwrap_or_default().at(raw.len());
+            let weak = st.hits.first().is_none_or(|h| {
+                Self::span_frac(Some(h), st.seq.len()) < self.p.pi_cov
+                    || (rescued && h.score < t + g.weak_margin)
+            });
+            if weak {
+                let seed = |s: &Strand| {
+                    let mut h = r.global_hits(&self.idx, &s.seq, &self.p.chain, g.weak_cands);
+                    sort_hits(&mut h, salt);
+                    h
+                };
+                let (a, b) = (seed(&st), seed(&other));
+                if rescued {
+                    // Rescue-level chains on both sides: the higher score per transcript.
+                    let join = |hits: &mut Vec<TxHit>, mut new: Vec<TxHit>| {
+                        new.retain(|n| hits.iter().all(|h| h.tx != n.tx || h.score < n.score));
+                        hits.retain(|h| new.iter().all(|n| n.tx != h.tx));
+                        hits.extend(new);
+                        sort_hits(hits, salt);
+                    };
+                    join(&mut st.hits, a);
+                    join(&mut other.hits, b);
+                    if best(&other.hits) > best(&st.hits) {
+                        std::mem::swap(&mut st, &mut other);
+                        reverse = !reverse;
+                    }
+                } else {
+                    // As the rescue: its chains replace base-level ones if they span more.
+                    let (rev, hits, alt, seq) = if best(&b) > best(&a) {
+                        (!reverse, b, a, &other.seq)
+                    } else {
+                        (reverse, a, b, &st.seq)
+                    };
+                    if Self::span_frac(hits.first(), seq.len())
+                        > Self::span_frac(st.hits.first(), st.seq.len())
+                    {
+                        if rev != reverse {
+                            std::mem::swap(&mut st, &mut other);
+                        }
+                        st.hits = hits;
+                        other.hits = alt;
+                        reverse = rev;
+                        rescued = true;
+                    }
+                }
+            } else if rescued {
+                // Transcripts the rescue's candidate genes left out join this orientation's
+                // hits.
+                let mut h = r.global_hits(&self.idx, &st.seq, &self.p.chain, g.extra_cands);
+                h.retain(|n| st.hits.iter().all(|h| h.tx != n.tx));
+                if !h.is_empty() {
+                    st.hits.extend(h);
+                    sort_hits(&mut st.hits, salt);
+                }
+            }
+        }
         let plen = st.seq.len() as u32;
+        // Transcripts the read's own seeds did not nominate, found through the best hit's
+        // reference region instead (error-free, unlike the read), on the opposite strand: for
+        // the read's other orientation, whose seeds are independent of this one's.
+        let mut anti = false;
+        // The best hits were chained again in their own windows at the rescue level.
+        let mut targeted = false;
+        if let (Some(r), Some(top)) = (&self.rescuer, st.hits.first().cloned()) {
+            // Chains of `new` replace those of the same transcripts unless they score lower.
+            let merge = |hits: &mut Vec<TxHit>, mut new: Vec<TxHit>| {
+                new.retain(|n| hits.iter().all(|h| h.tx != n.tx || h.score < n.score));
+                if new.is_empty() {
+                    return false;
+                }
+                hits.retain(|h| new.iter().all(|n| n.tx != h.tx));
+                hits.extend(new);
+                sort_hits(hits, salt);
+                true
+            };
+            // An orientation's hits within the tie-break margin, or `w` × the best score, of
+            // its best (`top`), chained again at the rescue level in their own windows.
+            let rechain = |hits: &[TxHit], seq: &[u8], top: &TxHit, w: f32| {
+                let margin = self
+                    .p
+                    .tiebreak
+                    .as_ref()
+                    .map_or(0.0, |tb| tb.margin_abs.max(tb.margin_rel * top.score.abs()))
+                    .max(w * top.score.abs());
+                let txs: Vec<(u32, i64, i64)> = hits
+                    .iter()
+                    .take_while(|h| h.score >= top.score - margin)
+                    .take(rescue::RECHAIN_MAX)
+                    .map(|h| {
+                        let ((lo, hi), _) = self.hit_span(h, plen);
+                        (h.tx, lo, hi)
+                    })
+                    .collect();
+                r.rescue_txs(&self.idx, seq, &txs, &self.p.chain)
+            };
+            // A read whose base-level chain anchors enough of it, with no rival on the other
+            // orientation, is settled: nothing is nominated for it.
+            let settled = !rescued
+                && r.p.settled.is_some_and(|s| {
+                    top.anchors >= s.anchors
+                        && top.anchored as f32 >= s.anchored * plen as f32
+                        && other.hits.first().is_none_or(|o| o.score < s.other * top.score)
+                });
+            let mates = if r.p.antisense > 0 && matches!(self.p.strands, Strands::Both) && !settled {
+                self.antisense_mates(&top, plen)
+            } else {
+                Vec::new()
+            };
+            if let Some(w) = r.p.rechain
+                && !rescued
+                && !settled
+            {
+                // What is nominated below is chained at the rescue level, whose chains score
+                // higher than base-level ones: so are this orientation's best hits, to compare
+                // like with like.
+                let new = rechain(&st.hits, &st.seq, &top, w);
+                targeted = merge(&mut st.hits, new);
+                // Transcripts the base-level candidates left out join the hits.
+                if let Some((_, g)) = global {
+                    let new = r.global_hits(&self.idx, &st.seq, &self.p.chain, g.extra_cands);
+                    merge(&mut st.hits, new);
+                }
+            }
+            if !mates.is_empty() {
+                let txs: Vec<(u32, i64, i64)> = mates
+                    .iter()
+                    .take(r.p.antisense)
+                    .map(|&(t, _, lo, hi)| (t, lo, hi))
+                    .collect();
+                stats::add(&stats::ANTISENSE_TX, txs.len() as u64);
+                merge(
+                    &mut other.hits,
+                    r.rescue_txs(&self.idx, &other.seq, &txs, &self.p.chain),
+                );
+                // The other orientation's best hit shares sequence with this one's region:
+                // the two are compared by alignment, however far apart their chains score.
+                anti = other
+                    .hits
+                    .first()
+                    .is_some_and(|o| mates.iter().any(|m| m.0 == o.tx));
+            }
+            // The other orientation, if it competes, gets what this one got: its best hits
+            // chained at the rescue level, then the transcripts its candidates left out.
+            if let Some((_, g)) = global
+                && g.other
+                && !settled
+                && let (Some(a), Some(b)) = (st.hits.first(), other.hits.first().cloned())
+                && let Some(tb) = &self.p.tiebreak
+                && (anti || b.score >= a.score - tb.margin_abs.max(tb.orient_margin_rel * a.score.abs()))
+            {
+                if let Some(w) = r.p.rechain
+                    && !rescued
+                {
+                    let new = rechain(&other.hits, &other.seq, &b, w);
+                    merge(&mut other.hits, new);
+                }
+                let new = r.global_hits(&self.idx, &other.seq, &self.p.chain, g.extra_cands);
+                merge(&mut other.hits, new);
+            }
+        }
+        let rescued_any = rescued || targeted;
+        let reject = |low: bool| self.p.min_score.is_some_and(|m| low && !m.keep);
+        // Nothing below would raise the best score: skip the alignments of a read that is
+        // rejected anyway.
+        if reject(low(&st.hits, rescued_any)) {
+            return ReadResult {
+                len: raw.len() as u32,
+                plen,
+                reverse,
+                hits: Vec::new(),
+                low_coverage: true,
+                rescued,
+                low_score: true,
+                hpc: if reverse { other.raw } else { st.raw }.map(|r| r.hpc),
+            };
+        }
         let mut both = false;
         if let Some(tb) = &self.p.tiebreak {
             let margin = |s: f32| tb.margin_abs.max(tb.orient_margin_rel * s.abs());
@@ -1367,19 +2016,36 @@ impl<C: Chainer> Mapper<C> {
                     (Some(a), Some(b)) if b.score >= a.score - margin(a.score));
             let codes = || strand_codes(&st.codes, &st.seq);
             self.tiebreak(tb, codes, st.raw.as_ref(), &mut st.hits, salt);
+            // The two best hits are one sequence on opposite strands: the read fits both
+            // equally, however far apart seed luck leaves the two chains.
+            let same = |a: &Strand, b: &Strand| match (a.hits.first(), b.hits.first()) {
+                (Some(a), Some(b)) => self.same_antisense(tb, plen, a, b),
+                _ => false,
+            };
+            let mut mirror = tb.orient_same && same(&st, &other);
+            both |= mirror || anti;
             if both {
                 // Near-tied orientations (antisense transcripts sharing sequence): re-rank each
                 // orientation, then place the other's scores relative to this one by the
                 // whole-read edit distances of the two best transcripts.
                 stats::add(&stats::BOTH_ORIENTATIONS, 1);
+                let top = other.hits[0].tx;
                 let codes = || strand_codes(&other.codes, &other.seq);
                 self.tiebreak(tb, codes, other.raw.as_ref(), &mut other.hits, salt);
+                if tb.orient_same && other.hits[0].tx != top {
+                    mirror = same(&st, &other);
+                }
                 let (qa, qb) = (
                     strand_codes(&st.codes, &st.seq),
                     strand_codes(&other.codes, &other.seq),
                 );
                 // Costs of the two best hits and the score charged per unit.
                 let (ca, cb, unit) = match &tb.affine {
+                    // Two banded alignments of one sequence differ only by their heuristics.
+                    _ if mirror => {
+                        stats::add(&stats::SAME_ANTISENSE, 1);
+                        (0, 0, 0.0)
+                    }
                     Some(sc) if tb.orient_clipped => (
                         -i64::from(self.clipped(tb, sc, qa, st.raw.as_ref(), &st.hits[0])),
                         -i64::from(self.clipped(tb, sc, qb, other.raw.as_ref(), &other.hits[0])),
@@ -1405,6 +2071,20 @@ impl<C: Chainer> Mapper<C> {
                     lead += tb.orient_tail as f32
                         * (f32::from(u8::from(tailed(&st))) - f32::from(u8::from(tailed(&other))));
                 }
+                // A close call is decided by exact local alignments instead of the clipped
+                // ones (`TieBreak::orient_exact`); the tail term stands.
+                if let Some(sc) = &tb.affine
+                    && !mirror
+                    && tb.orient_clipped
+                    && tb.orient_exact > 0.0
+                    && lead.abs() <= tb.orient_exact
+                {
+                    let w = ORIENT_EXACT_BAND + plen / 20;
+                    let tail = lead - unit * (cb - ca) as f32;
+                    let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w);
+                    let xb = self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w);
+                    lead = unit * (xa - xb) as f32 + tail;
+                }
                 if lead < 0.0 {
                     std::mem::swap(&mut st, &mut other);
                     reverse = !reverse;
@@ -1425,9 +2105,32 @@ impl<C: Chainer> Mapper<C> {
             hits.append(&mut other.hits);
             sort_hits(&mut hits, salt);
         }
+        // A weak rescued best hit must also align (`MinScore::verify`).
+        let mut unverified = false;
+        if rescued
+            && let Some(ms) = self.p.min_score
+            && let Some(v) = ms.verify
+            && let (Some(tb), Some(top)) = (&self.p.tiebreak, hits.first())
+            && let Some(sc) = &tb.affine
+        {
+            let span = (top.qend - top.qstart) as f32;
+            if span < self.p.pi_cov * plen as f32 || top.score < ms.at(raw.len()) + v.margin {
+                let (c, r) = if top.reverse == reverse {
+                    (strand_codes(&st.codes, &st.seq), st.raw.as_ref())
+                } else {
+                    (strand_codes(&other.codes, &other.seq), other.raw.as_ref())
+                };
+                unverified = (self.clipped(tb, sc, c, r, top) as f32) < v.base + v.per_base * span;
+            }
+        }
         let mut low_coverage = true;
+        // Tie-broken orientations can leave the lower-scoring one on top.
+        let low_score = low(&hits, rescued_any) || unverified;
+        if reject(low_score) {
+            hits.clear();
+        }
         if let Some(top) = hits.first() {
-            let floor = top.score - self.p.delta_rep * top.score.abs();
+            let floor = top.score - (self.p.delta_rep * top.score.abs()).max(self.p.rep_abs);
             low_coverage = ((top.qend - top.qstart) as f32) < self.p.pi_cov * plen as f32;
             hits.retain(|h| h.score >= floor);
         }
@@ -1452,12 +2155,16 @@ impl<C: Chainer> Mapper<C> {
             hits,
             low_coverage,
             rescued,
+            low_score,
             // `st` is the orientation `reverse` names (swapped together), `other` the opposite.
             hpc: if reverse { other.raw } else { st.raw }.map(|r| r.hpc),
         }
     }
 }
 
+/// Diagonals searched on each side of a chain's by the exact comparison of near-tied read
+/// orientations ([`TieBreak::orient_exact`]), plus a twentieth of the parsed read.
+pub const ORIENT_EXACT_BAND: u32 = 100;
 /// Bases between a transcript's 3' end and a read's tail start treated as the same end.
 const TAIL_TOL: usize = 15;
 /// Most read bases after a poly(A) tail (adapter and the like).
@@ -1470,6 +2177,23 @@ const TAIL_WINDOW: usize = 200;
 fn ends_in_tail(codes: &[u8], run: usize) -> bool {
     let a = lcp_core::encode::CODE[b'A' as usize] & 3;
     tail_start(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run).is_some()
+}
+
+/// The first A-run of `text` (raw codes) starting in `[lo, hi]`: a window of `run` bases with at
+/// most one other base. Returns its first A and the end of the A-run from there (as
+/// [`tail_start`]).
+fn own_run(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usize, usize)> {
+    let i = (lo..=hi.min(text.len().checked_sub(run)?))
+        .find(|&i| text[i..i + run].iter().filter(|&&c| c != a).count() <= 1)?;
+    let s = i + text[i..].iter().position(|&c| c == a)?;
+    let (mut end, mut non) = (s, 0);
+    for (k, &c) in text.iter().enumerate().skip(s) {
+        non += usize::from(c != a);
+        if c == a && non * 10 <= k + 1 - s {
+            end = k + 1;
+        }
+    }
+    Some((s, end))
 }
 
 /// The first poly(A) tail in `rest` (raw codes): a window of `run` bases with at most one other
@@ -2039,5 +2763,49 @@ mod segmented_tests {
             sort_distinct_hits(&mut b, salt);
             proptest::prop_assert_eq!(key(&a), key(&b));
         }
+    }
+}
+
+#[cfg(test)]
+mod min_score_tests {
+    use super::*;
+
+    fn hit(score: f32, anchors: usize) -> TxHit {
+        let path = (0..anchors as u32).map(|i| (10 * i, 10 * i + 5, 10 * i, 5));
+        chain::hit_from_path(0, score, 0.0, path)
+    }
+
+    #[test]
+    fn threshold_grows_with_the_log_of_read_length() {
+        let m = MinScore::default();
+        assert_eq!(m.at(1000), m.at_1kb);
+        assert!((m.at(2718) - (m.at_1kb + m.per_ln_len)).abs() < 1e-2);
+        assert!(m.at(100) < m.at(1000) && m.at(1000) < m.at(10_000));
+        // A zero-length read has a finite threshold.
+        assert!(m.at(0).is_finite());
+    }
+
+    #[test]
+    fn the_default_judges_by_score_alone() {
+        let m = MinScore::default();
+        let t = m.at(1000);
+        assert!(m.passes(&hit(t, 1), 1000, false) && m.passes(&hit(t, 1), 1000, true));
+        assert!(!m.passes(&hit(t - 1.0, 1), 1000, false));
+        assert!(!m.passes(&hit(t - 1.0, 5), 1000, false));
+        assert!(m.passes(&hit(t, 5), 1000, false));
+    }
+
+    #[test]
+    fn several_base_level_anchors_pass_at_any_score() {
+        let m = MinScore {
+            anchors: 2,
+            ..Default::default()
+        };
+        let t = m.at(1000);
+        assert!(!m.passes(&hit(t - 1.0, 1), 1000, false));
+        // Two anchors pass under the threshold, but not when they are rescue seeds.
+        assert_eq!(hit(1.0, 2).anchors, 2);
+        assert!(m.passes(&hit(t - 1.0, 2), 1000, false));
+        assert!(!m.passes(&hit(t - 1.0, 2), 1000, true));
     }
 }
