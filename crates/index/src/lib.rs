@@ -198,6 +198,9 @@ pub struct IndexData {
     pub gene_names: Vec<String>,
     /// What built the index, as JSON (written as section `manifest`; the caller fills it in).
     pub manifest: Option<String>,
+    /// Further sections (name, bytes), written as they are: tables that other crates keep
+    /// in the index ([`IndexData::add_section`]). A reader that does not know one skips it.
+    pub extra: Vec<(String, Vec<u8>)>,
 }
 
 /// 2-bit pack an ASCII sequence (non-ACGT as A), 32 bases per word, base i at bits
@@ -271,7 +274,22 @@ impl IndexData {
         if let Some(m) = &self.manifest {
             w.add("manifest", m.as_bytes());
         }
+        for (name, bytes) in &self.extra {
+            w.add(name, bytes);
+        }
         w
+    }
+
+    /// Keep `data` as a further section `name` of the index ([`Index::section`] reads it).
+    pub fn add_section<T: bytemuck::Pod>(&mut self, name: &str, data: &[T]) {
+        self.extra
+            .push((name.to_string(), bytemuck::cast_slice(data).to_vec()));
+    }
+
+    /// Append the whole parsed transcript `t` to `out`, as 2-bit codes.
+    pub fn tx_codes_into(&self, t: u32, out: &mut Vec<u8>) {
+        let words = &self.tx_seq.1[self.tx_seq.0[t as usize] as usize..];
+        decode_into(words, 0, self.tx_plen[t as usize], out);
     }
 
     /// Write to `path`; returns bytes written.
@@ -282,6 +300,11 @@ impl IndexData {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.writer().to_bytes()
     }
+}
+
+/// Worker threads of the pool the caller runs in: those a build uses.
+pub fn build_threads() -> usize {
+    rayon::current_num_threads()
 }
 
 /// A cache hint for the line holding `p` (no effect off x86-64 and aarch64; never faults).
@@ -657,6 +680,12 @@ impl Index {
         }
     }
 
+    /// A further section of the index ([`IndexData::add_section`]) as `T`s: `None` if the
+    /// index has none of that name, or it is not a whole number of them.
+    pub fn section<T: bytemuck::Pod>(&self, name: &str) -> Option<&[T]> {
+        self.store.get(name).ok()
+    }
+
     /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes.
     pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>) {
         let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
@@ -706,6 +735,17 @@ impl Index {
         Some(match p % RAW_CK {
             0 => r,
             q => nth_run_start(words, rlen, r, q),
+        })
+    }
+
+    /// Raw position of transcript `t` where the parsed base `q` bases after the one starting
+    /// at raw position `r` starts: [`Self::tx_raw_pos`] of that base, found from `r` (cheaper
+    /// when `q` is small and the bases after `r` are read anyway).
+    pub fn tx_raw_after(&self, t: u32, r: u32, q: u32) -> Option<u32> {
+        let (words, _) = self.raw_words(t)?;
+        Some(match q {
+            0 => r,
+            q => nth_run_start(words, self.tx_len()[t as usize], r, q),
         })
     }
 

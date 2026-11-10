@@ -230,7 +230,7 @@ fn utility_commands() {
         String::from_utf8(o.stdout).unwrap()
     };
     let d: serde_json::Value = serde_json::from_str(&ok(&["doctor", "--json"])).unwrap();
-    for p in ["ont", "drna", "hifi"] {
+    for p in ["ont", "drna", "hifi", "ont-fast", "drna-fast", "hifi-fast"] {
         assert_eq!(d["self_test"][p]["pass"], true, "{d}");
     }
     assert!(ok(&["completions", "bash"]).contains("spearfish"));

@@ -62,9 +62,10 @@ spearfish map transcripts.sfi reads.fq.gz --preset ont -o reads.tsv   # and/or -
 | `doctor` | Report the build and machine and run a self-test; `--index` also checks an index. |
 | `completions`, `man` | Shell completions and man pages. |
 
-Presets (`--preset ont|drna|hifi`) set every default; any setting can be changed with its
-flag, and `spearfish map --print-params` prints the parameters a run would use. `-h` lists
-the common flags, `--help` all of them.
+Presets (`--preset ont|drna|hifi`) set every default (`ont-fast`, `drna-fast` and `hifi-fast`
+map as 0.1.0 did: faster, less accurate); any setting can be changed with its flag, and
+`spearfish map --print-params` prints the parameters a run would use. `-h` lists the common
+flags, `--help` all of them.
 
 Every index records how it was built (`<index>.json`, and `spearfish inspect`), and every
 mapping run writes `<output>.meta.json`: the build, command line, index, settings, every

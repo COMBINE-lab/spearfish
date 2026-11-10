@@ -17,6 +17,12 @@ pub enum PresetArg {
     Drna,
     /// PacBio HiFi (minimap2 map-hifi scores).
     Hifi,
+    /// ONT cDNA as 0.1.0 mapped it: faster, less accurate, reports every read with a chain.
+    OntFast,
+    /// ONT direct RNA as 0.1.0 mapped it.
+    DrnaFast,
+    /// PacBio HiFi as 0.1.0 mapped it.
+    HifiFast,
 }
 
 impl From<PresetArg> for Preset {
@@ -25,6 +31,9 @@ impl From<PresetArg> for Preset {
             PresetArg::Ont => Preset::Ont,
             PresetArg::Drna => Preset::Drna,
             PresetArg::Hifi => Preset::Hifi,
+            PresetArg::OntFast => Preset::OntFast,
+            PresetArg::DrnaFast => Preset::DrnaFast,
+            PresetArg::HifiFast => Preset::HifiFast,
         }
     }
 }
@@ -468,10 +477,11 @@ pub struct MapArgs {
     /// Re-seed the other orientation regardless of its score.
     #[arg(long, hide_short_help = true, help_heading = "Rescue")]
     pub rescue_other_always: bool,
-    /// Skip transcripts longer than this, in compressed bases [default: 50000].
+    /// Skip transcript parts longer than this, in compressed bases [default: 50000].
     #[arg(long, hide_short_help = true, help_heading = "Rescue")]
     pub rescue_max_tx_len: Option<u32>,
-    /// Keep every transcript's rescue seeds in memory, made at startup [default: on].
+    /// Map with every transcript's rescue seeds, read from the index or made at startup
+    /// [default: on].
     #[arg(
         long,
         overrides_with = "no_rescue_store",
@@ -499,8 +509,8 @@ pub struct MapArgs {
     /// reverse-complemented, with the best hit (0: off) [default: 16].
     #[arg(long, value_name = "N", hide_short_help = true, help_heading = "Rescue")]
     pub rescue_antisense: Option<usize>,
-    /// Seed doubtful reads against every transcript at the rescue level, by a table made at
-    /// startup [default: on].
+    /// Seed doubtful reads against every transcript at the rescue level, by a table read
+    /// from the index or made at startup [default: on].
     #[arg(
         long,
         overrides_with = "no_rescue_global",

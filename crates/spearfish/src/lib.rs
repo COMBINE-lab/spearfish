@@ -70,21 +70,36 @@ pub enum Preset {
     Drna,
     /// PacBio HiFi: both orientations, minimap2 map-hifi scores.
     Hifi,
+    /// ONT cDNA as 0.1.0 mapped it ([`Preset::fast`]).
+    #[serde(rename = "ont-fast")]
+    OntFast,
+    /// ONT direct RNA as 0.1.0 mapped it ([`Preset::fast`]).
+    #[serde(rename = "drna-fast")]
+    DrnaFast,
+    /// PacBio HiFi as 0.1.0 mapped it ([`Preset::fast`]).
+    #[serde(rename = "hifi-fast")]
+    HifiFast,
 }
 
 impl std::str::FromStr for Preset {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        Preset::ALL
-            .into_iter()
-            .find(|p| p.name() == s)
-            .ok_or_else(|| anyhow::anyhow!("unknown preset {s:?} (ont, drna, hifi)"))
+        Preset::ALL.into_iter().find(|p| p.name() == s).ok_or_else(|| {
+            anyhow::anyhow!("unknown preset {s:?} (ont, drna, hifi, ont-fast, drna-fast, hifi-fast)")
+        })
     }
 }
 
 impl Preset {
     /// Every preset.
-    pub const ALL: [Preset; 3] = [Preset::Ont, Preset::Drna, Preset::Hifi];
+    pub const ALL: [Preset; 6] = [
+        Preset::Ont,
+        Preset::Drna,
+        Preset::Hifi,
+        Preset::OntFast,
+        Preset::DrnaFast,
+        Preset::HifiFast,
+    ];
 
     /// The preset's name (as `--preset` takes it).
     pub fn name(self) -> &'static str {
@@ -92,15 +107,38 @@ impl Preset {
             Preset::Ont => "ont",
             Preset::Drna => "drna",
             Preset::Hifi => "hifi",
+            Preset::OntFast => "ont-fast",
+            Preset::DrnaFast => "drna-fast",
+            Preset::HifiFast => "hifi-fast",
         }
+    }
+
+    /// The preset of this one's technology that maps as accurately as spearfish can (itself,
+    /// unless it is a `-fast` preset).
+    pub fn accurate(self) -> Preset {
+        match self {
+            Preset::Ont | Preset::OntFast => Preset::Ont,
+            Preset::Drna | Preset::DrnaFast => Preset::Drna,
+            Preset::Hifi | Preset::HifiFast => Preset::Hifi,
+        }
+    }
+
+    /// A `-fast` preset: the technology's preset as 0.1.0 mapped it. Faster on noisy reads (by
+    /// a few percent to a third, the most on reads with many near-identical candidates) and
+    /// without the stored rescue tables' memory, but it reports every read with a chain,
+    /// however weak, which places reads from outside the annotation; it more often takes the
+    /// wrong member of a gene family or the wrong orientation for a read with few seeds; and
+    /// it reports fewer of the transcripts a read fits equally well.
+    pub fn fast(self) -> bool {
+        self != self.accurate()
     }
 
     /// The sequencing technology as oarfish's `--seq-tech` names it.
     pub fn seq_tech(self) -> &'static str {
         match self {
-            Preset::Ont => "ont-cdna",
-            Preset::Drna => "ont-drna",
-            Preset::Hifi => "pac-bio-hifi",
+            Preset::Ont | Preset::OntFast => "ont-cdna",
+            Preset::Drna | Preset::DrnaFast => "ont-drna",
+            Preset::Hifi | Preset::HifiFast => "pac-bio-hifi",
         }
     }
 }
@@ -137,9 +175,9 @@ impl MapOptions {
     /// [`MapOptions::set_extend_ends`], which uses the options' own preset.
     pub fn extend_ends(&mut self, p: Preset) {
         if self.params.ends.is_none() {
-            let sc = match p {
+            let sc = match p.accurate() {
                 Preset::Hifi => Affine::HIFI,
-                Preset::Ont | Preset::Drna => Affine::ONT,
+                _ => Affine::ONT,
             };
             self.params.ends = Some(map::Ends {
                 sc,
@@ -166,8 +204,7 @@ impl MapOptions {
     pub fn preset(p: Preset) -> Self {
         let mut params = MapParams::default();
         let tb = params.tiebreak.as_mut().expect("tie-break on by default");
-        match p {
-            Preset::Ont => {}
+        match p.accurate() {
             Preset::Drna => {
                 params.strands = Strands::Forward;
                 tb.affine_within = Some(4);
@@ -197,6 +234,34 @@ impl MapOptions {
                 // HiFi anchors already end within a few bases of the read's ends: extending
                 // spans changes no spike-in estimate. Positional models turn it on.
                 params.ends = None;
+            }
+            _ => {}
+        }
+        if p.fast() {
+            // Everything that came after 0.1.0, off: read rejection and the wider reporting
+            // margin; in candidate selection, credit for overlapping anchors; in the
+            // tie-break, the comparisons added for reads the anchors leave in doubt; in the
+            // rescue, the stored tables and all that nominates candidates beyond the first
+            // pass's genes.
+            params.min_score = None;
+            params.rep_abs = 0.0;
+            params.anchor.overlap_credit = false;
+            let tb = params.tiebreak.as_mut().expect("tie-break on by default");
+            tb.group_fallback = p == Preset::HifiFast;
+            tb.orient_same = false;
+            tb.orient_exact = 0.0;
+            tb.raw_mid = false;
+            tb.mid_inset = 0;
+            tb.clip_pieces = false;
+            tb.tail_templated = false;
+            if let Some(r) = &mut params.rescue {
+                r.cap_window = false;
+                r.store = false;
+                r.band = 0.0;
+                r.rechain = None;
+                r.settled = None;
+                r.antisense = 0;
+                r.global = None;
             }
         }
         MapOptions {
@@ -240,6 +305,12 @@ pub struct IndexOptions {
     /// Build even if two different seed contents share a label (normally an error).
     #[builder(default)]
     pub allow_collisions: bool,
+    /// Keep the rescue tables of the default rescue settings in the index: every
+    /// transcript's rescue seeds and the table of their runs, which the `ont` and `drna`
+    /// presets map with. A mapper reads them in place; without them it makes them each time
+    /// it is built. They about double the index file; the `hifi` preset never reads them.
+    #[builder(default = true)]
+    pub rescue_tables: bool,
 }
 
 impl Default for IndexOptions {
@@ -370,7 +441,14 @@ impl Index {
             .into_iter()
             .map(|(name, gene, seq)| TxInput { name, gene, seq })
             .collect();
-        let (mut data, rep) = index::build(txs, &opts.build_params())?;
+        let (mut data, mut rep) = index::build(txs, &opts.build_params())?;
+        if opts.rescue_tables {
+            let t = std::time::Instant::now();
+            let rescue = map::rescue::RescueParams::default();
+            let tuple = map::rescue::GlobalParams::default().tuple;
+            map::tables::build_into(&mut data, &rescue.spec, tuple, index::build_threads())?;
+            rep.seconds.push(("rescue tables", t.elapsed().as_secs_f64()));
+        }
         let mut manifest = provenance::IndexManifest::new(&data, opts, &rep, input);
         manifest.command_line = command_line;
         manifest.working_directory = std::env::current_dir()
@@ -673,6 +751,11 @@ impl Mapper {
             ChainerKind::Refine { beam } => AnyChainer::Refine(RefineChainer { p: chain, beam }),
         };
         let inner = map::Mapper::new(index.inner.clone(), chainer, opts.params.clone())?;
+        if inner.made_rescue_tables() {
+            log::info!(
+                "the index keeps no rescue tables for these settings: made them (an index built with rescue tables saves this at every start)"
+            );
+        }
         Ok(Mapper {
             index,
             inner,

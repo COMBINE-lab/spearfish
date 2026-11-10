@@ -19,7 +19,7 @@ TSV_HEADER: str
 
 PathLike = Union[str, os.PathLike]
 Seq = Union[str, bytes, bytearray, memoryview]
-Preset = Literal["ont", "drna", "hifi"]
+Preset = Literal["ont", "drna", "hifi", "ont-fast", "drna-fast", "hifi-fast"]
 
 def presets() -> list[str]: ...
 def resolve_settings(preset: Preset = "ont", **settings: Any) -> dict[str, Any]:
@@ -47,6 +47,7 @@ class Index:
         collapse: Literal["gene", "global"] = "gene",
         threads: int = 0,
         allow_collisions: bool = False,
+        rescue_tables: bool = True,
     ) -> Index:
         """Build an index from a transcript FASTA or sequences, in memory or to ``output``."""
 

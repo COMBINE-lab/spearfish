@@ -59,7 +59,7 @@ index = spearfish.Index.build("transcripts.fa", infer_genes=True)
 ```
 
 `Index.build` takes the options of `spearfish index`: `scheme`, `hpc`, `mask_genes`,
-`collapse`, `threads`, and `allow_collisions`. An index tells you about itself:
+`collapse`, `threads`, `allow_collisions`, and `rescue_tables`. An index tells you about itself:
 `num_transcripts`, `num_genes`, `transcript_names()`, `transcript_lengths()`,
 `transcript_gene(i)`, `gene_names()`, `transcript_id(name)`, `scheme`, `hpc`, `id`, `manifest`
 (what built it and from what), and `build_report` (construction statistics, for an index built

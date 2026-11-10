@@ -7,6 +7,7 @@ pub mod chain;
 pub mod refine;
 pub mod rescue;
 pub mod stats;
+pub mod tables;
 
 use std::sync::Arc;
 
@@ -127,6 +128,18 @@ pub struct TieBreak {
     /// next to a run changes the parsed alignment around it.
     #[serde(default)]
     pub raw_mid: bool,
+    /// With `raw_mid`, a shared block longer than twice this many parsed bases is cut this
+    /// far inside each of its edges instead of at its midpoint, and its bases between the two
+    /// cuts are compared on their own (0: every block is cut at its midpoint). Candidates
+    /// differ next to a block's edges, not deep inside it, and a short stretch that is
+    /// identical in most of them is compared once for all.
+    #[serde(default)]
+    pub mid_inset: u32,
+    /// The clipped alignment score (orientation comparison, anchor groups) follows the chain
+    /// piece by piece and keeps the best run of pieces (off: one banded alignment of the
+    /// whole chained span, as in 0.1.0, which a long noisy chain's indels drift out of).
+    #[serde(default)]
+    pub clip_pieces: bool,
     /// A candidate with its own A-run where the read's poly(A) tail starts explains the tail
     /// as well as one that ends there: it gains `tail_bonus` too, and what the read's bases
     /// after the run gain against its continuation.
@@ -172,6 +185,8 @@ impl Default for TieBreak {
             orient_same: true,
             orient_exact: 150.0,
             raw_mid: true,
+            mid_inset: 8,
+            clip_pieces: true,
             tail_templated: true,
             flank_min: 0,
         }
@@ -395,28 +410,29 @@ pub struct Mapper<C: Chainer> {
     rescuer: Option<Rescuer>,
     /// [`anchor::node_families`] of `idx`.
     node_fam: Vec<u32>,
-    /// Per transcript, its [`AntiSeed`]s by position (made on first use).
-    anti: Vec<std::sync::OnceLock<Box<[AntiSeed]>>>,
+    /// Per transcript, its [`MateSeg`]s by mate (made on first use).
+    anti: Vec<std::sync::OnceLock<Box<[MateSeg]>>>,
 }
 
-/// A base-level seed of a transcript's reverse complement that occurs in another transcript:
-/// the two share that sequence on opposite strands.
+/// A stretch of a transcript that occurs reverse-complemented in another one, its antisense
+/// mate: the base-level seeds of the transcript's reverse complement found in the mate on one
+/// diagonal.
 #[derive(Clone, Copy)]
-struct AntiSeed {
-    /// The seed's first base in the transcript (forward coordinates).
-    x: u32,
-    len: u32,
-    /// The index nodes with the seed's label.
-    nodes: (u32, u32),
+struct MateSeg {
+    /// The mate.
+    t: u32,
+    /// The stretch in the transcript (forward coordinates).
+    x: (u32, u32),
+    /// A seed's first base in the transcript + its first base in the mate + its length: the
+    /// same for every seed of one antisense match.
+    c: u32,
+    /// Bases of the stretch's seeds.
+    w: u32,
 }
 
-/// Transcript -> (weight, lowest and highest diagonal), while a hit's antisense mates are
-/// gathered.
-type Mates = rustc_hash::FxHashMap<u32, (u32, i64, i64)>;
-
-thread_local! {
-    static MATES: std::cell::RefCell<Mates> = std::cell::RefCell::new(Mates::default());
-}
+/// Seeds with more occurrences than this name no antisense mates: they are repeats, which
+/// every transcript shares with hundreds of unrelated ones.
+const MATE_MAX_OCC: usize = 1024;
 
 /// A read orientation's raw bases (2-bit codes) and HPC run map, for raw-space read ends.
 struct RawRead {
@@ -535,6 +551,12 @@ fn strand_codes<'a>(codes: &'a std::cell::OnceCell<Vec<u8>>, seq: &[u8]) -> &'a 
 }
 
 impl<C: Chainer> Mapper<C> {
+    /// Whether the mapper made its rescue tables itself, the index keeping none it could
+    /// use (false also when it needs none).
+    pub fn made_rescue_tables(&self) -> bool {
+        self.rescuer.as_ref().is_some_and(|r| r.tables_made())
+    }
+
     /// A mapper seeding exactly as the index was built.
     pub fn new(idx: Arc<Index>, chainer: C, p: MapParams) -> Result<Self> {
         p.chain.check()?;
@@ -848,7 +870,7 @@ impl<C: Chainer> Mapper<C> {
         let mut cuts = vec![(h.qstart, h.tstart)];
         for &(q, t, _) in &h.chain {
             let &(pq, pt) = cuts.last().unwrap();
-            if q >= pq + 2 * tb.band as u32 && t > pt && q < h.qend && t < h.tend {
+            if tb.clip_pieces && q >= pq + 2 * tb.band as u32 && t > pt && q < h.qend && t < h.tend {
                 cuts.push((q, t));
             }
         }
@@ -1260,38 +1282,83 @@ impl<C: Chainer> Mapper<C> {
         let raw_mid = raw.filter(|_| {
             tb.raw_ends && tb.raw_mid && hits.iter().all(|h| self.idx.tx_raw_pos(h.tx, 0).is_some())
         });
-        let half = |b: &SharedBlock| -> u32 {
-            if raw_mid.is_some() {
-                (b.query.end - b.query.start) / 2
+        // Where a block is cut, from its start: the segment before it ends at the first cut and
+        // the one after it starts at the second. A long block is cut `MID_INSET` bases inside
+        // each edge, and its bases between the cuts are compared on their own; a shorter one
+        // at its midpoint.
+        let inset = tb.mid_inset;
+        let cuts = |b: &SharedBlock| -> (u32, u32) {
+            let len = b.query.end - b.query.start;
+            if raw_mid.is_none() {
+                (0, 0)
+            } else if inset == 0 || len <= 2 * inset {
+                (len / 2, len / 2)
             } else {
-                0
+                (inset, len - inset)
             }
         };
-        let starts = |b: &SharedBlock| -> Vec<u32> {
+        // Each candidate's raw position `off` bases into a block: counted on from its raw
+        // position `from.1` at `from.0` bases into the block `from.2` (the same block or the
+        // one before), whose bases up to this one are read anyway.
+        let starts = |b: &SharedBlock, off: u32, from: Option<(u32, &[u32], &SharedBlock)>| -> Vec<u32> {
             hits.iter()
                 .zip(&b.targets)
-                .map(|(h, t)| self.idx.tx_raw_pos(h.tx, t.start + half(b)).unwrap())
+                .enumerate()
+                .map(|(i, (h, t))| {
+                    let p = t.start + off;
+                    match from.map(|(o, raw, pb)| (pb.targets[i].start + o, raw[i])) {
+                        Some((p0, r0)) if p0 <= p => self.idx.tx_raw_after(h.tx, r0, p - p0).unwrap(),
+                        _ => self.idx.tx_raw_pos(h.tx, p).unwrap(),
+                    }
+                })
                 .collect()
         };
-        let mut prev = raw_mid.map(|_| starts(&blocks[0]));
+        // The candidates' costs for the read's raw bases between two cuts.
+        let between = |r: &RawRead, q: (u32, u32), lo: &[u32], hi: &[u32]| {
+            let texts = hits
+                .iter()
+                .enumerate()
+                .map(|(i, h)| self.idx.tx_raw_slice(h.tx, lo[i], hi[i]).unwrap())
+                .collect();
+            seg(
+                texts,
+                &r.codes[r.pos(q.0)..r.pos(q.1)],
+                align::Mode::Global,
+                false,
+                None,
+            )
+            .map(|(d, _, _)| d)
+        };
+        // A block's bases between its cuts: the candidates' raw positions at its second cut
+        // and their costs.
+        let inside = |r: &RawRead, b: &SharedBlock, at: Vec<u32>| {
+            let (c0, c1) = cuts(b);
+            if c0 == c1 {
+                return (at, None);
+            }
+            let to = starts(b, c1, Some((c0, &at, b)));
+            let d = between(r, (b.query.start + c0, b.query.start + c1), &at, &to);
+            (to, d)
+        };
+        let mut prev = raw_mid.map(|r| {
+            let at = starts(&blocks[0], cuts(&blocks[0]).0, None);
+            let (at, d) = inside(r, &blocks[0], at);
+            add(d);
+            at
+        });
         for pair in blocks.windows(2) {
             if let (Some(r), Some(lo)) = (raw_mid, prev.as_mut()) {
-                let hi = starts(&pair[1]);
-                let texts = hits
-                    .iter()
-                    .enumerate()
-                    .map(|(i, h)| self.idx.tx_raw_slice(h.tx, lo[i], hi[i]).unwrap())
-                    .collect();
-                add(seg(
-                    texts,
-                    &r.codes[r.pos(pair[0].query.start + half(&pair[0]))
-                        ..r.pos(pair[1].query.start + half(&pair[1]))],
-                    align::Mode::Global,
-                    false,
-                    None,
-                )
-                .map(|(d, _, _)| d));
-                *lo = hi;
+                let (c0, c1) = (cuts(&pair[0]).1, cuts(&pair[1]).0);
+                let hi = starts(&pair[1], c1, Some((c0, lo, &pair[0])));
+                add(between(
+                    r,
+                    (pair[0].query.start + c0, pair[1].query.start + c1),
+                    lo,
+                    &hi,
+                ));
+                let (at, d) = inside(r, &pair[1], hi);
+                add(d);
+                *lo = at;
                 continue;
             }
             let (left, right) = (&pair[0], &pair[1]);
@@ -1324,7 +1391,7 @@ impl<C: Chainer> Mapper<C> {
         }
         // Left end: read[0, q0) against transcript windows ending at each candidate's anchor.
         let first = &blocks[0];
-        let h0 = half(first);
+        let h0 = cuts(first).0;
         let q0 = first.query.start + h0;
         if q0 > 0 {
             let spans: Vec<(u32, u32, u32)> = hits
@@ -1363,7 +1430,7 @@ impl<C: Chainer> Mapper<C> {
                             .is_some_and(|r| !r.sequence_eq(&r0))
                     })
                 });
-        let hl = half(last);
+        let hl = cuts(last).1;
         let ql = if hl > 0 {
             last.query.start + hl
         } else if through {
@@ -1540,8 +1607,9 @@ impl<C: Chainer> Mapper<C> {
         false
     }
 
-    /// The [`AntiSeed`]s of transcript `x`, sorted by position.
-    fn anti_seeds(&self, x: u32) -> &[AntiSeed] {
+    /// The [`MateSeg`]s of transcript `x`, by mate: of the mates sharing at least two seeds
+    /// with it.
+    fn mate_segs(&self, x: u32) -> &[MateSeg] {
         self.anti[x as usize].get_or_init(|| {
             let tlen = self.idx.tx_plen()[x as usize];
             let mut codes = self.idx.tx_codes(x, 0, tlen);
@@ -1549,21 +1617,51 @@ impl<C: Chainer> Mapper<C> {
             codes.iter_mut().for_each(|c| *c = 3 - *c);
             let mut seeds = Vec::new();
             self.seeder.seed_codes_into(&codes, &mut seeds, &mut Vec::new());
-            let mut out: Vec<AntiSeed> = seeds
-                .iter()
-                .filter_map(|s| {
-                    let r = self.idx.lookup(s.label);
-                    let found = !r.is_empty()
-                        && r.len() <= self.p.anchor.h_max
-                        && self.node_occurrences(r.clone(), |t, _| t != x);
-                    found.then_some(AntiSeed {
-                        x: tlen - s.end,
-                        len: s.end - s.start,
-                        nodes: (r.start, r.end),
-                    })
-                })
-                .collect();
-            out.sort_unstable_by_key(|a| a.x);
+            // Per occurrence in another transcript: (mate, c, first base here, length).
+            let mut occ: Vec<(u32, u32, u32, u32)> = Vec::new();
+            for s in &seeds {
+                let r = self.idx.lookup(s.label);
+                if r.is_empty() || r.len() > self.p.anchor.h_max {
+                    continue;
+                }
+                let (from, at, len) = (occ.len(), tlen - s.end, s.end - s.start);
+                let over = self.node_occurrences(r, |t, p| {
+                    if t != x {
+                        occ.push((t, at + p + len, at, len));
+                    }
+                    occ.len() - from > MATE_MAX_OCC
+                });
+                if over {
+                    occ.truncate(from);
+                }
+            }
+            occ.sort_unstable();
+            let mut out: Vec<MateSeg> = Vec::new();
+            let mut i = 0;
+            while i < occ.len() {
+                let t = occ[i].0;
+                let (from, mut n) = (out.len(), 0);
+                while i < occ.len() && occ[i].0 == t {
+                    let (_, c, at, len) = occ[i];
+                    match out[from..].last_mut() {
+                        Some(m) if m.c == c => {
+                            m.x.1 = m.x.1.max(at + len);
+                            m.w += len;
+                        }
+                        _ => out.push(MateSeg {
+                            t,
+                            x: (at, at + len),
+                            c,
+                            w: len,
+                        }),
+                    }
+                    n += 1;
+                    i += 1;
+                }
+                if n < 2 {
+                    out.truncate(from);
+                }
+            }
             out.into_boxed_slice()
         })
     }
@@ -1586,11 +1684,42 @@ impl<C: Chainer> Mapper<C> {
         )
     }
 
-    /// The transcripts of `found` (transcript -> weight and diagonal range): the `k` of
-    /// largest weight first, in that order, then the others in no order.
-    fn mates(found: &mut Mates, k: usize) -> Vec<(u32, u32, i64, i64)> {
-        let mut out: Vec<(u32, u32, i64, i64)> =
-            found.drain().map(|(t, (w, lo, hi))| (t, w, lo, hi)).collect();
+    /// Transcripts sharing sequence with the region of hit `h` on the opposite strand, with
+    /// the diagonals the read's other orientation would lie on: those sharing at least `min`
+    /// of the read's `plen` parsed bases, the `k` sharing most first, in that order, then the
+    /// others in no order.
+    fn antisense_mates(&self, h: &TxHit, plen: u32, k: usize, min: f32) -> Vec<(u32, u32, i64, i64)> {
+        let segs = self.mate_segs(h.tx);
+        if segs.is_empty() {
+            return Vec::new();
+        }
+        let ((dlo, dhi), (lo, hi)) = self.hit_span(h, plen);
+        let min = ((min * plen as f32) as u64).max(1);
+        stats::add(&stats::MATE_CALLS, 1);
+        stats::add(&stats::MATE_SEEDS, segs.len() as u64);
+        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
+        let mut i = 0;
+        while i < segs.len() {
+            let t = segs[i].t;
+            // Bases shared within the region (a stretch partly inside it counts in
+            // proportion) and the range of diagonals: a seed at read position q of this
+            // orientation lies at plen - q - len of the other.
+            let (mut w, mut d) = (0u64, (i64::MAX, i64::MIN));
+            while i < segs.len() && segs[i].t == t {
+                let m = &segs[i];
+                let (a, b) = (m.x.0.max(lo), m.x.1.min(hi));
+                if a < b {
+                    w += u64::from(m.w) * u64::from(b - a) / u64::from(m.x.1 - m.x.0);
+                    let c = i64::from(m.c) - i64::from(plen);
+                    d = (d.0.min(c - dhi), d.1.max(c - dlo));
+                }
+                i += 1;
+            }
+            if w >= min {
+                out.push((t, w as u32, d.0, d.1));
+            }
+        }
+        stats::add(&stats::MATE_FOUND, out.len() as u64);
         let key = |&(t, w, _, _): &(u32, u32, i64, i64)| (std::cmp::Reverse(w), t);
         if k > 0 && out.len() > k {
             out.select_nth_unstable_by_key(k - 1, key);
@@ -1599,37 +1728,6 @@ impl<C: Chainer> Mapper<C> {
             out.sort_unstable_by_key(key);
         }
         out
-    }
-
-    /// Transcripts sharing sequence with the region of hit `h` on the opposite strand, with
-    /// the diagonals the read's other orientation would lie on: the `k` sharing most first,
-    /// in that order, then the others in no order.
-    fn antisense_mates(&self, h: &TxHit, plen: u32, k: usize) -> Vec<(u32, u32, i64, i64)> {
-        let seeds = self.anti_seeds(h.tx);
-        if seeds.is_empty() {
-            return Vec::new();
-        }
-        let ((dlo, dhi), (lo, hi)) = self.hit_span(h, plen);
-        let seeds = &seeds[seeds.partition_point(|a| a.x < lo)..seeds.partition_point(|a| a.x < hi)];
-        // A seed at read position q of this orientation lies at plen - q - len of the other;
-        // its position here + its first base in the mate + its length is constant along one
-        // antisense match.
-        MATES.with(|found| {
-            let found = &mut *found.borrow_mut();
-            for a in seeds {
-                self.node_occurrences(a.nodes.0..a.nodes.1, |t, p| {
-                    if t != h.tx {
-                        let d = i64::from(a.x + p + a.len) - i64::from(plen);
-                        let e = found.entry(t).or_insert((0, d - dhi, d - dlo));
-                        e.0 += a.len;
-                        e.1 = e.1.min(d - dhi);
-                        e.2 = e.2.max(d - dlo);
-                    }
-                    false
-                });
-            }
-            Self::mates(found, k)
-        })
     }
 
     fn map_strand(&self, (seq, raw_read): (Vec<u8>, Option<RawRead>), salt: u64) -> Strand {
@@ -1849,8 +1947,28 @@ impl<C: Chainer> Mapper<C> {
                     || (rescued && h.score < t + g.weak_margin)
             });
             if weak {
+                stats::add(&stats::WEAK, 1);
+                // The candidates of both orientations: one whose shared seeds fall far short
+                // of the best candidate's (of either orientation) is not chained, past the
+                // first few of its orientation.
+                let (mut va, mut vb) = (
+                    r.global_votes(&st.seq, g.weak_cands),
+                    r.global_votes(&other.seq, g.weak_cands),
+                );
+                let most = va.first().map_or(0, |c| c.0).max(vb.first().map_or(0, |c| c.0));
+                for v in [&mut va, &mut vb] {
+                    let keep = v
+                        .iter()
+                        .enumerate()
+                        .take_while(|&(k, c)| {
+                            k < g.weak_keep || f64::from(c.0) >= f64::from(g.weak_rel) * f64::from(most)
+                        })
+                        .count();
+                    v.truncate(keep);
+                }
                 let seed = |s: &Strand| {
-                    let mut h = r.global_hits(&self.idx, &s.seq, &self.p.chain, g.weak_cands);
+                    let v = if std::ptr::eq(s, &st) { &va } else { &vb };
+                    let mut h = r.global_chain(&self.idx, &s.seq, &self.p.chain, v);
                     sort_hits(&mut h, salt);
                     h
                 };
@@ -1936,6 +2054,7 @@ impl<C: Chainer> Mapper<C> {
                         (h.tx, lo, hi)
                     })
                     .collect();
+                stats::add(&stats::RECHAIN_TX, txs.len() as u64);
                 r.rescue_txs(&self.idx, seq, &txs, &self.p.chain)
             };
             // A read whose base-level chain anchors enough of it, with no rival on the other
@@ -1946,8 +2065,9 @@ impl<C: Chainer> Mapper<C> {
                         && top.anchored as f32 >= s.anchored * plen as f32
                         && other.hits.first().is_none_or(|o| o.score < s.other * top.score)
                 });
+            stats::add(&stats::UNSETTLED, u64::from(!settled));
             let mates = if r.p.antisense > 0 && matches!(self.p.strands, Strands::Both) && !settled {
-                self.antisense_mates(&top, plen, r.p.antisense)
+                self.antisense_mates(&top, plen, r.p.antisense, r.p.antisense_share)
             } else {
                 Vec::new()
             };
@@ -1987,9 +2107,7 @@ impl<C: Chainer> Mapper<C> {
             }
             // The other orientation, if it competes, gets what this one got: its best hits
             // chained at the rescue level, then the transcripts its candidates left out.
-            if let Some((_, g)) = global
-                && g.other
-                && !settled
+            if !settled
                 && let (Some(a), Some(b)) = (st.hits.first(), other.hits.first().cloned())
                 && let Some(tb) = &self.p.tiebreak
                 && (anti || b.score >= a.score - tb.margin_abs.max(tb.orient_margin_rel * a.score.abs()))
@@ -2000,8 +2118,10 @@ impl<C: Chainer> Mapper<C> {
                     let new = rechain(&other.hits, &other.seq, &b, w);
                     merge(&mut other.hits, new);
                 }
-                let new = r.global_hits(&self.idx, &other.seq, &self.p.chain, g.extra_cands);
-                merge(&mut other.hits, new);
+                if let Some((_, g)) = global {
+                    let new = r.global_hits(&self.idx, &other.seq, &self.p.chain, g.extra_cands);
+                    merge(&mut other.hits, new);
+                }
             }
         }
         let rescued_any = rescued || targeted;

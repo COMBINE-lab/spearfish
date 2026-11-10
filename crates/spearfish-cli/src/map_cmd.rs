@@ -91,9 +91,11 @@ pub struct Args {
     settings: MapArgs,
 }
 
-/// The settings that differ between presets, for `--help`.
+/// The settings that differ between presets, for `--help` (the `-fast` presets, which turn
+/// off what came after 0.1.0, are described in a line).
 fn preset_table() -> String {
-    let opts: Vec<serde_json::Value> = spearfish::Preset::ALL
+    use spearfish::Preset;
+    let opts: Vec<serde_json::Value> = [Preset::Ont, Preset::Drna, Preset::Hifi]
         .iter()
         .map(|&p| serde_json::to_value(MapOptions::preset(p)).unwrap())
         .collect();
@@ -133,7 +135,9 @@ fn preset_table() -> String {
     for (k, v) in rows {
         s += &format!("  {k:w$}  {}\n", v.join("  "));
     }
-    s + "\n`spearfish map --print-params [--preset P] [settings]` prints every parameter."
+    s + "\nont-fast, drna-fast and hifi-fast map as 0.1.0 did: faster on noisy reads and in less\n\
+         memory, less accurate, and every read with a chain is reported.\n\
+         \n`spearfish map --print-params [--preset P] [settings]` prints every parameter."
 }
 
 /// Per-thread and total counts.

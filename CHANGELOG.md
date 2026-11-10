@@ -31,12 +31,22 @@
 
   On simulated ONT reads, correctly placed reads rise by about 0.4 points at 5% error and 1.5
   points at 10%, and transcript abundances from oarfish follow the truth more closely at
-  every error rate from 3% to 14%. The cost: mapping ONT reads takes about one and a half
-  times the instructions at 5% error and nearly twice at 10%, and the table and the
-  transcripts' rescue seeds (`--rescue-store`) are made at startup, in under a second on 64
-  threads and about 4.5 GB more memory for a human transcriptome.
-  `--no-rescue-global --no-rescue-store --rescue-rechain 0 --rescue-antisense 0` maps as
-  before. The `hifi` preset, which has no rescue, is unchanged in cost.
+  every error rate from 3% to 14%. The cost: ONT cDNA reads take 1.2 to 1.35 times the CPU
+  time they took (direct RNA reads about the same), and mapping takes 1.5 to 2 GB more
+  memory for a human transcriptome, for the table and the transcripts' rescue seeds
+  (`--rescue-store`). The `hifi` preset, which has no rescue, costs what it did.
+- **The index holds the rescue tables.** `spearfish index` writes the table and the
+  transcripts' rescue seeds into the index, as sections that 0.1.0 skips, so mapping starts
+  as fast as it did. They about double the file (2.6 GB for a human transcriptome) and add
+  about a second to the build. `spearfish index --no-rescue-tables` (`rescue_tables` in the
+  library and in Python) leaves them out; with such an index, or one built by 0.1.0, the
+  `ont` and `drna` presets make them at every start, in about half a second on 32 threads
+  and 1.7 GB more memory at the peak. Nothing else in the index changed, and its format
+  version is the same.
+- **`ont-fast`, `drna-fast` and `hifi-fast` presets** map as 0.1.0 did: the same hits and
+  scores, every read with a chain reported; of the mapping changes listed here, only the
+  score scale applies to them. On noisy reads they are faster and less accurate than the
+  presets they are named for, and they never read the rescue tables.
 - Tie-break (all presets unless noted):
   - Read orientations that nearly tie are compared by exact local alignment around each
     chain (`--orient-exact`; off for `hifi`), and an orientation's poly(A) tail counts only

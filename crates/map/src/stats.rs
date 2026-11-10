@@ -60,6 +60,21 @@ counters!(
     CHAIN_PLACEMENTS,
     RESCUE_PTS,
     RESCUE_PTS_DP,
+    UNSETTLED,
+    WEAK,
+    RECHAIN_TX,
+    REQUESTS,
+    REQ_INSIDE,
+    REQ_SAME_SEEDS,
+    REQ_SAME_POINTS,
+    VOTE_CALLS,
+    VOTE_KEYS,
+    VOTE_POSTS,
+    VOTE_KEPT,
+    VOTE_CANDS,
+    MATE_CALLS,
+    MATE_SEEDS,
+    MATE_FOUND,
 );
 
 #[inline]

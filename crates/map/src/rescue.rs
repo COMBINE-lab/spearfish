@@ -5,9 +5,9 @@
 //! transcripts, they are informative. Candidates are the strand's best genes by base-level
 //! score (those scoring at least `alpha` times the best gene, at most
 //! [`RescueParams::max_genes_for`] of them) and, in each, the `max_tx_per_gene` transcripts
-//! with the most base anchors, skipping those longer than `max_tx_len` (windows, with `window`). With `window` set,
-//! only the part of each transcript the read can occupy is re-seeded; identical windows (or
-//! whole transcripts) are seeded once per read orientation. Transcript sequences come from the
+//! with the most base anchors. With `window` set, only the part of each transcript the read
+//! can occupy is re-seeded (parts longer than `max_tx_len` are skipped); identical windows
+//! (or whole transcripts) are seeded once per read orientation. Transcript sequences come from the
 //! index (parsed, 2-bit), so no extra index is needed.
 //!
 //! The same seeds serve reads the base level did place, when the placement is in doubt
@@ -23,11 +23,14 @@
 //! For these every transcript's rescue seeds are made once and kept
 //! ([`RescueParams::store`], [`Rescuer::build_tables`]).
 
+use std::sync::Arc;
+
 use index::Index;
 use seeds::{BaseSeeder, Seed};
 
 use crate::anchor::{self, AnchorParams};
 use crate::chain::{ChainParams, Pt, TxHit, best_chains};
+use crate::tables::{self, Global, LOOKUPS, Store, Window, mix, tuple};
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RescueParams {
@@ -40,8 +43,13 @@ pub struct RescueParams {
     /// length, and a short read's few base anchors rank its true gene among many genes that
     /// share one common label with it (0: `max_genes` for every read).
     pub genes_len: u32,
-    /// Skip transcripts (with `window`, transcript windows) longer than this (parsed bases).
+    /// Skip transcript windows longer than this (parsed bases).
     pub max_tx_len: u32,
+    /// `max_tx_len` bounds the window re-seeded (off: the whole transcript's length, whatever
+    /// part of it the window is, as in 0.1.0: a read from a transcript longer than the cap
+    /// then has no rescue there).
+    #[serde(default)]
+    pub cap_window: bool,
     /// Per gene, re-seed at most this many transcripts: those with the most base anchors.
     pub max_tx_per_gene: usize,
     /// Re-seed only the window of each transcript the read can occupy (projected from its
@@ -66,12 +74,24 @@ pub struct RescueParams {
     /// tie-break's orientation margin (0: always).
     #[serde(default)]
     pub antisense_min: f32,
-    /// Keep every transcript's rescue seeds in memory, made once when the mapper is built,
-    /// instead of parsing each transcript window again for every read that needs it. Costs
-    /// eight bytes per rescue seed of the transcriptome; without it only the occasional
-    /// low-coverage read pays for rescue seeds, with it every read may use them cheaply.
+    /// Those transcripts share at least this fraction of the read's parsed bases with the
+    /// best hit's region (0: any shared seed).
+    #[serde(default)]
+    pub antisense_share: f32,
+    /// Take every transcript's rescue seeds from a table (read from the index, or made once
+    /// when the mapper is built if the index has none) instead of parsing each transcript
+    /// window again for every read that needs it. The table keeps stretches of seeds that
+    /// transcripts share once; without it only the occasional low-coverage read pays for
+    /// rescue seeds, with it every read may use them cheaply.
     #[serde(default)]
     pub store: bool,
+    /// With `store`, a window's stored seeds become chaining points only within this many
+    /// window slacks (`window`'s pad + read share) of the diagonals the request names (0:
+    /// every seed of the window that matches a read seed). A request names the diagonals of
+    /// a chain or of shared table keys, and matches far from them are repeats that cost
+    /// chaining work without joining the chain.
+    #[serde(default)]
+    pub band: f32,
     /// Chain a read's best base-level hits again at the rescue level, in their own windows:
     /// those scoring within this fraction of the best (or the tie-break margin, if wider), at
     /// most [`RECHAIN_MAX`] of them (None: only reads the hierarchical rescue takes get
@@ -108,7 +128,7 @@ impl Default for Settled {
         Settled {
             anchored: 0.3,
             anchors: 3,
-            other: 0.5,
+            other: 0.65,
         }
     }
 }
@@ -136,13 +156,19 @@ pub struct GlobalParams {
     pub weak_margin: f32,
     /// Transcripts chained per orientation of a weak read: those sharing the most keys.
     pub weak_cands: usize,
-    /// Transcripts chained for any other read that is not [`Settled`], next to its
-    /// base-level candidates (0: none). Few are needed: these reads have a good hit, and
-    /// more candidates mostly add equally good alternates of large families.
+    /// Of those, past the first `weak_keep` of an orientation, only the ones sharing at
+    /// least `weak_rel` times as many keys as the best candidate of either orientation
+    /// (0: all `weak_cands`). The true transcript is rarely far down the list, and chaining
+    /// the tail of it is most of a weak read's cost.
+    #[serde(default)]
+    pub weak_rel: f32,
+    #[serde(default)]
+    pub weak_keep: usize,
+    /// Transcripts chained for a read the rescue took that is not weak, next to the
+    /// transcripts of the rescue's candidate genes (0: none). Few are needed: these reads
+    /// have a good hit, and more candidates mostly add equally good alternates of large
+    /// families.
     pub extra_cands: usize,
-    /// The other read orientation gets the same when its best chain competes with this
-    /// one's (within the tie-break's orientation margin).
-    pub other: bool,
 }
 
 impl Default for GlobalParams {
@@ -153,8 +179,9 @@ impl Default for GlobalParams {
             min_shared: 2,
             weak_margin: 10.0,
             weak_cands: 64,
+            weak_rel: 0.25,
+            weak_keep: 8,
             extra_cands: 8,
-            other: true,
         }
     }
 }
@@ -166,13 +193,16 @@ impl Default for RescueParams {
             max_genes: 16,
             genes_len: 350,
             max_tx_len: 50_000,
+            cap_window: true,
             max_tx_per_gene: 128,
             window: Some((10, 50)),
             other_margin: Some(30.0),
             alpha: 0.5,
             antisense: 16,
             antisense_min: 0.5,
+            antisense_share: 0.05,
             store: true,
+            band: 4.0,
             rechain: Some(0.5),
             settled: Some(Settled::default()),
             global: Some(GlobalParams::default()),
@@ -201,122 +231,9 @@ pub struct Rescuer {
     global: Option<Global>,
     /// The seeds of [`RescueParams::store`].
     store: Option<Store>,
-}
-
-/// Every transcript's rescue seeds as (label hash, start), in start order per transcript.
-/// Transcripts are kept [`PIECE_TX`] to a piece, as the builder's threads made them.
-pub struct Store {
-    pieces: Vec<StorePiece>,
-}
-
-/// Transcripts per piece of the tables' build (a power of two).
-const PIECE_TX: usize = 256;
-
-#[derive(Default)]
-struct StorePiece {
-    /// Where each transcript's seeds start in `seeds` (one more entry closes the last).
-    off: Vec<u32>,
-    seeds: Vec<(u32, u32)>,
-}
-
-impl Store {
-    /// The seeds of transcript `t` (of `tlen` parsed bases) that start in `[lo, hi)`.
-    fn window(&self, t: u32, tlen: u32, lo: u32, hi: u32) -> &[(u32, u32)] {
-        let (p, i) = (&self.pieces[t as usize / PIECE_TX], t as usize % PIECE_TX);
-        let s = &p.seeds[p.off[i] as usize..p.off[i + 1] as usize];
-        let a = first_from(s, lo, Self::guess(s.len(), tlen, lo));
-        let b = first_from(s, hi, Self::guess(s.len(), tlen, hi).max(a));
-        &s[a..b]
-    }
-
-    /// About where, among a transcript's `n` seeds, those starting at `pos` are: seeds are
-    /// spread nearly evenly along a transcript.
-    fn guess(n: usize, tlen: u32, pos: u32) -> usize {
-        (u64::from(pos) * n as u64 / u64::from(tlen.max(1))) as usize
-    }
-
-    /// Ask the caches for what [`Self::prefetch_window`] and [`Self::window`] of `t` read
-    /// first.
-    fn prefetch_tx(&self, t: u32) {
-        let (p, i) = (&self.pieces[t as usize / PIECE_TX], t as usize % PIECE_TX);
-        index::prefetch(p.off.as_ptr().wrapping_add(i));
-    }
-
-    /// Ask the caches for the seeds [`Self::window`] searches from (reads the transcript's
-    /// offsets: call it after [`Self::prefetch_tx`] has had time to land).
-    fn prefetch_window(&self, t: u32, tlen: u32, lo: u32) {
-        let (p, i) = (&self.pieces[t as usize / PIECE_TX], t as usize % PIECE_TX);
-        let (a, b) = (p.off[i] as usize, p.off[i + 1] as usize);
-        let at = p.seeds.as_ptr().wrapping_add(a + Self::guess(b - a, tlen, lo));
-        index::prefetch(at);
-        index::prefetch(at.wrapping_add(8));
-    }
-}
-
-/// The first of the seeds `s` (in start order) that starts at `x` or later, searched outward
-/// from index `g`: a few probes next to each other when the guess is close, where a binary
-/// search of a long transcript's seeds misses the caches at every step.
-fn first_from(s: &[(u32, u32)], x: u32, g: usize) -> usize {
-    let n = s.len();
-    let g = g.min(n);
-    // The answer is in `lo..=hi`.
-    let (mut lo, mut hi) = (0, n);
-    let mut step = 1;
-    if g < n && s[g].1 < x {
-        lo = g + 1;
-        while lo + step - 1 < n {
-            let k = lo + step - 1;
-            if s[k].1 < x {
-                lo = k + 1;
-                step *= 2;
-            } else {
-                hi = k;
-                break;
-            }
-        }
-    } else {
-        hi = g;
-        while step <= hi {
-            let k = hi - step;
-            if s[k].1 < x {
-                lo = k + 1;
-                break;
-            }
-            hi = k;
-            step *= 2;
-        }
-    }
-    lo + s[lo..hi].partition_point(|y| y.1 < x)
-}
-
-/// A hash of the seeds `w` of a transcript window that windows with the same seeds elsewhere
-/// along a transcript share: starts count from the first seed's. Four interleaved chains, so
-/// that the multiplications of one seed do not wait for those of the last.
-fn window_hash(w: &[(u32, u32)]) -> u64 {
-    let s0 = w.first().map_or(0, |x| x.1);
-    let mut h = [
-        0x9e37_79b9_7f4a_7c15u64,
-        0xc2b2_ae3d_27d4_eb4f,
-        0x1656_67b1_9e37_79f9,
-        0x27d4_eb2f_1656_67c5,
-    ];
-    let step = |h: u64, x: &(u32, u32)| {
-        (h ^ (u64::from(x.0) << 32 | u64::from(x.1 - s0)))
-            .wrapping_mul(0xff51_afd7_ed55_8ccd)
-            .rotate_left(29)
-    };
-    let (quads, rest) = w.as_chunks::<4>();
-    for q in quads {
-        for (h, x) in h.iter_mut().zip(q) {
-            *h = step(*h, x);
-        }
-    }
-    for (h, x) in h.iter_mut().zip(rest) {
-        *h = step(*h, x);
-    }
-    h.iter().fold(w.len() as u64, |a, &b| {
-        (a.rotate_left(23) ^ b).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-    })
+    /// Whether the tables had to be made, the index keeping none of this rescue scheme
+    /// ([`Self::build_tables`]).
+    tables_made: bool,
 }
 
 /// Read seed label -> its first seed in the read: an open-addressing table sized for the
@@ -370,259 +287,6 @@ impl LabelTable {
     }
 }
 
-/// A rescue seed label as the store keeps it.
-fn mix(label: u64) -> u32 {
-    (label.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as u32
-}
-
-/// The table key of a run of consecutive rescue seeds, from their label hashes (the store
-/// has no more of a label).
-fn tuple(it: impl Iterator<Item = u32>) -> u64 {
-    it.fold(0x9e37_79b9_7f4a_7c15, |h, l| {
-        (h ^ u64::from(l))
-            .wrapping_mul(0xff51_afd7_ed55_8ccd)
-            .rotate_left(29)
-    })
-}
-
-/// Every transcript's runs of consecutive rescue seeds: tuple key -> (transcript, start of
-/// the run's first seed). Keys are split by their top eight bits.
-pub struct Global {
-    buckets: Vec<Bucket>,
-}
-
-/// The keys of one value of the top eight bits.
-#[derive(Default)]
-struct Bucket {
-    /// The distinct keys in order, and where each one's postings start (one more entry
-    /// closes the last).
-    keys: Vec<u64>,
-    first: Vec<u32>,
-    /// Where the keys of each value of the next `DIR_BITS` bits start in `keys`.
-    dir: Vec<u32>,
-    posts: Vec<(u32, u32)>,
-}
-
-const BUCKETS: usize = 256;
-const DIR_BITS: u32 = 16;
-/// Buckets sorted at a time while the table is built: the unsorted postings of that many
-/// are all the build holds beyond its input and the table.
-const GROUP: usize = 32;
-
-/// A run of rescue seeds while the table is built: (key, transcript, start).
-type Run = (u64, u32, u32);
-
-impl Bucket {
-    /// The bucket of `runs`, all of its keys. A directory cell holds a handful of runs: they
-    /// are dealt out by cell first, in place and in two steps (each to few enough places for
-    /// the caches), which leaves little for the comparison sort.
-    fn new(runs: &mut [Run]) -> Self {
-        assert!(runs.len() < u32::MAX as usize, "too many rescue seed postings");
-        let low = DIR_BITS / 2;
-        deal(runs, 1 << (DIR_BITS - low), |k| Self::dir_of(k) >> low);
-        for part in runs.chunk_by_mut(|a, b| Self::dir_of(a.0) >> low == Self::dir_of(b.0) >> low) {
-            deal(part, 1 << low, |k| Self::dir_of(k) & ((1 << low) - 1));
-            for cell in part.chunk_by_mut(|a, b| Self::dir_of(a.0) == Self::dir_of(b.0)) {
-                cell.sort_unstable();
-            }
-        }
-        let (mut keys, mut first) = (Vec::new(), Vec::new());
-        let mut dir = vec![0u32; (1 << DIR_BITS) + 1];
-        let mut at = 0u32;
-        for run in runs.chunk_by(|a, b| a.0 == b.0) {
-            keys.push(run[0].0);
-            first.push(at);
-            at += run.len() as u32;
-            dir[Self::dir_of(run[0].0) + 1] += 1;
-        }
-        first.push(at);
-        for d in 0..1 << DIR_BITS {
-            dir[d + 1] += dir[d];
-        }
-        keys.shrink_to_fit();
-        first.shrink_to_fit();
-        Bucket {
-            keys,
-            first,
-            dir,
-            posts: runs.iter().map(|&(_, t, s)| (t, s)).collect(),
-        }
-    }
-
-    fn dir_of(key: u64) -> usize {
-        (key >> (56 - DIR_BITS)) as usize & ((1 << DIR_BITS) - 1)
-    }
-}
-
-/// Reorder `runs` by `digit` of their keys (below `n`), in place: each run is swapped to the
-/// next free place of its digit until the one that belongs here turns up.
-fn deal(runs: &mut [Run], n: usize, digit: impl Fn(u64) -> usize) {
-    let mut end = vec![0usize; n];
-    for r in runs.iter() {
-        end[digit(r.0)] += 1;
-    }
-    let mut at = Vec::with_capacity(n);
-    let mut sum = 0;
-    for e in &mut end {
-        at.push(sum);
-        sum += *e;
-        *e = sum;
-    }
-    for d in 0..n {
-        while at[d] < end[d] {
-            let mut r = runs[at[d]];
-            loop {
-                let k = digit(r.0);
-                if k == d {
-                    break;
-                }
-                std::mem::swap(&mut r, &mut runs[at[k]]);
-                at[k] += 1;
-            }
-            runs[at[d]] = r;
-            at[d] += 1;
-        }
-    }
-}
-
-/// Table keys looked up side by side ([`Global::get_batch`]).
-const LOOKUPS: usize = 32;
-
-impl Global {
-    /// The postings of each of `keys` (at most [`LOOKUPS`]) to `f`, with the key's index. A
-    /// lookup reads four places in turn, each of them rarely in the caches; taking every
-    /// step for all the keys before the next lets the caches fetch them side by side.
-    fn get_batch<'a>(&'a self, keys: &[u64], mut f: impl FnMut(usize, &'a [(u32, u32)])) {
-        debug_assert!(keys.len() <= LOOKUPS);
-        let bucket = |k: u64| &self.buckets[(k >> 56) as usize];
-        for &k in keys {
-            index::prefetch(bucket(k).dir.as_ptr().wrapping_add(Bucket::dir_of(k)));
-        }
-        // Each key's range of `keys`, then of `posts` (empty: no such key).
-        let mut at = [(0u32, 0u32); LOOKUPS];
-        for (&k, at) in keys.iter().zip(&mut at) {
-            let (b, d) = (bucket(k), Bucket::dir_of(k));
-            *at = (b.dir[d], b.dir[d + 1]);
-            index::prefetch(b.keys.as_ptr().wrapping_add(at.0 as usize));
-            index::prefetch(b.keys.as_ptr().wrapping_add((at.1 as usize).saturating_sub(1)));
-        }
-        for (&k, at) in keys.iter().zip(&mut at) {
-            let b = bucket(k);
-            *at = match b.keys[at.0 as usize..at.1 as usize].binary_search(&k) {
-                Ok(i) => {
-                    let i = at.0 as usize + i;
-                    index::prefetch(b.first.as_ptr().wrapping_add(i));
-                    index::prefetch(b.first.as_ptr().wrapping_add(i + 1));
-                    (i as u32, 1)
-                }
-                Err(_) => (0, 0),
-            };
-        }
-        for (&k, at) in keys.iter().zip(&mut at) {
-            if at.1 != 0 {
-                let b = bucket(k);
-                *at = (b.first[at.0 as usize], b.first[at.0 as usize + 1]);
-                // The first lines of the postings; a longer list is read in order.
-                for i in (at.0..at.1).step_by(8).take(4) {
-                    index::prefetch(b.posts.as_ptr().wrapping_add(i as usize));
-                }
-            }
-        }
-        for (i, (&k, at)) in keys.iter().zip(&at).enumerate() {
-            f(i, &bucket(k).posts[at.0 as usize..at.1 as usize]);
-        }
-    }
-
-    /// The table of the runs of `tk` seeds in the store's `pieces` (`hist`: each piece's runs
-    /// per bucket; `tops`: the bucket of each of its runs, in order), on `nt` threads. Buckets
-    /// are made [`GROUP`] at a time: the seeds are read once per group, and only one group's
-    /// postings are ever held unsorted.
-    fn build(pieces: &[StorePiece], hist: &[Vec<u32>], tops: Vec<Vec<u8>>, tk: usize, nt: usize) -> Self {
-        let mut tops = Some(tops);
-        let size = |b: usize| hist.iter().map(|h| h[b] as usize).sum::<usize>();
-        let most = (0..BUCKETS)
-            .step_by(GROUP)
-            .map(|b0| (b0..b0 + GROUP).map(size).sum())
-            .max()
-            .unwrap_or(0);
-        let mut runs: Vec<Run> = vec![(0, 0, 0); most];
-        let mut buckets: Vec<(usize, Bucket)> = Vec::with_capacity(BUCKETS);
-        for b0 in (0..BUCKETS).step_by(GROUP) {
-            // Each bucket's runs, cut into the parts the pieces fill.
-            let mut of_bucket: Vec<&mut [Run]> = Vec::with_capacity(GROUP);
-            let mut rest = runs.as_mut_slice();
-            for b in b0..b0 + GROUP {
-                let (a, r) = rest.split_at_mut(size(b));
-                of_bucket.push(a);
-                rest = r;
-            }
-            let mut parts: Vec<Vec<&mut [Run]>> = hist.iter().map(|_| Vec::with_capacity(GROUP)).collect();
-            for (b, v) in of_bucket.iter_mut().enumerate() {
-                let mut rest = &mut **v;
-                for (h, part) in hist.iter().zip(&mut parts) {
-                    let (a, r) = rest.split_at_mut(h[b0 + b] as usize);
-                    part.push(a);
-                    rest = r;
-                }
-            }
-            let work = std::sync::Mutex::new(parts.into_iter().enumerate());
-            let of_piece = tops.as_deref().unwrap();
-            std::thread::scope(|sc| {
-                for _ in 0..nt {
-                    sc.spawn(|| {
-                        loop {
-                            let Some((p, mut part)) = work.lock().unwrap().next() else {
-                                break;
-                            };
-                            let sp = &pieces[p];
-                            let mut top = of_piece[p].iter();
-                            let mut fill = [0usize; GROUP];
-                            for (i, o) in sp.off.windows(2).enumerate() {
-                                let t = (p * PIECE_TX + i) as u32;
-                                for w in sp.seeds[o[0] as usize..o[1] as usize].windows(tk) {
-                                    let b = usize::from(*top.next().unwrap()).wrapping_sub(b0);
-                                    if b < GROUP {
-                                        let key = tuple(w.iter().map(|x| x.0));
-                                        part[b][fill[b]] = (key, t, w[0].1);
-                                        fill[b] += 1;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-            if b0 + GROUP >= BUCKETS {
-                // Read for the last time: gone before the last buckets take their memory.
-                tops = None;
-            }
-            let work = std::sync::Mutex::new(of_bucket.into_iter().enumerate());
-            let made: Vec<(usize, Bucket)> = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..nt.min(GROUP))
-                    .map(|_| {
-                        sc.spawn(|| {
-                            let mut out = Vec::new();
-                            loop {
-                                let Some((b, runs)) = work.lock().unwrap().next() else {
-                                    break;
-                                };
-                                out.push((b0 + b, Bucket::new(runs)));
-                            }
-                            out
-                        })
-                    })
-                    .collect();
-                hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-            });
-            buckets.extend(made);
-        }
-        buckets.sort_unstable_by_key(|x| x.0);
-        Global {
-            buckets: buckets.into_iter().map(|x| x.1).collect(),
-        }
-    }
-}
-
 /// One read orientation's rescue state: its seeds and the windows chained so far, which
 /// later calls for the same orientation reuse.
 #[derive(Default)]
@@ -637,7 +301,7 @@ struct Session {
     read_next: Vec<u32>,
     /// Distinct window (hash of its points, their number) -> its index in `results`.
     seen: rustc_hash::FxHashMap<(u64, u32), u32>,
-    /// With stored seeds: a window's seeds ([`window_hash`], their number) -> its index in
+    /// With stored seeds: a window's seeds ([`Window::key`], their chunks) -> its index in
     /// `results`, and where its points' transcript positions count from, relative to its
     /// first seed. Isoforms mostly repeat a window seed for seed, and then need no join.
     seen_seeds: rustc_hash::FxHashMap<(u64, u32), (u32, i64)>,
@@ -735,7 +399,13 @@ impl Rescuer {
             seeder,
             global: None,
             store: None,
+            tables_made: false,
         })
+    }
+
+    /// Whether the tables were made for this mapper rather than read from the index.
+    pub fn tables_made(&self) -> bool {
+        self.tables_made
     }
 
     /// Whether reads can be seeded against the whole transcriptome ([`RescueParams::global`],
@@ -744,84 +414,29 @@ impl Rescuer {
         self.global.is_some()
     }
 
-    /// Parse every transcript at the rescue level, once, for the table of
-    /// [`RescueParams::global`] and the seeds of [`RescueParams::store`] (nothing to do
-    /// without either).
-    pub fn build_tables(&mut self, idx: &Index) {
+    /// The tables of [`RescueParams::global`] and [`RescueParams::store`] (nothing to do
+    /// without either): those kept in the index, if they are of this rescue scheme, or else
+    /// every transcript parsed at the rescue level, once.
+    pub fn build_tables(&mut self, idx: &Arc<Index>) {
         let (tuple_k, store) = (self.p.global.map(|g| g.tuple.max(1)), self.p.store);
         if tuple_k.is_none() && !store {
             return;
         }
-        let n = idx.n_transcripts();
-        let nt = std::thread::available_parallelism()
-            .map_or(8, |x| x.get())
-            .min(64);
-        let seeder = &self.seeder;
-        // Pieces of PIECE_TX transcripts, taken by whichever thread is free. A thread grows
-        // its seeds in one buffer and keeps each piece as an exact copy, so that no piece
-        // holds more memory than its seeds.
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let n_pieces = n.div_ceil(PIECE_TX);
-        let mut made: Vec<(usize, StorePiece, Vec<u32>, Vec<u8>)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..nt)
-                .map(|_| {
-                    sc.spawn(|| {
-                        let mut out = Vec::new();
-                        let (mut codes, mut sd) = (Vec::new(), Vec::new());
-                        let (mut off, mut seeds) = (Vec::new(), Vec::new());
-                        loop {
-                            let p = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if p >= n_pieces {
-                                break;
-                            }
-                            off.clear();
-                            seeds.clear();
-                            off.push(0);
-                            let mut hist = vec![0u32; BUCKETS];
-                            let mut top = Vec::new();
-                            for t in p * PIECE_TX..((p + 1) * PIECE_TX).min(n) {
-                                codes.clear();
-                                idx.tx_codes_into(t as u32, 0, idx.tx_plen()[t], &mut codes);
-                                seeder.seed_starts_codes_into(&codes, &mut sd);
-                                if !sd.is_sorted_by_key(|x| x.1) {
-                                    sd.sort_unstable_by_key(|x| x.1);
-                                }
-                                let from = seeds.len();
-                                seeds.extend(sd.iter().map(|&(l, s)| (mix(l), s)));
-                                if let Some(tk) = tuple_k {
-                                    for w in seeds[from..].windows(tk) {
-                                        let b = (tuple(w.iter().map(|x| x.0)) >> 56) as u8;
-                                        hist[usize::from(b)] += 1;
-                                        top.push(b);
-                                    }
-                                }
-                                off.push(seeds.len() as u32);
-                            }
-                            let piece = StorePiece {
-                                off: off.clone(),
-                                seeds: seeds.clone(),
-                            };
-                            top.shrink_to_fit();
-                            out.push((p, piece, hist, top));
-                        }
-                        out
-                    })
-                })
-                .collect();
-            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
-        made.sort_unstable_by_key(|x| x.0);
-        let (mut pieces, mut hist, mut tops) = (Vec::new(), Vec::new(), Vec::new());
-        for (_, sp, h, top) in made {
-            pieces.push(sp);
-            hist.push(h);
-            tops.push(top);
-        }
-        if let Some(tk) = tuple_k {
-            self.global = Some(Global::build(&pieces, &hist, tops, tk, nt.min(32)));
-        }
+        let (s, g) = match tables::load(idx, &self.p.spec, tuple_k) {
+            Some(kept) => kept,
+            None => {
+                self.tables_made = true;
+                let nt = std::thread::available_parallelism()
+                    .map_or(8, |x| x.get())
+                    .min(64);
+                let codes =
+                    |t: u32, out: &mut Vec<u8>| idx.tx_codes_into(t, 0, idx.tx_plen()[t as usize], out);
+                tables::build(&self.seeder, idx.n_transcripts(), &codes, tuple_k, nt)
+            }
+        };
+        self.global = g;
         if store {
-            self.store = Some(Store { pieces });
+            self.store = Some(s);
         }
     }
 
@@ -829,6 +444,13 @@ impl Rescuer {
     /// most table keys with it on nearby diagonals ([`RescueParams::global`]; none without
     /// the table). Hits are unsorted.
     pub fn global_hits(&self, idx: &Index, seq: &[u8], cp: &ChainParams, n: usize) -> Vec<TxHit> {
+        let cand = self.global_votes(seq, n);
+        self.global_chain(idx, seq, cp, &cand)
+    }
+
+    /// The candidates of [`Self::global_hits`]: (shared keys within one diagonal window,
+    /// transcript, lowest and highest diagonal), most keys first.
+    pub fn global_votes(&self, seq: &[u8], n: usize) -> Vec<(u32, u32, i64, i64)> {
         let (Some(g), Some(table)) = (&self.p.global, &self.global) else {
             return Vec::new();
         };
@@ -838,7 +460,25 @@ impl Rescuer {
         RESCUE.with(|sc| {
             let sc = &mut *sc.borrow_mut();
             self.begin(seq, sc);
-            let cand = Self::votes(g, table, seq.len(), n, sc);
+            Self::votes(g, table, seq.len(), n, sc)
+        })
+    }
+
+    /// Rescue hits of one read orientation (`seq`, parsed) in the candidates `cand` of
+    /// [`Self::global_votes`]. Hits are unsorted.
+    pub fn global_chain(
+        &self,
+        idx: &Index,
+        seq: &[u8],
+        cp: &ChainParams,
+        cand: &[(u32, u32, i64, i64)],
+    ) -> Vec<TxHit> {
+        if cand.is_empty() {
+            return Vec::new();
+        }
+        RESCUE.with(|sc| {
+            let sc = &mut *sc.borrow_mut();
+            self.begin(seq, sc);
             crate::stats::add(&crate::stats::RESCUE_STRANDS, 1);
             for (k, &(_, t, lo, hi)) in cand.iter().enumerate() {
                 let next = cand.get(k + 1).map(|&(_, t, lo, hi)| (t, lo, hi));
@@ -873,15 +513,26 @@ impl Rescuer {
             }
             table.get_batch(&batch[..m], |i, posts| {
                 if posts.len() <= max_occ {
-                    let start = read[from + i].start;
-                    keys.extend(
-                        posts
-                            .iter()
-                            .map(|&(t, p)| (u64::from(t) << 32) | (p as i64 - start as i64 + OFF) as u64),
-                    );
+                    let d = OFF - i64::from(read[from + i].start);
+                    let at = keys.len();
+                    keys.resize(at + posts.len(), 0);
+                    let mut out = keys[at..].iter_mut();
+                    posts.for_each(|t, p| {
+                        if let Some(o) = out.next() {
+                            *o = (u64::from(t) << 32) | (i64::from(p) + d) as u64;
+                        }
+                    });
+                    let unread = out.len();
+                    keys.truncate(keys.len() - unread);
                 }
             });
         }
+        crate::stats::add(&crate::stats::VOTE_CALLS, 1);
+        crate::stats::add(
+            &crate::stats::VOTE_KEYS,
+            (read.len() + 1).saturating_sub(tk) as u64,
+        );
+        crate::stats::add(&crate::stats::VOTE_POSTS, keys.len() as u64);
         // Most postings are the only one of their transcript, which then cannot be a
         // candidate: count postings by a hash of the transcript, and sort only those that
         // have, or may have, enough company.
@@ -907,6 +558,7 @@ impl Rescuer {
             }
             keys.truncate(kept);
         }
+        crate::stats::add(&crate::stats::VOTE_KEPT, keys.len() as u64);
         keys.sort_unstable();
         let w = 32 + plen as u64 / 8;
         // Per transcript: the most seeds within `w` diagonals.
@@ -935,6 +587,7 @@ impl Rescuer {
             }
             i = j;
         }
+        crate::stats::add(&crate::stats::VOTE_CANDS, cand.len() as u64);
         if keys.capacity() > VOTES_KEEP {
             *keys = Vec::new();
             sc.counts = Vec::new();
@@ -1008,15 +661,19 @@ impl Rescuer {
     }
 
     /// [`Self::point_keys`] of a transcript window starting at `lo`, by its stored seeds `win`.
-    fn stored_point_keys(win: &[(u32, u32)], lo: u32, sc: &mut Scratch) {
+    fn stored_point_keys(win: &Window, lo: u32, band: (i64, i64), sc: &mut Scratch) {
         sc.keys.clear();
-        for &(label, start) in win {
-            let mut i = sc.s.read_at.get(u64::from(label));
+        let (s, keys) = (&sc.s, &mut sc.keys);
+        win.for_each(|label, start| {
+            let mut i = s.read_at.get(u64::from(label));
             while i != u32::MAX {
-                sc.keys.push((u64::from(i) << 32) | u64::from(start - lo));
-                i = sc.s.read_next[i as usize];
+                let d = i64::from(start) - i64::from(s.read[i as usize].start);
+                if band.0 <= d && d <= band.1 {
+                    keys.push((u64::from(i) << 32) | u64::from(start - lo));
+                }
+                i = s.read_next[i as usize];
             }
-        }
+        });
         sc.keys.sort_unstable();
     }
 
@@ -1184,8 +841,9 @@ impl Rescuer {
     fn request(&self, idx: &Index, cp: &ChainParams, plen: usize, w: (u32, i64, i64), sc: &mut Scratch) {
         let t = w.0;
         let (tlen, lo, hi) = self.window_of(idx, plen, w);
+        crate::stats::add(&crate::stats::REQUESTS, 1);
         // The cap bounds the bases re-seeded: a window of a longer transcript is within it.
-        if hi - lo > self.p.max_tx_len {
+        if (if self.p.cap_window { hi - lo } else { tlen }) > self.p.max_tx_len {
             return;
         }
         // A window within one already chained for this transcript has no better chain.
@@ -1193,6 +851,7 @@ impl Rescuer {
         while k != u32::MAX {
             let (w, next) = sc.s.tx_wins[k as usize];
             if w.0 <= lo && hi <= w.1 {
+                crate::stats::add(&crate::stats::REQ_INSIDE, 1);
                 sc.reqs.push((t, w.2, w.3));
                 return;
             }
@@ -1204,17 +863,34 @@ impl Rescuer {
             Some(store) => {
                 let win = store.window(t, tlen, lo, hi);
                 // The same seeds as an earlier window's make the same points.
-                let (skey, s0) = (
-                    (window_hash(win), win.len() as u32),
-                    win.first().map_or(lo, |x| x.1),
-                );
+                let s0 = win.first_start().unwrap_or(lo);
+                // Only the stored seeds a read on the requested diagonals can chain through
+                // become points: `band` window slacks on either side of them.
+                let bm = f64::from(self.p.band);
+                let band = if bm > 0.0 {
+                    let slack = self.p.window.map_or(0.0, |(pad, div)| {
+                        f64::from(pad) + (plen / div.max(1) as usize) as f64
+                    });
+                    let b = (bm * slack) as i64;
+                    (w.1 - b, w.2 + b)
+                } else {
+                    (i64::MIN, i64::MAX)
+                };
+                let bh = if bm > 0.0 {
+                    ((band.0 - i64::from(s0)) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        ^ ((band.1 - i64::from(s0)) as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+                } else {
+                    0
+                };
+                let skey = (win.key(s0) ^ bh, win.chunks() as u32);
                 if let Some(&(r, d)) = sc.s.seen_seeds.get(&skey) {
+                    crate::stats::add(&crate::stats::REQ_SAME_SEEDS, 1);
                     let base = (i64::from(s0) + d).max(0) as u32;
                     Self::note(t, (lo, hi, base, r), sc);
                     return;
                 }
                 seeds = Some((skey, s0));
-                Self::stored_point_keys(win, lo, sc);
+                Self::stored_point_keys(&win, lo, band, sc);
                 // Equal points up to a shift along the transcript have equal chains: the
                 // points are kept relative to the first one's transcript position.
                 let first = sc.keys.iter().map(|&k| k as u32).min().unwrap_or(0);
@@ -1232,7 +908,10 @@ impl Rescuer {
             }
         };
         let r = match sc.s.seen.get(&key) {
-            Some(&r) => r,
+            Some(&r) => {
+                crate::stats::add(&crate::stats::REQ_SAME_POINTS, 1);
+                r
+            }
             None => {
                 crate::stats::add(&crate::stats::RESCUE_TX, 1);
                 crate::stats::add(&crate::stats::RESCUE_TX_BASES, (hi - lo) as u64);

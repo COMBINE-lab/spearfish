@@ -284,11 +284,11 @@ pub struct MapSettings {
     /// Rescue: re-seed the other orientation regardless of its score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_other_always: Option<bool>,
-    /// Rescue: skip transcripts longer than this (compressed bases).
+    /// Rescue: skip transcript parts longer than this (compressed bases).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_max_tx_len: Option<u32>,
-    /// Rescue: keep every transcript's rescue seeds in memory (made when the mapper is
-    /// built) instead of parsing transcript windows per read.
+    /// Rescue: map with every transcript's rescue seeds (read from the index, or made when
+    /// the mapper is built) instead of parsing transcript windows per read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_store: Option<bool>,
     /// Rescue: chain a read's best hits again at the rescue level, those scoring within
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn unset_settings_are_the_preset() {
-        for p in [Preset::Ont, Preset::Drna, Preset::Hifi] {
+        for p in Preset::ALL {
             assert_eq!(MapSettings::preset(p).resolve().unwrap(), MapOptions::preset(p));
             assert_eq!(MapSettings::builder(p).build(), MapSettings::preset(p));
         }
@@ -790,10 +790,10 @@ mod tests {
                 .resolve()
                 .is_err()
         );
-        // Read rejection: every preset has it, by the same rule.
-        for p in [Preset::Ont, Preset::Drna, Preset::Hifi] {
-            let rule = MapOptions::preset(p).params.min_score.unwrap();
-            assert_eq!(rule, map::MinScore::default());
+        // Read rejection: every preset has it, by the same rule, but the `-fast` ones.
+        for p in Preset::ALL {
+            let rule = MapOptions::preset(p).params.min_score;
+            assert_eq!(rule, (!p.fast()).then(map::MinScore::default));
         }
         let o = MapSettings::builder(Preset::Hifi)
             .min_score(50.0)

@@ -268,8 +268,11 @@ impl PyIndex {
     /// :param collapse: Graph nodes per ``"gene"`` (label, gene) or ``"global"`` (label).
     /// :param threads: Build threads (0: every available CPU).
     /// :param allow_collisions: Build even if two seed contents share a label.
+    /// :param rescue_tables: Keep the rescue tables the ``"ont"`` and ``"drna"`` presets map
+    ///     with in the index (about twice the size); without them every :class:`Mapper` of
+    ///     those presets makes them when it is built.
     #[staticmethod]
-    #[pyo3(signature = (transcripts, output=None, *, t2g=None, infer_genes=None, scheme="lcp:K=3", hpc=true, mask_genes=20, collapse="gene", threads=0, allow_collisions=false))]
+    #[pyo3(signature = (transcripts, output=None, *, t2g=None, infer_genes=None, scheme="lcp:K=3", hpc=true, mask_genes=20, collapse="gene", threads=0, allow_collisions=false, rescue_tables=true))]
     #[allow(clippy::too_many_arguments)]
     fn build(
         py: Python<'_>,
@@ -283,6 +286,7 @@ impl PyIndex {
         collapse: &str,
         threads: usize,
         allow_collisions: bool,
+        rescue_tables: bool,
     ) -> PyResult<Self> {
         let per_gene = match collapse {
             "gene" => true,
@@ -356,6 +360,7 @@ impl PyIndex {
             .f_max(mask_genes)
             .per_gene(per_gene)
             .allow_collisions(allow_collisions)
+            .rescue_tables(rescue_tables)
             .maybe_infer_genes(infer)
             .build();
         let pool = pool(threads)?;
@@ -582,7 +587,7 @@ fn settings_from(preset: &str, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<M
 /// The complete parameters a preset and settings resolve to, as a dict (what ``spearfish map
 /// --print-params`` prints).
 ///
-/// :param preset: ``"ont"``, ``"drna"`` or ``"hifi"``.
+/// :param preset: ``"ont"``, ``"drna"`` or ``"hifi"``, or one of them with ``-fast``.
 /// :param settings: Settings changed from the preset (see :data:`SETTINGS`).
 #[pyfunction]
 #[pyo3(signature = (preset="ont", **settings))]
@@ -1144,7 +1149,8 @@ impl PyMapper {
 impl PyMapper {
     /// :param index: The :class:`Index` to map against.
     /// :param preset: ``"ont"`` (ONT cDNA, the default), ``"drna"`` (ONT direct RNA) or
-    ///     ``"hifi"`` (PacBio HiFi).
+    ///     ``"hifi"`` (PacBio HiFi); ``"ont-fast"``, ``"drna-fast"`` and ``"hifi-fast"`` map
+    ///     as 0.1.0 did, faster and less accurately, and report every read with a chain.
     /// :param threads: Threads for :meth:`map_batch` and :meth:`map_file` (0: every
     ///     available CPU).
     /// :param settings: Settings changed from the preset.

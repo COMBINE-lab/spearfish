@@ -33,6 +33,7 @@ setting.
 | `ont` (default) | ONT cDNA (PCR-cDNA and direct cDNA) | Both orientations; minimap2 `map-ont` scores; read ends aligned in uncompressed sequence; spans extended to the read ends; low-coverage rescue and rescue-level work for doubtful reads (see [Doubtful reads](#doubtful-reads)). |
 | `drna` | ONT direct RNA | Sense orientation only; read ends in compressed sequence (no template-switch Gs to correct); shorter poly(A) tails recognized (10 bases); spans end at the outermost anchors. |
 | `hifi` | PacBio HiFi (Kinnex, Iso-Seq) | minimap2 `map-hifi` scores; read-end bands kept on the anchor diagonal; no rescue and no raw-base or exact-alignment comparisons of near ties (`--raw-mid`, `--orient-exact`), since accurate reads rarely need them; spans end at the outermost anchors. |
+| `ont-fast`, `drna-fast`, `hifi-fast` | As the preset each is named for | That preset as spearfish 0.1.0 mapped it: every read with a chain is reported ([no read is rejected](/spearfish/guide/output/#mapped-or-not)), doubtful reads get no extra work, and near ties are compared as they were then. ONT cDNA reads map in about a fifth to a quarter less CPU time and 1.5 to 2 GB less memory, less accurately when reads have many errors; for direct RNA and HiFi reads the time is about the same. |
 
 With every preset, a poly(A) tail at a read's 3′ end is found (a run of A's with at most one
 other base) and trimmed before the read end is aligned, and isoforms whose annotated 3′ end lies
@@ -59,9 +60,11 @@ presets these reads get more work at the rescue level, whose seeds are shorter a
   with the best hit (`--rescue-antisense`).
 
 `--rescue-settled` sets how well a chain must cover its read for the read to skip all this.
-The table and every transcript's rescue seeds (`--rescue-store`) are made when mapping starts:
-for a human transcriptome that takes under a second on 64 threads and about 4.5 GB of memory
-on top of the index. `--no-rescue-global --no-rescue-store` gives the memory back, at some cost in
+The table and every transcript's rescue seeds (`--rescue-store`) are read from the index, where
+`spearfish index` keeps them, and take 1.5 to 2 GB of memory for a human transcriptome. With an
+index that lacks them (built with `--no-rescue-tables`, or by spearfish 0.1.0) they are made when
+mapping starts, which takes about half a second on 32 threads and 1.7 GB more memory at the
+peak. `--no-rescue-global --no-rescue-store` gives the memory back, at some cost in
 accuracy on high-error reads; `--no-rescue` turns the rescue off altogether, tables included.
 
 ## Changing settings

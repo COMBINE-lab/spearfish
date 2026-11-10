@@ -41,7 +41,8 @@ transcript by chance. spearfish reports a read unmapped when its best chain scor
 `--min-score` + `--min-score-ln-len` · ln(read length / 1000): 36 for a 1,000-base read, 27 for
 100 bases, 45 for 10,000. The threshold grows with the logarithm of the read's length because
 the best chance chain does, as the largest of the chance matches a longer read has more room
-for. Every preset uses the same rule.
+for. Every preset uses the same rule, except the `-fast` ones, which report every read with a
+chain.
 
 The rescue's seeds are denser, and on low-complexity and foreign reads their chance matches
 chain past the threshold more often. A best hit that only the rescue found, and that scores
