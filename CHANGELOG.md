@@ -2,6 +2,10 @@
 
 ## 0.1.1 (unreleased)
 
+- `spearfish simulate` can make harder read sets: `--expressed` (fraction of transcripts with
+  any abundance), `--fragment` and `--min-fragment` (internal fragments), `--rate-sd` (per-read
+  error rates), `--junk` (random sequence at the read ends) and `--unmappable` (reads of random
+  sequence, named `r<i>|*|*|0|0`). Without them it writes the reads it wrote before.
 - `spearfish --version` and every output's provenance name the commit a crates.io build was
   packaged from (`.cargo_vcs_info.json`), where they said `unknown`.
 - `bump_and_publish.sh` resumes an interrupted release: run it again from the same checkout,
