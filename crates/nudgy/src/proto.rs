@@ -2,10 +2,12 @@
 //!
 //! - An arena has one thread at a time (a bit of a `TAKEN` word). What the thread leaves in the
 //!   arena's counts when it gives the arena back must be visible to the next thread.
-//! - A chunk has two counts: `LIVE`, blocks handed out minus those the arena's thread freed,
-//!   which only that thread reads and writes, and `FREED`, blocks other threads freed. The
-//!   chunk's bytes are handed out again when the two are equal, and whatever the freeing
-//!   threads wrote to the blocks must come before that.
+//! - A chunk has two counts, in bytes and modulo 2^32: `LIVE`, what was handed out of it
+//!   minus what the arena's thread freed, which only that thread reads and writes, and
+//!   `FREED`, what other threads freed. The chunk's bytes are handed out again when the two
+//!   are equal, and whatever the freeing threads wrote to the blocks must come before that.
+//!   A thread keeps the `LIVE` of the chunk it is allocating from to itself, and writes it
+//!   here when it moves to another chunk or gives the arena back.
 //! - `enable` publishes the reservation's address before any thread can get a block of it.
 //!
 //! The functions take the atomics by reference, of the types `crate::sync` names:
@@ -34,24 +36,27 @@ pub(crate) fn give_back(word: &AtomicU64, bit: u32) {
     word.fetch_and(!(1 << bit), Release);
 }
 
-/// Counts a block handed out of a chunk. For the arena's thread only.
-#[inline(always)]
-pub(crate) fn handed_out(live: &AtomicU32) {
-    live.store(live.load(Relaxed).wrapping_add(1), Relaxed);
-}
-
-/// Counts a block that the arena's thread freed, and returns the chunk's `LIVE` after it.
-#[inline(always)]
-pub(crate) fn freed_by_owner(live: &AtomicU32) -> u32 {
-    let now = live.load(Relaxed).wrapping_sub(1);
+/// The arena's thread stops allocating from a chunk whose `LIVE` it counted up to `now`.
+pub(crate) fn left(live: &AtomicU32, now: u32) {
     live.store(now, Relaxed);
-    now
 }
 
-/// Counts a block that a thread other than the arena's freed.
+/// A chunk's `LIVE`, as its arena's thread left it. For the arena's thread only.
 #[inline(always)]
-pub(crate) fn freed_by_other(freed: &AtomicU32) {
-    freed.fetch_add(1, Release);
+pub(crate) fn live(live: &AtomicU32) -> u32 {
+    live.load(Relaxed)
+}
+
+/// Counts `n` bytes that the arena's thread freed in a chunk it is not allocating from.
+#[inline(always)]
+pub(crate) fn freed_by_owner(live: &AtomicU32, n: u32) {
+    live.store(live.load(Relaxed).wrapping_sub(n), Relaxed);
+}
+
+/// Counts `n` bytes that a thread other than the arena's freed.
+#[inline(always)]
+pub(crate) fn freed_by_other(freed: &AtomicU32, n: u32) {
+    freed.fetch_add(n, Release);
 }
 
 /// Whether a chunk whose `LIVE` is `live` holds no block. For the arena's thread only.
@@ -59,12 +64,6 @@ pub(crate) fn freed_by_other(freed: &AtomicU32) {
 pub(crate) fn holds_none(live: u32, freed: &AtomicU32) -> bool {
     // Acquire: what the threads that freed the chunk's blocks wrote to them came first.
     live == freed.load(Acquire)
-}
-
-/// Whether a chunk holds no block. For the arena's thread only.
-#[inline(always)]
-pub(crate) fn is_empty(live: &AtomicU32, freed: &AtomicU32) -> bool {
-    holds_none(live.load(Relaxed), freed)
 }
 
 /// `enable`: the reservation is at `at`, and blocks of up to `limit` bytes come from it.

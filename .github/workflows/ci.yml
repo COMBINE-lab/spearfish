@@ -118,7 +118,7 @@ jobs:
         env:
           SPEARFISH_BIN: ${{ github.workspace }}/target/debug/spearfish
 
-  # crates/nudge-alloc, the allocator behind `--bump-alloc`, beyond its ordinary tests (the test
+  # crates/nudgy, the allocator behind `--bump-alloc`, beyond its ordinary tests (the test
   # jobs above run those, the loom models of its cross-thread protocol among them): its small
   # test under Miri, over several thread schedules, and its stress tests for longer and with
   # debug assertions.
@@ -129,11 +129,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo miri test --locked -p nudge-alloc --test miri
+      - run: cargo miri test --locked -p nudgy --test miri
         env:
           MIRIFLAGS: -Zmiri-many-seeds=0..8
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo +stable test --locked --release -p nudge-alloc --test stress
+      - run: cargo +stable test --locked --release -p nudgy --test stress
         env:
           STRESS_SECS: 10
           RUSTFLAGS: -C debug-assertions -C overflow-checks

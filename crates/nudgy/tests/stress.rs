@@ -1,6 +1,6 @@
 //! Stress tests, from the allocator's safety review: arena hand-over with frees by the new
 //! owner and by third threads, allocation and frees during thread-local destruction, realloc
-//! across the 1 KB boundary, and thread churn with a shared pool of blocks. Every block knows
+//! across the largest size an arena serves, and thread churn with a shared pool of blocks. Every block knows
 //! its contents and checks them when it is freed.
 //!
 //! `STRESS_SECS` sets the length of each timed test (default 1, to keep `cargo test` short).
@@ -15,10 +15,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use nudge_alloc::{self as alloc, Bump};
+use nudgy::{self as alloc, Bump};
 
 #[global_allocator]
 static GLOBAL: Bump<System> = Bump::new(System);
+
+/// The largest block an arena serves.
+const M: usize = alloc::MAX_BLOCK;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -136,7 +139,13 @@ fn new_owner_and_third_thread_free_the_old_owners_blocks() {
                 let batch: Vec<_> = theirs.drain(..k).collect();
                 tx.send(batch).unwrap();
                 for _ in 0..rng.next() % 40 {
-                    let blk = Blk::new(1 + rng.next() % 1024);
+                    // One in eight around the largest size served, to grow and shrink across it.
+                    let near = rng.next().is_multiple_of(8);
+                    let blk = Blk::new(if near {
+                        M - 200 + rng.next() % 400
+                    } else {
+                        1 + rng.next() % 1024
+                    });
                     if rng.next().is_multiple_of(4) {
                         keep.push(blk);
                     }
@@ -253,7 +262,7 @@ fn tls_destructors_free_and_allocate_while_arenas_change_hands() {
     eprintln!("tls: {n} rounds of 24 threads");
 }
 
-/// Realloc across the 1024 boundary and the in-place paths, through the allocator directly.
+/// Realloc across the largest size served and the in-place paths, through the allocator directly.
 #[test]
 fn realloc_across_the_boundary() {
     assert!(alloc::enable());
@@ -265,18 +274,18 @@ fn realloc_across_the_boundary() {
         };
         let ok = |p: *mut u8, n: usize, t: u8| (0..n).all(|i| *p.add(i) == t.wrapping_add(i as u8));
         for &(a, b, c) in &[
-            (1usize, 1024usize, 1025usize),
-            (1000, 1025, 100),
-            (1024, 1023, 1),
-            (17, 16, 4000),
-            (500, 9000, 1024),
-            (64, 1024, 64),
+            (1usize, M, M + 1),
+            (M - 24, M + 1, 100),
+            (M, M - 1, 1),
+            (17, 16, 4 * M),
+            (500, 9 * M, M),
+            (64, M, 64),
         ] {
             for align in [1usize, 2, 8, 16, 32, 64] {
                 let l = Layout::from_size_align(a, align).unwrap();
                 let p = GLOBAL.alloc(l);
                 assert!(!p.is_null() && (p as usize).is_multiple_of(align));
-                assert_eq!(alloc::in_arena(p), a <= 1024 && align <= 16);
+                assert_eq!(alloc::in_arena(p), a <= M && align <= 16);
                 fill(p, a, 3);
                 // A block after it, so the next realloc of p cannot be in place (sometimes).
                 let lx = Layout::from_size_align(48, 8).unwrap();
@@ -347,7 +356,7 @@ fn thread_churn_with_a_shared_pool() {
                         let mut mine: Vec<Blk> = Vec::new();
                         for _ in 0..life {
                             let len = 1 + if rng.next().is_multiple_of(64) {
-                                rng.next() % 3000
+                                rng.next() % (M + M / 2)
                             } else {
                                 rng.next() % 400
                             };

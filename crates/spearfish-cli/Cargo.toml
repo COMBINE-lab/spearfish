@@ -21,7 +21,7 @@ doc = false
 spearfish.workspace = true
 # The allocator behind `spearfish map --bump-alloc`. It has its own version, so it is named
 # here and not among the workspace's dependencies, which share the workspace's.
-nudge-alloc = { path = "../nudge-alloc", version = "0.1.0" }
+nudgy = { path = "../nudgy", version = "0.1.0" }
 long-read-rad.workspace = true
 anyhow.workspace = true
 mimalloc.workspace = true

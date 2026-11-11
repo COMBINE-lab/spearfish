@@ -9,7 +9,7 @@ use std::alloc::System;
 use std::cell::RefCell;
 use std::sync::mpsc;
 
-use nudge_alloc::{self as alloc, Bump};
+use nudgy::{self as alloc, Bump};
 
 #[global_allocator]
 static GLOBAL: Bump<System> = Bump::new(System);
@@ -57,9 +57,10 @@ fn miri_protocol() {
             g.truncate(3);
             g.shrink_to_fit();
             ok(t, &g);
-            let big: Vec<u8> = blk(1, 1000);
-            let mut big = big;
-            big.extend((1000..1100).map(|i| 1u8.wrapping_add(i as u8)));
+            // Out of the arena as it grows.
+            let n = alloc::MAX_BLOCK - 24;
+            let mut big: Vec<u8> = blk(1, n);
+            big.extend((n..n + 100).map(|i| 1u8.wrapping_add(i as u8)));
             ok(1, &big);
             assert!(alloc::in_arena(mine[0].1.as_ptr()));
             mine

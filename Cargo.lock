@@ -837,7 +837,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nudge-alloc"
+name = "nudgy"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -1448,7 +1448,7 @@ dependencies = [
  "log",
  "long-read-rad",
  "mimalloc",
- "nudge-alloc",
+ "nudgy",
  "paraseq",
  "rayon",
  "rustc-hash",

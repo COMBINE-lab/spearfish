@@ -25,7 +25,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 // mimalloc, behind the per-thread arenas that `spearfish map --bump-alloc` turns on.
 #[global_allocator]
-static GLOBAL: nudge_alloc::Bump<mimalloc::MiMalloc> = nudge_alloc::Bump::new(mimalloc::MiMalloc);
+static GLOBAL: nudgy::Bump<mimalloc::MiMalloc> = nudgy::Bump::new(mimalloc::MiMalloc);
 
 /// `--version`: the version and git revision; `--version` (long) also the target and SIMD.
 fn long_version() -> &'static str {

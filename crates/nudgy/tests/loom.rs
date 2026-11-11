@@ -48,8 +48,9 @@ impl Arena {
     fn give_back(&self) {
         proto::give_back(&self.taken, 0);
     }
+    /// What the arena's thread asks of a chunk it is not allocating from.
     fn is_empty(&self) -> bool {
-        proto::is_empty(&self.live, &self.freed)
+        proto::holds_none(proto::live(&self.live), &self.freed)
     }
     fn write(&self, v: u64) {
         // SAFETY: loom checks that no other access is concurrent.
@@ -72,9 +73,10 @@ fn a_block_freed_by_a_third_thread_after_its_arena_changed_hands() {
         let a = {
             let s = s.clone();
             thread::spawn(move || {
-                proto::handed_out(&s.live);
+                // A block of 16 bytes: the thread counts it itself until it leaves the chunk.
                 s.write(7);
                 s.sent.store(true, Release);
+                proto::left(&s.live, 16);
                 s.give_back();
             })
         };
@@ -85,7 +87,7 @@ fn a_block_freed_by_a_third_thread_after_its_arena_changed_hands() {
                     thread::yield_now();
                 }
                 assert_eq!(s.read(), 7);
-                proto::freed_by_other(&s.freed);
+                proto::freed_by_other(&s.freed, 16);
             })
         };
         let b = {
@@ -93,7 +95,7 @@ fn a_block_freed_by_a_third_thread_after_its_arena_changed_hands() {
             thread::spawn(move || {
                 if s.take() {
                     // What A counted is visible to the arena's next thread.
-                    assert_eq!(s.live.load(Relaxed), 1);
+                    assert_eq!(s.live.load(Relaxed), 16);
                     if s.is_empty() {
                         s.write(9);
                     }
@@ -115,10 +117,10 @@ fn an_arena_changes_hands_after_its_thread_freed_its_block() {
         let a = {
             let s = s.clone();
             thread::spawn(move || {
-                proto::handed_out(&s.live);
+                // A block of 16 bytes, allocated and freed: the thread's own count is 0 again.
                 s.write(7);
-                let live = proto::freed_by_owner(&s.live);
-                assert!(proto::holds_none(live, &s.freed));
+                assert!(proto::holds_none(0, &s.freed));
+                proto::left(&s.live, 0);
                 s.give_back();
             })
         };
@@ -144,21 +146,76 @@ fn the_owner_and_another_thread_free_the_last_two_blocks() {
     loom::model(|| {
         let s = Arena::new();
         assert!(s.take());
-        proto::handed_out(&s.live);
+        // Two blocks of 16 bytes, of which the thread frees one: its own count is 16.
         s.write(1);
-        proto::handed_out(&s.live);
         let c = {
             let s = s.clone();
             thread::spawn(move || {
                 assert_eq!(s.read(), 1);
-                proto::freed_by_other(&s.freed);
+                proto::freed_by_other(&s.freed, 16);
             })
         };
-        let live = proto::freed_by_owner(&s.live);
-        if proto::holds_none(live, &s.freed) || s.is_empty() {
+        if proto::holds_none(16, &s.freed) {
+            s.write(3);
+        } else {
+            // Its next look, after it left the chunk for another.
+            proto::left(&s.live, 16);
+            if s.is_empty() {
+                s.write(3);
+            }
+        }
+        c.join().unwrap();
+        assert!(proto::holds_none(16, &s.freed));
+    });
+}
+
+/// The same in a chunk the arena's thread has left for another: its frees go to the chunk's
+/// `LIVE`, and it uses the chunk again when a later look finds it empty.
+#[test]
+fn the_owner_and_another_thread_free_the_last_two_blocks_of_a_chunk_it_left() {
+    loom::model(|| {
+        let s = Arena::new();
+        assert!(s.take());
+        s.write(1);
+        proto::left(&s.live, 32);
+        let c = {
+            let s = s.clone();
+            thread::spawn(move || {
+                assert_eq!(s.read(), 1);
+                proto::freed_by_other(&s.freed, 16);
+            })
+        };
+        proto::freed_by_owner(&s.live, 16);
+        if s.is_empty() {
             s.write(3);
         }
         c.join().unwrap();
+        assert!(s.is_empty());
+    });
+}
+
+/// Two threads other than the arena's free its last two blocks at once: both frees count,
+/// and the arena's thread, which waits for neither, does not use the chunk before both.
+#[test]
+fn two_other_threads_free_the_last_two_blocks() {
+    loom::model(|| {
+        let s = Arena::new();
+        assert!(s.take());
+        s.write(1);
+        proto::left(&s.live, 32);
+        let free = |s: &Arc<Arena>| {
+            let s = s.clone();
+            thread::spawn(move || {
+                assert_eq!(s.read(), 1);
+                proto::freed_by_other(&s.freed, 16);
+            })
+        };
+        let (c, d) = (free(&s), free(&s));
+        if s.is_empty() {
+            s.write(3);
+        }
+        c.join().unwrap();
+        d.join().unwrap();
         assert!(s.is_empty());
     });
 }
@@ -176,7 +233,7 @@ fn one_arena_goes_to_one_thread() {
                     if s.take() {
                         got.fetch_add(1, Relaxed);
                         // The arena's thread alone writes LIVE.
-                        proto::handed_out(&s.live);
+                        proto::left(&s.live, 16);
                         s.write(5);
                     }
                 })
@@ -186,7 +243,7 @@ fn one_arena_goes_to_one_thread() {
             h.join().unwrap();
         }
         assert_eq!(got.load(Relaxed), 1);
-        assert_eq!(s.live.load(Relaxed), 1);
+        assert_eq!(s.live.load(Relaxed), 16);
     });
 }
 
@@ -204,7 +261,7 @@ fn enable_publishes_the_reservation_before_any_block() {
         let block = Arc::new(AtomicUsize::new(0));
         let enable = {
             let (base, on, small) = (base.clone(), on.clone(), small.clone());
-            thread::spawn(move || proto::turn_on(&base, &on, &small, AT, 1024))
+            thread::spawn(move || proto::turn_on(&base, &on, &small, AT, 8192))
         };
         let allocate = {
             let (base, on, small, block) = (base.clone(), on.clone(), small.clone(), block.clone());

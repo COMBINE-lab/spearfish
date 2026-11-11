@@ -7,10 +7,13 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 
-use nudge_alloc::{self as alloc, Bump};
+use nudgy::{self as alloc, Bump};
 
 #[global_allocator]
 static GLOBAL: Bump<System> = Bump::new(System);
+
+/// The largest block an arena serves.
+const M: usize = alloc::MAX_BLOCK;
 
 /// Whether this target has the arenas; the tests pass (and test little) where it does not.
 fn on() -> bool {
@@ -49,8 +52,8 @@ fn small_blocks_come_from_the_arena() {
     let on = on();
     assert_eq!(alloc::enabled(), on);
     let small = Box::new([7u8; 64]);
-    let edge = vec![1u8; 1024];
-    let large = vec![1u8; 1025];
+    let edge = vec![1u8; M];
+    let large = vec![1u8; M + 1];
     #[repr(align(64))]
     struct Wide(#[allow(dead_code)] u8);
     let wide = Box::new(Wide(1));
@@ -72,7 +75,7 @@ fn blocks_grow_and_shrink_with_their_contents() {
     // Growth in place (the last block), by moving (another block follows), and out of the arena.
     let mut a: Vec<u8> = Vec::new();
     let mut b: Vec<u8> = Vec::new();
-    for i in 0..5000usize {
+    for i in 0..2 * M {
         a.push(i as u8);
         if i % 3 == 0 {
             b.push((i / 3) as u8);
@@ -129,7 +132,7 @@ fn blocks_survive_churn_and_frees_on_other_threads() {
                 let mut pool: Vec<(usize, Vec<u8>)> = Vec::new();
                 for i in 0..200_000usize {
                     let tag = w * 1_000_003 + i;
-                    let len = 1 + rng.next() % if i % 50 == 0 { 3000 } else { 300 };
+                    let len = 1 + rng.next() % if i % 50 == 0 { M + M / 2 } else { 300 };
                     let v = block(tag, len);
                     match rng.next() % 8 {
                         0 => tx.send((tag, v)).unwrap(),
@@ -299,7 +302,14 @@ fn the_next_owner_and_other_threads_free_what_an_arena_held() {
                 }
                 for i in 0..rng.next() % 4 {
                     let tag = 1_000_000 + n * 4 + i;
-                    let mut v = block(tag, 1 + rng.next() % 1024);
+                    // One in eight just under the largest size served, to grow past it.
+                    let near = rng.next().is_multiple_of(8);
+                    let len = if near {
+                        M - rng.next() % 200
+                    } else {
+                        1 + rng.next() % 1024
+                    };
+                    let mut v = block(tag, len);
                     let grown = v.len() + rng.next() % 300;
                     v.extend((v.len()..grown).map(|i| (tag + i) as u8));
                     if rng.next().is_multiple_of(4) {
@@ -401,23 +411,23 @@ fn direct_calls_keep_to_the_contract() {
         let filled = |p: *mut u8, n: usize| (0..n).all(|i| *p.add(i) == (i * 7) as u8);
         // Every alignment, sizes around the largest served.
         for align in [1usize, 2, 4, 8, 16, 32, 64] {
-            for size in [1usize, 15, 16, 17, 1023, 1024, 1025, 5000] {
+            for size in [1usize, 15, 16, 17, M - 1, M, M + 1, 5 * M] {
                 let l = Layout::from_size_align(size, align).unwrap();
                 let mut p = a.alloc_zeroed(l);
                 assert_eq!(p as usize % align, 0);
                 assert!((0..size).all(|i| *p.add(i) == 0));
-                assert_eq!(alloc::in_arena(p), on && size <= 1024 && align <= 16);
+                assert_eq!(alloc::in_arena(p), on && size <= M && align <= 16);
                 fill(p, size);
                 // To the other side of the largest size and back, growing and shrinking. A
                 // block that left the arenas stays the wrapped allocator's.
-                for new in [size + 1, 1024, 1025, 3000, 700, 1, size] {
+                for new in [size + 1, M, M + 1, 3 * M, 700, 1, size] {
                     let was = alloc::in_arena(p);
                     let q = a.realloc(p, l, new);
                     assert_eq!(q as usize % align, 0);
                     assert!(filled(q, size.min(new)));
-                    assert_eq!(alloc::in_arena(q), was && new <= 1024);
+                    assert_eq!(alloc::in_arena(q), was && new <= M);
                     p = a.realloc(q, Layout::from_size_align(new, align).unwrap(), size);
-                    assert_eq!(alloc::in_arena(p), was && new <= 1024);
+                    assert_eq!(alloc::in_arena(p), was && new <= M);
                     assert!(filled(p, size.min(new)));
                     fill(p, size);
                 }

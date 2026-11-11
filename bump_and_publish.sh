@@ -19,9 +19,9 @@ workspace's own dependency versions, dates the CHANGELOG section `## <version> (
 commits, checks that every crate builds from its own package (`cargo publish --workspace
 --dry-run`), tags `v<version>`, and pushes the commit and the tag to origin.
 
-A crate that sets a version of its own (crates/nudge-alloc) keeps it: it is published with
-the release when that version is not on crates.io yet, and the release stops if the crate
-has changed since the version it names was published.
+A crate that sets a version of its own (crates/nudgy) keeps it: it is published with the
+release when that version is not on crates.io yet, and the release stops if the crate has
+changed since the version it names was published.
 
 Options:
   --publish             Publish the crates to crates.io (`cargo publish --workspace`, in
@@ -218,18 +218,24 @@ on_crates_io() {
     [[ "$code" == "200" ]]
 }
 
-# Whether directory $3 is as it was when crate $1 was published at version $2 (the package
-# records the commit it was made from).
+# Whether directory $3 holds what crate $1 was published with at version $2: the package's
+# files are the directory's committed ones. (The package keeps the Cargo.toml as it was
+# written as Cargo.toml.orig, and adds a lockfile and a note of the commit it was made from.)
 unchanged_since_published() {
-    local sha
-    sha="$(curl -sfL -A "spearfish-release (${REPO_URL})" \
+    local tmp same=true
+    tmp="$(mktemp -d)"
+    mkdir "$tmp/published" "$tmp/here"
+    curl -sfL -A "spearfish-release (${REPO_URL})" \
         "https://crates.io/api/v1/crates/$1/$2/download" |
-        tar -xzOf - "$1-$2/.cargo_vcs_info.json" 2>/dev/null |
-        python3 -c 'import json, sys; print(json.load(sys.stdin)["git"]["sha1"])' 2>/dev/null)" ||
-        die "could not read the commit that $1 v$2 was published from"
-    git cat-file -e "${sha}^{commit}" 2>/dev/null ||
-        die "$1 v$2 was published from commit $sha, which is not in this repository"
-    git diff --quiet "$sha" HEAD -- "$3"
+        tar -xzf - -C "$tmp/published" --strip-components 1 ||
+        die "could not download $1 v$2 from crates.io"
+    mv "$tmp/published/Cargo.toml.orig" "$tmp/published/Cargo.toml" ||
+        die "the package of $1 v$2 has no Cargo.toml.orig"
+    rm -f "$tmp/published/Cargo.lock" "$tmp/published/.cargo_vcs_info.json"
+    git archive "HEAD:$3" | tar -xf - -C "$tmp/here" || die "could not read $3 at HEAD"
+    diff -r -q "$tmp/published" "$tmp/here" >&2 || same=false
+    rm -rf "${tmp:?}"
+    [[ "$same" == true ]]
 }
 
 # A crate with a version of its own is uploaded only when that version is new. If the version

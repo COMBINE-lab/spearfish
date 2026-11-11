@@ -3,7 +3,7 @@
 
 use std::alloc::System;
 
-use nudge_alloc::{self as alloc, Bump};
+use nudgy::{self as alloc, Bump};
 
 #[global_allocator]
 static GLOBAL: Bump<System> = Bump::new(System);

@@ -127,13 +127,13 @@ in sync with `origin`:
 4. The script prints the release tarball's URL and `sha256` for the bioconda recipe. bioconda's
    bot proposes the version bump for later releases.
 
-`crates/nudge-alloc` has a version of its own (in its `Cargo.toml`), since it does not depend
-on spearfish and seldom changes. A change to anything in that directory comes with a new
-version there, and in `crates/spearfish-cli/Cargo.toml` when the old requirement no longer
-admits it. The release script publishes the crate with the others when its version is not on
-crates.io yet, and stops before changing anything if the directory has changed since the
-version it names was published. Between spearfish releases, `cargo publish -p nudge-alloc`
-from `main` publishes it alone.
+`crates/nudgy` has a version of its own (in its `Cargo.toml`), since it does not depend on
+spearfish and seldom changes. A change to anything in that directory comes with a new version
+there, and in `crates/spearfish-cli/Cargo.toml` when the old requirement no longer admits it.
+The release script publishes the crate with the others when its version is not on crates.io
+yet, and stops before changing anything if the directory no longer holds the files that
+version was published with. Between spearfish releases, `cargo publish -p nudgy` publishes it
+alone.
 
 oarfish's spearfish backend depends on `spearfish` and `long-read-rad` from crates.io, so an
 oarfish release that needs a new spearfish follows the crates.

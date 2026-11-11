@@ -94,19 +94,19 @@
 - The `low_coverage` flag's documentation said oarfish skips such reads by default; it does
   not, and most of them are correctly placed.
 - **An optional allocator for mapping (`spearfish map --bump-alloc`, the new crate
-  `nudge-alloc`).** Mapping a read makes a few hundred small allocations and frees nearly all
-  of them before the next read. With `--bump-alloc`, blocks of up to 1 KB come from memory
-  that belongs to the allocating thread (64 KB chunks, each used again from its start once
-  its blocks are freed), and everything else from mimalloc as before. Mapping takes about 2%
-  less CPU time, for up to 4 MB of memory a thread; the output is the same. It is off by
-  default, and there on 64-bit Linux and macOS. The allocator is a crate of its own,
-  `nudge-alloc` (`crates/nudge-alloc`, with its own version), and does not depend on
-  spearfish: `nudge_alloc::Bump<A>` wraps any global allocator, a program that embeds the
-  mapper declares it as its global allocator and calls `nudge_alloc::enable()`, and until
-  that call every allocation goes to the wrapped allocator. `nudge_alloc::stats()` says how
-  many arenas were in use and how often a thread went without one (`spearfish map -v` prints
-  it). The crate carries its checks: loom models of what its threads share, a test for Miri
-  and stress tests.
+  [`nudgy`](https://crates.io/crates/nudgy)).** Mapping a read makes a few hundred small
+  allocations and frees nearly all of them before the next read. With `--bump-alloc`, blocks
+  of up to 8 KB come from memory that belongs to the allocating thread (64 KB chunks, each
+  used again from its start once its blocks are freed), and everything else from mimalloc as
+  before. Mapping takes about 3% less CPU time, for 3 to 8 MB of memory a thread; the output
+  is the same. It is off by default, and there on 64-bit Linux and macOS. The allocator is a
+  crate of its own, `nudgy` (`crates/nudgy`, published with its own version), and does not
+  depend on spearfish: `nudgy::Bump<A>` wraps any global allocator, a program that embeds
+  the mapper declares it as its global allocator and calls `nudgy::enable()`, and until that
+  call every allocation goes to the wrapped allocator. `nudgy::stats()` says how many arenas
+  were in use and how often a thread went without one (`spearfish map -v` prints it). The
+  crate carries its checks: loom models of what its threads share, a test for Miri, stress
+  tests and a benchmark of the allocation paths.
 - **`hifi` preset: the poly(A) tail orders the two orientations** (`--tail-first`, on for
   `hifi`). A read that ends in a tail of 20 bases or more in exactly one orientation is mapped
   in that orientation first, and in the other only when the first one's best hit spans less

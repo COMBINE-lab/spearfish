@@ -87,8 +87,8 @@ pub struct Args {
         help_heading = "Input and output"
     )]
     batch_size: usize,
-    /// Take the mapper's small allocations from per-thread arenas: about 2% less CPU time for
-    /// up to 4 MB of memory a thread, and the same output.
+    /// Take the mapper's small allocations from per-thread arenas: about 3% less CPU time for
+    /// 3 to 8 MB of memory a thread, and the same output.
     #[arg(long, hide_short_help = true, help_heading = "Input and output")]
     bump_alloc: bool,
     #[command(flatten)]
@@ -406,7 +406,7 @@ pub fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
     }
-    if args.bump_alloc && !nudge_alloc::enable() {
+    if args.bump_alloc && !nudgy::enable() {
         log::warn!("--bump-alloc is not available on this system; mapping without it");
     }
     execute(Job {
@@ -540,7 +540,7 @@ pub fn execute(args: Job) -> Result<Counts> {
         c.reads as f64 / secs,
         c.bases as f64 / 1e6 / secs
     );
-    let arenas = nudge_alloc::stats();
+    let arenas = nudgy::stats();
     if arenas.enabled {
         log::debug!(
             "bump-alloc: {} arenas at most, {} chunks started, no arena free {} times, arena full {} times (at most {} allocations left to the general allocator)",

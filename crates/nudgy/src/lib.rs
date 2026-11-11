@@ -3,26 +3,26 @@
 //! Some programs make many small allocations and free nearly all of them soon after: a read
 //! mapper makes a few hundred for a read and frees them before the next one. [`Bump`] wraps a
 //! program's global allocator and, once [`enable`] has been called, serves blocks of up to
-//! 1 KB from memory that belongs to the allocating thread: a block is the next free bytes of
-//! the thread's current 64 KB chunk, and a chunk whose blocks have all been freed is used
-//! again from its start. Such a thread then stays in the same few pages, which is where the
-//! gain comes from, for memory of at most 4 MB a thread. Every other allocation, and every
-//! allocation before `enable`, goes to the wrapped allocator, at the cost of one comparison.
-//! (It was written for [spearfish](https://github.com/COMBINE-lab/spearfish), which maps reads
-//! in about 2% less CPU time with it.)
+//! 8 KB ([`MAX_BLOCK`]) from memory that belongs to the allocating thread: a block is the next
+//! free bytes of the thread's current 64 KB chunk, and a chunk whose blocks have all been
+//! freed is used again from its start. Such a thread then stays in the same few pages, which
+//! is where the gain comes from, for memory of at most 4 MB a thread. Every other allocation,
+//! and every allocation before `enable`, goes to the wrapped allocator, at the cost of one
+//! comparison. (It was written for [spearfish](https://github.com/COMBINE-lab/spearfish),
+//! which maps reads in about 3% less CPU time with it.)
 //!
 //! A program opts in twice: it declares the allocator, and it turns the arenas on.
 //!
 //! ```no_run
-//! use nudge_alloc::Bump;
+//! use nudgy::Bump;
 //!
 //! #[global_allocator]
 //! static GLOBAL: Bump<std::alloc::System> = Bump::new(std::alloc::System);
 //!
 //! fn main() {
-//!     nudge_alloc::enable();
+//!     nudgy::enable();
 //!     // ... the work, on any threads ...
-//!     eprintln!("{:?}", nudge_alloc::stats());
+//!     eprintln!("{:?}", nudgy::stats());
 //! }
 //! ```
 //!
@@ -42,6 +42,12 @@
 //! arenas are there on 64-bit Linux and macOS; on other targets `enable` returns false and
 //! `Bump` only forwards.
 //!
+//! An allocation from an arena moves a pointer in the thread's own storage, and a free moves
+//! it back or adds to a count there; neither writes anything that another thread reads. The
+//! last block of a chunk grows and shrinks where it is, so a vector that is being filled is
+//! not copied until another block follows it. `cargo bench` times the common patterns with
+//! and without the arenas.
+//!
 //! As with most allocators, a signal handler must not allocate or free through it. A thread
 //! that never exits normally (after `fork`, or a detached thread when the process ends) keeps
 //! its arena.
@@ -52,8 +58,8 @@
 //! `src/proto.rs`, a file that `tests/loom.rs` also compiles, against
 //! [loom](https://docs.rs/loom)'s atomics, to check every interleaving of small models. A
 //! change to an ordering there is checked by `cargo test`. `tests/miri.rs` is small enough for
-//! Miri (`cargo +nightly miri test --test miri`), and `tests/stress.rs` runs for as long as
-//! `STRESS_SECS` says.
+//! Miri (`cargo +nightly miri test --test miri`), `tests/stress.rs` runs for as long as
+//! `STRESS_SECS` says, and `benches/ops.rs` (`cargo bench`) times an allocation and its free.
 
 #![warn(missing_docs)]
 
@@ -73,8 +79,16 @@ use sync::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 /// arenas and a shorter back-off.
 const TINY: bool = cfg!(miri);
 
-/// Largest block served from an arena, and the alignment of every such block.
-const SMALL: usize = 1024;
+/// The largest block, in bytes, that an arena serves. A larger block, or one aligned to more
+/// than 16 bytes, is the wrapped allocator's.
+///
+/// The limit is a trade. A vector that grows past it is copied to the wrapped allocator, so
+/// a low limit sends vectors there that would have been filled and freed within their chunk;
+/// larger blocks fill a thread's 4 MB sooner, and leave more of a chunk unused at its end
+/// (at most this many bytes of its 64 KB). For spearfish, 8 KB was the best of the limits
+/// from 512 bytes to 32 KB.
+pub const MAX_BLOCK: usize = 8192;
+/// The alignment of every block of an arena.
 const ALIGN: usize = 16;
 const CHUNK_BITS: usize = 16;
 const CHUNK: usize = 1 << CHUNK_BITS;
@@ -91,6 +105,7 @@ const BACKOFF: u32 = if TINY { 64 } else { 4096 };
 /// `Local::skip` of a thread that never looks again.
 const NEVER: u32 = u32::MAX;
 const NO_ARENA: usize = usize::MAX;
+const NO_CHUNK: usize = usize::MAX;
 
 /// Targets with the arenas: their thread-local storage is the linker's, so reading `LOCAL`
 /// inside the allocator never allocates, and no address is within `REGION` of the top of
@@ -120,10 +135,12 @@ static TAKEN: [AtomicU64; ARENAS / 64] = [const { AtomicU64::new(0) }; ARENAS / 
 
 #[repr(align(64))]
 struct PerChunk([AtomicU32; CHUNKS]);
-/// Blocks handed out of each chunk minus those its arena's thread freed. Only that thread
-/// reads or writes it.
+/// Bytes handed out of each chunk minus those its arena's thread freed, modulo 2^32. Only
+/// that thread reads or writes it, and for the chunk it is allocating from it keeps the count
+/// in `Local` instead: this one is behind until the thread leaves the chunk (`leave`).
 static LIVE: PerChunk = PerChunk([const { AtomicU32::new(0) }; CHUNKS]);
-/// Blocks of each chunk that other threads freed. `LIVE == FREED`: the chunk holds no block.
+/// Bytes of each chunk that other threads freed, modulo 2^32. `LIVE == FREED`: the chunk
+/// holds no block (the two differ by the bytes of its live blocks, at most a chunk's).
 static FREED: PerChunk = PerChunk([const { AtomicU32::new(0) }; CHUNKS]);
 
 /// What an arena's threads did, for [`stats`]. Only the arena's thread writes it, so each
@@ -149,15 +166,55 @@ fn tick(count: &AtomicU64) {
 }
 
 /// A thread's arena and its place in the current chunk.
-#[derive(Clone, Copy)]
 struct Local {
-    /// The next free byte of the current chunk, and the chunk's end.
-    ptr: usize,
-    end: usize,
-    chunk: usize,
-    arena: usize,
+    /// The next free byte of the current chunk, and the chunk's end: both zero without one.
+    ptr: Cell<usize>,
+    end: Cell<usize>,
+    /// `ptr - bias`, in its low 32 bits, is the current chunk's `LIVE`. An allocation moves
+    /// `ptr` and so counts itself; a free moves `ptr` back or `bias` up.
+    bias: Cell<usize>,
+    /// The current chunk (one of the arena's), or `NO_CHUNK`.
+    chunk: Cell<usize>,
+    arena: Cell<usize>,
     /// Small allocations still to pass on before `refill` looks for a chunk again.
-    skip: u32,
+    skip: Cell<u32>,
+}
+
+impl Local {
+    const fn new() -> Local {
+        Local {
+            ptr: Cell::new(0),
+            end: Cell::new(0),
+            bias: Cell::new(0),
+            chunk: Cell::new(NO_CHUNK),
+            arena: Cell::new(NO_ARENA),
+            skip: Cell::new(0),
+        }
+    }
+
+    /// The current chunk's `LIVE`.
+    #[inline(always)]
+    fn live(&self) -> usize {
+        self.ptr.get().wrapping_sub(self.bias.get())
+    }
+
+    /// Writes the current chunk's `LIVE` where whoever looks at the chunk next reads it:
+    /// before this thread looks for an empty chunk, and before it gives the arena back.
+    fn leave(&self) {
+        let c = self.chunk.get();
+        if c != NO_CHUNK {
+            proto::left(&LIVE.0[c], self.live() as u32);
+        }
+    }
+
+    /// Makes `c`, which holds no block and whose `LIVE` is `live`, the current chunk.
+    fn start(&self, base: usize, c: usize, live: usize) {
+        let first = base + (c << CHUNK_BITS);
+        self.chunk.set(c);
+        self.ptr.set(first);
+        self.end.set(first + CHUNK);
+        self.bias.set(first.wrapping_sub(live));
+    }
 }
 
 /// Gives the thread's arena back when the thread exits.
@@ -169,27 +226,24 @@ thread_local! {
     // allocator. That is sound where registering does not come back here for memory in a way
     // std forbids: glibc and macOS register through libc, and std's own list (musl) is on the
     // system allocator from Rust 1.89, the crate's `rust-version`; an earlier std aborts.
-    static LOCAL: Cell<Local> = const {
-        Cell::new(Local { ptr: 0, end: 0, chunk: 0, arena: NO_ARENA, skip: 0 })
-    };
+    static LOCAL: Local = const { Local::new() };
     static EXIT: Exit = const { Exit };
 }
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        let _ = LOCAL.try_with(|cell| {
-            let s = cell.get();
+        let _ = LOCAL.try_with(|l| {
+            let arena = l.arena.get();
+            l.leave();
             // Destructors that run after this one allocate from the wrapped allocator, and
             // free this arena's blocks as any other thread would.
-            cell.set(Local {
-                ptr: 0,
-                end: 0,
-                chunk: 0,
-                arena: NO_ARENA,
-                skip: NEVER,
-            });
-            if s.arena != NO_ARENA {
-                give_back(s.arena);
+            l.ptr.set(0);
+            l.end.set(0);
+            l.chunk.set(NO_CHUNK);
+            l.arena.set(NO_ARENA);
+            l.skip.set(NEVER);
+            if arena != NO_ARENA {
+                give_back(arena);
             }
         });
     }
@@ -218,69 +272,69 @@ fn taken() -> usize {
     TAKEN.iter().map(|w| w.load(Relaxed).count_ones() as usize).sum()
 }
 
-/// The first chunk of `arena` that holds no block. For the arena's thread only.
-fn empty_chunk(arena: usize) -> Option<usize> {
+/// The first chunk of `arena` that holds no block, and its `LIVE`. For the arena's thread
+/// only, once it has left its current chunk.
+fn empty_chunk(arena: usize) -> Option<(usize, u32)> {
     let first = arena << ARENA_BITS;
-    (first..first + ARENA_CHUNKS).find(|&c| proto::is_empty(&LIVE.0[c], &FREED.0[c]))
+    (first..first + ARENA_CHUNKS).find_map(|c| {
+        let live = proto::live(&LIVE.0[c]);
+        proto::holds_none(live, &FREED.0[c]).then_some((c, live))
+    })
 }
 
-/// Points `cell` at an empty chunk of the thread's arena, the first one, so that a thread
-/// keeps to the start of its arena. False: the allocation goes to the wrapped allocator.
-#[cold]
-#[inline(never)]
-fn refill(cell: &Cell<Local>) -> bool {
-    let mut s = cell.get();
-    if s.skip > 0 {
-        if s.skip != NEVER {
-            s.skip -= 1;
-            cell.set(s);
+/// Points the thread at an empty chunk of its arena, the first one, so that a thread keeps
+/// to the start of its arena. False: the allocation goes to the wrapped allocator.
+fn refill(l: &Local) -> bool {
+    let skip = l.skip.get();
+    if skip > 0 {
+        if skip != NEVER {
+            l.skip.set(skip - 1);
         }
         return false;
     }
-    if s.arena == NO_ARENA {
+    let mut arena = l.arena.get();
+    if arena == NO_ARENA {
         if !proto::is_on(&ON) {
             return false;
         }
         // Registering the exit hook may allocate, and a thread that is exiting has none.
-        s.skip = NEVER;
-        cell.set(s);
+        l.skip.set(NEVER);
         if EXIT.try_with(|_| ()).is_err() {
             return false;
         }
         // An arena whose chunks all hold blocks that outlived its earlier threads is passed
         // over.
         let mut from = 0;
-        s.skip = BACKOFF;
-        while let Some(arena) = take_arena(from) {
-            if empty_chunk(arena).is_some() {
-                s.arena = arena;
-                s.skip = 0;
+        while let Some(a) = take_arena(from) {
+            if empty_chunk(a).is_some() {
+                arena = a;
                 break;
             }
-            give_back(arena);
-            from = arena + 1;
+            give_back(a);
+            from = a + 1;
         }
-        if s.arena == NO_ARENA {
+        if arena == NO_ARENA {
+            l.skip.set(BACKOFF);
             NO_ARENA_FOUND.fetch_add(1, Relaxed);
-            cell.set(s);
             return false;
         }
+        l.skip.set(0);
+        l.arena.set(arena);
         PEAK.fetch_max(taken(), Relaxed);
     }
-    match empty_chunk(s.arena) {
-        Some(c) => {
-            s.chunk = c;
-            s.ptr = proto::base(&BASE) + (c << CHUNK_BITS);
-            s.end = s.ptr + CHUNK;
-            tick(&TALLY[s.arena].refills);
+    l.leave();
+    match empty_chunk(arena) {
+        Some((c, live)) => {
+            l.start(proto::base(&BASE), c, live as usize);
+            tick(&TALLY[arena].refills);
+            true
         }
         None => {
-            s.skip = BACKOFF;
-            tick(&TALLY[s.arena].full);
+            l.skip.set(BACKOFF);
+            tick(&TALLY[arena].full);
+            false
         }
     }
-    cell.set(s);
-    s.skip == 0
 }
 
 #[inline(always)]
@@ -289,56 +343,78 @@ fn round(n: usize) -> usize {
 }
 
 /// Whether an arena serves `l` now: 1 to `SMALL_NOW` bytes. A size of zero, which a caller
-/// must not ask for, goes to the wrapped allocator like any size while the arenas are off: a
-/// block of no bytes at the end of a full chunk would be counted in one chunk and freed in
-/// the next.
+/// must not ask for, goes to the wrapped allocator like any size while the arenas are off.
 #[inline(always)]
 fn serves(l: Layout) -> bool {
     l.size().wrapping_sub(1) < proto::limit(&SMALL_NOW) && l.align() <= ALIGN
 }
 
 /// The address of `n` bytes (a nonzero multiple of `ALIGN`) of the thread's current chunk,
-/// or 0.
+/// when it has that many left. All an allocation costs when it does.
 #[inline(always)]
-fn bump(n: usize) -> usize {
-    LOCAL.with(|cell| {
-        let mut s = cell.get();
-        if s.ptr + n > s.end {
-            if !refill(cell) {
-                return 0;
-            }
-            s = cell.get();
+fn bump(n: usize) -> Option<usize> {
+    LOCAL.with(|l| {
+        let p = l.ptr.get();
+        (n <= l.end.get() - p).then(|| {
+            l.ptr.set(p + n);
+            p
+        })
+    })
+}
+
+/// `bump` for a thread whose current chunk has fewer than `n` bytes left, or that has none:
+/// from an empty chunk of its arena, or 0.
+#[cold]
+#[inline(never)]
+fn bump_slow(n: usize) -> usize {
+    LOCAL.with(|l| {
+        if !refill(l) {
+            return 0;
         }
-        let p = s.ptr;
-        s.ptr += n;
-        cell.set(s);
-        proto::handed_out(&LIVE.0[s.chunk]);
+        let p = l.ptr.get();
+        l.ptr.set(p + n);
         p
     })
 }
 
-/// Frees the arena block at address `p` (`off` bytes into the reservation at `base`).
+/// Frees the `n` bytes (a block's size, rounded) at address `p`, `off` bytes into the
+/// reservation at `base`.
 #[inline(always)]
-fn release(base: usize, off: usize, p: usize, size: usize) {
+fn release(base: usize, off: usize, p: usize, n: usize) {
     let c = off >> CHUNK_BITS;
-    LOCAL.with(|cell| {
-        let mut s = cell.get();
-        if c >> ARENA_BITS == s.arena {
-            let live = proto::freed_by_owner(&LIVE.0[c]);
-            if c == s.chunk {
-                if proto::holds_none(live, &FREED.0[c]) {
-                    // The current chunk is empty: start it again.
-                    s.ptr = base + (c << CHUNK_BITS);
-                    cell.set(s);
-                } else if p + round(size) == s.ptr {
-                    // The last block handed out: take it back.
-                    s.ptr = p;
-                    cell.set(s);
-                }
+    LOCAL.with(|l| {
+        if c == l.chunk.get() {
+            if p + n == l.ptr.get() {
+                // The last block handed out: take it back.
+                l.ptr.set(p);
+            } else {
+                l.bias.set(l.bias.get().wrapping_add(n));
             }
+            let live = l.live();
+            if proto::holds_none(live as u32, &FREED.0[c]) {
+                // The current chunk is empty: start it again, with the same `LIVE`.
+                let first = base + (c << CHUNK_BITS);
+                l.ptr.set(first);
+                l.bias.set(first.wrapping_sub(live));
+            }
+        } else if c >> ARENA_BITS == l.arena.get() {
+            proto::freed_by_owner(&LIVE.0[c], n as u32);
         } else {
-            proto::freed_by_other(&FREED.0[c]);
+            proto::freed_by_other(&FREED.0[c], n as u32);
         }
+    })
+}
+
+/// Makes the block of `old` bytes at `p`, in chunk `c`, one of `n` bytes where it is, when
+/// it is the last block of this thread's current chunk and the chunk has the room.
+#[inline(always)]
+fn resize_last(c: usize, p: usize, old: usize, n: usize) -> bool {
+    LOCAL.with(|l| {
+        let fits = c == l.chunk.get() && p + old == l.ptr.get() && p + n <= l.end.get();
+        if fits {
+            l.ptr.set(p + n);
+        }
+        fits
     })
 }
 
@@ -350,7 +426,7 @@ pub fn enable() -> bool {
     static RESERVE: std::sync::Once = std::sync::Once::new();
     RESERVE.call_once(|| {
         if let Some(base) = reserve() {
-            proto::turn_on(&BASE, &ON, &SMALL_NOW, base, SMALL);
+            proto::turn_on(&BASE, &ON, &SMALL_NOW, base, MAX_BLOCK);
         }
     });
     enabled()
@@ -454,20 +530,63 @@ impl<A> Bump<A> {
     }
 }
 
+impl<A: GlobalAlloc> Bump<A> {
+    /// `alloc` and `alloc_zeroed` for a small block that the thread's current chunk has no
+    /// room for.
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_slow(&self, l: Layout, zeroed: bool) -> *mut u8 {
+        match bump_slow(round(l.size())) {
+            // SAFETY: the caller's contract, passed on.
+            0 if zeroed => unsafe { self.0.alloc_zeroed(l) },
+            // SAFETY: as above.
+            0 => unsafe { self.0.alloc(l) },
+            p => {
+                let p = with_exposed_provenance_mut::<u8>(p);
+                if zeroed {
+                    // SAFETY: `p` is a fresh block of at least `l.size()` bytes.
+                    unsafe { std::ptr::write_bytes(p, 0, l.size()) };
+                }
+                p
+            }
+        }
+    }
+}
+
+impl<A: GlobalAlloc> Bump<A> {
+    /// `realloc` for an arena block that cannot stay where it is: a new block, the bytes
+    /// copied, the old one freed.
+    #[inline(never)]
+    unsafe fn realloc_moving(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        // SAFETY: `new` is nonzero and valid for `l.align()` (the caller's contract); the two
+        // blocks are distinct, and `p` is freed with the layout it was allocated with.
+        unsafe {
+            let q = self.alloc(Layout::from_size_align_unchecked(new, l.align()));
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc(p, l);
+            }
+            q
+        }
+    }
+}
+
 // SAFETY: a block is either the wrapped allocator's, which gets it back with the layout it
 // was given, or `round(size)` bytes of the reservation, aligned to ALIGN, that no other live
-// block overlaps: a chunk's bytes are handed out again only below the current thread's own
-// last block or once the chunk's counts say that every block in it was freed. The two kinds
-// are told apart by address, so a block allocated before `enable` is never taken for an
-// arena's.
+// block overlaps: a chunk's bytes are handed out again only above the current thread's own
+// last block or once the chunk's counts say that every byte handed out of it was freed (the
+// counts are of the same rounded sizes on both sides, because a block is freed with the size
+// it was allocated or last reallocated with). The two kinds are told apart by address, so a
+// block allocated before `enable` is never taken for an arena's.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
     #[inline]
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if serves(l) {
-            let p = bump(round(l.size()));
-            if p != 0 {
-                return with_exposed_provenance_mut(p);
-            }
+            return match bump(round(l.size())) {
+                Some(p) => with_exposed_provenance_mut(p),
+                // SAFETY: the caller's contract, passed on.
+                None => unsafe { self.alloc_slow(l, false) },
+            };
         }
         // SAFETY: the caller's contract, passed on.
         unsafe { self.0.alloc(l) }
@@ -477,7 +596,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         let base = proto::base(&BASE);
         match offset(base, p) {
-            Some(off) => release(base, off, p.addr(), l.size()),
+            Some(off) => release(base, off, p.addr(), round(l.size())),
             // SAFETY: not an arena block, so `p` came from the wrapped allocator with `l`.
             None => unsafe { self.0.dealloc(p, l) },
         }
@@ -486,14 +605,17 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
     #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         if serves(l) {
-            let p = bump(round(l.size()));
-            if p != 0 {
-                let p = with_exposed_provenance_mut::<u8>(p);
-                // SAFETY: `p` is a fresh block of at least `l.size()` bytes. A reused chunk
-                // holds old bytes.
-                unsafe { std::ptr::write_bytes(p, 0, l.size()) };
-                return p;
-            }
+            return match bump(round(l.size())) {
+                Some(p) => {
+                    let p = with_exposed_provenance_mut::<u8>(p);
+                    // SAFETY: `p` is a fresh block of at least `l.size()` bytes. A reused
+                    // chunk holds old bytes.
+                    unsafe { std::ptr::write_bytes(p, 0, l.size()) };
+                    p
+                }
+                // SAFETY: the caller's contract, passed on.
+                None => unsafe { self.alloc_slow(l, true) },
+            };
         }
         // SAFETY: the caller's contract, passed on.
         unsafe { self.0.alloc_zeroed(l) }
@@ -506,32 +628,13 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
             // SAFETY: not an arena block, so `p` came from the wrapped allocator with `l`.
             return unsafe { self.0.realloc(p, l, new) };
         };
-        // The last block of this thread's current chunk grows or shrinks where it is.
+        // A block keeps its place when its rounded size does not change, and the last block
+        // of this thread's current chunk grows (to MAX_BLOCK at most) or shrinks where it is.
         let (old, n) = (round(l.size()), round(new));
-        let c = off >> CHUNK_BITS;
-        let in_place = new.wrapping_sub(1) < SMALL
-            && LOCAL.with(|cell| {
-                let mut s = cell.get();
-                let last = c == s.chunk && c >> ARENA_BITS == s.arena && p.addr() + old == s.ptr;
-                let fits = last && p.addr() + n <= s.end;
-                if fits {
-                    s.ptr = p.addr() + n;
-                    cell.set(s);
-                }
-                fits
-            });
-        if in_place {
+        if n == old || (new.wrapping_sub(1) < MAX_BLOCK && resize_last(off >> CHUNK_BITS, p.addr(), old, n)) {
             return p;
         }
-        // SAFETY: `new` is nonzero and valid for `l.align()` (the caller's contract); the two
-        // blocks are distinct, and `p` is freed with the layout it was allocated with.
-        unsafe {
-            let q = self.alloc(Layout::from_size_align_unchecked(new, l.align()));
-            if !q.is_null() {
-                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
-                self.dealloc(p, l);
-            }
-            q
-        }
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.realloc_moving(p, l, new) }
     }
 }
