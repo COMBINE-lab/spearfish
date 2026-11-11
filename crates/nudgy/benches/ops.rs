@@ -61,7 +61,7 @@ fn batch<A: GlobalAlloc>(a: &A, rounds: usize, sizes: &[usize], order: &[usize])
     rounds * sizes.len()
 }
 
-/// A vector that grows from 8 bytes to 4 KB by doubling, as `Vec::push` does, next to a
+/// A vector that grows from 8 bytes to 8 KB by doubling, as `Vec::push` does, next to a
 /// block that stays: the last block of a chunk grows where it is.
 fn grow<A: GlobalAlloc>(a: &A, rounds: usize) -> usize {
     for _ in 0..rounds {
@@ -69,7 +69,7 @@ fn grow<A: GlobalAlloc>(a: &A, rounds: usize) -> usize {
         unsafe {
             let keep = a.alloc(layout(48));
             let (mut p, mut size) = (a.alloc(layout(8)), 8);
-            while size < 4096 {
+            while size < nudgy::MAX_BLOCK {
                 p.add(size - 1).write(1);
                 p = a.realloc(p, layout(size), size * 2);
                 size *= 2;
@@ -155,7 +155,7 @@ fn main() {
         "300 blocks, freed in reverse",
         "300 blocks, freed in order",
         "300 blocks, freed as nested scopes do",
-        "a vector growing to 4 KB",
+        "a vector growing to 8 KB",
         "300 blocks, freed on another thread",
         "nested, on several threads at once",
     ];

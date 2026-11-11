@@ -36,21 +36,26 @@
 //!
 //! The arenas are one reservation of 1 GB of address space, of which only the chunks in use
 //! are backed by memory. Where transparent huge pages are always on, a chunk's first write
-//! backs the 2 MB around it, half its thread's arena, which is a little faster and stays
-//! within the 4 MB a thread. Where the kernel does not overcommit
+//! can back 2 MB around it, half an arena, which is a little faster and stays within 4 MB
+//! an arena. Where the kernel does not overcommit
 //! (`vm.overcommit_memory=2`), the whole reservation counts against the commit limit. The
 //! arenas are there on 64-bit Linux and macOS; on other targets `enable` returns false and
 //! `Bump` only forwards.
 //!
-//! An allocation from an arena moves a pointer in the thread's own storage, and a free moves
-//! it back or adds to a count there; neither writes anything that another thread reads. The
-//! last block of a chunk grows and shrinks where it is, so a vector that is being filled is
-//! not copied until another block follows it. `cargo bench` times the common patterns with
-//! and without the arenas.
+//! An allocation from an arena moves a pointer in the thread's own storage. A thread's free
+//! of a block of the chunk it is filling moves the pointer back or adds to a count there, and
+//! reads one count that other threads write; it writes nothing that another thread reads. (A
+//! free of any other block of an arena, by its thread or another, writes a count of the
+//! block's chunk.) The last block of a chunk grows and shrinks where it is, so a vector that
+//! is being filled is not copied until another block follows it. `cargo bench` times the
+//! common patterns with and without the arenas.
 //!
-//! As with most allocators, a signal handler must not allocate or free through it. A thread
-//! that never exits normally (after `fork`, or a detached thread when the process ends) keeps
-//! its arena.
+//! As with most allocators, a signal handler must not allocate or free through it, and a
+//! block must reach the thread that frees it in a way that orders the two threads (a channel,
+//! a lock, a join, an atomic stored with `Release` and loaded with `Acquire`), as it does in
+//! safe code. A thread that never exits normally (after `fork`, or a detached thread when the
+//! process ends) keeps its arena, and so does one whose first small allocation comes after
+//! its thread-local destructors have run; blocks of such an arena are still freed correctly.
 //!
 //! # Changing it
 //!
@@ -60,6 +65,8 @@
 //! change to an ordering there is checked by `cargo test`. `tests/miri.rs` is small enough for
 //! Miri (`cargo +nightly miri test --test miri`), `tests/stress.rs` runs for as long as
 //! `STRESS_SECS` says, and `benches/ops.rs` (`cargo bench`) times an allocation and its free.
+//! What one thread does with its own chunk is checked by address in `tests/paths.rs`, and
+//! `tests/shadow.rs` keeps a record of every live block and fails when two overlap.
 
 #![warn(missing_docs)]
 
@@ -108,8 +115,9 @@ const NO_ARENA: usize = usize::MAX;
 const NO_CHUNK: usize = usize::MAX;
 
 /// Targets with the arenas: their thread-local storage is the linker's, so reading `LOCAL`
-/// inside the allocator never allocates, and no address is within `REGION` of the top of
-/// their address space.
+/// inside the allocator never comes back to it for memory (where a thread's first read
+/// allocates, in a library loaded while the program runs, the C library's allocator is
+/// asked), and no address is within `REGION` of the top of their address space.
 const SUPPORTED: bool = cfg!(all(
     any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64"

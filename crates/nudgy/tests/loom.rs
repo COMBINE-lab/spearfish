@@ -220,6 +220,50 @@ fn two_other_threads_free_the_last_two_blocks() {
     });
 }
 
+/// An arena passes from A to B while a third thread takes and gives back another arena of the
+/// same word: B still sees what A wrote before it left, its block and its count.
+#[test]
+fn an_arena_changes_hands_while_its_neighbour_does() {
+    loom::model(|| {
+        let s = Arena::new();
+        // The second arena is free too.
+        s.taken.store(!0b11, Relaxed);
+        assert!(s.take());
+        let a = {
+            let s = s.clone();
+            thread::spawn(move || {
+                s.write(7);
+                proto::left(&s.live, 0);
+                s.give_back();
+            })
+        };
+        let neighbour = {
+            let s = s.clone();
+            thread::spawn(move || {
+                // The first arena, if A has left by now, or else the second.
+                if let Some(bit) = proto::take(&s.taken, 0) {
+                    proto::give_back(&s.taken, bit);
+                }
+            })
+        };
+        let b = {
+            let s = s.clone();
+            thread::spawn(move || {
+                // The first arena or none.
+                if proto::take(&s.taken, !1).is_some() {
+                    if s.is_empty() {
+                        s.write(9);
+                    }
+                    s.give_back();
+                }
+            })
+        };
+        a.join().unwrap();
+        neighbour.join().unwrap();
+        b.join().unwrap();
+    });
+}
+
 /// Two threads ask for the one free arena: one gets it.
 #[test]
 fn one_arena_goes_to_one_thread() {

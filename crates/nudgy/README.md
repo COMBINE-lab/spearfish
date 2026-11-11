@@ -49,7 +49,8 @@ carries the means to check it:
   its data-race detection.
 - `STRESS_SECS=20 cargo test -p nudgy --release --test stress` runs the stress tests for
   longer: arenas changing hands, frees on other threads, and allocation inside thread-local
-  destructors.
+  destructors. `GENS=150 cargo test -p nudgy --release --test shadow` does the same for the
+  test that records every live block and fails when two overlap.
 
 The repository's continuous integration runs all three. `cargo bench -p nudgy` times an
 allocation and its free in a few patterns, for the wrapped allocator alone and with the
