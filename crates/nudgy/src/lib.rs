@@ -30,7 +30,8 @@
 //! [`enable_with`] takes a [`Config`] in place of the defaults: the largest block an arena
 //! serves is chosen when the program starts (from a flag, say), not when it is built. The
 //! limit is read where an allocation already read whether the arenas are on, so choosing it
-//! costs an allocation nothing.
+//! costs an allocation nothing. A `Config` is also read from a size as text
+//! (`"4KB".parse()`).
 //!
 //! The wrapped allocator can be any [`GlobalAlloc`]. A block may be freed by a thread other
 //! than the one that allocated it, and a thread's arena passes to a later thread when it
@@ -479,6 +480,61 @@ impl Default for Config {
         Config::new()
     }
 }
+
+/// A limit as the user of a program writes it, for a program that takes it from its command
+/// line: a number of bytes (`4096`) or a number and a unit, `B` or `KB` (`512B`, `8KB`). A
+/// kilobyte is 1024 bytes; `K` and `KiB` mean the same, and the case of the unit does not
+/// matter. The limit is rounded up as [`Config::with_max_block`] rounds it, but more than
+/// [`LARGEST_MAX_BLOCK`] is an error here and not that limit.
+///
+/// ```
+/// let config: nudgy::Config = "1KB".parse().unwrap();
+/// assert_eq!(config.max_block(), 1024);
+/// assert!("64KB".parse::<nudgy::Config>().is_err());
+/// ```
+impl std::str::FromStr for Config {
+    type Err = ParseConfigError;
+
+    fn from_str(s: &str) -> Result<Config, ParseConfigError> {
+        let s = s.trim();
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        let unit = match s[digits..].trim_start().to_ascii_lowercase().as_str() {
+            "" | "b" => 1,
+            "k" | "kb" | "kib" => 1024,
+            _ => return Err(ParseConfigError { too_large: false }),
+        };
+        if digits == 0 {
+            return Err(ParseConfigError { too_large: false });
+        }
+        // Digits that are no `usize` are a number too large for one.
+        match s[..digits]
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(unit))
+        {
+            Some(bytes) if bytes <= LARGEST_MAX_BLOCK => Ok(Config::new().with_max_block(bytes)),
+            _ => Err(ParseConfigError { too_large: true }),
+        }
+    }
+}
+
+/// Why a string is not a [`Config`]: it is no size, or a size above [`LARGEST_MAX_BLOCK`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseConfigError {
+    too_large: bool,
+}
+
+impl std::fmt::Display for ParseConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.too_large {
+            write!(f, "the largest block is at most {} KB", LARGEST_MAX_BLOCK / 1024)
+        } else {
+            f.write_str("expected a size in bytes or KB, such as 4096, 512B or 8KB")
+        }
+    }
+}
+
+impl std::error::Error for ParseConfigError {}
 
 /// Turns the arenas on for every [`Bump`] of the process, from now on; there is no turning
 /// them off. Returns whether they are on: false where the address space could not be

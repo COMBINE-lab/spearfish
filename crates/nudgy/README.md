@@ -64,6 +64,7 @@ arenas off and on.
 
 - **0.2.0.** The largest block an arena serves can be set when the arenas are turned on:
   `enable_with(Config)`, `Config::with_max_block`, and `Stats::max_block` for the limit in
-  force. `enable()` is unchanged. The constant `MAX_BLOCK` is now `DEFAULT_MAX_BLOCK`, and
-  `LARGEST_MAX_BLOCK` is the most a `Config` takes.
+  force. A `Config` is also read from a size as text (`"1KB".parse()`), for a program that
+  takes the limit from its command line. `enable()` is unchanged. The constant `MAX_BLOCK`
+  is now `DEFAULT_MAX_BLOCK`, and `LARGEST_MAX_BLOCK` is the most a `Config` takes.
 - **0.1.0.** The first release.

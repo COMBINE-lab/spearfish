@@ -52,6 +52,45 @@ fn a_config_keeps_what_it_is_given_up_to_the_largest_limit() {
 }
 
 #[test]
+fn a_config_is_read_from_a_size_as_a_user_writes_it() {
+    let limit = |s: &str| s.parse::<Config>().map(|c| c.max_block());
+    for (s, bytes) in [
+        ("4096", 4096),
+        ("512B", 512),
+        ("512b", 512),
+        ("8KB", 8192),
+        ("8kb", 8192),
+        ("8K", 8192),
+        ("8KiB", 8192),
+        (" 1 KB ", 1024),
+        ("100", LIMIT),
+        ("0", 0),
+        ("0KB", 0),
+        ("32KB", nudgy::LARGEST_MAX_BLOCK),
+        ("32768", nudgy::LARGEST_MAX_BLOCK),
+    ] {
+        assert_eq!(limit(s), Ok(bytes), "{s:?}");
+    }
+    // A size above the largest limit is an error, where `with_max_block` gives that limit.
+    for s in [
+        "32769",
+        "33KB",
+        "64KB",
+        "99999999999999999999999999",
+        "18446744073709551615KB",
+    ] {
+        let e = limit(s).expect_err(s);
+        assert_eq!(e.to_string(), "the largest block is at most 32 KB", "{s:?}");
+    }
+    for s in [
+        "", "KB", "8MB", "8GB", "-1", "+8KB", "1.5KB", "8 K B", "0x10", "off", "8KB8",
+    ] {
+        let e = limit(s).expect_err(s);
+        assert!(e.to_string().starts_with("expected a size"), "{s:?}: {e}");
+    }
+}
+
+#[test]
 fn the_first_configuration_holds() {
     if !on() {
         assert_eq!(nudgy::stats().max_block, 0);

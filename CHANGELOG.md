@@ -104,10 +104,11 @@
   depend on spearfish: `nudgy::Bump<A>` wraps any global allocator, a program that embeds
   the mapper declares it as its global allocator and calls `nudgy::enable()`, and until that
   call every allocation goes to the wrapped allocator. `nudgy::enable_with` takes another
-  limit than 8 KB (up to 32 KB), chosen at run time. `nudgy::stats()` says how many arenas
-  were in use and how often a thread went without one (`spearfish map -v` prints it). The
-  crate carries its checks: loom models of what its threads share, a test for Miri, stress
-  tests and a benchmark of the allocation paths.
+  limit than 8 KB (up to 32 KB), chosen at run time, and so does the option:
+  `--bump-alloc=1KB` (`--bump-alloc=off` or `none` is no arenas). `nudgy::stats()` says how
+  many arenas were in use and how often a thread went without one (`spearfish map -v` prints
+  it). The crate carries its checks: loom models of what its threads share, a test for Miri,
+  stress tests and a benchmark of the allocation paths.
 - **`hifi` preset: the poly(A) tail orders the two orientations** (`--tail-first`, on for
   `hifi`). A read that ends in a tail of 20 bases or more in exactly one orientation is mapped
   in that orientation first, and in the other only when the first one's best hit spans less

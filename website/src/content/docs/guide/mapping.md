@@ -153,6 +153,11 @@ thread, and the output is the same. It is there on 64-bit Linux and macOS. Up to
 have such memory at a time; with `-v`, the summary says how many did and how often a thread
 went without.
 
+The option takes the largest allocation to serve this way as a value, joined by `=`:
+`--bump-alloc=1KB`, or a number of bytes, up to 32 KB. 8 KB, what the option means without a
+value, was the best of the limits measured, so a value is for trying another.
+`--bump-alloc=off` (or `none`) is the same as leaving the option out.
+
 ## Messages
 
 Progress and a summary go to standard error. `-q` shows errors only, `-v` adds detail. On a

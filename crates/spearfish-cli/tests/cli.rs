@@ -445,6 +445,101 @@ fn simulate_and_map_on_toy() {
 /// random sequence, and unexpressed transcripts. The same seed gives the same reads; random
 /// reads stay unmapped and the rest still map to their source.
 #[test]
+fn bump_alloc_takes_an_optional_size() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let (idx, reads) = (dir.join("toy_bump.sfi"), dir.join("toy_bump.fa"));
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = run(&[
+        "index".as_ref(),
+        toy().as_os_str(),
+        "-o".as_ref(),
+        idx.as_os_str(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run(&[
+        "simulate".as_ref(),
+        toy().as_os_str(),
+        "-n".as_ref(),
+        "100".as_ref(),
+        "-o".as_ref(),
+        reads.as_os_str(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // The option stands before the index, so a value it took without `=` would be the index.
+    let map = |flag: Option<&str>| {
+        let mut args: Vec<&std::ffi::OsStr> = vec!["map".as_ref()];
+        args.extend(flag.map(std::ffi::OsStr::new));
+        args.extend([
+            idx.as_os_str(),
+            reads.as_os_str(),
+            "-t".as_ref(),
+            "2".as_ref(),
+            "-v".as_ref(),
+            "--meta".as_ref(),
+            "/dev/null".as_ref(),
+        ]);
+        run(&args)
+    };
+    let lines = |o: &std::process::Output| {
+        let mut l: Vec<String> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+        l.sort();
+        l
+    };
+    let plain = map(None);
+    assert!(plain.status.success());
+    assert!(lines(&plain).len() > 100);
+    // The limit in force, where this target has the arenas.
+    let arenas = cfg!(all(
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "macos")
+    ));
+    for (flag, limit) in [
+        ("--bump-alloc", Some(8192)),
+        ("--bump-alloc=8KB", Some(8192)),
+        ("--bump-alloc=1KB", Some(1024)),
+        ("--bump-alloc=500", Some(512)),
+        ("--bump-alloc=32kb", Some(32768)),
+        ("--bump-alloc=off", None),
+        ("--bump-alloc=none", None),
+        ("--bump-alloc=0", None),
+    ] {
+        let o = map(Some(flag));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{flag}: {err}");
+        assert_eq!(lines(&o), lines(&plain), "{flag}");
+        match limit {
+            Some(bytes) if arenas => {
+                assert!(
+                    err.contains(&format!("bump-alloc: blocks of up to {bytes} bytes")),
+                    "{flag}: {err}"
+                );
+            }
+            Some(_) => assert!(err.contains("--bump-alloc is not available"), "{flag}: {err}"),
+            None => assert!(!err.contains("bump-alloc"), "{flag}: {err}"),
+        }
+    }
+    for (flag, why) in [
+        ("--bump-alloc=64KB", "at most 32 KB"),
+        ("--bump-alloc=8MB", "expected a size"),
+        ("--bump-alloc=on", "expected a size"),
+        ("--bump-alloc=", "expected a size"),
+    ] {
+        let o = map(Some(flag));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success(), "{flag}");
+        assert!(err.contains(why), "{flag}: {err}");
+    }
+}
+
+#[test]
 fn simulated_random_reads_stay_unmapped() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let run = |args: &[&std::ffi::OsStr]| {
