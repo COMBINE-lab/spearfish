@@ -1,6 +1,6 @@
 //! Antisense mates: per transcript, the transcripts that hold stretches of its reverse
 //! complement, kept as a few bytes per stretch. A mapper reads them from the index
-//! ([`build_into`], [`Mates::load`]) or makes a transcript's on first use.
+//! ([`build_into`], `Mates::load`) or makes a transcript's on first use.
 
 use std::sync::{Arc, OnceLock};
 
@@ -317,7 +317,7 @@ fn build(idx: &Index, seeder: &BaseSeeder, h_max: usize, nt: usize) -> (Vec<u64>
 
 /// Make every transcript's mates of `idx` (`data` laid out), for anchoring with `h_max`, and
 /// keep them in `data` as sections of the index: a mapper anchoring so then reads them in
-/// place ([`Mates::load`]) instead of making each on first use.
+/// place (`Mates::load`) instead of making each on first use.
 pub fn build_into(data: &mut index::IndexData, h_max: usize, nt: usize) -> anyhow::Result<()> {
     let (off, bytes) = {
         let idx = Index::from_data(data)?;
