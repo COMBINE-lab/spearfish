@@ -3,13 +3,14 @@
 //! Some programs make many small allocations and free nearly all of them soon after: a read
 //! mapper makes a few hundred for a read and frees them before the next one. [`Bump`] wraps a
 //! program's global allocator and, once [`enable`] has been called, serves blocks of up to
-//! 8 KB ([`MAX_BLOCK`]) from memory that belongs to the allocating thread: a block is the next
-//! free bytes of the thread's current 64 KB chunk, and a chunk whose blocks have all been
-//! freed is used again from its start. Such a thread then stays in the same few pages, which
-//! is where the gain comes from, for memory of at most 4 MB a thread. Every other allocation,
-//! and every allocation before `enable`, goes to the wrapped allocator, at the cost of one
-//! comparison. (It was written for [spearfish](https://github.com/COMBINE-lab/spearfish),
-//! which maps reads in about 3% less CPU time with it.)
+//! 8 KB (or the limit a [`Config`] names) from memory that belongs to the allocating thread:
+//! a block is the next free bytes of the thread's current 64 KB chunk, and a chunk whose
+//! blocks have all been freed is used again from its start. Such a thread then stays in the
+//! same few pages, which is where the gain comes from, for memory of at most 4 MB a thread.
+//! Every other allocation, and every allocation before `enable`, goes to the wrapped
+//! allocator, at the cost of one comparison. (It was written for
+//! [spearfish](https://github.com/COMBINE-lab/spearfish), which maps reads in about 3% less
+//! CPU time with it.)
 //!
 //! A program opts in twice: it declares the allocator, and it turns the arenas on.
 //!
@@ -25,6 +26,11 @@
 //!     eprintln!("{:?}", nudgy::stats());
 //! }
 //! ```
+//!
+//! [`enable_with`] takes a [`Config`] in place of the defaults: the largest block an arena
+//! serves is chosen when the program starts (from a flag, say), not when it is built. The
+//! limit is read where an allocation already read whether the arenas are on, so choosing it
+//! costs an allocation nothing.
 //!
 //! The wrapped allocator can be any [`GlobalAlloc`]. A block may be freed by a thread other
 //! than the one that allocated it, and a thread's arena passes to a later thread when it
@@ -86,15 +92,17 @@ use sync::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 /// arenas and a shorter back-off.
 const TINY: bool = cfg!(miri);
 
-/// The largest block, in bytes, that an arena serves. A larger block, or one aligned to more
-/// than 16 bytes, is the wrapped allocator's.
+/// The largest block, in bytes, that an arena serves unless a [`Config`] says otherwise. A
+/// larger block, or one aligned to more than 16 bytes, is the wrapped allocator's.
 ///
 /// The limit is a trade. A vector that grows past it is copied to the wrapped allocator, so
 /// a low limit sends vectors there that would have been filled and freed within their chunk;
 /// larger blocks fill a thread's 4 MB sooner, and leave more of a chunk unused at its end
-/// (at most this many bytes of its 64 KB). For spearfish, 8 KB was the best of the limits
+/// (at most the limit's bytes of its 64 KB). For spearfish, 8 KB was the best of the limits
 /// from 512 bytes to 32 KB.
-pub const MAX_BLOCK: usize = 8192;
+pub const DEFAULT_MAX_BLOCK: usize = 8192;
+/// The largest limit a [`Config`] takes: 32 KB, half a chunk.
+pub const LARGEST_MAX_BLOCK: usize = CHUNK / 2;
 /// The alignment of every block of an arena.
 const ALIGN: usize = 16;
 const CHUNK_BITS: usize = 16;
@@ -124,8 +132,8 @@ const SUPPORTED: bool = cfg!(all(
 ));
 
 static ON: AtomicBool = AtomicBool::new(false);
-/// The largest size served from an arena now: zero, so that none is, until `enable`. The one
-/// load an allocation costs while the arenas are off.
+/// The largest size served from an arena now: zero, so that none is, until `enable`, and the
+/// configured limit from then on. The one load an allocation costs while the arenas are off.
 static SMALL_NOW: AtomicUsize = AtomicUsize::new(0);
 /// The reservation is `BASE..BASE + REGION`. Until `enable` reserved it, the top of the
 /// address space, where no block is: the one load a free costs while the arenas are off.
@@ -346,7 +354,7 @@ fn refill(l: &Local) -> bool {
 }
 
 #[inline(always)]
-fn round(n: usize) -> usize {
+const fn round(n: usize) -> usize {
     (n + (ALIGN - 1)) & !(ALIGN - 1)
 }
 
@@ -371,7 +379,8 @@ fn bump(n: usize) -> Option<usize> {
 }
 
 /// `bump` for a thread whose current chunk has fewer than `n` bytes left, or that has none:
-/// from an empty chunk of its arena, or 0.
+/// from an empty chunk of its arena, or 0. (`n` is at most a chunk's bytes: no limit is above
+/// `LARGEST_MAX_BLOCK`.)
 #[cold]
 #[inline(never)]
 fn bump_slow(n: usize) -> usize {
@@ -426,15 +435,73 @@ fn resize_last(c: usize, p: usize, old: usize, n: usize) -> bool {
     })
 }
 
+/// What [`enable_with`] turns the arenas on with. `Config::new()` is what [`enable`] uses.
+///
+/// ```
+/// let config = nudgy::Config::new().with_max_block(4096);
+/// assert_eq!(config.max_block(), 4096);
+/// // nudgy::enable_with(config);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    max_block: usize,
+}
+
+impl Config {
+    /// The defaults: blocks of up to [`DEFAULT_MAX_BLOCK`] bytes come from the arenas.
+    pub const fn new() -> Config {
+        Config {
+            max_block: DEFAULT_MAX_BLOCK,
+        }
+    }
+
+    /// The largest block, in bytes, that an arena serves (see [`DEFAULT_MAX_BLOCK`] for what
+    /// a lower or higher limit costs). The limit is `bytes` rounded up to a multiple of 16,
+    /// as a block's size is, and [`LARGEST_MAX_BLOCK`] when that is more; with zero the
+    /// arenas serve nothing.
+    pub const fn with_max_block(mut self, bytes: usize) -> Config {
+        self.max_block = if bytes > LARGEST_MAX_BLOCK {
+            LARGEST_MAX_BLOCK
+        } else {
+            round(bytes)
+        };
+        self
+    }
+
+    /// The limit this configuration sets.
+    pub const fn max_block(&self) -> usize {
+        self.max_block
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config::new()
+    }
+}
+
 /// Turns the arenas on for every [`Bump`] of the process, from now on; there is no turning
 /// them off. Returns whether they are on: false where the address space could not be
 /// reserved, or on a target other than 64-bit Linux and macOS. Without a `Bump` as the
 /// global allocator this reserves the address space and changes nothing else.
+///
+/// The same as [`enable_with`] and `Config::new()`.
 pub fn enable() -> bool {
+    enable_with(Config::new())
+}
+
+/// [`enable`], with a [`Config`] in place of the defaults.
+///
+/// The arenas are turned on once: the first call of either function settles the
+/// configuration, and a later call returns whether they are on and changes nothing.
+/// [`Stats::max_block`] is the limit in force.
+pub fn enable_with(config: Config) -> bool {
+    // A block is at most a chunk: `bump_slow` counts on it.
+    const _: () = assert!(LARGEST_MAX_BLOCK <= CHUNK);
     static RESERVE: std::sync::Once = std::sync::Once::new();
     RESERVE.call_once(|| {
         if let Some(base) = reserve() {
-            proto::turn_on(&BASE, &ON, &SMALL_NOW, base, MAX_BLOCK);
+            proto::turn_on(&BASE, &ON, &SMALL_NOW, base, config.max_block);
         }
     });
     enabled()
@@ -456,6 +523,9 @@ pub fn enabled() -> bool {
 pub struct Stats {
     /// Whether the arenas are on.
     pub enabled: bool,
+    /// The largest block, in bytes, that the arenas serve: [`DEFAULT_MAX_BLOCK`] or what the
+    /// [`Config`] said, and zero while they are off.
+    pub max_block: usize,
     /// Threads that have an arena now.
     pub arenas_in_use: usize,
     /// The most threads that had an arena at once.
@@ -483,6 +553,7 @@ impl Stats {
 pub fn stats() -> Stats {
     Stats {
         enabled: enabled(),
+        max_block: proto::limit(&SMALL_NOW),
         arenas_in_use: taken(),
         arenas_peak: PEAK.load(Relaxed),
         chunk_refills: TALLY.iter().map(|t| t.refills.load(Relaxed)).sum(),
@@ -637,9 +708,12 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
             return unsafe { self.0.realloc(p, l, new) };
         };
         // A block keeps its place when its rounded size does not change, and the last block
-        // of this thread's current chunk grows (to MAX_BLOCK at most) or shrinks where it is.
+        // of this thread's current chunk grows (to the limit at most) or shrinks where it is.
         let (old, n) = (round(l.size()), round(new));
-        if n == old || (new.wrapping_sub(1) < MAX_BLOCK && resize_last(off >> CHUNK_BITS, p.addr(), old, n)) {
+        if n == old
+            || (new.wrapping_sub(1) < proto::limit(&SMALL_NOW)
+                && resize_last(off >> CHUNK_BITS, p.addr(), old, n))
+        {
             return p;
         }
         // SAFETY: the caller's contract, passed on.

@@ -69,7 +69,7 @@ fn grow<A: GlobalAlloc>(a: &A, rounds: usize) -> usize {
         unsafe {
             let keep = a.alloc(layout(48));
             let (mut p, mut size) = (a.alloc(layout(8)), 8);
-            while size < nudgy::MAX_BLOCK {
+            while size < nudgy::DEFAULT_MAX_BLOCK {
                 p.add(size - 1).write(1);
                 p = a.realloc(p, layout(size), size * 2);
                 size *= 2;

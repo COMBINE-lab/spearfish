@@ -129,7 +129,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo miri test --locked -p nudgy --test miri --test paths
+      - run: cargo miri test --locked -p nudgy --test miri --test paths --test config --test config_largest
         env:
           MIRIFLAGS: -Zmiri-many-seeds=0..8
       - uses: dtolnay/rust-toolchain@stable
@@ -137,6 +137,13 @@ jobs:
         env:
           STRESS_SECS: 10
           GENS: 100
+          RUSTFLAGS: -C debug-assertions -C overflow-checks
+      # The record of live blocks again, with the smallest and the largest limit.
+      - run: |
+          MAX_BLOCK=16 cargo +stable test --locked --release -p nudgy --test shadow
+          MAX_BLOCK=32768 cargo +stable test --locked --release -p nudgy --test shadow
+        env:
+          GENS: 50
           RUSTFLAGS: -C debug-assertions -C overflow-checks
 
   msrv:

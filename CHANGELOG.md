@@ -103,7 +103,8 @@
   crate of its own, `nudgy` (`crates/nudgy`, published with its own version), and does not
   depend on spearfish: `nudgy::Bump<A>` wraps any global allocator, a program that embeds
   the mapper declares it as its global allocator and calls `nudgy::enable()`, and until that
-  call every allocation goes to the wrapped allocator. `nudgy::stats()` says how many arenas
+  call every allocation goes to the wrapped allocator. `nudgy::enable_with` takes another
+  limit than 8 KB (up to 32 KB), chosen at run time. `nudgy::stats()` says how many arenas
   were in use and how often a thread went without one (`spearfish map -v` prints it). The
   crate carries its checks: loom models of what its threads share, a test for Miri, stress
   tests and a benchmark of the allocation paths.

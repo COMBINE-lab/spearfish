@@ -28,6 +28,9 @@ fn main() {
   exits.
 - Up to 256 threads have an arena (4 MB) at a time. A thread without one, or whose arena is
   full of live blocks, uses the wrapped allocator; `stats()` counts how often that happened.
+- The largest block an arena serves, 8 KB unless the program says otherwise, is chosen when
+  the arenas are turned on: `nudgy::enable_with(Config::new().with_max_block(bytes))`, up to
+  32 KB. Choosing it at run time costs an allocation nothing.
 - The arenas are there on 64-bit Linux and macOS. Elsewhere `enable()` returns false and
   `Bump` only forwards.
 - It suits programs whose small allocations are mostly short-lived. Blocks that stay
@@ -50,8 +53,17 @@ carries the means to check it:
 - `STRESS_SECS=20 cargo test -p nudgy --release --test stress` runs the stress tests for
   longer: arenas changing hands, frees on other threads, and allocation inside thread-local
   destructors. `GENS=150 cargo test -p nudgy --release --test shadow` does the same for the
-  test that records every live block and fails when two overlap.
+  test that records every live block and fails when two overlap, and `MAX_BLOCK=<bytes>`
+  runs that test with another limit.
 
 The repository's continuous integration runs all three. `cargo bench -p nudgy` times an
 allocation and its free in a few patterns, for the wrapped allocator alone and with the
 arenas off and on.
+
+## Changes
+
+- **0.2.0.** The largest block an arena serves can be set when the arenas are turned on:
+  `enable_with(Config)`, `Config::with_max_block`, and `Stats::max_block` for the limit in
+  force. `enable()` is unchanged. The constant `MAX_BLOCK` is now `DEFAULT_MAX_BLOCK`, and
+  `LARGEST_MAX_BLOCK` is the most a `Config` takes.
+- **0.1.0.** The first release.

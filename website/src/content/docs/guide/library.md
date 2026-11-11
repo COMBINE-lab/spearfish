@@ -49,7 +49,9 @@ for hit in &read.hits {
   depends on `nudgy`, declares `Bump` around the allocator it uses, and calls
   `nudgy::enable()` before mapping. Until that call every allocation goes to the wrapped
   allocator. Afterwards `nudgy::stats()` says how many arenas were in use and how often a
-  thread went without one.
+  thread went without one. An arena serves blocks of up to 8 KB, the best limit for
+  `spearfish map`; `nudgy::enable_with(nudgy::Config::new().with_max_block(bytes))` turns the
+  arenas on with another, for a program whose other allocations make another one better.
 
   ```rust
   use nudgy::Bump;

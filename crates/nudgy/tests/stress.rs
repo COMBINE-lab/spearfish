@@ -21,7 +21,7 @@ use nudgy::{self as alloc, Bump};
 static GLOBAL: Bump<System> = Bump::new(System);
 
 /// The largest block an arena serves.
-const M: usize = alloc::MAX_BLOCK;
+const M: usize = alloc::DEFAULT_MAX_BLOCK;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 

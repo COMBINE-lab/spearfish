@@ -4,7 +4,7 @@ description = "Small blocks from per-thread bump arenas, in front of any global 
 # Its own version, not the workspace's: it changes rarely, and other programs depend on it
 # without the rest of spearfish. A change to this crate needs a new version here (see
 # "Releasing" in CONTRIBUTING.md).
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

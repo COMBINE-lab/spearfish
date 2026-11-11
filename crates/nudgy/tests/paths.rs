@@ -12,7 +12,7 @@ use nudgy::Bump;
 static B: Bump<System> = Bump::new(System);
 
 /// The largest block an arena serves.
-const M: usize = nudgy::MAX_BLOCK;
+const M: usize = nudgy::DEFAULT_MAX_BLOCK;
 const CHUNK: usize = 1 << 16;
 
 /// One test at a time: each counts on its thread's arena holding its own blocks only.

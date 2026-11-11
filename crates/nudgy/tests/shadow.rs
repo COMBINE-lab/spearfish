@@ -5,7 +5,8 @@
 //! thread that made them, and are made and freed in thread-local destructors that run before
 //! and after the thread's arena is given back.
 //!
-//! `GENS` sets how many generations of threads run (8 in `cargo test`).
+//! `GENS` sets how many generations of threads run (8 in `cargo test`), and `MAX_BLOCK` the
+//! largest block the arenas are turned on to serve (the default one without it).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
@@ -16,7 +17,11 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use nudgy::Bump;
 
 static B: Bump<System> = Bump::new(System);
-const M: usize = nudgy::MAX_BLOCK;
+/// The largest block an arena serves in this run.
+static LIMIT: AtomicUsize = AtomicUsize::new(nudgy::DEFAULT_MAX_BLOCK);
+fn m() -> usize {
+    LIMIT.load(Relaxed)
+}
 
 /// Address to size and tag, of every live block, from an arena or not.
 static LIVE: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new());
@@ -146,8 +151,8 @@ impl Rng {
 /// Mostly small, some near the largest an arena serves, some past it.
 fn size(r: &mut Rng) -> usize {
     match r.next() % 10 {
-        0 => 1 + r.next() % (M + 600),
-        1 => M - r.next() % 64,
+        0 => 1 + r.next() % (m() + 600),
+        1 => m() - r.next() % 64,
         2 => 1 + r.next() % 16,
         _ => 1 + r.next() % 500,
     }
@@ -214,7 +219,7 @@ fn worker(seed: u64, ops: usize) {
                         0 => b.size + 1 + r.next() % 64,
                         1 => (b.size / 2).max(1),
                         2 => ((b.size + 15) & !15).max(1),
-                        3 => M + r.next() % 3,
+                        3 => m() + r.next() % 3,
                         _ => size(&mut r),
                     };
                     b.realloc(n);
@@ -276,7 +281,13 @@ fn worker(seed: u64, ops: usize) {
 
 #[test]
 fn no_block_overlaps_a_live_one() {
-    let on = nudgy::enable();
+    let config = match std::env::var("MAX_BLOCK").ok().and_then(|s| s.parse().ok()) {
+        Some(bytes) => nudgy::Config::new().with_max_block(bytes),
+        None => nudgy::Config::new(),
+    };
+    let on = nudgy::enable_with(config);
+    LIMIT.store(config.max_block().max(64), Relaxed);
+    assert!(!on || nudgy::stats().max_block == config.max_block());
     let (gens, threads, ops) = if cfg!(miri) {
         (3, 3, 150)
     } else {
@@ -303,6 +314,17 @@ fn no_block_overlaps_a_live_one() {
     }
     drop(std::mem::take(&mut *POOL.lock().unwrap()));
     assert!(LIVE.lock().unwrap().is_empty());
-    // Or the test checked the system allocator.
-    assert!(!on || IN_ARENA.load(Relaxed) * 2 > TOTAL.load(Relaxed));
+    // Or the test checked the system allocator. (With another limit than the default one
+    // the arenas serve another share of these sizes: some, unless the limit is zero.)
+    let (in_arena, total) = (IN_ARENA.load(Relaxed), TOTAL.load(Relaxed));
+    eprintln!(
+        "limit {}: {in_arena} of {total} blocks from an arena",
+        config.max_block()
+    );
+    match config.max_block() {
+        _ if !on => assert_eq!(in_arena, 0),
+        nudgy::DEFAULT_MAX_BLOCK => assert!(in_arena * 2 > total),
+        0 => assert_eq!(in_arena, 0),
+        _ => assert!(in_arena * 20 > total),
+    }
 }

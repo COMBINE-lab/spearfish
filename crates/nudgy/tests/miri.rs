@@ -58,7 +58,7 @@ fn miri_protocol() {
             g.shrink_to_fit();
             ok(t, &g);
             // Out of the arena as it grows.
-            let n = alloc::MAX_BLOCK - 24;
+            let n = alloc::DEFAULT_MAX_BLOCK - 24;
             let mut big: Vec<u8> = blk(1, n);
             big.extend((n..n + 100).map(|i| 1u8.wrapping_add(i as u8)));
             ok(1, &big);
