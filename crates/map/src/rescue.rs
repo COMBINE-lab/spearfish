@@ -234,6 +234,8 @@ pub struct Rescuer {
     /// Whether the tables had to be made, the index keeping none of this rescue scheme
     /// ([`Self::build_tables`]).
     tables_made: bool,
+    /// Distinct per rescuer: a thread's [`Session`]s are those of one rescuer.
+    id: u64,
 }
 
 /// Read seed label -> its first seed in the read: an open-addressing table sized for the
@@ -287,12 +289,16 @@ impl LabelTable {
     }
 }
 
+/// A candidate of [`Rescuer::global_votes`]: (shared keys within one diagonal window,
+/// transcript, lowest and highest diagonal).
+type Vote = (u32, u32, i64, i64);
+
 /// One read orientation's rescue state: its seeds and the windows chained so far, which
 /// later calls for the same orientation reuse.
 #[derive(Default)]
 struct Session {
-    /// The orientation's parsed sequence (hash, length); `None`: unused.
-    key: Option<(u64, usize)>,
+    /// The orientation's parsed sequence (hash, length) and the rescuer's id; `None`: unused.
+    key: Option<(u64, usize, u64)>,
     /// The read's rescue seeds, in start order (starts are distinct).
     read: Vec<Seed>,
     /// Read seed label -> its first seed in `read`; `read_next` links each seed to the next one
@@ -313,6 +319,9 @@ struct Session {
     tx_wins: Vec<((u32, u32, u32, u32), u32)>,
     /// The best chain of each distinct window (those of the pending batch follow).
     results: Vec<Option<WindowChain>>,
+    /// The candidates of [`Rescuer::global_votes`] and how many were asked for: fewer than
+    /// that are all there are, and the best of them are a prefix.
+    voted: Option<(usize, Vec<Vote>)>,
 }
 
 /// Per-thread buffers, reused across reads.
@@ -344,6 +353,13 @@ struct Scratch {
 
 /// Most postings (eight bytes each) a thread keeps room for between reads.
 const VOTES_KEEP: usize = 1 << 16;
+
+/// Added to a posting's diagonal in [`Rescuer::votes`], which keeps it positive.
+const OFF: i64 = 1 << 30;
+
+/// [`Rescuer::votes`] takes first the hash values with the most postings: enough of them to
+/// hold this many times the candidates asked for.
+const VOTES_FIRST: usize = 2;
 
 /// A rescue chain in one transcript window: (score, max discrepancy, anchored bases, chain
 /// as (qs, qe, ts relative to the window, len)).
@@ -394,12 +410,14 @@ impl Rescuer {
     pub fn new(p: RescueParams) -> anyhow::Result<Self> {
         // Sequences are already parsed (HPC if the index used it): no HPC here.
         let seeder = BaseSeeder::new(&p.spec, false)?;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Ok(Rescuer {
             p,
             seeder,
             global: None,
             store: None,
             tables_made: false,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -460,7 +478,14 @@ impl Rescuer {
         RESCUE.with(|sc| {
             let sc = &mut *sc.borrow_mut();
             self.begin(seq, sc);
-            Self::votes(g, table, seq.len(), n, sc)
+            if let Some((asked, cand)) = &sc.s.voted
+                && (n <= *asked || cand.len() < *asked)
+            {
+                return cand[..n.min(cand.len())].to_vec();
+            }
+            let cand = Self::votes(g, table, seq.len(), n, sc);
+            sc.s.voted = Some((n, cand.clone()));
+            cand
         })
     }
 
@@ -499,7 +524,6 @@ impl Rescuer {
         n: usize,
         sc: &mut Scratch,
     ) -> Vec<(u32, u32, i64, i64)> {
-        const OFF: i64 = 1 << 30;
         let max_occ = g.max_occ as usize;
         let (read, tk) = (&sc.s.read, g.tuple.max(1));
         // Every posting of the read's keys, as transcript << 32 | diagonal.
@@ -533,6 +557,9 @@ impl Rescuer {
             (read.len() + 1).saturating_sub(tk) as u64,
         );
         crate::stats::add(&crate::stats::VOTE_POSTS, keys.len() as u64);
+        let w = 32 + plen as u64 / 8;
+        let by = |&(c, t, _, _): &(u32, u32, i64, i64)| (std::cmp::Reverse(c), t);
+        let mut cand: Vec<(u32, u32, i64, i64)> = Vec::new();
         // Most postings are the only one of their transcript, which then cannot be a
         // candidate: count postings by a hash of the transcript, and sort only those that
         // have, or may have, enough company.
@@ -545,24 +572,71 @@ impl Rescuer {
             let count = &mut sc.counts;
             count.clear();
             count.resize(1 << bits, 0u8);
+            // reached[c]: the hash values with at least `c` postings (255: or more).
+            let mut reached = [0u32; 256];
             for &k in keys.iter() {
                 let c = &mut count[slot(k)];
-                *c = c.saturating_add(1);
+                let up = c.saturating_add(1);
+                reached[usize::from(up)] += u32::from(up != *c);
+                *c = up;
             }
             let need = g.min_shared.min(255) as u8;
-            let mut kept = 0;
+            // A transcript has at most as many postings as its hash value, and a candidate no
+            // more shared keys than postings. So the transcripts of the fullest hash values go
+            // first: once they make `n` candidates, those of a hash value with fewer postings
+            // than the least of them has shared keys cannot be among the best `n`, and their
+            // postings are never sorted. (An equal count can be, by its transcript's rank.)
+            let want = n.saturating_mul(VOTES_FIRST);
+            let first = (need..=255)
+                .rev()
+                .find(|&c| reached[usize::from(c)] as usize >= want)
+                .unwrap_or(need);
+            let mut top = 0;
             for i in 0..keys.len() {
                 let k = keys[i];
-                keys[kept] = k;
-                kept += usize::from(count[slot(k)] >= need);
+                keys.swap(i, top);
+                top += usize::from(count[slot(k)] >= first);
             }
-            keys.truncate(kept);
+            Self::windows(&mut keys[..top], w, g.min_shared, &mut cand);
+            let mut floor = need;
+            if cand.len() >= n {
+                cand.select_nth_unstable_by_key(n - 1, by);
+                cand.truncate(n);
+                floor = floor.max(cand[n - 1].0.min(255) as u8);
+            }
+            let mut kept = top;
+            if floor < first {
+                for i in top..keys.len() {
+                    let k = keys[i];
+                    keys[kept] = k;
+                    kept += usize::from(count[slot(k)] >= floor);
+                }
+                Self::windows(&mut keys[top..kept], w, g.min_shared, &mut cand);
+            }
+            crate::stats::add(&crate::stats::VOTE_KEPT, kept as u64);
+        } else {
+            crate::stats::add(&crate::stats::VOTE_KEPT, keys.len() as u64);
+            Self::windows(keys, w, g.min_shared, &mut cand);
         }
-        crate::stats::add(&crate::stats::VOTE_KEPT, keys.len() as u64);
+        crate::stats::add(&crate::stats::VOTE_CANDS, cand.len() as u64);
+        if keys.capacity() > VOTES_KEEP {
+            *keys = Vec::new();
+            sc.counts = Vec::new();
+        }
+        // Transcripts are distinct, so the order is total: the best `n`, then those in order.
+        if cand.len() > n {
+            cand.select_nth_unstable_by_key(n - 1, by);
+            cand.truncate(n);
+        }
+        cand.sort_unstable_by_key(by);
+        cand
+    }
+
+    /// Adds to `cand` each transcript of `keys` (transcript << 32 | diagonal, which this
+    /// sorts) with at least `min_shared` of them within `w` diagonals: (the most within `w`,
+    /// transcript, lowest and highest diagonal of those).
+    fn windows(keys: &mut [u64], w: u64, min_shared: u32, cand: &mut Vec<(u32, u32, i64, i64)>) {
         keys.sort_unstable();
-        let w = 32 + plen as u64 / 8;
-        // Per transcript: the most seeds within `w` diagonals.
-        let mut cand: Vec<(u32, u32, i64, i64)> = Vec::new();
         let mut i = 0;
         while i < keys.len() {
             let t = keys[i] >> 32;
@@ -582,24 +656,11 @@ impl Rescuer {
                     hi = (keys[b] & 0xffff_ffff) as i64 - OFF;
                 }
             }
-            if bestc >= g.min_shared {
+            if bestc >= min_shared {
                 cand.push((bestc, t as u32, lo, hi));
             }
             i = j;
         }
-        crate::stats::add(&crate::stats::VOTE_CANDS, cand.len() as u64);
-        if keys.capacity() > VOTES_KEEP {
-            *keys = Vec::new();
-            sc.counts = Vec::new();
-        }
-        // Transcripts are distinct, so the order is total: the best `n`, then those in order.
-        let by = |&(c, t, _, _): &(u32, u32, i64, i64)| (std::cmp::Reverse(c), t);
-        if cand.len() > n {
-            cand.select_nth_unstable_by_key(n - 1, by);
-            cand.truncate(n);
-        }
-        cand.sort_unstable_by_key(by);
-        cand
     }
 
     /// Rescue hits for one orientation of a read: `seq` is the parsed read, `base` its
@@ -785,7 +846,7 @@ impl Rescuer {
     /// Start a call for a read orientation: its rescue seeds and the windows chained for it
     /// so far, if it is one of the last two orientations seen (a read's two, usually).
     fn begin(&self, seq: &[u8], sc: &mut Scratch) {
-        let key = Some((xxhash_rust::xxh3::xxh3_64(seq), seq.len()));
+        let key = Some((xxhash_rust::xxh3::xxh3_64(seq), seq.len(), self.id));
         if sc.s.key != key {
             std::mem::swap(&mut sc.s, &mut sc.alt);
         }
@@ -798,6 +859,7 @@ impl Rescuer {
             s.by_tx.clear();
             s.tx_wins.clear();
             s.results.clear();
+            s.voted = None;
         }
         debug_assert!(sc.pool.is_empty() && sc.wins.is_empty());
         sc.reqs.clear();

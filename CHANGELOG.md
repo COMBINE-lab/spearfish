@@ -31,18 +31,22 @@
 
   On simulated ONT reads, correctly placed reads rise by about 0.4 points at 5% error and 1.5
   points at 10%, and transcript abundances from oarfish follow the truth more closely at
-  every error rate from 3% to 14%. The cost: ONT cDNA reads take 1.2 to 1.35 times the CPU
-  time they took (direct RNA reads about the same), and mapping takes 1.5 to 2 GB more
-  memory for a human transcriptome, for the table and the transcripts' rescue seeds
-  (`--rescue-store`). The `hifi` preset, which has no rescue, costs what it did.
-- **The index holds the rescue tables.** `spearfish index` writes the table and the
-  transcripts' rescue seeds into the index, as sections that 0.1.0 skips, so mapping starts
-  as fast as it did. They about double the file (2.6 GB for a human transcriptome) and add
-  about a second to the build. `spearfish index --no-rescue-tables` (`rescue_tables` in the
-  library and in Python) leaves them out; with such an index, or one built by 0.1.0, the
-  `ont` and `drna` presets make them at every start, in about half a second on 32 threads
-  and 1.7 GB more memory at the peak. Nothing else in the index changed, and its format
-  version is the same.
+  every error rate from 3% to 14%. The cost: ONT cDNA reads take 1.1 to 1.15 times the CPU
+  time they took (direct RNA reads within 5% of it), and mapping holds about 1.5 GB more of
+  the index in memory for a human transcriptome: the table, the transcripts' rescue seeds
+  (`--rescue-store`) and their antisense mates, all read in place from the index file. The
+  `hifi` preset, which has no rescue, costs no more than it did.
+- **The index holds the rescue tables.** `spearfish index` writes the table, the
+  transcripts' rescue seeds and each transcript's antisense mates (the transcripts that hold
+  stretches of its reverse complement) into the index, as sections that 0.1.0 skips. Mapping
+  reads them in place, so it starts as fast as it did and keeps no copy of them of its own.
+  They are a little over half of the file (2.8 GB for a human transcriptome) and add two to
+  three seconds to the build on 32 threads. `spearfish index --no-rescue-tables`
+  (`rescue_tables` in the library and in Python) leaves them out; with such an index, or one
+  built by 0.1.0, the `ont` and `drna` presets make the table and the seeds at every start,
+  in about half a second on 32 threads, and a transcript's mates when a read first needs
+  them, and the peak is about 1.4 GB higher. Nothing else in the index changed, and its
+  format version is the same.
 - **`ont-fast`, `drna-fast` and `hifi-fast` presets** map as 0.1.0 did: the same hits and
   scores, every read with a chain reported; of the mapping changes listed here, only the
   score scale applies to them. On noisy reads they are faster and less accurate than the
@@ -68,6 +72,20 @@
   chance match by itself (`--min-score`), not only when it scores within
   `--rescue-other-margin` of the chosen orientation's. When neither chain covers the read, the
   chosen orientation's lead says little.
+- Faster, with the same hits and scores (all presets, the `-fast` ones included):
+  - the tie-break's banded affine alignment runs on 16-bit cells when a pass's scores are sure
+    to fit them (AVX-512: 32 cells per register instead of 16, with narrow bands held in
+    registers from row to row);
+  - a read's whole-transcriptome votes for an orientation are kept, and reused when a later
+    step asks for no more candidates than the first did;
+  - the index's run-start select is branch-free, and output lines format their integers
+    without a call per number.
+- `spearfish map` asks Linux not to back its heap with transparent huge pages. Where they are
+  always on (the default of some distributions), each 2 MB stretch of the allocator's arenas
+  that one of mapping's many small per-thread buffers touched became resident whole: several
+  hundred megabytes at the peak, for no gain in speed. `MIMALLOC_ALLOW_THP=1` in the
+  environment leaves them on. `spearfish index`, which is faster with them, is unchanged, and
+  so is the library, which leaves the process's memory policy to its caller.
 - `SCORE_DENOM`, the scale RAD output suggests for turning score differences into
   probabilities (`score_denom`), is 3, where it was 1: a hit `d` below its read's best counts
   `exp(-d / 3)` times as much. 1 was chosen on simulated sets in which every transcript is

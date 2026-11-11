@@ -70,9 +70,10 @@ pub struct Args {
     /// Mask unitigs whose color touches more than this many genes.
     #[arg(long, alias = "f-max", default_value_t = 20, help_heading = "Index")]
     mask_genes: u32,
-    /// Don't keep the rescue tables in the index (they about double the file): mapping
-    /// with the ont and drna presets then makes them at every start. The hifi preset
-    /// never reads them.
+    /// Don't keep the rescue tables in the index (the rescue seeds, the table of their runs
+    /// and the transcripts' antisense mates: a little over half of the file). Mapping with
+    /// the ont and drna presets then makes them, at every start and as reads need them. The
+    /// hifi preset never reads them.
     #[arg(long, help_heading = "Index")]
     no_rescue_tables: bool,
     /// Build even if two different seed contents share a label (normally an error).

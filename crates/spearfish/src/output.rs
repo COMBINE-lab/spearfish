@@ -28,8 +28,11 @@ pub const TSV_HEADER: &str = "read\tread_len\tstrand\trank\ttranscript\tscore\tq
 
 /// Append `x` in decimal (as `{}` would).
 fn push_uint(buf: &mut Vec<u8>, mut x: u64) {
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
+    // The digits end at byte 20. Twenty bytes are copied from the first digit on and the
+    // surplus cut off again: a copy of fixed length is a few moves, one of the digits alone
+    // a call.
+    let mut tmp = [0u8; 40];
+    let mut i = 20;
     loop {
         i -= 1;
         tmp[i] = b'0' + (x % 10) as u8;
@@ -38,7 +41,10 @@ fn push_uint(buf: &mut Vec<u8>, mut x: u64) {
             break;
         }
     }
-    buf.extend_from_slice(&tmp[i..]);
+    let at = buf.len();
+    let from: &[u8; 20] = tmp[i..i + 20].try_into().unwrap();
+    buf.extend_from_slice(from);
+    buf.truncate(at + 20 - i);
 }
 
 /// Append `v` with `dec` (at most 4) decimals, digit for digit as `{:.dec$}` would: `v * 10^dec`

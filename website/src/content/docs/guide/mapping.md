@@ -60,11 +60,14 @@ presets these reads get more work at the rescue level, whose seeds are shorter a
   with the best hit (`--rescue-antisense`).
 
 `--rescue-settled` sets how well a chain must cover its read for the read to skip all this.
-The table and every transcript's rescue seeds (`--rescue-store`) are read from the index, where
-`spearfish index` keeps them, and take 1.5 to 2 GB of memory for a human transcriptome. With an
-index that lacks them (built with `--no-rescue-tables`, or by spearfish 0.1.0) they are made when
-mapping starts, which takes about half a second on 32 threads and 1.7 GB more memory at the
-peak. `--no-rescue-global --no-rescue-store` gives the memory back, at some cost in
+The table, every transcript's rescue seeds (`--rescue-store`) and the transcripts' antisense
+mates are read in place from the index, where `spearfish index` keeps them: about 1.5 GB of the
+file for a human transcriptome, which is the memory these presets take over the `-fast` ones.
+It is the file's own pages, which processes mapping against the same index share. With an
+index that lacks them (built with `--no-rescue-tables`, or by spearfish 0.1.0) the table and
+the seeds are made when mapping starts, which takes about half a second on 32 threads, and a
+transcript's mates when a read first needs them; the peak is then about 1.4 GB higher.
+`--no-rescue-global --no-rescue-store` gives most of the memory back, at some cost in
 accuracy on high-error reads; `--no-rescue` turns the rescue off altogether, tables included.
 
 ## Changing settings
@@ -98,6 +101,10 @@ Settings you may want to change:
 
 The remaining settings tune gene selection, chaining, the tie-break and the rescue; they are
 listed under their headings in `--help`.
+
+On Linux, `spearfish map` asks the kernel not to back its heap with transparent huge pages:
+where they are always on, they add several hundred megabytes to the peak memory and no speed.
+Set `MIMALLOC_ALLOW_THP=1` in the environment to leave them on.
 
 ## Messages
 

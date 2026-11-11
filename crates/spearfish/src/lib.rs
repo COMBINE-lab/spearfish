@@ -306,9 +306,11 @@ pub struct IndexOptions {
     #[builder(default)]
     pub allow_collisions: bool,
     /// Keep the rescue tables of the default rescue settings in the index: every
-    /// transcript's rescue seeds and the table of their runs, which the `ont` and `drna`
-    /// presets map with. A mapper reads them in place; without them it makes them each time
-    /// it is built. They about double the index file; the `hifi` preset never reads them.
+    /// transcript's rescue seeds, the table of their runs and each transcript's antisense
+    /// mates, which the `ont` and `drna` presets map with. A mapper reads them in place;
+    /// without them it makes the seeds and the table each time it is built, and a
+    /// transcript's mates when a read first needs them. They are a little over half of the
+    /// index file; the `hifi` preset never reads them.
     #[builder(default = true)]
     pub rescue_tables: bool,
 }
@@ -448,6 +450,10 @@ impl Index {
             let tuple = map::rescue::GlobalParams::default().tuple;
             map::tables::build_into(&mut data, &rescue.spec, tuple, index::build_threads())?;
             rep.seconds.push(("rescue tables", t.elapsed().as_secs_f64()));
+            let t = std::time::Instant::now();
+            let h_max = map::anchor::AnchorParams::default().h_max;
+            map::mates::build_into(&mut data, h_max, index::build_threads())?;
+            rep.seconds.push(("antisense mates", t.elapsed().as_secs_f64()));
         }
         let mut manifest = provenance::IndexManifest::new(&data, opts, &rep, input);
         manifest.command_line = command_line;

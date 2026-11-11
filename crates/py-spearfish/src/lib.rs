@@ -269,8 +269,9 @@ impl PyIndex {
     /// :param threads: Build threads (0: every available CPU).
     /// :param allow_collisions: Build even if two seed contents share a label.
     /// :param rescue_tables: Keep the rescue tables the ``"ont"`` and ``"drna"`` presets map
-    ///     with in the index (about twice the size); without them every :class:`Mapper` of
-    ///     those presets makes them when it is built.
+    ///     with in the index (a little over half of the file); without them every
+    ///     :class:`Mapper` of those presets makes them, when it is built and as reads need
+    ///     them.
     #[staticmethod]
     #[pyo3(signature = (transcripts, output=None, *, t2g=None, infer_genes=None, scheme="lcp:K=3", hpc=true, mask_genes=20, collapse="gene", threads=0, allow_collisions=false, rescue_tables=true))]
     #[allow(clippy::too_many_arguments)]

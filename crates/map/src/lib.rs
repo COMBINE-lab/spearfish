@@ -4,6 +4,7 @@
 pub mod align;
 pub mod anchor;
 pub mod chain;
+pub mod mates;
 pub mod refine;
 pub mod rescue;
 pub mod stats;
@@ -410,29 +411,9 @@ pub struct Mapper<C: Chainer> {
     rescuer: Option<Rescuer>,
     /// [`anchor::node_families`] of `idx`.
     node_fam: Vec<u32>,
-    /// Per transcript, its [`MateSeg`]s by mate (made on first use).
-    anti: Vec<std::sync::OnceLock<Box<[MateSeg]>>>,
+    /// Every transcript's antisense mates.
+    anti: mates::Mates,
 }
-
-/// A stretch of a transcript that occurs reverse-complemented in another one, its antisense
-/// mate: the base-level seeds of the transcript's reverse complement found in the mate on one
-/// diagonal.
-#[derive(Clone, Copy)]
-struct MateSeg {
-    /// The mate.
-    t: u32,
-    /// The stretch in the transcript (forward coordinates).
-    x: (u32, u32),
-    /// A seed's first base in the transcript + its first base in the mate + its length: the
-    /// same for every seed of one antisense match.
-    c: u32,
-    /// Bases of the stretch's seeds.
-    w: u32,
-}
-
-/// Seeds with more occurrences than this name no antisense mates: they are repeats, which
-/// every transcript shares with hundreds of unrelated ones.
-const MATE_MAX_OCC: usize = 1024;
 
 /// A read orientation's raw bases (2-bit codes) and HPC run map, for raw-space read ends.
 struct RawRead {
@@ -571,7 +552,7 @@ impl<C: Chainer> Mapper<C> {
         let node_fam = anchor::node_families(&idx);
         Ok(Mapper {
             node_fam,
-            anti: (0..idx.n_transcripts()).map(|_| Default::default()).collect(),
+            anti: mates::Mates::load(&idx, p.anchor.h_max),
             idx,
             seeder,
             chainer,
@@ -1590,82 +1571,6 @@ impl<C: Chainer> Mapper<C> {
         Some((cost, unit))
     }
 
-    /// Transcript occurrences (transcript, first base) of the seed at index nodes `nodes`, until
-    /// `f` returns true; whether it did.
-    fn node_occurrences(&self, nodes: std::ops::Range<u32>, mut f: impl FnMut(u32, u32) -> bool) -> bool {
-        let flags = self.idx.node_flags();
-        for node in nodes {
-            if flags[node as usize] & index::FLAG_MASKED != 0 {
-                continue;
-            }
-            let off = self.idx.node_offset()[node as usize];
-            let (ts, ps) = self.idx.occurrences(self.idx.node_unitig()[node as usize]);
-            if ts.iter().zip(ps).any(|(&t, &p)| f(t, p + off)) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// The [`MateSeg`]s of transcript `x`, by mate: of the mates sharing at least two seeds
-    /// with it.
-    fn mate_segs(&self, x: u32) -> &[MateSeg] {
-        self.anti[x as usize].get_or_init(|| {
-            let tlen = self.idx.tx_plen()[x as usize];
-            let mut codes = self.idx.tx_codes(x, 0, tlen);
-            codes.reverse();
-            codes.iter_mut().for_each(|c| *c = 3 - *c);
-            let mut seeds = Vec::new();
-            self.seeder.seed_codes_into(&codes, &mut seeds, &mut Vec::new());
-            // Per occurrence in another transcript: (mate, c, first base here, length).
-            let mut occ: Vec<(u32, u32, u32, u32)> = Vec::new();
-            for s in &seeds {
-                let r = self.idx.lookup(s.label);
-                if r.is_empty() || r.len() > self.p.anchor.h_max {
-                    continue;
-                }
-                let (from, at, len) = (occ.len(), tlen - s.end, s.end - s.start);
-                let over = self.node_occurrences(r, |t, p| {
-                    if t != x {
-                        occ.push((t, at + p + len, at, len));
-                    }
-                    occ.len() - from > MATE_MAX_OCC
-                });
-                if over {
-                    occ.truncate(from);
-                }
-            }
-            occ.sort_unstable();
-            let mut out: Vec<MateSeg> = Vec::new();
-            let mut i = 0;
-            while i < occ.len() {
-                let t = occ[i].0;
-                let (from, mut n) = (out.len(), 0);
-                while i < occ.len() && occ[i].0 == t {
-                    let (_, c, at, len) = occ[i];
-                    match out[from..].last_mut() {
-                        Some(m) if m.c == c => {
-                            m.x.1 = m.x.1.max(at + len);
-                            m.w += len;
-                        }
-                        _ => out.push(MateSeg {
-                            t,
-                            x: (at, at + len),
-                            c,
-                            w: len,
-                        }),
-                    }
-                    n += 1;
-                    i += 1;
-                }
-                if n < 2 {
-                    out.truncate(from);
-                }
-            }
-            out.into_boxed_slice()
-        })
-    }
-
     /// The range of diagonals of `h` and the transcript interval a read of `plen` parsed
     /// bases on them covers.
     fn hit_span(&self, h: &TxHit, plen: u32) -> ((i64, i64), (u32, u32)) {
@@ -1689,36 +1594,47 @@ impl<C: Chainer> Mapper<C> {
     /// of the read's `plen` parsed bases, the `k` sharing most first, in that order, then the
     /// others in no order.
     fn antisense_mates(&self, h: &TxHit, plen: u32, k: usize, min: f32) -> Vec<(u32, u32, i64, i64)> {
-        let segs = self.mate_segs(h.tx);
+        let segs = self.anti.of(&self.idx, &self.seeder, self.p.anchor.h_max, h.tx);
         if segs.is_empty() {
             return Vec::new();
         }
         let ((dlo, dhi), (lo, hi)) = self.hit_span(h, plen);
         let min = ((min * plen as f32) as u64).max(1);
         stats::add(&stats::MATE_CALLS, 1);
-        stats::add(&stats::MATE_SEEDS, segs.len() as u64);
+        // Per distinct stretch, the bases it shares within the region (a stretch partly
+        // inside it counts in proportion), if it reaches into the region at all.
+        let mut stretches = Vec::new();
+        let first = segs.stretches(&mut stretches);
+        let within: Vec<Option<u64>> = stretches
+            .iter()
+            .map(|&(x0, x1, w)| {
+                let (a, b) = (x0.max(lo), x1.min(hi));
+                (a < b).then(|| u64::from(w) * u64::from(b - a) / u64::from(x1 - x0))
+            })
+            .collect();
         let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
-        let mut i = 0;
-        while i < segs.len() {
-            let t = segs[i].t;
-            // Bases shared within the region (a stretch partly inside it counts in
-            // proportion) and the range of diagonals: a seed at read position q of this
-            // orientation lies at plen - q - len of the other.
-            let (mut w, mut d) = (0u64, (i64::MAX, i64::MIN));
-            while i < segs.len() && segs[i].t == t {
-                let m = &segs[i];
-                let (a, b) = (m.x.0.max(lo), m.x.1.min(hi));
-                if a < b {
-                    w += u64::from(m.w) * u64::from(b - a) / u64::from(m.x.1 - m.x.0);
-                    let c = i64::from(m.c) - i64::from(plen);
-                    d = (d.0.min(c - dhi), d.1.max(c - dlo));
+        // The mate at hand: its shared bases and its range of diagonals (a seed at read
+        // position q of this orientation lies at plen - q - len of the other).
+        let (mut t, mut w, mut d) = (u32::MAX, 0u64, (i64::MAX, i64::MIN));
+        let mut n = 0u64;
+        segs.for_each(first, |u, id, c| {
+            n += 1;
+            if u != t {
+                if w >= min {
+                    out.push((t, w as u32, d.0, d.1));
                 }
-                i += 1;
+                (t, w, d) = (u, 0, (i64::MAX, i64::MIN));
             }
-            if w >= min {
-                out.push((t, w as u32, d.0, d.1));
+            if let Some(&Some(x)) = within.get(id) {
+                w += x;
+                let c = i64::from(c) - i64::from(plen);
+                d = (d.0.min(c - dhi), d.1.max(c - dlo));
             }
+        });
+        if w >= min {
+            out.push((t, w as u32, d.0, d.1));
         }
+        stats::add(&stats::MATE_SEEDS, n);
         stats::add(&stats::MATE_FOUND, out.len() as u64);
         let key = |&(t, w, _, _): &(u32, u32, i64, i64)| (std::cmp::Reverse(w), t);
         if k > 0 && out.len() > k {

@@ -39,11 +39,11 @@ time and memory, and fewer reads are assigned to the right transcript (top-1 fal
 99.4%), because the per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
 writes the grouping that was used.
 
-For human GENCODE v50 (670,670 transcripts) the index is 2.6 GB and builds in about 6 seconds on
-32 threads. Half of the file is the rescue tables, which the `ont` and `drna` presets map
-doubtful reads with ([Doubtful reads](/spearfish/guide/mapping/#doubtful-reads));
-`--no-rescue-tables` leaves them out, and mapping with those presets then makes them at every
-start. Map against an index built from the same transcript FASTA you quantify against.
+For human GENCODE v50 (670,670 transcripts) the index is 2.8 GB and builds in about 7 seconds on
+32 threads. A little over half of the file is the rescue tables, which the `ont` and `drna`
+presets map doubtful reads with ([Doubtful reads](/spearfish/guide/mapping/#doubtful-reads));
+`--no-rescue-tables` leaves them out, and mapping with those presets then makes them, at every
+start and as reads need them. Map against an index built from the same transcript FASTA you quantify against.
 
 ## What the index holds
 
@@ -52,6 +52,9 @@ start. Map against an index built from the same transcript FASTA you quantify ag
 - For every unitig, the transcripts that contain it and where.
 - The homopolymer-compressed sequence of every transcript, and its raw sequence, used to align
   read ends where isoforms differ.
+- The **rescue tables** of the `ont` and `drna` presets: every transcript's rescue seeds, a
+  table of their runs of three, and each transcript's antisense mates (the transcripts that
+  hold stretches of its reverse complement). Mapping reads them in place from the file.
 
 [Inside spearfish](/spearfish/concepts/inside/) explains why this structure is small.
 
@@ -85,7 +88,7 @@ giving wrong results.
 | `--no-hpc` | | Don't homopolymer-compress transcripts (and reads at mapping time). |
 | `--collapse` | `gene` | Collapse seeds per (label, gene) or globally (`global`, larger and slower). |
 | `--mask-genes` | `20` | Mask unitigs shared by more than this many genes (repeats). |
-| `--no-rescue-tables` | | Leave the rescue tables out of the index (half its size); the `ont` and `drna` presets then make them at every start. |
+| `--no-rescue-tables` | | Leave the rescue tables out of the index (a little over half its size); the `ont` and `drna` presets then make them, at every start and as reads need them. |
 | `--t2g` | | Transcript-to-gene table (see above). |
 | `--infer-genes [N]` | off (N = 64) | Infer genes from shared seed runs, ignoring runs in more than N transcripts. |
 | `--infer-span` | `12` | Consecutive seeds a shared run must span. |

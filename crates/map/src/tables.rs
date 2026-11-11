@@ -39,7 +39,7 @@ impl<T> Arr<T> {
 
     /// A view of `s`, without its lifetime: the caller keeps the memory alive and in place
     /// for as long as the `Arr` lives.
-    fn of(s: &[T]) -> Self {
+    pub(crate) fn of(s: &[T]) -> Self {
         Arr {
             ptr: s.as_ptr(),
             len: s.len(),
@@ -380,7 +380,7 @@ const GROUP: usize = 32;
 type Run = (u64, u32, u32);
 
 /// Append `x` as a byte varint.
-fn put(out: &mut Vec<u8>, mut x: u32) {
+pub(crate) fn put(out: &mut Vec<u8>, mut x: u32) {
     while x >= 0x80 {
         out.push(x as u8 | 0x80);
         x >>= 7;
@@ -391,7 +391,7 @@ fn put(out: &mut Vec<u8>, mut x: u32) {
 /// The byte varint at `b[p..]` and where the next one starts (past the end of `b`, if it
 /// runs out).
 #[inline]
-fn varint(b: &[u8], mut p: usize) -> (u32, usize) {
+pub(crate) fn varint(b: &[u8], mut p: usize) -> (u32, usize) {
     let (mut x, mut sh) = (0u32, 0);
     loop {
         let Some(&c) = b.get(p) else {
