@@ -1,4 +1,4 @@
-//! `alloc::Bump` as this test program's global allocator, with the arenas on: blocks keep
+//! `Bump` as this test program's global allocator, with the arenas on: blocks keep
 //! their contents whichever thread frees them, through thread exits and when arenas or chunks
 //! run out.
 
@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 
-use spearfish::alloc::{self, Bump};
+use nudge_alloc::{self as alloc, Bump};
 
 #[global_allocator]
 static GLOBAL: Bump<System> = Bump::new(System);
@@ -213,7 +213,14 @@ fn more_threads_than_arenas_use_the_wrapped_allocator() {
         .filter(|&a| a)
         .count();
     assert!(in_arena <= 256);
-    assert!(alloc::arenas_in_use() <= 256);
+    let stats = alloc::stats();
+    assert!(stats.arenas_in_use <= 256);
+    if stats.enabled {
+        // Every arena was taken, and the threads that found none were counted.
+        assert_eq!(stats.arenas_peak, 256);
+        assert!(stats.no_arena >= (THREADS - 256) as u64, "{stats:?}");
+        assert!(stats.fallback_allocations() >= stats.no_arena);
+    }
 }
 
 #[test]
@@ -222,10 +229,18 @@ fn a_full_arena_uses_the_wrapped_allocator() {
     let _arenas = ARENAS.lock().unwrap();
     // 16 MB of live small blocks from one thread, whose arena holds 4 MB.
     std::thread::spawn(move || {
+        let before = alloc::stats();
         let blocks: Vec<Vec<u8>> = (0..64_000usize).map(|i| block(i, 250)).collect();
         let n = blocks.iter().filter(|b| alloc::in_arena(b.as_ptr())).count();
         if on {
             assert!(n > 10_000 && n < 64_000, "{n} blocks in the arena");
+            // The thread went through its 64 chunks, then found its arena full.
+            let after = alloc::stats();
+            assert!(
+                after.chunk_refills >= before.chunk_refills + 64,
+                "{before:?} {after:?}"
+            );
+            assert!(after.arena_full > before.arena_full, "{before:?} {after:?}");
         }
         for (i, b) in blocks.iter().enumerate() {
             check(i, b);

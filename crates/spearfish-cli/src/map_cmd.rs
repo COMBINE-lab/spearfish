@@ -406,7 +406,7 @@ pub fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
     }
-    if args.bump_alloc && !spearfish::alloc::enable() {
+    if args.bump_alloc && !nudge_alloc::enable() {
         log::warn!("--bump-alloc is not available on this system; mapping without it");
     }
     execute(Job {
@@ -540,6 +540,17 @@ pub fn execute(args: Job) -> Result<Counts> {
         c.reads as f64 / secs,
         c.bases as f64 / 1e6 / secs
     );
+    let arenas = nudge_alloc::stats();
+    if arenas.enabled {
+        log::debug!(
+            "bump-alloc: {} arenas at most, {} chunks started, no arena free {} times, arena full {} times (at most {} allocations left to the general allocator)",
+            arenas.arenas_peak,
+            arenas.chunk_refills,
+            arenas.no_arena,
+            arenas.arena_full,
+            arenas.fallback_allocations()
+        );
+    }
     if let Some(strand) = oriented(&c, both_strands) {
         log::info!(
             "map: {:.1}% of the mapped reads map forward: the reads look oriented, and `--strands {strand}` maps only that orientation, which is faster",

@@ -1,0 +1,22 @@
+[package]
+name = "nudge-alloc"
+description = "Small blocks from per-thread bump arenas, in front of any global allocator"
+# Its own version, not the workspace's: it changes rarely, and other programs depend on it
+# without the rest of spearfish. A change to this crate needs a new version here (see
+# "Releasing" in CONTRIBUTING.md).
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["allocator", "bump", "arena", "global-allocator"]
+categories = ["memory-management"]
+
+# The reservation behind the arenas (mmap).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc.workspace = true
+
+# tests/loom.rs: the models are the same on every target, so one is enough.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+loom = "0.7"

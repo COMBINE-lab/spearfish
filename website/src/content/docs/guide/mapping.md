@@ -149,7 +149,9 @@ in the environment turns that off, which lowers the peak by several hundred mega
 each thread, instead of from the general allocator. Mapping a read makes a few hundred of
 them and frees nearly all before the next read, so a thread stays in the same few pages. It
 is off by default: mapping takes about 2% less CPU time with it, for up to 4 MB of memory a
-thread, and the output is the same. It is there on 64-bit Linux and macOS.
+thread, and the output is the same. It is there on 64-bit Linux and macOS. Up to 256 threads
+have such memory at a time; with `-v`, the summary says how many did and how often a thread
+went without.
 
 ## Messages
 

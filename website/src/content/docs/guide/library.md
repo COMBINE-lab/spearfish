@@ -42,20 +42,23 @@ for hit in &read.hits {
   `tsv_lines`), PAF (`paf_lines`) and, with the default `rad` feature, RAD records for oarfish
   (`rad_writer`, `rad_record`). The text writers append to a byte buffer, so each thread can
   format its own batch.
-- `spearfish::alloc::Bump` is the optional allocator behind `spearfish map --bump-alloc`: it
-  wraps a program's global allocator and serves small blocks from per-thread arenas. Only a
-  program can choose its global allocator, so an embedding opts in itself: it declares
-  `Bump` around the allocator it uses, and calls `spearfish::alloc::enable()` before mapping.
-  Until that call every allocation goes to the wrapped allocator.
+- The optional allocator behind `spearfish map --bump-alloc` is a crate of its own,
+  `nudge-alloc` (`crates/nudge-alloc` in the repository): `nudge_alloc::Bump` wraps a
+  program's global allocator and serves small blocks from per-thread arenas. Only a program
+  can choose its global allocator, so an embedding opts in itself: it depends on
+  `nudge-alloc`, declares `Bump` around the allocator it uses, and calls
+  `nudge_alloc::enable()` before mapping. Until that call every allocation goes to the
+  wrapped allocator. Afterwards `nudge_alloc::stats()` says how many arenas were in use and
+  how often a thread went without one.
 
   ```rust
-  use spearfish::alloc::Bump;
+  use nudge_alloc::Bump;
 
   #[global_allocator]
   static GLOBAL: Bump<std::alloc::System> = Bump::new(std::alloc::System);
 
   fn main() {
-      spearfish::alloc::enable();
+      nudge_alloc::enable();
       // build a Mapper and map reads
   }
   ```

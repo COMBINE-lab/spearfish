@@ -14,15 +14,19 @@ Usage:
   ./bump_and_publish.sh <version> [--publish] [--dry-run] [--allow-same-version]
                                   [--github-release] [--python]
 
-Bumps the workspace version (every crate, and the Python package, share it) and the
+Bumps the workspace version (the spearfish crates and the Python package share it) and the
 workspace's own dependency versions, dates the CHANGELOG section `## <version> (unreleased)`,
 commits, checks that every crate builds from its own package (`cargo publish --workspace
 --dry-run`), tags `v<version>`, and pushes the commit and the tag to origin.
 
+A crate that sets a version of its own (crates/nudge-alloc) keeps it: it is published with
+the release when that version is not on crates.io yet, and the release stops if the crate
+has changed since the version it names was published.
+
 Options:
   --publish             Publish the crates to crates.io (`cargo publish --workspace`, in
                         dependency order) before tagging. Crates already published at
-                        <version> are skipped, so an interrupted release can be re-run.
+                        their version are skipped, so an interrupted release can be re-run.
   --allow-same-version  Proceed when the workspace is already at <version> (the version edits
                         are skipped; the CHANGELOG is still dated, and check/publish/tag run).
   --github-release      Also make a GitHub release from the tag, with the CHANGELOG section
@@ -186,19 +190,62 @@ if [[ "$GITHUB_RELEASE" == true ]]; then
     command -v gh >/dev/null || die "--github-release needs the GitHub CLI (gh)"
 fi
 
-# The crates to publish: every workspace member that does not say `publish = false`.
+# The crates to publish: every workspace member that does not say `publish = false`, one per
+# line as `name version directory`. The version is `-` for a crate at the workspace version; a
+# crate that sets a version of its own is released at that one.
 PUBLISHABLE="$(cargo metadata --no-deps --format-version 1 --locked | python3 -c '
-import json, sys
+import json, os, re, sys
+shared = re.compile(r"^version(\.workspace\s*=\s*true|\s*=\s*\{\s*workspace\s*=\s*true\s*\})", re.M)
 for p in json.load(sys.stdin)["packages"]:
-    if p.get("publish") != []:
-        print(p["name"])
+    if p.get("publish") == []:
+        continue
+    with open(p["manifest_path"]) as f:
+        own = not shared.search(f.read())
+    print(p["name"], p["version"] if own else "-", os.path.relpath(os.path.dirname(p["manifest_path"])))
 ')"
 [[ -n "$PUBLISHABLE" ]] || die "found no publishable crates"
+
+# The version a crate is released at, from the second field of its PUBLISHABLE line.
+crate_version() {
+    if [[ "$1" == "-" ]]; then echo "$VERSION"; else echo "$1"; fi
+}
+
+# Whether crate $1 is on crates.io at version $2.
+on_crates_io() {
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -A "spearfish-release (${REPO_URL})" \
+        "https://crates.io/api/v1/crates/$1/$2")"
+    [[ "$code" == "200" ]]
+}
+
+# Whether directory $3 is as it was when crate $1 was published at version $2 (the package
+# records the commit it was made from).
+unchanged_since_published() {
+    local sha
+    sha="$(curl -sfL -A "spearfish-release (${REPO_URL})" \
+        "https://crates.io/api/v1/crates/$1/$2/download" |
+        tar -xzOf - "$1-$2/.cargo_vcs_info.json" 2>/dev/null |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["git"]["sha1"])' 2>/dev/null)" ||
+        die "could not read the commit that $1 v$2 was published from"
+    git cat-file -e "${sha}^{commit}" 2>/dev/null ||
+        die "$1 v$2 was published from commit $sha, which is not in this repository"
+    git diff --quiet "$sha" HEAD -- "$3"
+}
+
+# A crate with a version of its own is uploaded only when that version is new. If the version
+# is already on crates.io and the crate has changed since, the release would ship the other
+# crates against the old code: the crate needs a new version first.
+while read -r name ver dir; do
+    [[ "$ver" != "-" ]] || continue
+    if on_crates_io "$name" "$ver" && ! unchanged_since_published "$name" "$ver" "$dir"; then
+        die "$dir has changed since $name v$ver was published: give it a new version (in $dir/Cargo.toml, and where another crate requires it)"
+    fi
+done <<<"$PUBLISHABLE"
 
 echo "Current workspace version : $CURRENT_VERSION"
 echo "New workspace version     : $VERSION"
 echo "CHANGELOG section         : $NEW_HEADING"
-echo "Crates                    : $(tr '\n' ' ' <<<"$PUBLISHABLE")"
+echo "Crates                    : $(awk '{printf "%s%s ", $1, ($2 == "-" ? "" : " (v" $2 ")")}' <<<"$PUBLISHABLE")"
 echo "Tag                       : $TAG$([[ "$PYTHON" == true ]] && echo ", $PY_TAG")"
 echo "Publish crates            : $([[ "$PUBLISH" == true ]] && echo yes || echo no)"
 echo "GitHub release            : $([[ "$GITHUB_RELEASE" == true ]] && echo yes || echo no)"
@@ -250,27 +297,22 @@ fi
 
 # ── Publish ─────────────────────────────────────────────────────────────────────────────────
 
-on_crates_io() {
-    local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' -A "spearfish-release (${REPO_URL})" \
-        "https://crates.io/api/v1/crates/$1/${VERSION}")"
-    [[ "$code" == "200" ]]
-}
-
-# Crates already on crates.io at this version (published by an interrupted release, or by an
-# earlier attempt below) are left out of the check and the upload.
+# Crates already on crates.io at their version (published by an interrupted release or by an
+# earlier attempt below, or a crate with a version of its own that has not changed) are left
+# out of the check and the upload.
 EXCLUDE=()
 TO_PUBLISH=0
 pending_crates() {
+    local name ver
     EXCLUDE=()
     TO_PUBLISH=0
-    for c in $PUBLISHABLE; do
-        if on_crates_io "$c"; then
-            EXCLUDE+=(--exclude "$c")
+    while read -r name ver _; do
+        if on_crates_io "$name" "$(crate_version "$ver")"; then
+            EXCLUDE+=(--exclude "$name")
         else
             TO_PUBLISH=$((TO_PUBLISH + 1))
         fi
-    done
+    done <<<"$PUBLISHABLE"
 }
 
 # How long to wait before trying again after a failed `cargo publish` whose output is in $1, in
@@ -297,13 +339,13 @@ retry_wait() {
 
 pending_crates
 if [[ "$TO_PUBLISH" -eq 0 ]]; then
-    echo "Every crate is already on crates.io at v${VERSION}"
+    echo "Every crate of v${VERSION} is already on crates.io"
 else
-    for c in $PUBLISHABLE; do
-        if [[ " ${EXCLUDE[*]-} " == *" $c "* ]]; then
-            echo "$c v${VERSION} is already on crates.io; leaving it out"
+    while read -r name ver _; do
+        if [[ " ${EXCLUDE[*]-} " == *" $name "* ]]; then
+            echo "$name v$(crate_version "$ver") is already on crates.io; leaving it out"
         fi
-    done
+    done <<<"$PUBLISHABLE"
     # Every crate must build from its own package, as crates.io will build it.
     run cargo publish --workspace ${EXCLUDE[@]+"${EXCLUDE[@]}"} --dry-run
     if [[ "$PUBLISH" == true ]]; then

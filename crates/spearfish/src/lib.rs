@@ -25,15 +25,11 @@
 //! [`IndexOptions`], also with a builder. Score differences between a read's hits convert to
 //! probabilities as `exp(-d / SCORE_DENOM)` ([`SCORE_DENOM`]).
 //!
-//! Allocation: [`alloc::Bump`] is an optional global allocator that serves the mapper's small
-//! allocations from per-thread arenas, for programs that map many reads.
-//!
 //! Output: [`output`] formats mapped reads as `spearfish map` writes them (TSV, PAF and, with
 //! the `rad` feature, RAD for oarfish).
 
 #![warn(missing_docs)]
 
-pub mod alloc;
 pub mod output;
 pub mod provenance;
 pub mod settings;
