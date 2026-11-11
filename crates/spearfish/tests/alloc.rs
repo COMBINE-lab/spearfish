@@ -2,7 +2,9 @@
 //! their contents whichever thread frees them, through thread exits and when arenas or chunks
 //! run out.
 
-use std::alloc::System;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 
 use spearfish::alloc::{self, Bump};
@@ -240,6 +242,188 @@ fn a_full_arena_uses_the_wrapped_allocator() {
         assert_eq!(again[5000..].iter().all(|b| alloc::in_arena(b.as_ptr())), on);
         for (i, b) in again.iter().enumerate() {
             check(i, b);
+        }
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn the_next_owner_and_other_threads_free_what_an_arena_held() {
+    on();
+    let _arenas = ARENAS.lock().unwrap();
+    for round in 0..50usize {
+        // A thread leaves part-used chunks behind. The next thread takes its arena, frees
+        // half of the blocks itself and passes the rest to a third thread, allocating all
+        // the while.
+        let left: Vec<(usize, Vec<u8>)> = std::thread::spawn(move || {
+            let mut v: Vec<_> = (0..2000usize)
+                .map(|i| (i, block(i, 1 + (i * 37) % 600)))
+                .collect();
+            for i in (0..v.len()).rev().step_by(3) {
+                v.swap_remove(i);
+            }
+            v
+        })
+        .join()
+        .unwrap();
+        let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
+        let third = std::thread::spawn(move || {
+            for (tag, v) in rx {
+                check(tag, &v);
+            }
+        });
+        let kept = std::thread::spawn(move || {
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (round as u64 + 1));
+            let mut kept: Vec<(usize, Vec<u8>)> = Vec::new();
+            for (n, (tag, v)) in left.into_iter().enumerate() {
+                if n % 2 == 0 {
+                    check(tag, &v);
+                } else {
+                    tx.send((tag, v)).unwrap();
+                }
+                for i in 0..rng.next() % 4 {
+                    let tag = 1_000_000 + n * 4 + i;
+                    let mut v = block(tag, 1 + rng.next() % 1024);
+                    let grown = v.len() + rng.next() % 300;
+                    v.extend((v.len()..grown).map(|i| (tag + i) as u8));
+                    if rng.next().is_multiple_of(4) {
+                        kept.push((tag, v));
+                    }
+                }
+            }
+            kept
+        })
+        .join()
+        .unwrap();
+        third.join().unwrap();
+        for (tag, v) in &kept {
+            check(*tag, v);
+        }
+    }
+}
+
+/// Blocks that a thread's destructors free, and one that allocates as it runs.
+struct AtExit(Vec<(usize, Vec<u8>)>, mpsc::Sender<(usize, Vec<u8>)>);
+impl Drop for AtExit {
+    fn drop(&mut self) {
+        let mut more: Vec<_> = (0..50usize).map(|i| (i, block(i, 1 + i * 13))).collect();
+        for (tag, v) in more.iter_mut().step_by(3) {
+            v.extend((v.len()..v.len() + 17).map(|i| (*tag + i) as u8));
+        }
+        for (tag, v) in self.0.iter().chain(&more) {
+            check(*tag, v);
+        }
+        // Some outlive the thread.
+        for b in more.drain(..10) {
+            self.1.send(b).unwrap();
+        }
+    }
+}
+thread_local! {
+    static BEFORE: RefCell<Option<AtExit>> = const { RefCell::new(None) };
+    static AFTER: RefCell<Option<AtExit>> = const { RefCell::new(None) };
+}
+
+#[test]
+fn thread_local_destructors_allocate_and_free() {
+    on();
+    let _arenas = ARENAS.lock().unwrap();
+    let (tx, rx) = mpsc::channel();
+    for t in 0..200usize {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            // One destructor is registered before the thread has an arena, and so runs after
+            // the arena was given back; the other one before.
+            BEFORE.with(|_| ());
+            let held = |k: usize| {
+                (0..100usize)
+                    .map(|i| (t + k + i, block(t + k + i, 1 + i * 7)))
+                    .collect()
+            };
+            let (a, b): (Vec<_>, Vec<_>) = (held(0), held(1000));
+            BEFORE.with(|c| *c.borrow_mut() = Some(AtExit(a, tx.clone())));
+            AFTER.with(|c| *c.borrow_mut() = Some(AtExit(b, tx)));
+        })
+        .join()
+        .unwrap();
+        // The next thread has the arena while the last one's blocks are still here.
+        if t % 10 == 9 {
+            for (tag, v) in rx.try_iter() {
+                check(tag, &v);
+            }
+        }
+    }
+}
+
+/// An allocator that counts what reaches it, and answers a request for no bytes (which
+/// `System` need not) with an address no block has.
+struct Probe;
+static PROBED: AtomicUsize = AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Probe {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        PROBED.fetch_add(1, Relaxed);
+        if l.size() == 0 {
+            return l.align() as *mut u8;
+        }
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        PROBED.fetch_add(1, Relaxed);
+        if l.size() != 0 {
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+}
+
+#[test]
+fn direct_calls_keep_to_the_contract() {
+    let on = on();
+    // One thread, so that the blocks follow one another in its chunk.
+    std::thread::spawn(move || unsafe {
+        let a = Bump::new(Probe);
+        let fill = |p: *mut u8, n: usize| (0..n).for_each(|i| *p.add(i) = (i * 7) as u8);
+        let filled = |p: *mut u8, n: usize| (0..n).all(|i| *p.add(i) == (i * 7) as u8);
+        // Every alignment, sizes around the largest served.
+        for align in [1usize, 2, 4, 8, 16, 32, 64] {
+            for size in [1usize, 15, 16, 17, 1023, 1024, 1025, 5000] {
+                let l = Layout::from_size_align(size, align).unwrap();
+                let mut p = a.alloc_zeroed(l);
+                assert_eq!(p as usize % align, 0);
+                assert!((0..size).all(|i| *p.add(i) == 0));
+                assert_eq!(alloc::in_arena(p), on && size <= 1024 && align <= 16);
+                fill(p, size);
+                // To the other side of the largest size and back, growing and shrinking. A
+                // block that left the arenas stays the wrapped allocator's.
+                for new in [size + 1, 1024, 1025, 3000, 700, 1, size] {
+                    let was = alloc::in_arena(p);
+                    let q = a.realloc(p, l, new);
+                    assert_eq!(q as usize % align, 0);
+                    assert!(filled(q, size.min(new)));
+                    assert_eq!(alloc::in_arena(q), was && new <= 1024);
+                    p = a.realloc(q, Layout::from_size_align(new, align).unwrap(), size);
+                    assert_eq!(alloc::in_arena(p), was && new <= 1024);
+                    assert!(filled(p, size.min(new)));
+                    fill(p, size);
+                }
+                a.dealloc(p, l);
+            }
+        }
+        // A request for no bytes is the wrapped allocator's, also when the thread's chunk is
+        // full to its last byte, as it is three times here.
+        let (word, none) = (Layout::new::<[u8; 16]>(), Layout::from_size_align(0, 1).unwrap());
+        let mut blocks: Vec<*mut u8> = Vec::with_capacity(3 * 4096);
+        for _ in 0..3 * 4096 {
+            blocks.push(a.alloc(word));
+            let before = PROBED.load(Relaxed);
+            let z = a.alloc(none);
+            assert!(!alloc::in_arena(z));
+            a.dealloc(z, none);
+            assert_eq!(PROBED.load(Relaxed), before + 2);
+        }
+        assert_eq!(blocks.iter().all(|&p| alloc::in_arena(p)), on);
+        for p in blocks {
+            a.dealloc(p, word);
         }
     })
     .join()

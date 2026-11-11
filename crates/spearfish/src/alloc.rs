@@ -32,8 +32,14 @@
 //! small allocations are mostly short-lived, as a mapper's are.
 //!
 //! The arenas are one reservation of 1 GB of address space, of which only the chunks in use
-//! are backed by memory. They are there on 64-bit Linux and macOS; on other targets `enable`
-//! returns false and `Bump` only forwards.
+//! are backed by memory. Where transparent huge pages are always on, a chunk's first write
+//! backs the 2 MB around it, half its thread's arena, which is a little faster and stays
+//! within the 4 MB a thread. Where the kernel does not overcommit
+//! (`vm.overcommit_memory=2`), the whole reservation counts against the commit limit. The
+//! arenas are there on 64-bit Linux and macOS; on other targets `enable` returns false and
+//! `Bump` only forwards.
+//!
+//! As with most allocators, a signal handler must not allocate or free through it.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
@@ -68,8 +74,8 @@ const SUPPORTED: bool = cfg!(all(
 ));
 
 static ON: AtomicBool = AtomicBool::new(false);
-/// The largest size served from an arena now: zero (no allocation has it) until `enable`.
-/// The one load an allocation costs while the arenas are off.
+/// The largest size served from an arena now: zero, so that none is, until `enable`. The one
+/// load an allocation costs while the arenas are off.
 static SMALL_NOW: AtomicUsize = AtomicUsize::new(0);
 /// The reservation is `BASE..BASE + REGION`. Until `enable` reserved it, the top of the
 /// address space, where no block is: the one load a free costs while the arenas are off.
@@ -110,6 +116,10 @@ struct Exit;
 
 thread_local! {
     // No destructor, so it stays readable while the thread's other destructors run.
+    // EXIT has one, and a thread's first small allocation registers it from inside the
+    // allocator. That is sound where registering does not come back here for memory in a way
+    // std forbids: glibc and macOS register through libc, and std's own list (musl) is on the
+    // system allocator from Rust 1.89, the workspace's `rust-version`; an earlier std aborts.
     static LOCAL: Cell<Local> = const {
         Cell::new(Local { ptr: 0, end: 0, chunk: 0, arena: NO_ARENA, skip: 0 })
     };
@@ -228,7 +238,16 @@ fn round(n: usize) -> usize {
     (n + (ALIGN - 1)) & !(ALIGN - 1)
 }
 
-/// `n` bytes (a multiple of `ALIGN`) of the thread's current chunk, or 0.
+/// Whether an arena serves `l` now: 1 to `SMALL_NOW` bytes. A size of zero, which a caller
+/// must not ask for, goes to the wrapped allocator like any size while the arenas are off: a
+/// block of no bytes at the end of a full chunk would be counted in one chunk and freed in
+/// the next.
+#[inline(always)]
+fn serves(l: Layout) -> bool {
+    l.size().wrapping_sub(1) < SMALL_NOW.load(Relaxed) && l.align() <= ALIGN
+}
+
+/// `n` bytes (a nonzero multiple of `ALIGN`) of the thread's current chunk, or 0.
 #[inline(always)]
 fn bump(n: usize) -> usize {
     LOCAL.with(|cell| {
@@ -354,7 +373,7 @@ impl<A> Bump<A> {
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
     #[inline]
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() <= SMALL_NOW.load(Relaxed) && l.align() <= ALIGN {
+        if serves(l) {
             let p = bump(round(l.size()));
             if p != 0 {
                 return p as *mut u8;
@@ -376,7 +395,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        if l.size() <= SMALL_NOW.load(Relaxed) && l.align() <= ALIGN {
+        if serves(l) {
             let p = bump(round(l.size()));
             if p != 0 {
                 // SAFETY: `p` is a fresh block of at least `l.size()` bytes. A reused chunk
@@ -399,7 +418,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Bump<A> {
         // The last block of this thread's current chunk grows or shrinks where it is.
         let (old, n) = (round(l.size()), round(new));
         let c = off >> CHUNK_BITS;
-        let in_place = new <= SMALL
+        let in_place = new.wrapping_sub(1) < SMALL
             && LOCAL.with(|cell| {
                 let mut s = cell.get();
                 let last = c == s.chunk && c >> ARENA_BITS == s.arena && p as usize + old == s.ptr;
