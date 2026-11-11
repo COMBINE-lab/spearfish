@@ -2312,32 +2312,34 @@ fn own_run(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usiz
 /// the end of the A-run from there (the longest stretch ending in A with at most one other base
 /// per ten).
 fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while let Some(w) = rest.get(i..i + run) {
-        // The window's last two other bases are in every window that starts at or before the
-        // earlier of them, so the search resumes past it. In sequence that is not a tail the two
-        // are found within a few bases of the window's end.
-        if let Some((j, _)) = w.iter().enumerate().rev().filter(|&(_, &c)| c != a).nth(1) {
-            i += j + 1;
-            continue;
-        }
-        let s = i + w.iter().position(|&c| c == a).unwrap_or(0);
-        let (mut end, mut non) = (s, 0);
-        for (k, &c) in rest.iter().enumerate().skip(s) {
-            non += usize::from(c != a);
-            if c == a && non * 10 <= k + 1 - s {
-                end = k + 1;
+    let others = |w: &[u8]| w.iter().filter(|&&c| c != a).count();
+    let (mut i, mut other) = (0, others(rest.get(..run)?));
+    loop {
+        if other <= 1 {
+            let s = i + rest[i..].iter().position(|&c| c == a).unwrap_or(0);
+            let (mut end, mut non) = (s, 0);
+            for (k, &c) in rest.iter().enumerate().skip(s) {
+                non += usize::from(c != a);
+                if c == a && non * 10 <= k + 1 - s {
+                    end = k + 1;
+                }
             }
+            if rest.len() - end <= TAIL_AFTER {
+                return Some((s, end));
+            }
+            // A tail is followed only by adapter: an A-run with more of the read after it is
+            // transcript sequence (or internal priming), not the molecule's 3' end. The tail
+            // may still come after it; the windows inside the run are part of it.
+            i = end.max(i + 1);
+            other = others(rest.get(i..i + run)?);
+        } else {
+            if i + run >= rest.len() {
+                return None;
+            }
+            other = other + usize::from(rest[i + run] != a) - usize::from(rest[i] != a);
+            i += 1;
         }
-        if rest.len() - end <= TAIL_AFTER {
-            return Some((s, end));
-        }
-        // A tail is followed only by adapter: an A-run with more of the read after it is
-        // transcript sequence (or internal priming), not the molecule's 3' end. The tail
-        // may still come after it; the windows inside the run are part of it.
-        i = end.max(i + 1);
     }
-    None
 }
 
 /// Best score first; equal scores in the order of `tie_key(salt, tx)`, a per-read
@@ -2681,58 +2683,6 @@ mod segmented_tests {
         // One base in a window may be a sequencing error.
         assert_eq!(tail_start(&codes(b"CGAAAAAAACAAAAAAAGT"), a, 15), Some((2, 17)));
         assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAGTCAAAA"), a, 15), None);
-    }
-
-    /// [`tail_start`] one window at a time: its definition, without the jumps.
-    fn tail_start_sliding(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
-        let mut i = 0;
-        while let Some(w) = rest.get(i..i + run) {
-            if w.iter().filter(|&&c| c != a).count() > 1 {
-                i += 1;
-                continue;
-            }
-            let s = i + w.iter().position(|&c| c == a).unwrap_or(0);
-            let (mut end, mut non) = (s, 0);
-            for (k, &c) in rest.iter().enumerate().skip(s) {
-                non += usize::from(c != a);
-                if c == a && non * 10 <= k + 1 - s {
-                    end = k + 1;
-                }
-            }
-            if rest.len() - end <= TAIL_AFTER {
-                return Some((s, end));
-            }
-            i = end.max(i + 1);
-        }
-        None
-    }
-
-    #[test]
-    fn tail_start_jumps_over_no_window() {
-        // Sequences from mostly-A to uniform, so that windows with zero, one and two other
-        // bases all occur, at every run length and with tails at every distance from the end.
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        let (mut found, mut none) = (0, 0);
-        for case in 0..4000 {
-            let len = (next() % 260) as usize;
-            let bias = [1, 2, 4, 12][case % 4];
-            let seq: Vec<u8> = (0..len)
-                .map(|_| if next() % bias == 0 { (next() % 4) as u8 } else { 0 })
-                .collect();
-            for run in [2, 3, 10, 15, 20, 31] {
-                let want = tail_start_sliding(&seq, 0, run);
-                assert_eq!(tail_start(&seq, 0, run), want, "{seq:?} run {run}");
-                found += usize::from(want.is_some());
-                none += usize::from(want.is_none());
-            }
-        }
-        assert!(found > 1000 && none > 1000, "{found} {none}");
     }
 
     #[test]

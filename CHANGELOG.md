@@ -102,8 +102,6 @@
   accuracy on simulated reads and spike-in quantification unchanged. Reads without such a tail
   are mapped as before. `--no-tail-first` restores the previous behaviour; the other presets
   are unchanged, and `--tail-first` turns it on for them.
-- Finding a read's poly(A) tail skips ahead over sequence that cannot hold one instead of
-  testing every window, which is slightly faster with every preset and gives the same tails.
 - `spearfish --version` and every output's provenance name the commit a crates.io build was
   packaged from (`.cargo_vcs_info.json`), where they said `unknown`.
 - `bump_and_publish.sh` resumes an interrupted release: run it again from the same checkout,
