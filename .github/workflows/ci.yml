@@ -118,6 +118,34 @@ jobs:
         env:
           SPEARFISH_BIN: ${{ github.workspace }}/target/debug/spearfish
 
+  # crates/nudgy, the allocator behind `--bump-alloc`, beyond its ordinary tests (the test
+  # jobs above run those, the loom models of its cross-thread protocol among them): its small
+  # tests under Miri, over several thread schedules, and its stress tests for longer and with
+  # debug assertions.
+  alloc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --locked -p nudgy --test miri --test paths --test config --test config_largest
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..8
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo +stable test --locked --release -p nudgy --test stress --test shadow
+        env:
+          STRESS_SECS: 10
+          GENS: 100
+          RUSTFLAGS: -C debug-assertions -C overflow-checks
+      # The record of live blocks again, with the smallest and the largest limit.
+      - run: |
+          MAX_BLOCK=16 cargo +stable test --locked --release -p nudgy --test shadow
+          MAX_BLOCK=32768 cargo +stable test --locked --release -p nudgy --test shadow
+        env:
+          GENS: 50
+          RUSTFLAGS: -C debug-assertions -C overflow-checks
+
   msrv:
     runs-on: ubuntu-latest
     steps:

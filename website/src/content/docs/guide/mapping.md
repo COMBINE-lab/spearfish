@@ -145,6 +145,19 @@ Where Linux has transparent huge pages always on, the allocator's memory uses th
 2 MB stretch that mapping touches is resident whole. If memory is tight, `MIMALLOC_ALLOW_THP=0`
 in the environment turns that off, which lowers the peak by several hundred megabytes.
 
+`--bump-alloc` takes the mapper's small allocations (up to 8 KB) from memory that belongs to
+each thread, instead of from the general allocator. Mapping a read makes a few hundred of
+them and frees nearly all before the next read, so a thread stays in the same few pages. It
+is off by default: mapping takes about 3% less CPU time with it, for 3 to 8 MB of memory a
+thread, and the output is the same. It is there on 64-bit Linux and macOS. Up to 256 threads
+have such memory at a time; with `-v`, the summary says how many did and how often a thread
+went without.
+
+The option takes the largest allocation to serve this way as a value, joined by `=`:
+`--bump-alloc=1KB`, or a number of bytes, up to 32 KB. 8 KB, what the option means without a
+value, was the best of the limits measured, so a value is for trying another.
+`--bump-alloc=off` (or `none`) is the same as leaving the option out.
+
 ## Messages
 
 Progress and a summary go to standard error. `-q` shows errors only, `-v` adds detail. On a

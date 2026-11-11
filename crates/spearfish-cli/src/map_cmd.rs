@@ -41,6 +41,19 @@ pub enum Codec {
 /// Reads per work batch, unless `--batch-size` says otherwise.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 
+/// What `--bump-alloc` asks for: the arenas with this configuration, or no arenas.
+#[derive(Clone, Copy, Debug)]
+struct BumpAlloc(Option<nudgy::Config>);
+
+fn parse_bump_alloc(s: &str) -> Result<BumpAlloc, nudgy::ParseConfigError> {
+    if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") {
+        return Ok(BumpAlloc(None));
+    }
+    // Arenas that serve blocks of no size are no arenas.
+    let config: nudgy::Config = s.parse()?;
+    Ok(BumpAlloc((config.max_block() > 0).then_some(config)))
+}
+
 #[derive(clap::Args, Debug)]
 #[command(after_long_help = preset_table())]
 pub struct Args {
@@ -87,6 +100,22 @@ pub struct Args {
         help_heading = "Input and output"
     )]
     batch_size: usize,
+    /// Take the mapper's small allocations from per-thread arenas: about 3% less CPU time for
+    /// 3 to 8 MB of memory a thread, and the same output. A size is the largest allocation
+    /// the arenas serve (`--bump-alloc=1KB`; 8KB without one, at most 32KB); `off` or `none`
+    /// is no arenas.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_value = "off",
+        default_missing_value = "8KB",
+        value_parser = parse_bump_alloc,
+        hide_short_help = true,
+        help_heading = "Input and output"
+    )]
+    bump_alloc: BumpAlloc,
     #[command(flatten)]
     settings: MapArgs,
 }
@@ -402,6 +431,13 @@ pub fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
     }
+    if args
+        .bump_alloc
+        .0
+        .is_some_and(|config| !nudgy::enable_with(config))
+    {
+        log::warn!("--bump-alloc is not available on this system; mapping without it");
+    }
     execute(Job {
         index: args.index.unwrap(),
         reads: args.reads.unwrap(),
@@ -533,6 +569,18 @@ pub fn execute(args: Job) -> Result<Counts> {
         c.reads as f64 / secs,
         c.bases as f64 / 1e6 / secs
     );
+    let arenas = nudgy::stats();
+    if arenas.enabled {
+        log::debug!(
+            "bump-alloc: blocks of up to {} bytes, {} arenas at most, {} chunks started, no arena free {} times, arena full {} times (at most {} allocations left to the general allocator)",
+            arenas.max_block,
+            arenas.arenas_peak,
+            arenas.chunk_refills,
+            arenas.no_arena,
+            arenas.arena_full,
+            arenas.fallback_allocations()
+        );
+    }
     if let Some(strand) = oriented(&c, both_strands) {
         log::info!(
             "map: {:.1}% of the mapped reads map forward: the reads look oriented, and `--strands {strand}` maps only that orientation, which is faster",
@@ -617,5 +665,19 @@ mod tests {
         assert_eq!(oriented(&counts(10_000, 9_800), true), None);
         assert_eq!(oriented(&counts(900, 900), true), None);
         assert_eq!(oriented(&counts(10_000, 10_000), false), None);
+    }
+
+    #[test]
+    fn bump_alloc_takes_a_size_or_off() {
+        let limit = |s: &str| parse_bump_alloc(s).map(|b| b.0.map(|c| c.max_block()));
+        assert_eq!(limit("off"), Ok(None));
+        assert_eq!(limit("none"), Ok(None));
+        assert_eq!(limit("None"), Ok(None));
+        assert_eq!(limit("0"), Ok(None));
+        assert_eq!(limit("1KB"), Ok(Some(1024)));
+        assert_eq!(limit("8KB"), Ok(Some(nudgy::DEFAULT_MAX_BLOCK)));
+        assert_eq!(limit("32KB"), Ok(Some(nudgy::LARGEST_MAX_BLOCK)));
+        assert!(limit("33KB").is_err());
+        assert!(limit("on").is_err());
     }
 }

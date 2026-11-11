@@ -19,6 +19,9 @@ doc = false
 
 [dependencies]
 spearfish.workspace = true
+# The allocator behind `spearfish map --bump-alloc`. It has its own version, so it is named
+# here and not among the workspace's dependencies, which share the workspace's.
+nudgy = { path = "../nudgy", version = "0.2.0" }
 long-read-rad.workspace = true
 anyhow.workspace = true
 mimalloc.workspace = true
@@ -36,4 +39,4 @@ serde_json.workspace = true
 log.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
-libc = "0.2"
+libc.workspace = true

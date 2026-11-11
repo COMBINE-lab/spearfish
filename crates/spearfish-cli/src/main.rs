@@ -23,8 +23,9 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
+// mimalloc, behind the per-thread arenas that `spearfish map --bump-alloc` turns on.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: nudgy::Bump<mimalloc::MiMalloc> = nudgy::Bump::new(mimalloc::MiMalloc);
 
 /// `--version`: the version and git revision; `--version` (long) also the target and SIMD.
 fn long_version() -> &'static str {
