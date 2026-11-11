@@ -30,6 +30,10 @@ niffler = { workspace = true, optional = true }
 # Not used directly: bzip2's pure-Rust backend.
 bzip2 = { workspace = true, optional = true }
 
+# The reservation behind alloc::Bump (mmap).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc.workspace = true
+
 [features]
 default = ["fasta", "rad"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.

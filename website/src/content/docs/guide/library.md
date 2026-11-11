@@ -42,5 +42,22 @@ for hit in &read.hits {
   `tsv_lines`), PAF (`paf_lines`) and, with the default `rad` feature, RAD records for oarfish
   (`rad_writer`, `rad_record`). The text writers append to a byte buffer, so each thread can
   format its own batch.
+- `spearfish::alloc::Bump` is the optional allocator behind `spearfish map --bump-alloc`: it
+  wraps a program's global allocator and serves small blocks from per-thread arenas. Only a
+  program can choose its global allocator, so an embedding opts in itself: it declares
+  `Bump` around the allocator it uses, and calls `spearfish::alloc::enable()` before mapping.
+  Until that call every allocation goes to the wrapped allocator.
+
+  ```rust
+  use spearfish::alloc::Bump;
+
+  #[global_allocator]
+  static GLOBAL: Bump<std::alloc::System> = Bump::new(std::alloc::System);
+
+  fn main() {
+      spearfish::alloc::enable();
+      // build a Mapper and map reads
+  }
+  ```
 
 The API documentation is `cargo doc -p spearfish --open`.

@@ -87,6 +87,10 @@ pub struct Args {
         help_heading = "Input and output"
     )]
     batch_size: usize,
+    /// Take the mapper's small allocations from per-thread arenas: about 2% less CPU time for
+    /// up to 4 MB of memory a thread, and the same output.
+    #[arg(long, hide_short_help = true, help_heading = "Input and output")]
+    bump_alloc: bool,
     #[command(flatten)]
     settings: MapArgs,
 }
@@ -401,6 +405,9 @@ pub fn run(args: Args) -> Result<()> {
     if args.print_params {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
+    }
+    if args.bump_alloc && !spearfish::alloc::enable() {
+        log::warn!("--bump-alloc is not available on this system; mapping without it");
     }
     execute(Job {
         index: args.index.unwrap(),

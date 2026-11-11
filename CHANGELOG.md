@@ -93,6 +93,16 @@
   sequence, named `r<i>|*|*|0|0`). Without them it writes the reads it wrote before.
 - The `low_coverage` flag's documentation said oarfish skips such reads by default; it does
   not, and most of them are correctly placed.
+- **An optional allocator for mapping (`spearfish map --bump-alloc`, `spearfish::alloc`).**
+  Mapping a read makes a few hundred small allocations and frees nearly all of them before
+  the next read. With `--bump-alloc`, blocks of up to 1 KB come from memory that belongs to
+  the allocating thread (64 KB chunks, each used again from its start once its blocks are
+  freed), and everything else from mimalloc as before. Mapping takes about 2% less CPU time,
+  for up to 4 MB of memory a thread; the output is the same. It is off by default, and there
+  on 64-bit Linux and macOS. The library type is `spearfish::alloc::Bump<A>`, which wraps any
+  global allocator: a program that embeds the mapper declares it as its global allocator and
+  calls `spearfish::alloc::enable()`, and until that call every allocation goes to the
+  wrapped allocator.
 - **`hifi` preset: the poly(A) tail orders the two orientations** (`--tail-first`, on for
   `hifi`). A read that ends in a tail of 20 bases or more in exactly one orientation is mapped
   in that orientation first, and in the other only when the first one's best hit spans less

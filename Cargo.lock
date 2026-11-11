@@ -1349,6 +1349,7 @@ dependencies = [
  "bon",
  "bzip2",
  "flate2",
+ "libc",
  "log",
  "long-read-rad",
  "niffler",
