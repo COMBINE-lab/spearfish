@@ -376,7 +376,8 @@ impl Default for Ends {
 pub enum Strands {
     #[serde(rename = "both")]
     Both,
-    /// The read as given (sense: direct RNA).
+    /// The read as given (sense: direct RNA, reads oriented before mapping). A read of the
+    /// other strand is not always left unmapped: it may have a weak hit in this orientation.
     #[serde(rename = "fwd")]
     Forward,
     /// Only its reverse complement.

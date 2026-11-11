@@ -102,6 +102,22 @@ fn tail_first_maps_the_tailed_orientation() {
         // No tail: both orientations, as without staging.
         assert_eq!(staged.map(seq), both.map(seq));
     }
+    // One orientation set on the preset's parameters directly, as a caller that does not go
+    // through the settings may: there is nothing to stage, and a tail on the other strand
+    // does not move the read there.
+    let mut o = MapOptions::preset(Preset::Hifi);
+    assert!(o.params.tail_first.is_some());
+    o.params.strands = spearfish::Strands::Forward;
+    let direct = Mapper::new(index.clone(), &o).unwrap();
+    for (_, _, seq) in &txs {
+        for read in [
+            [&seq[..], &[b'A'; 30][..]].concat(),
+            [&revcomp(seq)[..], &[b'A'; 30][..]].concat(),
+            revcomp(&[&seq[..], &[b'A'; 30][..]].concat()),
+        ] {
+            assert_eq!(direct.map(&read), fwd.map(&read));
+        }
+    }
 }
 
 /// The settings builder gives the same mapper as the preset's options, and records what it

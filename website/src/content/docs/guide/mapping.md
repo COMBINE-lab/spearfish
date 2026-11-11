@@ -50,9 +50,37 @@ orientation first, and the other orientation is mapped only if the first one's b
 less than 80% of the read. Most reads of a library that keeps its tails then need one
 orientation, which is about a fifth less mapping work, and well under 1% of reads report a
 different set of transcripts. Reads without such a tail are mapped in both orientations as
-before, so a library whose tails were trimmed loses nothing and gains nothing; if its reads were
-also oriented (Iso-Seq FLNC reads, for example), `--strands fwd` maps the one orientation
-directly. `--no-tail-first` always maps both.
+before, so a library whose tails were trimmed loses nothing and gains nothing.
+`--no-tail-first` always maps both.
+
+### Oriented reads
+
+Some reads are oriented before they are mapped, so that every read is its transcript's sense
+strand: Iso-Seq FLNC reads (`isoseq refine` orients them, and usually trims their tails), cDNA
+reads turned by a tool that finds their primers, and direct RNA reads. For these,
+`--strands fwd` is the setting to use with any preset (`drna` has it already): it maps one
+orientation of every read, with or without a tail, where `--tail-first` saves the second
+orientation only for reads that kept theirs. `--strands fwd` or `rev` takes precedence:
+with one orientation mapped there is nothing for `--tail-first` to order, and it is off.
+
+Use it only for reads that are oriented. A read of the other strand is not simply left
+unmapped: if part of it matches some transcript in the mapped orientation (a gene on the
+opposite strand, a repeat), that weak, partial hit is all the read has, and it is reported
+when it passes `--min-score`. In a human cDNA library of both strands, about a third of the
+reads of the other orientation are reported this way, each to a transcript it did not come
+from.
+
+A FASTA or FASTQ file does not say whether its reads were oriented, and a trimmed tail leaves
+no trace, so spearfish does not guess. The mapping shows it: reads of both strands split about
+evenly between `+` and `-`, and oriented reads map `+` nearly always. When both orientations
+were mapped and at least 99% of the mapped reads map to one strand, the summary says so and
+names the `--strands` value to use; the run record has the count (`forward` in
+[`stats`](/spearfish/guide/output/#run-records)). Mapping the first hundred thousand reads of
+a library is enough to find out:
+
+```sh
+head -n 400000 reads.fastq | spearfish map transcripts.sfi - --preset hifi -o /dev/null
+```
 
 ## Doubtful reads
 
@@ -103,8 +131,8 @@ Settings you may want to change:
 | `--min-score` | `36` | Report a read unmapped when its best chain scores under this for a 1,000-base read: no better than a chance match (see [Mapped or not](/spearfish/guide/output/#mapped-or-not)). `0` maps every read with a chain. |
 | `--extend-ends`, `--no-extend-ends` | preset | Extend each reported span past its outermost anchors to where the read's alignment ends. Needed by models that use read positions, such as oarfish's truncation model. |
 | `--extend-within` | `0.05` | Extend only hits within this fraction of the best score. |
-| `--strands` | preset | Orientations mapped: `both`, `fwd` or `rev`. |
-| `--tail-first`, `--no-tail-first` | preset | Map the orientation that ends in a poly(A) tail first, and the other only when the first one's best hit spans less than `--tail-first-span` (0.8) of the read. |
+| `--strands` | preset | Orientations mapped: `both`, `fwd` or `rev`. `fwd` for [oriented reads](#oriented-reads). |
+| `--tail-first`, `--no-tail-first` | preset | Map the orientation that ends in a poly(A) tail first, and the other only when the first one's best hit spans less than `--tail-first-span` (0.8) of the read. Only with `--strands both`. |
 | `--rescue`, `--no-rescue` | preset | Re-seed reads whose best chain covers less than half the read at a lower LCP level. Reads shorter than `--rescue-genes-len` (350 compressed bases) re-seed proportionally more candidate genes. |
 | `--tail-trim`, `--no-tail-trim` | on | Trim poly(A) tails before aligning read ends. |
 | `--tail-run` | preset | Shortest poly(A) tail recognized. |

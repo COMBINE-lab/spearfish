@@ -148,6 +148,8 @@ pub struct Counts {
     pub unmapped: u64,
     /// Mapped reads with more than one reported hit.
     pub multi_mapped: u64,
+    /// Mapped reads whose best hit is on the read's forward strand.
+    pub forward: u64,
     pub rescued: u64,
     pub low_coverage: u64,
     /// Reads whose best chain scored under the minimum (unmapped unless kept).
@@ -165,6 +167,7 @@ impl Counts {
         } else {
             self.mapped += 1;
             self.multi_mapped += (r.hits.len() > 1) as u64;
+            self.forward += !r.hits[0].reverse as u64;
         }
         self.rescued += r.rescued as u64;
         self.low_coverage += r.low_coverage as u64;
@@ -177,11 +180,35 @@ impl Counts {
         self.mapped += o.mapped;
         self.unmapped += o.unmapped;
         self.multi_mapped += o.multi_mapped;
+        self.forward += o.forward;
         self.rescued += o.rescued;
         self.low_coverage += o.low_coverage;
         self.low_score += o.low_score;
         self.hits += o.hits;
         self.bases += o.bases;
+    }
+}
+
+/// Fewest mapped reads from which [`oriented`] concludes anything.
+const ORIENTED_MIN_READS: u64 = 1000;
+/// Share of the mapped reads on one strand from which a library counts as oriented. Reads of
+/// both strands split about evenly; among oriented reads, only wrongly placed ones (and reads
+/// of sequence shared antisense) map to the other strand.
+const ORIENTED_SHARE: f64 = 0.99;
+
+/// The `--strands` value that suits reads mapped in both orientations nearly all of which
+/// mapped in one: such reads were oriented before mapping. A file of reads does not say so.
+fn oriented(c: &Counts, both_strands: bool) -> Option<&'static str> {
+    if !both_strands || c.mapped < ORIENTED_MIN_READS {
+        return None;
+    }
+    let fwd = c.forward as f64 / c.mapped as f64;
+    if fwd >= ORIENTED_SHARE {
+        Some("fwd")
+    } else if fwd <= 1.0 - ORIENTED_SHARE {
+        Some("rev")
+    } else {
+        None
     }
 }
 
@@ -394,6 +421,7 @@ pub fn run(args: Args) -> Result<()> {
 pub fn execute(args: Job) -> Result<Counts> {
     let settings = args.settings.clone();
     let opts = settings.resolve()?;
+    let both_strands = opts.params.strands == spearfish::Strands::Both;
     let (index_path, reads) = (args.index.clone(), args.reads.clone());
     let stdout_outputs = [&args.output, &args.paf]
         .iter()
@@ -505,6 +533,12 @@ pub fn execute(args: Job) -> Result<Counts> {
         c.reads as f64 / secs,
         c.bases as f64 / 1e6 / secs
     );
+    if let Some(strand) = oriented(&c, both_strands) {
+        log::info!(
+            "map: {:.1}% of the mapped reads map forward: the reads look oriented, and `--strands {strand}` maps only that orientation, which is faster",
+            100.0 * c.forward as f64 / c.mapped as f64
+        );
+    }
     if let Some(m) = &meta_path {
         // Absolute paths, so the record still names the files when read from elsewhere.
         let abs = |p: &Path| {
@@ -563,4 +597,25 @@ fn rad_writer(
     };
     let cmdline = invocation.command_line.join(" ");
     output::rad_writer(path, mapper, Some(settings), &cmdline, codec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oriented_needs_both_orientations_and_one_sided_reads() {
+        let counts = |mapped, forward| Counts {
+            mapped,
+            forward,
+            ..Counts::default()
+        };
+        assert_eq!(oriented(&counts(10_000, 9_950), true), Some("fwd"));
+        assert_eq!(oriented(&counts(10_000, 60), true), Some("rev"));
+        // Reads of both strands, too few reads, and a run that mapped one orientation anyway.
+        assert_eq!(oriented(&counts(10_000, 5_100), true), None);
+        assert_eq!(oriented(&counts(10_000, 9_800), true), None);
+        assert_eq!(oriented(&counts(900, 900), true), None);
+        assert_eq!(oriented(&counts(10_000, 10_000), false), None);
+    }
 }

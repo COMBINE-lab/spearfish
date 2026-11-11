@@ -85,11 +85,15 @@ pub struct MapArgs {
     /// Read type; sets the defaults of every other setting.
     #[arg(long, value_enum, default_value = "ont", help_heading = "Settings")]
     pub preset: PresetArg,
-    /// Read orientations to map [default: drna fwd, others both].
+    /// Read orientations to map [default: drna fwd, others both]. For reads already oriented
+    /// to the transcripts' strand (Iso-Seq FLNC reads, for example), fwd maps the one
+    /// orientation; with fwd or rev, --tail-first has nothing to order and is off. Reads of
+    /// the other orientation are not all left unmapped (some have a weak hit in this one), so
+    /// use fwd or rev only when the reads are oriented.
     #[arg(long, value_enum, help_heading = "Settings")]
     pub strands: Option<StrandsArg>,
     /// Map first the read orientation that ends in a poly(A) tail, and the other only if the
-    /// first maps poorly [default: hifi].
+    /// first maps poorly [default: hifi]. Only with --strands both.
     #[arg(long, overrides_with = "no_tail_first", help_heading = "Settings")]
     pub tail_first: bool,
     /// Always map both read orientations.

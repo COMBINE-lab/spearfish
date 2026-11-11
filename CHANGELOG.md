@@ -102,6 +102,10 @@
   accuracy on simulated reads and spike-in quantification unchanged. Reads without such a tail
   are mapped as before. `--no-tail-first` restores the previous behaviour; the other presets
   are unchanged, and `--tail-first` turns it on for them.
+- `spearfish map` says when the reads look oriented: with both orientations mapped and at
+  least 99% of the mapped reads on one strand, the summary names the `--strands` value that
+  maps them in one orientation, and the run record counts the mapped reads whose best hit is
+  forward (`forward`). `--strands fwd` or `rev` takes precedence over `--tail-first`.
 - `spearfish --version` and every output's provenance name the commit a crates.io build was
   packaged from (`.cargo_vcs_info.json`), where they said `unknown`.
 - `bump_and_publish.sh` resumes an interrupted release: run it again from the same checkout,
