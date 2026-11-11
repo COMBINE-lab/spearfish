@@ -1,7 +1,20 @@
 # Changelog
 
-## 0.1.1 (unreleased)
+## 0.2.0 (unreleased)
 
+- **A 0.2, not a 0.1.1: mapping results and the library change.** The default presets map
+  differently from 0.1.0 (the entries below), and code written against the 0.1.0 library may
+  not compile: the mapping presets gained variants (`Preset::OntFast`, `DrnaFast`,
+  `HifiFast`), and `MappedRead`, `IndexOptions` and the option structs of `spearfish-map` and
+  `spearfish-index` gained fields. A program that asks for `spearfish = "0.1"` therefore
+  keeps 0.1.0's behaviour until it asks for 0.2. So that later additions are not breaking,
+  `Preset`, `Hit`, `MappedRead` and `IndexOptions` are now `#[non_exhaustive]`, as
+  `MapSettings` already was: outside the crate, match a `Preset` with a wildcard arm, read
+  the fields of a `Hit` or `MappedRead` without building one by a literal, and build
+  `IndexOptions` with `IndexOptions::builder()` or by changing fields of
+  `IndexOptions::default()`. The structs of the lower-level crates (`spearfish-map`,
+  `spearfish-index`) stay plain, and may gain fields in any 0.x release; `MapSettings` is the
+  stable way to set them.
 - **Reads with only a chance match are unmapped.** Every read with a chain used to be
   reported, so reads from outside the transcriptome (unannotated loci, contaminants, random
   sequence) were placed on whichever transcript shared a seed with them. `spearfish map` now

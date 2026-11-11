@@ -19,8 +19,8 @@ alignment is restricted to the read segments where tied isoforms differ.
 Documentation: https://combine-lab.github.io/spearfish/ (source in `website/`; preview locally
 with `cd website && npm install && npm run dev`).
 
-**Status:** 0.1.0, the first release. Interfaces may change before 1.0; see
-[CHANGELOG.md](CHANGELOG.md).
+**Status:** 0.2.0. The default presets map reads differently from 0.1.0, and the library
+gained fields and presets: see [CHANGELOG.md](CHANGELOG.md). Interfaces may change before 1.0.
 
 ## Install
 
@@ -88,9 +88,12 @@ spearfish map transcripts.sfi reads.fq.gz --preset ont --rad sample.rad
 oarfish -a sample.rad -o sample
 ```
 
+oarfish 0.11.0 maps in process with spearfish 0.1; until an oarfish release embeds 0.2, the RAD
+route is how to quantify this version's mappings.
+
 ## As a library
 
-`spearfish = "0.1"` in `Cargo.toml`:
+`spearfish = "0.2"` in `Cargo.toml`:
 
 ```rust
 use std::sync::Arc;

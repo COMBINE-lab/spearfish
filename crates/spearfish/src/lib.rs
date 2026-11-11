@@ -62,6 +62,7 @@ pub const SCORE_DENOM: f32 = 3.0;
 /// Read technology / protocol presets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Preset {
     /// ONT cDNA: both orientations, minimap2 map-ont scores.
     #[default]
@@ -291,6 +292,7 @@ impl Default for MapOptions {
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct IndexOptions {
     /// Base seed scheme (its highest level is used), e.g. `lcp:K=3` or `minimizer:k=19,w=23`.
     #[builder(into, default = "lcp:K=3".to_string())]
@@ -692,6 +694,7 @@ pub fn apply_t2g(txs: &mut [(String, String, Vec<u8>)], table: &str) -> usize {
 
 /// One reported transcript for a read.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Hit {
     /// Transcript id (index order, as in the FASTA the index was built from).
     pub tx: u32,
@@ -722,6 +725,7 @@ pub struct Hit {
 
 /// All hits of one read, best first.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct MappedRead {
     /// Read length (raw bases).
     pub len: u32,

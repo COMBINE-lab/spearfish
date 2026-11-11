@@ -3,7 +3,7 @@ title: Using the library
 description: Build an index, set up a mapper and map reads from Rust.
 ---
 
-The `spearfish` crate is the library behind the command line (`spearfish = "0.1"` in
+The `spearfish` crate is the library behind the command line (`spearfish = "0.2"` in
 `Cargo.toml`). Its default features read FASTA/FASTQ (`fasta`) and write RAD files (`rad`); an
 embedding that needs neither, such as oarfish's, can turn them off.
 
@@ -33,6 +33,9 @@ for hit in &read.hits {
   preset's value. `resolve()` gives the complete `MapOptions` (which serialize to JSON), and
   rejects settings that contradict each other.
 - `Mapper` is `Send + Sync`: share one across threads.
+- `Preset`, `Hit`, `MappedRead`, `IndexOptions` and `MapSettings` are `#[non_exhaustive]`, so
+  that a release can add a preset or a field without breaking callers: match a `Preset` with
+  a wildcard arm, and build `IndexOptions` and `MapSettings` with their builders.
 - `Hit` coordinates are raw bases: query spans on the read's forward strand, transcript spans
   on the transcript. Score differences convert to probabilities with
   `exp(-d / spearfish::SCORE_DENOM)`.
