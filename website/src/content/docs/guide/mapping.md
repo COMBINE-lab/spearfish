@@ -113,9 +113,9 @@ Settings you may want to change:
 The remaining settings tune gene selection, chaining, the tie-break and the rescue; they are
 listed under their headings in `--help`.
 
-On Linux, `spearfish map` asks the kernel not to back its heap with transparent huge pages:
-where they are always on, they add several hundred megabytes to the peak memory and no speed.
-Set `MIMALLOC_ALLOW_THP=1` in the environment to leave them on.
+Where Linux has transparent huge pages always on, the allocator's memory uses them, and each
+2 MB stretch that mapping touches is resident whole. If memory is tight, `MIMALLOC_ALLOW_THP=0`
+in the environment turns that off, which lowers the peak by several hundred megabytes.
 
 ## Messages
 

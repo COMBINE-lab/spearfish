@@ -369,28 +369,12 @@ pub struct Job {
     pub settings: MapSettings,
 }
 
-/// Ask the kernel not to back this process's memory with transparent huge pages, unless
-/// `MIMALLOC_ALLOW_THP` is set (the allocator then does as it says). Mapping allocates many
-/// small buffers per thread, spread over the allocator's arenas: where huge pages are always
-/// on, every 2 MB stretch one of them touches becomes resident whole, which adds several
-/// hundred megabytes to the peak and makes mapping no faster. (Building an index is faster
-/// with huge pages, so only `map` asks.)
-fn small_pages() {
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("MIMALLOC_ALLOW_THP").is_none() {
-        // SAFETY: a prctl that takes integers only; if it fails nothing has changed.
-        let (on, zero): (libc::c_ulong, libc::c_ulong) = (1, 0);
-        unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, on, zero, zero, zero) };
-    }
-}
-
 pub fn run(args: Args) -> Result<()> {
     let settings = args.settings.settings();
     if args.print_params {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
     }
-    small_pages();
     execute(Job {
         index: args.index.unwrap(),
         reads: args.reads.unwrap(),

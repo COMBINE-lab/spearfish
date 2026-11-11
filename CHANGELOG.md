@@ -80,12 +80,6 @@
     step asks for no more candidates than the first did;
   - the index's run-start select is branch-free, and output lines format their integers
     without a call per number.
-- `spearfish map` asks Linux not to back its heap with transparent huge pages. Where they are
-  always on (the default of some distributions), each 2 MB stretch of the allocator's arenas
-  that one of mapping's many small per-thread buffers touched became resident whole: several
-  hundred megabytes at the peak, for no gain in speed. `MIMALLOC_ALLOW_THP=1` in the
-  environment leaves them on. `spearfish index`, which is faster with them, is unchanged, and
-  so is the library, which leaves the process's memory policy to its caller.
 - `SCORE_DENOM`, the scale RAD output suggests for turning score differences into
   probabilities (`score_denom`), is 3, where it was 1: a hit `d` below its read's best counts
   `exp(-d / 3)` times as much. 1 was chosen on simulated sets in which every transcript is
