@@ -224,6 +224,9 @@ pub struct MapParams {
     /// chain is reported).
     #[serde(default)]
     pub min_score: Option<MinScore>,
+    /// With both `strands`: map the two orientations in turn where the read's poly(A) tail
+    /// names its strand (None: always both).
+    pub tail_first: Option<TailFirst>,
 }
 
 /// The lowest best-chain score a read is reported at. A read that matches nothing still
@@ -302,6 +305,35 @@ impl Default for MinScore {
     }
 }
 
+/// Staged mapping of a read's two orientations. A read whose raw sequence ends in a poly(A)
+/// tail in exactly one orientation (the tail itself, or a leading poly(T), its reverse
+/// complement) is mapped in that orientation first, and in the other only if the first's best
+/// chain spans less than `span` of the read. The tail names the molecule's strand, so the other
+/// orientation's seeding and chaining, half the work of such a read, is rarely needed.
+///
+/// A read mapped in one orientation reports no hits in the other: where transcripts share
+/// sequence antisense, the hits a near-tied opposite orientation would have added are the ones
+/// the tail speaks against. Reads without a tail, or with one in both orientations, are mapped
+/// as without staging, so a library without tails maps as before (bar the few reads whose
+/// sequence happens to end in such a run and that also map well in that orientation).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TailFirst {
+    /// The tailed orientation stands alone if its best chain spans at least this fraction of
+    /// the (parsed) read.
+    pub span: f32,
+    /// Shortest poly(A) tail that orders the orientations (a window as
+    /// [`TieBreak::tail_run`]'s). Longer than the tie-break's 15: there a tail adds points to an
+    /// alignment, here it decides what is aligned, and 20 leaves out more than half of the A-rich
+    /// ends of tail-less reads while keeping all but 0.1% of the tails that 15 finds.
+    pub run: usize,
+}
+
+impl Default for TailFirst {
+    fn default() -> Self {
+        TailFirst { span: 0.8, run: 20 }
+    }
+}
+
 /// X-drop extension of each reported hit from its first and last anchors toward the read's
 /// ends, as minimap2 extends its chains. The anchors stop short of the read's ends by up to a
 /// seed spacing; where the read really starts and ends on the transcript is what positional
@@ -377,6 +409,7 @@ impl Default for MapParams {
             merge_collinear: true,
             ends: Some(Ends::default()),
             min_score: Some(MinScore::default()),
+            tail_first: None,
         }
     }
 }
@@ -1786,8 +1819,39 @@ impl<C: Chainer> Mapper<C> {
             Strands::Forward => [Self::parse(&self.seeder, raw), (Vec::new(), None)],
             _ => Self::parse_both(&self.seeder, raw),
         };
+        // With `tail_first`: the orientation ending in a poly(A) tail, if exactly one does.
+        let tailed = match (&self.p.tail_first, self.p.strands) {
+            (Some(t), Strands::Both) => {
+                let tail = |p: &(Vec<u8>, Option<RawRead>)| match &p.1 {
+                    Some(r) => ends_in_tail(&r.codes, t.run),
+                    // Without HPC the parsed read is the raw read.
+                    None if self.seeder.hpc => false,
+                    None => ends_in_tail(&codes(&p.0[p.0.len().saturating_sub(TAIL_WINDOW)..]), t.run),
+                };
+                match (tail(&pf), tail(&pr)) {
+                    (true, false) => Some((false, t.span)),
+                    (false, true) => Some((true, t.span)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let (fwd, rc) = match self.p.strands {
-            Strands::Both => (self.map_strand(pf, salt), self.map_strand(pr, salt)),
+            Strands::Both => match tailed {
+                None => (self.map_strand(pf, salt), self.map_strand(pr, salt)),
+                Some((reverse, span)) => {
+                    stats::add(&stats::TAIL_FIRST, 1);
+                    let (first, second) = if reverse { (pr, pf) } else { (pf, pr) };
+                    let first = self.map_strand(first, salt);
+                    let second = if Self::span_frac(first.hits.first(), first.seq.len()) >= span {
+                        stats::add(&stats::TAIL_FIRST_ALONE, 1);
+                        skip(second)
+                    } else {
+                        self.map_strand(second, salt)
+                    };
+                    if reverse { (second, first) } else { (first, second) }
+                }
+            },
             Strands::Forward => (self.map_strand(pf, salt), skip(pr)),
             Strands::Reverse => (skip(pf), self.map_strand(pr, salt)),
         };
@@ -2248,34 +2312,32 @@ fn own_run(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usiz
 /// the end of the A-run from there (the longest stretch ending in A with at most one other base
 /// per ten).
 fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
-    let others = |w: &[u8]| w.iter().filter(|&&c| c != a).count();
-    let (mut i, mut other) = (0, others(rest.get(..run)?));
-    loop {
-        if other <= 1 {
-            let s = i + rest[i..].iter().position(|&c| c == a).unwrap_or(0);
-            let (mut end, mut non) = (s, 0);
-            for (k, &c) in rest.iter().enumerate().skip(s) {
-                non += usize::from(c != a);
-                if c == a && non * 10 <= k + 1 - s {
-                    end = k + 1;
-                }
-            }
-            if rest.len() - end <= TAIL_AFTER {
-                return Some((s, end));
-            }
-            // A tail is followed only by adapter: an A-run with more of the read after it is
-            // transcript sequence (or internal priming), not the molecule's 3' end. The tail
-            // may still come after it; the windows inside the run are part of it.
-            i = end.max(i + 1);
-            other = others(rest.get(i..i + run)?);
-        } else {
-            if i + run >= rest.len() {
-                return None;
-            }
-            other = other + usize::from(rest[i + run] != a) - usize::from(rest[i] != a);
-            i += 1;
+    let mut i = 0;
+    while let Some(w) = rest.get(i..i + run) {
+        // The window's last two other bases are in every window that starts at or before the
+        // earlier of them, so the search resumes past it. In sequence that is not a tail the two
+        // are found within a few bases of the window's end.
+        if let Some((j, _)) = w.iter().enumerate().rev().filter(|&(_, &c)| c != a).nth(1) {
+            i += j + 1;
+            continue;
         }
+        let s = i + w.iter().position(|&c| c == a).unwrap_or(0);
+        let (mut end, mut non) = (s, 0);
+        for (k, &c) in rest.iter().enumerate().skip(s) {
+            non += usize::from(c != a);
+            if c == a && non * 10 <= k + 1 - s {
+                end = k + 1;
+            }
+        }
+        if rest.len() - end <= TAIL_AFTER {
+            return Some((s, end));
+        }
+        // A tail is followed only by adapter: an A-run with more of the read after it is
+        // transcript sequence (or internal priming), not the molecule's 3' end. The tail
+        // may still come after it; the windows inside the run are part of it.
+        i = end.max(i + 1);
     }
+    None
 }
 
 /// Best score first; equal scores in the order of `tie_key(salt, tx)`, a per-read
@@ -2619,6 +2681,58 @@ mod segmented_tests {
         // One base in a window may be a sequencing error.
         assert_eq!(tail_start(&codes(b"CGAAAAAAACAAAAAAAGT"), a, 15), Some((2, 17)));
         assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAGTCAAAA"), a, 15), None);
+    }
+
+    /// [`tail_start`] one window at a time: its definition, without the jumps.
+    fn tail_start_sliding(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
+        let mut i = 0;
+        while let Some(w) = rest.get(i..i + run) {
+            if w.iter().filter(|&&c| c != a).count() > 1 {
+                i += 1;
+                continue;
+            }
+            let s = i + w.iter().position(|&c| c == a).unwrap_or(0);
+            let (mut end, mut non) = (s, 0);
+            for (k, &c) in rest.iter().enumerate().skip(s) {
+                non += usize::from(c != a);
+                if c == a && non * 10 <= k + 1 - s {
+                    end = k + 1;
+                }
+            }
+            if rest.len() - end <= TAIL_AFTER {
+                return Some((s, end));
+            }
+            i = end.max(i + 1);
+        }
+        None
+    }
+
+    #[test]
+    fn tail_start_jumps_over_no_window() {
+        // Sequences from mostly-A to uniform, so that windows with zero, one and two other
+        // bases all occur, at every run length and with tails at every distance from the end.
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut found, mut none) = (0, 0);
+        for case in 0..4000 {
+            let len = (next() % 260) as usize;
+            let bias = [1, 2, 4, 12][case % 4];
+            let seq: Vec<u8> = (0..len)
+                .map(|_| if next() % bias == 0 { (next() % 4) as u8 } else { 0 })
+                .collect();
+            for run in [2, 3, 10, 15, 20, 31] {
+                let want = tail_start_sliding(&seq, 0, run);
+                assert_eq!(tail_start(&seq, 0, run), want, "{seq:?} run {run}");
+                found += usize::from(want.is_some());
+                none += usize::from(want.is_none());
+            }
+        }
+        assert!(found > 1000 && none > 1000, "{found} {none}");
     }
 
     #[test]

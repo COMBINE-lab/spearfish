@@ -72,6 +72,17 @@ pub struct MapSettings {
     /// Read orientations to map.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strands: Option<Strands>,
+    /// With both orientations: map first the one whose read ends in a poly(A) tail, if exactly
+    /// one does, and the other only if the first maps poorly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_first: Option<bool>,
+    /// With `tail_first`: the other orientation is mapped if the tailed one's best hit spans
+    /// less than this fraction of the read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_first_span: Option<f32>,
+    /// With `tail_first`: shortest poly(A) tail that orders the orientations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_first_run: Option<usize>,
 
     // Reported hits.
     /// Report transcripts scoring within this fraction of the read's best.
@@ -341,6 +352,9 @@ impl MapSettings {
     pub const FIELDS: &[&str] = &[
         "preset",
         "strands",
+        "tail_first",
+        "tail_first_span",
+        "tail_first_run",
         "report_within",
         "report_within_abs",
         "min_coverage",
@@ -486,6 +500,34 @@ impl MapSettings {
         let mut o = MapOptions::preset(self.preset);
         let p = &mut o.params;
         set!(self.strands => p.strands);
+        match (self.tail_first, p.tail_first.is_some()) {
+            (Some(false), _) => p.tail_first = None,
+            (Some(true), false) => p.tail_first = Some(Default::default()),
+            _ => {}
+        }
+        let unused = set_names!(self: tail_first_span, tail_first_run);
+        match p.tail_first.as_mut() {
+            Some(t) if p.strands == Strands::Both => {
+                set!(self.tail_first_span => t.span);
+                set!(self.tail_first_run => t.run);
+                ensure!(
+                    t.span > 0.0 && t.span <= 1.0,
+                    "tail_first_span must be above 0 and at most 1"
+                );
+                ensure!(t.run >= 2, "tail_first_run must be at least 2");
+            }
+            Some(_) => {
+                // One orientation is mapped: nothing to stage.
+                if self.tail_first == Some(true) {
+                    log::warn!("one read orientation is mapped; ignoring tail_first");
+                }
+                p.tail_first = None;
+            }
+            None if !unused.is_empty() => {
+                log::warn!("tail_first is off; ignoring {}", unused.join(", "));
+            }
+            None => {}
+        }
         set!(self.report_within => p.delta_rep);
         set!(self.report_within_abs => p.rep_abs);
         ensure!(p.rep_abs >= 0.0, "report_within_abs must not be negative");
@@ -864,6 +906,39 @@ mod tests {
                 .resolve()
                 .is_err()
         );
+        // Tail-first staging: on for HiFi, its settings apply where it is on, and it needs
+        // both orientations.
+        let on = |s: MapSettings| s.resolve().unwrap().params.tail_first;
+        assert_eq!(on(MapSettings::preset(Preset::Ont)), None);
+        assert_eq!(
+            on(MapSettings::builder(Preset::Hifi).tail_first(false).build()),
+            None
+        );
+        assert_eq!(
+            on(MapSettings::builder(Preset::Ont)
+                .tail_first(true)
+                .tail_first_span(0.7)
+                .build()),
+            Some(map::TailFirst { span: 0.7, run: 20 })
+        );
+        assert_eq!(
+            on(MapSettings::builder(Preset::Hifi).tail_first_run(25).build()),
+            Some(map::TailFirst { span: 0.8, run: 25 })
+        );
+        assert_eq!(
+            on(MapSettings::builder(Preset::Hifi)
+                .strands(Strands::Forward)
+                .build()),
+            None
+        );
+        for span in [0.0, 1.5] {
+            assert!(
+                MapSettings::builder(Preset::Hifi)
+                    .tail_first_span(span)
+                    .resolve()
+                    .is_err()
+            );
+        }
         let w: RescueWindow = "10,50".parse().unwrap();
         assert_eq!(w, RescueWindow::Window { pad: 10, div: 50 });
         assert_eq!("full".parse::<RescueWindow>().unwrap(), RescueWindow::Full);
