@@ -24,6 +24,11 @@ pub const FLAG_MASKED: u8 = 1;
 /// Parsed bases between raw-position checkpoints (`tx_raw_ck`).
 pub const RAW_CK: u32 = 64;
 
+/// Queries between the steps of a pipelined prefetch ([`Index::prefetch_raw`]): enough work in
+/// between for a step's line to arrive from memory before the next step reads it, and few enough
+/// that a call's lookups (some dozens) keep the pipeline full.
+const PREFETCH_LAG: usize = 4;
+
 /// Base `i` of 2-bit packed `words`.
 #[inline]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -792,6 +797,80 @@ impl Index {
             0 => r,
             q => nth_run_start(words, self.tx_len()[t as usize], r, q),
         })
+    }
+
+    /// Ask the caches for what [`Self::tx_raw_pos`] reads for each `(transcript, parsed
+    /// position)` of `q`, to be called with a call's lookups before it makes them. A lookup reads
+    /// three places in turn, each rarely in the caches: the transcript's offsets, its run
+    /// checkpoint, and the raw words from the checkpoint on. Each step's address needs the step
+    /// before landed, so the steps are pipelined over the queries, a few queries apart.
+    pub fn prefetch_raw(&self, q: &[(u32, u32)]) {
+        let Some(r) = self.raw.as_ref() else {
+            return;
+        };
+        // SAFETY: borrowed from self.store, which outlives these slices.
+        let (off, words, ck_off, ck) =
+            unsafe { (r.off.slice(), r.words.slice(), r.ck_off.slice(), r.ck.slice()) };
+        // The checkpoint of a query, if its transcript has raw sequence (read by steps 2 and 3).
+        let checkpoint = |(t, p): (u32, u32)| -> Option<usize> {
+            let (t, c) = (t as usize, (p / RAW_CK) as usize);
+            let (lo, hi) = (*ck_off.get(t)? as usize, *ck_off.get(t + 1)? as usize);
+            (lo + c < hi).then_some(lo + c)
+        };
+        let lag = PREFETCH_LAG;
+        for i in 0..q.len() + 2 * lag {
+            if let Some(&(t, _)) = q.get(i) {
+                let t = t as usize;
+                if t + 1 < off.len() {
+                    prefetch(off.as_ptr().wrapping_add(t));
+                    prefetch(ck_off.as_ptr().wrapping_add(t));
+                    prefetch(self.tx_len().as_ptr().wrapping_add(t));
+                }
+            }
+            if let Some(&x) = i.checked_sub(lag).and_then(|j| q.get(j))
+                && let Some(c) = checkpoint(x)
+            {
+                prefetch(ck.as_ptr().wrapping_add(c));
+            }
+            if let Some(&x) = i.checked_sub(2 * lag).and_then(|j| q.get(j))
+                && let Some(c) = checkpoint(x)
+            {
+                let t = x.0 as usize;
+                let (Some(&w0), Some(&w1)) = (off.get(t), off.get(t + 1)) else {
+                    continue;
+                };
+                let (w, w1) = (w0 as usize + (ck[c] / 32) as usize, w1 as usize);
+                // The run scan reads at most a checkpoint's worth of runs: the first word's line
+                // and, for long runs, the next.
+                for k in [w, w + 8] {
+                    if k < w1 {
+                        prefetch(words.as_ptr().wrapping_add(k));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask the caches for the parsed bases of transcript `t` from position `lo` on, for each
+    /// `(t, lo)` of `q` (what [`Self::tx_codes_eq`] reads): the transcript's offset, then its
+    /// word at `lo`, pipelined as in [`Self::prefetch_raw`].
+    pub fn prefetch_codes(&self, q: &[(u32, u32)]) {
+        let (seq, off) = (self.tx_seq(), self.tx_seq_off());
+        for i in 0..q.len() + PREFETCH_LAG {
+            if let Some(&(t, _)) = q.get(i)
+                && (t as usize) < off.len()
+            {
+                prefetch(off.as_ptr().wrapping_add(t as usize));
+            }
+            if let Some(&(t, lo)) = i.checked_sub(PREFETCH_LAG).and_then(|j| q.get(j))
+                && let Some(&o) = off.get(t as usize)
+            {
+                let w = o as usize + (lo / 32) as usize;
+                if w < seq.len() {
+                    prefetch(seq.as_ptr().wrapping_add(w));
+                }
+            }
+        }
     }
 
     /// Transcript `t`'s packed raw bases and run checkpoints, if present.
