@@ -149,18 +149,25 @@ Where Linux has transparent huge pages always on, the allocator's memory uses th
 2 MB stretch that mapping touches is resident whole. If memory is tight, `MIMALLOC_ALLOW_THP=0`
 in the environment turns that off, which lowers the peak by several hundred megabytes.
 
-`--bump-alloc` takes the mapper's small allocations (up to 8 KB) from memory that belongs to
+`spearfish map` takes the mapper's small allocations (up to 8 KB) from memory that belongs to
 each thread, instead of from the general allocator. Mapping a read makes a few hundred of
-them and frees nearly all before the next read, so a thread stays in the same few pages. It
-is off by default: mapping takes about 3% less CPU time with it, for 3 to 8 MB of memory a
-thread, and the output is the same. It is there on 64-bit Linux and macOS. Up to 256 threads
-have such memory at a time; with `-v`, the summary says how many did and how often a thread
-went without.
+them and frees nearly all before the next read, so a thread stays in the same few pages.
+Mapping takes about 3% less CPU time this way, and the output is the same. The cost is
+memory: each thread's arena is 64 chunks of 64 KB, so the arenas hold at most 4 MB a thread
+(and at most 1 GB, since up to 256 threads have an arena at a time; a thread whose arena is
+full of live blocks, or that finds none free, goes to the general allocator). Where
+transparent huge pages are always on, the general allocator's peak can rise by a few
+megabytes a thread more; `MIMALLOC_ALLOW_THP=0` leaves only the arenas' share. The arenas
+are there on 64-bit Linux and macOS; elsewhere mapping goes without them. With `-v`, the
+summary says how many threads had an arena and how often a thread went without, and the run
+record has the same counts (`bump_alloc`).
 
-The option takes the largest allocation to serve this way as a value, joined by `=`:
-`--bump-alloc=1KB`, or a number of bytes, up to 32 KB. 8 KB, what the option means without a
-value, was the best of the limits measured, so a value is for trying another.
-`--bump-alloc=off` (or `none`) is the same as leaving the option out.
+`--no-bump-alloc` turns the arenas off, for the lowest peak memory, on a small machine or
+with many threads. `--bump-alloc` takes the largest allocation to serve this way as a value,
+joined by `=`: `--bump-alloc=1KB`, or a number of bytes, up to 32 KB. 8 KB, the default and
+what the option means without a value, was the best of the limits measured, so a value is
+for trying another. `--bump-alloc=off` (or `none`) is the same as `--no-bump-alloc`. Of the
+two options, the last one given counts.
 
 ## Messages
 

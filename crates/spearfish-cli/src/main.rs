@@ -23,7 +23,8 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-// mimalloc, behind the per-thread arenas that `spearfish map --bump-alloc` turns on.
+// mimalloc, behind the per-thread arenas that `spearfish map` turns on (`--no-bump-alloc` leaves
+// them off).
 #[global_allocator]
 static GLOBAL: nudgy::Bump<mimalloc::MiMalloc> = nudgy::Bump::new(mimalloc::MiMalloc);
 

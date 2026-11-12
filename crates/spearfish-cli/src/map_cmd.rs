@@ -100,22 +100,32 @@ pub struct Args {
         help_heading = "Input and output"
     )]
     batch_size: usize,
-    /// Take the mapper's small allocations from per-thread arenas: about 3% less CPU time for
-    /// 3 to 8 MB of memory a thread, and the same output. A size is the largest allocation
-    /// the arenas serve (`--bump-alloc=1KB`; 8KB without one, at most 32KB); `off` or `none`
-    /// is no arenas.
+    /// Take the mapper's small allocations from per-thread arenas [default: on, where the
+    /// system has them]: less CPU time for a few MB of memory a thread (an arena is at most
+    /// 4 MB), and the same output. A size is the largest allocation the arenas serve
+    /// (`--bump-alloc=1KB`; 8KB without one, at most 32KB); `off` or `none` is the same as
+    /// --no-bump-alloc.
     #[arg(
         long,
         value_name = "SIZE",
         num_args = 0..=1,
         require_equals = true,
-        default_value = "off",
         default_missing_value = "8KB",
         value_parser = parse_bump_alloc,
+        overrides_with = "no_bump_alloc",
         hide_short_help = true,
         help_heading = "Input and output"
     )]
-    bump_alloc: BumpAlloc,
+    bump_alloc: Option<BumpAlloc>,
+    /// Take every allocation from the general allocator (no per-thread arenas): a lower peak
+    /// memory, for more CPU time.
+    #[arg(
+        long,
+        overrides_with = "bump_alloc",
+        hide_short_help = true,
+        help_heading = "Input and output"
+    )]
+    no_bump_alloc: bool,
     #[command(flatten)]
     settings: MapArgs,
 }
@@ -381,9 +391,39 @@ struct RunStats {
     mbp_per_second: f64,
     #[serde(flatten)]
     usage: Usage,
+    /// The per-thread arenas (`--bump-alloc`), when they were on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bump_alloc: Option<ArenaStats>,
     /// Internal counters (`SPEARFISH_STATS=1`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     internal: Vec<(String, u64)>,
+}
+
+/// What the per-thread arenas did, from `nudgy::stats()`.
+#[derive(Serialize)]
+struct ArenaStats {
+    /// The largest allocation, in bytes, that they served.
+    max_block: usize,
+    /// The most threads that had an arena at once.
+    arenas_peak: usize,
+    /// Times a thread moved on to an empty chunk of its arena.
+    chunk_refills: u64,
+    /// Times a thread found no arena free, and times its arena had no empty chunk.
+    no_arena: u64,
+    arena_full: u64,
+}
+
+impl ArenaStats {
+    fn now() -> Option<ArenaStats> {
+        let s = nudgy::stats();
+        s.enabled.then_some(ArenaStats {
+            max_block: s.max_block,
+            arenas_peak: s.arenas_peak,
+            chunk_refills: s.chunk_refills,
+            no_arena: s.no_arena,
+            arena_full: s.arena_full,
+        })
+    }
 }
 
 /// Whether `p` names a regular file to write (or one to be created), so a run record can sit
@@ -431,12 +471,17 @@ pub fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
     }
-    if args
-        .bump_alloc
-        .0
-        .is_some_and(|config| !nudgy::enable_with(config))
-    {
-        log::warn!("--bump-alloc is not available on this system; mapping without it");
+    match (args.no_bump_alloc, args.bump_alloc) {
+        (true, _) | (_, Some(BumpAlloc(None))) => {}
+        // The default: the arenas where the system has them, and none, silently, elsewhere.
+        (false, None) => {
+            nudgy::enable();
+        }
+        (false, Some(BumpAlloc(Some(config)))) => {
+            if !nudgy::enable_with(config) {
+                log::warn!("--bump-alloc is not available on this system; mapping without it");
+            }
+        }
     }
     execute(Job {
         index: args.index.unwrap(),
@@ -621,6 +666,7 @@ pub fn execute(args: Job) -> Result<Counts> {
                 reads_per_second: c.reads as f64 / secs,
                 mbp_per_second: c.bases as f64 / 1e6 / secs,
                 usage: Usage::now(),
+                bump_alloc: ArenaStats::now(),
                 internal,
             },
         };

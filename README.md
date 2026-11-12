@@ -118,7 +118,7 @@ for hit in mapper.map(b"ACGT...").hits {
 | `crates/rad` (`long-read-rad`) | `bulk_long_read` RAD records, shared with oarfish |
 | `crates/spearfish` (`spearfish`) | the library: index, settings, mapper, output formats, provenance |
 | `crates/spearfish-cli` (`spearfish-cli`) | the `spearfish` binary |
-| `crates/nudgy` (`nudgy`) | the allocator behind `spearfish map --bump-alloc`: per-thread bump arenas in front of any global allocator (independent of spearfish, with its own version) |
+| `crates/nudgy` (`nudgy`) | the allocator behind `spearfish map`'s arenas (`--bump-alloc`): per-thread bump arenas in front of any global allocator (independent of spearfish, with its own version) |
 | `crates/py-spearfish` | the Python package (`spearfish` on PyPI; built with maturin) |
 | `fixtures/toy` | toy transcriptome with an exon skip, an alternative 3′ site and a paralog pair |
 

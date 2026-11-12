@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (unreleased)
 
 - **Tie-break: the end bonus no longer rewards bases past another candidate's transcript end**
   (`--end-bonus-cut`, on in every preset except the `-fast` ones). A read end earns
@@ -17,6 +17,19 @@
   isoforms and abundance estimates follow the truth more closely; on spike-in isoforms that are
   a prefix of a longer one, reads move to the shorter isoform. Mapping costs the same.
   `--no-end-bonus-cut` maps as 0.2.0 did.
+- **`spearfish map` takes its small allocations from per-thread arenas by default** (the
+  `--bump-alloc` of 0.2.0, with its 8 KB limit). Mapping uses less CPU time, with the same
+  output, at the cost of a higher peak memory: each thread's arena holds at most 4 MB (at most
+  1 GB in all), and where transparent huge pages are always on, the general allocator's peak
+  can rise by a few megabytes a thread more (`MIMALLOC_ALLOW_THP=0` leaves only the arenas'
+  share). `--no-bump-alloc` turns them off, as `--bump-alloc=off` or `none` still does; of
+  the two options, the last one given counts. `--bump-alloc=<size>` sets the limit as before,
+  and still warns where the arenas are missing; by default, mapping there goes without them
+  and says nothing. The run record says what the arenas did (`stats.bump_alloc`: the limit,
+  the most threads that had an arena at once, and how often a thread found none free or its
+  own full), and leaves the field out when they were off. Only the `spearfish` binary
+  changes: the library never turns the arenas on, the Python package does not use them, and
+  a program that embeds the mapper keeps its own choice.
 
 ## 0.2.0 (2026-11-11)
 
