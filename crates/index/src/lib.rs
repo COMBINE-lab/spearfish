@@ -24,6 +24,14 @@ pub const FLAG_MASKED: u8 = 1;
 /// Parsed bases between raw-position checkpoints (`tx_raw_ck`).
 pub const RAW_CK: u32 = 64;
 
+/// Labels (8 bytes) per cache line.
+const LABELS_PER_LINE: usize = 8;
+/// Lines of a directory bucket [`Index::prefetch_labels`] asks for. Most buckets hold a label
+/// or two, but a label found in many genes has one entry per gene, and the binary search of
+/// [`Index::lookup`] then reads several lines of its bucket; four cover buckets of up to 32
+/// labels, and the search of a longer one reads its later lines only near the label's place.
+const BUCKET_LINES: usize = 4;
+
 /// Queries between the steps of a pipelined prefetch ([`Index::prefetch_raw`]): enough work in
 /// between for a step's line to arrive from memory before the next step reads it, and few enough
 /// that a call's lookups (some dozens) keep the pipeline full.
@@ -667,13 +675,29 @@ impl Index {
         prefetch(self.label_dir().as_ptr().wrapping_add(b));
     }
 
-    /// Ask the caches for the labels and node flags `lookup(label)` scans (reads the directory
-    /// entry, so call it after [`Self::prefetch_dir`] has had time to land).
+    /// Ask the caches for the labels `lookup(label)` searches: its directory bucket, up to
+    /// four lines of it (reads the directory entry, so call it after
+    /// [`Self::prefetch_dir`] has had time to land).
     #[inline]
     pub fn prefetch_labels(&self, label: u64) {
         let b = (label >> self.dir_shift) as usize;
+        let dir = self.label_dir();
+        let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
+        let labels = self.labels().as_ptr();
+        prefetch(labels.wrapping_add(lo));
+        let mut k = lo + LABELS_PER_LINE;
+        while k < hi.min(lo + BUCKET_LINES * LABELS_PER_LINE) {
+            prefetch(labels.wrapping_add(k));
+            k += LABELS_PER_LINE;
+        }
+    }
+
+    /// Ask the caches for the node flags of `label`'s nodes (reads the directory entry, as
+    /// [`Self::prefetch_labels`]).
+    #[inline]
+    pub fn prefetch_flags(&self, label: u64) {
+        let b = (label >> self.dir_shift) as usize;
         let lo = self.label_dir()[b] as usize;
-        prefetch(self.labels().as_ptr().wrapping_add(lo));
         prefetch(self.node_flags().as_ptr().wrapping_add(lo));
     }
 

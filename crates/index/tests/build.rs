@@ -390,3 +390,20 @@ fn prefetches_change_nothing_and_stay_in_bounds() {
     }
     assert_eq!(lookups(&idx), before);
 }
+
+/// The label prefetches read only the directory and stay inside the label table, for present
+/// labels, absent ones and the extremes (first and last directory bucket).
+#[test]
+fn label_prefetches_stay_in_bounds() {
+    let idx = check_roundtrip(&toy(), "lcp:K=3", true, Collapse::Gene);
+    let mut labels: Vec<u64> = idx.labels().to_vec();
+    labels.extend([0, 1, u64::MAX, u64::MAX - 1, 0x8000_0000_0000_0000]);
+    let before: Vec<_> = labels.iter().map(|&l| idx.lookup(l)).collect();
+    for &l in &labels {
+        idx.prefetch_dir(l);
+        idx.prefetch_labels(l);
+        idx.prefetch_flags(l);
+    }
+    let after: Vec<_> = labels.iter().map(|&l| idx.lookup(l)).collect();
+    assert_eq!(before, after);
+}
