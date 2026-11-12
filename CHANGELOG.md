@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-11)
 
 - **A 0.2, not a 0.1.1: mapping results and the library change.** The default presets map
   differently from 0.1.0 (the entries below), and code written against the 0.1.0 library may
