@@ -94,12 +94,14 @@
   - the index's run-start select is branch-free, and output lines format their integers
     without a call per number.
 - `SCORE_DENOM`, the scale RAD output suggests for turning score differences into
-  probabilities (`score_denom`), is 3, where it was 1: a hit `d` below its read's best counts
-  `exp(-d / 3)` times as much. 1 was chosen on simulated sets in which every transcript is
+  probabilities (`score_denom`), is 2, where it was 1: a hit `d` below its read's best counts
+  `exp(-d / 2)` times as much. 1 was chosen on simulated sets in which every transcript is
   expressed. When most are not, as in real samples, it hands too many reads to unexpressed
-  relatives of the expressed transcripts; 3, which is also oarfish's default for minimap2
-  alignments, gave the most accurate abundances on such sets at every error rate tried, and
-  slightly less accurate ones than 1 when every transcript is expressed.
+  relatives of the expressed transcripts, and a larger scale gives more accurate abundances.
+  2 takes most of that gain for a small loss when every transcript is expressed. 3, oarfish's
+  default for minimap2 alignments, gains a little more on such sets, but loses more when
+  every transcript is expressed and takes the reads of spike-in isoforms that are nearly
+  contained in another isoform.
 - `spearfish simulate` can make harder read sets: `--expressed` (fraction of transcripts with
   any abundance), `--fragment` and `--min-fragment` (internal fragments), `--rate-sd` (per-read
   error rates), `--junk` (random sequence at the read ends) and `--unmappable` (reads of random

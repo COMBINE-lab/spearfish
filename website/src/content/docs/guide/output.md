@@ -102,7 +102,7 @@ long-read mappers can write it too:
 
 File-level tags give the transcript lengths (`ref_lengths`), the mapper, its version and git
 revision, command line, the settings and every parameter used (`params`, JSON), the preset, the
-sequencing technology, the score scale (`score_denom`, 3 for spearfish), whether spans were
+sequencing technology, the score scale (`score_denom`, 2 for spearfish), whether spans were
 extended to the read ends (`ends_extended`), the orientations mapped, the index's identifier
 (`index_id`), and the numbers of reads, mapped reads and bases. Unmapped reads are counted but get no
 record, and records carry no read names.
@@ -127,5 +127,6 @@ regular file, as when everything goes to standard output or `/dev/null`). It hol
 
 Only differences between a read's scores carry meaning: they are the "delta" of
 [delta mapping](/spearfish/concepts/delta-mapping/). An EM turns them into conditional
-probabilities, P(read | transcript) ∝ `exp((s - s_max) / D)`. oarfish uses D = 1 for
-spearfish's scores, which the RAD file records; for minimap2's alignment scores it uses 3.
+probabilities, P(read | transcript) ∝ `exp((s - s_max) / D)`. spearfish suggests D = 2
+(`spearfish::SCORE_DENOM`), which the RAD file records and oarfish reads there; for minimap2's
+alignment scores oarfish uses 3.

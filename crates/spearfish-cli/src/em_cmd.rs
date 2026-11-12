@@ -19,8 +19,8 @@ pub struct Args {
     /// Mapping TSV.
     mapping: PathBuf,
     /// Score denominator D in exp((s - s_max) / D). This EM's default (2) is what the
-    /// mapper's ablations were evaluated with; the scale spearfish suggests to quantifiers
-    /// such as oarfish is `spearfish::SCORE_DENOM`.
+    /// mapper's ablations were evaluated with, and also the scale spearfish suggests to
+    /// quantifiers such as oarfish (`spearfish::SCORE_DENOM`).
     #[arg(long, default_value_t = QuantParams::default().score_denom)]
     score_denom: f64,
     /// Keep hits scoring at least this fraction of the read's best.

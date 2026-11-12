@@ -52,12 +52,13 @@ pub use map::{AnchorParams, ChainParams, Ends, MapParams, RescueParams, Strands,
 pub use settings::{MapSettings, RescueWindow};
 
 /// Scale of score differences: a hit scoring `d` below its read's best is `exp(-d /
-/// SCORE_DENOM)` times as likely. spearfish's scores are on minimap2's alignment-score scale,
-/// and 3 is also the scale oarfish gives minimap2 alignments by default. RAD output records it,
-/// and oarfish reads it there. It was 1 until 0.1.0: that is a little better when every
-/// transcript is expressed, but in samples where most are not, as in real ones, it gives
-/// transcripts without reads more of the reads their expressed relatives share with them.
-pub const SCORE_DENOM: f32 = 3.0;
+/// SCORE_DENOM)` times as likely. RAD output records it, and oarfish reads it there. It was 1
+/// until 0.1.0: that is a little better when every transcript is expressed, but in samples
+/// where most are not, as in real ones, it gives transcripts without reads more of the reads
+/// their expressed relatives share with them. A larger scale than 2 (oarfish gives minimap2's
+/// alignment scores 3, and spearfish's scores are on that scale) helps a little more there,
+/// and takes reads from an expressed isoform that is nearly contained in another.
+pub const SCORE_DENOM: f32 = 2.0;
 
 /// Read technology / protocol presets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
