@@ -406,4 +406,19 @@ fn label_prefetches_stay_in_bounds() {
     }
     let after: Vec<_> = labels.iter().map(|&l| idx.lookup(l)).collect();
     assert_eq!(before, after);
+    // Occurrence lists: every unitig, the last one included.
+    let occ = |idx: &Index| -> Vec<(Vec<u32>, Vec<u32>)> {
+        (0..idx.n_unitigs() as u32)
+            .map(|u| {
+                let (t, p) = idx.occurrences(u);
+                (t.to_vec(), p.to_vec())
+            })
+            .collect()
+    };
+    let before = occ(&idx);
+    for u in 0..idx.n_unitigs() as u32 {
+        idx.prefetch_occ_off(u);
+        idx.prefetch_occurrences(u);
+    }
+    assert_eq!(occ(&idx), before);
 }

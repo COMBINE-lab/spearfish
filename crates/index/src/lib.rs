@@ -32,6 +32,13 @@ const LABELS_PER_LINE: usize = 8;
 /// labels, and the search of a longer one reads its later lines only near the label's place.
 const BUCKET_LINES: usize = 4;
 
+/// Occurrence entries (4 bytes) per cache line.
+const OCC_PER_LINE: usize = 16;
+/// Lines of each occurrence list [`Index::prefetch_occurrences`] asks for: lists of up to 64
+/// transcripts, which covers the unitigs of all but the largest isoform families; the chainer
+/// reads a longer list in order, which the hardware prefetcher follows.
+const OCC_LINES: usize = 4;
+
 /// Queries between the steps of a pipelined prefetch ([`Index::prefetch_raw`]): enough work in
 /// between for a step's line to arrive from memory before the next step reads it, and few enough
 /// that a call's lookups (some dozens) keep the pipeline full.
@@ -927,9 +934,18 @@ impl Index {
     /// [`Self::prefetch_occ_off`] has had time to land).
     #[inline]
     pub fn prefetch_occurrences(&self, u: u32) {
-        let o = self.occ_off()[u as usize] as usize;
-        prefetch(self.occ_tx().as_ptr().wrapping_add(o));
-        prefetch(self.occ_pos().as_ptr().wrapping_add(o));
+        let off = self.occ_off();
+        let (o, end) = (off[u as usize] as usize, off[u as usize + 1] as usize);
+        let (tx, pos) = (self.occ_tx().as_ptr(), self.occ_pos().as_ptr());
+        prefetch(tx.wrapping_add(o));
+        prefetch(pos.wrapping_add(o));
+        // A unitig shared by many isoforms has a list of several lines: up to OCC_LINES of each.
+        let mut k = o + OCC_PER_LINE;
+        while k < end.min(o + OCC_LINES * OCC_PER_LINE) {
+            prefetch(tx.wrapping_add(k));
+            prefetch(pos.wrapping_add(k));
+            k += OCC_PER_LINE;
+        }
     }
 
     /// Occurrences of unitig `u`: transcripts (sorted) and the position of its first seed.
