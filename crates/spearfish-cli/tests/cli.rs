@@ -230,7 +230,7 @@ fn utility_commands() {
         String::from_utf8(o.stdout).unwrap()
     };
     let d: serde_json::Value = serde_json::from_str(&ok(&["doctor", "--json"])).unwrap();
-    for p in ["ont", "drna", "hifi"] {
+    for p in ["ont", "drna", "hifi", "ont-fast", "drna-fast", "hifi-fast"] {
         assert_eq!(d["self_test"][p]["pass"], true, "{d}");
     }
     assert!(ok(&["completions", "bash"]).contains("spearfish"));
@@ -359,7 +359,7 @@ fn simulate_and_map_on_toy() {
         .collect();
     let (h, mut r) = long_read_rad::open(&out_rad, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
     assert_eq!(h.meta.mapper, "spearfish");
-    assert_eq!(h.meta.score_denom, 1.0);
+    assert_eq!(h.meta.score_denom, spearfish::SCORE_DENOM);
     assert_eq!(h.counts.reads, 200);
     assert_eq!(h.counts.mapped, 200);
     assert_eq!(h.ref_names.len(), h.ref_lengths.len());
@@ -441,6 +441,204 @@ fn simulate_and_map_on_toy() {
 }
 
 /// `em` skips reads flagged `low_coverage` whatever other flags the line carries.
+/// The simulator's harder reads: fragments, random sequence at the ends, reads of nothing but
+/// random sequence, and unexpressed transcripts. The same seed gives the same reads; random
+/// reads stay unmapped and the rest still map to their source.
+#[test]
+fn bump_alloc_takes_an_optional_size() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let (idx, reads) = (dir.join("toy_bump.sfi"), dir.join("toy_bump.fa"));
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = run(&[
+        "index".as_ref(),
+        toy().as_os_str(),
+        "-o".as_ref(),
+        idx.as_os_str(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run(&[
+        "simulate".as_ref(),
+        toy().as_os_str(),
+        "-n".as_ref(),
+        "100".as_ref(),
+        "-o".as_ref(),
+        reads.as_os_str(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // The option stands before the index, so a value it took without `=` would be the index.
+    let map = |flag: Option<&str>| {
+        let mut args: Vec<&std::ffi::OsStr> = vec!["map".as_ref()];
+        args.extend(flag.map(std::ffi::OsStr::new));
+        args.extend([
+            idx.as_os_str(),
+            reads.as_os_str(),
+            "-t".as_ref(),
+            "2".as_ref(),
+            "-v".as_ref(),
+            "--meta".as_ref(),
+            "/dev/null".as_ref(),
+        ]);
+        run(&args)
+    };
+    let lines = |o: &std::process::Output| {
+        let mut l: Vec<String> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+        l.sort();
+        l
+    };
+    let plain = map(None);
+    assert!(plain.status.success());
+    assert!(lines(&plain).len() > 100);
+    // The limit in force, where this target has the arenas.
+    let arenas = cfg!(all(
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "macos")
+    ));
+    for (flag, limit) in [
+        ("--bump-alloc", Some(8192)),
+        ("--bump-alloc=8KB", Some(8192)),
+        ("--bump-alloc=1KB", Some(1024)),
+        ("--bump-alloc=500", Some(512)),
+        ("--bump-alloc=32kb", Some(32768)),
+        ("--bump-alloc=off", None),
+        ("--bump-alloc=none", None),
+        ("--bump-alloc=0", None),
+    ] {
+        let o = map(Some(flag));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{flag}: {err}");
+        assert_eq!(lines(&o), lines(&plain), "{flag}");
+        match limit {
+            Some(bytes) if arenas => {
+                assert!(
+                    err.contains(&format!("bump-alloc: blocks of up to {bytes} bytes")),
+                    "{flag}: {err}"
+                );
+            }
+            Some(_) => assert!(err.contains("--bump-alloc is not available"), "{flag}: {err}"),
+            None => assert!(!err.contains("bump-alloc"), "{flag}: {err}"),
+        }
+    }
+    for (flag, why) in [
+        ("--bump-alloc=64KB", "at most 32 KB"),
+        ("--bump-alloc=8MB", "expected a size"),
+        ("--bump-alloc=on", "expected a size"),
+        ("--bump-alloc=", "expected a size"),
+    ] {
+        let o = map(Some(flag));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success(), "{flag}");
+        assert!(err.contains(why), "{flag}: {err}");
+    }
+}
+
+#[test]
+fn simulated_random_reads_stay_unmapped() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let run = |args: &[&std::ffi::OsStr]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    let (toy, idx) = (toy(), dir.join("hard_map.sfi"));
+    run(&["index".as_ref(), toy.as_os_str(), "-o".as_ref(), idx.as_os_str()]);
+    let simulate = |reads: &std::path::Path, truth: &std::path::Path| {
+        let mut args: Vec<&std::ffi::OsStr> = vec!["simulate".as_ref(), toy.as_os_str()];
+        args.extend(
+            [
+                "-n",
+                "400",
+                "--rate",
+                "0.05",
+                "--rate-sd",
+                "0.02",
+                "--expressed",
+                "0.5",
+                "--fragment",
+                "0.5",
+                "--min-fragment",
+                "300",
+                "--junk",
+                "40",
+                "--unmappable",
+                "0.25",
+                "--seed",
+                "3",
+                "-o",
+            ]
+            .map(std::ffi::OsStr::new),
+        );
+        args.extend([reads.as_os_str(), "--truth".as_ref(), truth.as_os_str()]);
+        run(&args);
+    };
+    let (reads, truth) = (dir.join("hard_reads.fa"), dir.join("hard_truth.tsv"));
+    let (reads2, truth2) = (dir.join("hard_reads2.fa"), dir.join("hard_truth2.tsv"));
+    simulate(&reads, &truth);
+    simulate(&reads2, &truth2);
+    let fa = std::fs::read_to_string(&reads).unwrap();
+    assert_eq!(fa, std::fs::read_to_string(&reads2).unwrap());
+    let truth = std::fs::read_to_string(&truth).unwrap();
+    assert_eq!(truth, std::fs::read_to_string(&truth2).unwrap());
+
+    // Names: `r<i>|<transcript>|<strand>|<start>|<end>|<head>|<tail>`, or `r<i>|*|*|0|0` for
+    // a random read; the truth counts the others, on expressed transcripts only.
+    let names: Vec<Vec<&str>> = fa
+        .lines()
+        .filter_map(|l| l.strip_prefix('>'))
+        .map(|n| n.split('|').collect())
+        .collect();
+    assert_eq!(names.len(), 400);
+    let random = names.iter().filter(|n| n[1] == "*").count();
+    assert!((50..150).contains(&random), "{random} random reads");
+    assert!(names.iter().all(|n| n.len() == if n[1] == "*" { 5 } else { 7 }));
+    let rows: Vec<Vec<&str>> = truth.lines().skip(1).map(|l| l.split('\t').collect()).collect();
+    let count = |r: &Vec<&str>| r[2].parse::<usize>().unwrap();
+    assert_eq!(rows.iter().map(count).sum::<usize>(), 400 - random);
+    let unexpressed = rows
+        .iter()
+        .filter(|r| r[3].parse::<f64>().unwrap() == 0.0)
+        .count();
+    assert!(unexpressed > 0 && unexpressed < rows.len());
+    assert!(
+        rows.iter()
+            .all(|r| count(r) == 0 || r[3].parse::<f64>().unwrap() > 0.0)
+    );
+
+    let out = dir.join("hard_map.tsv");
+    run(&[
+        "map".as_ref(),
+        idx.as_os_str(),
+        reads.as_os_str(),
+        "-t".as_ref(),
+        "2".as_ref(),
+        "-q".as_ref(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ]);
+    let (mut real, mut correct) = (0, 0);
+    for l in std::fs::read_to_string(&out).unwrap().lines().skip(1) {
+        let f: Vec<&str> = l.split('\t').collect();
+        let name: Vec<&str> = f[0].split('|').collect();
+        if name[1] == "*" {
+            assert!(f[4] == "*" && f[13].starts_with("unmapped"), "{l}");
+        } else if f[3] == "0" {
+            real += 1;
+            correct += (f[4] != "*" && !f[13].contains("low_score")) as usize;
+        }
+    }
+    assert_eq!(real, 400 - random);
+    assert!(correct * 100 >= real * 95, "{correct}/{real} reads mapped");
+}
+
 #[test]
 fn em_skips_low_coverage_reads_with_other_flags() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
@@ -455,6 +653,8 @@ fn em_skips_low_coverage_reads_with_other_flags() {
         line("r2", "TOYT0000002", "low_coverage,anchor_span"),
         line("r3", "TOYT0000002", "rescued,low_coverage"),
         line("r4", "TOYT0000003", "anchor_span"),
+        // A kept chance-level hit (`--keep-low-score`) never counts.
+        line("r5", "TOYT0000004", "low_score"),
     ]
     .concat();
     std::fs::write(&map, tsv).unwrap();
@@ -484,6 +684,7 @@ fn em_skips_low_coverage_reads_with_other_flags() {
     assert_eq!(counts["TOYT0000001"], 1.0);
     assert_eq!(counts["TOYT0000002"], 0.0);
     assert_eq!(counts["TOYT0000003"], 1.0);
+    assert_eq!(counts["TOYT0000004"], 0.0);
 }
 
 /// The toy transcripts with Ensembl-style headers (`>TOYT0000001 cdna gene:TOYG0000001`): the

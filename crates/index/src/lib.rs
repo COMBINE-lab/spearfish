@@ -134,7 +134,25 @@ impl PackedRange<'_> {
 /// The `q`-th position after `r` (q >= 1) where the base differs from the one before it, in
 /// 2-bit packed `words` of `rlen` bases, or `rlen` if there are fewer: where `q` runs after the
 /// run starting at `r` end. Changes are found a word at a time (XOR with the shifted word).
-fn nth_run_start(words: &[u64], rlen: u32, r: u32, mut q: u32) -> u32 {
+fn nth_run_start(words: &[u64], rlen: u32, r: u32, q: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("popcnt") {
+        // SAFETY: the CPU counts bits.
+        return unsafe { nth_run_start_popcnt(words, rlen, r, q) };
+    }
+    nth_run_start_core(words, rlen, r, q)
+}
+
+/// [`nth_run_start`] compiled for CPUs that count a word's bits in one instruction (the
+/// x86-64 baseline has none, and a call counts those of a word or two).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+fn nth_run_start_popcnt(words: &[u64], rlen: u32, r: u32, q: u32) -> u32 {
+    nth_run_start_core(words, rlen, r, q)
+}
+
+#[inline(always)]
+fn nth_run_start_core(words: &[u64], rlen: u32, r: u32, mut q: u32) -> u32 {
     let mut j0 = r + 1;
     while j0 < rlen {
         let wi = (j0 / 32) as usize;
@@ -151,15 +169,42 @@ fn nth_run_start(words: &[u64], rlen: u32, r: u32, mut q: u32) -> u32 {
         }
         let c = m.count_ones();
         if c >= q {
-            for _ in 1..q {
-                m &= m - 1;
-            }
-            return wi as u32 * 32 + m.trailing_zeros() / 2;
+            return wi as u32 * 32 + select_even(m, even_bit_counts(m), q) / 2;
         }
         q -= c;
         j0 = (wi as u32 + 1) * 32;
     }
     rlen
+}
+
+/// For `m` with bits at even positions only: in each byte, how many bits are set in it and
+/// the bytes below it.
+#[inline]
+fn even_bit_counts(m: u64) -> u64 {
+    debug_assert_eq!(m & 0xaaaa_aaaa_aaaa_aaaa, 0);
+    let pairs = (m & 0x3333_3333_3333_3333) + ((m >> 2) & 0x3333_3333_3333_3333);
+    let bytes = (pairs + (pairs >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    bytes.wrapping_mul(0x0101_0101_0101_0101)
+}
+
+/// The position of the `q`-th set bit of `m` (`q` from 1 to their number), with `upto` its
+/// [`even_bit_counts`]: found without a loop over the bits before it, whose length a branch
+/// predictor cannot learn.
+#[inline]
+fn select_even(m: u64, upto: u64, q: u32) -> u32 {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    debug_assert!(q >= 1 && u64::from(q) <= upto >> 56);
+    // A byte's high bit: whether the count up to it reaches `q` (counts are at most 32).
+    let reached = ((upto | HIGH) - u64::from(q) * ONES) & HIGH;
+    let byte = reached.trailing_zeros() & !7;
+    let before = ((upto << 8) >> byte) as u32 & 0xff;
+    // The byte holds at most four bits: drop those before the one asked for.
+    let mut x = (m >> byte) as u32 & 0xff;
+    for k in 1..4 {
+        x = if q - before > k { x & (x - 1) } else { x };
+    }
+    byte + x.trailing_zeros()
 }
 
 /// Owned index contents, as produced by `build`.
@@ -198,6 +243,9 @@ pub struct IndexData {
     pub gene_names: Vec<String>,
     /// What built the index, as JSON (written as section `manifest`; the caller fills it in).
     pub manifest: Option<String>,
+    /// Further sections (name, bytes), written as they are: tables that other crates keep
+    /// in the index ([`IndexData::add_section`]). A reader that does not know one skips it.
+    pub extra: Vec<(String, Vec<u8>)>,
 }
 
 /// 2-bit pack an ASCII sequence (non-ACGT as A), 32 bases per word, base i at bits
@@ -271,7 +319,22 @@ impl IndexData {
         if let Some(m) = &self.manifest {
             w.add("manifest", m.as_bytes());
         }
+        for (name, bytes) in &self.extra {
+            w.add(name, bytes);
+        }
         w
+    }
+
+    /// Keep `data` as a further section `name` of the index ([`Index::section`] reads it).
+    pub fn add_section<T: bytemuck::Pod>(&mut self, name: &str, data: &[T]) {
+        self.extra
+            .push((name.to_string(), bytemuck::cast_slice(data).to_vec()));
+    }
+
+    /// Append the whole parsed transcript `t` to `out`, as 2-bit codes.
+    pub fn tx_codes_into(&self, t: u32, out: &mut Vec<u8>) {
+        let words = &self.tx_seq.1[self.tx_seq.0[t as usize] as usize..];
+        decode_into(words, 0, self.tx_plen[t as usize], out);
     }
 
     /// Write to `path`; returns bytes written.
@@ -282,6 +345,11 @@ impl IndexData {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.writer().to_bytes()
     }
+}
+
+/// Worker threads of the pool the caller runs in: those a build uses.
+pub fn build_threads() -> usize {
+    rayon::current_num_threads()
 }
 
 /// A cache hint for the line holding `p` (no effect off x86-64 and aarch64; never faults).
@@ -657,6 +725,12 @@ impl Index {
         }
     }
 
+    /// A further section of the index ([`IndexData::add_section`]) as `T`s: `None` if the
+    /// index has none of that name, or it is not a whole number of them.
+    pub fn section<T: bytemuck::Pod>(&self, name: &str) -> Option<&[T]> {
+        self.store.get(name).ok()
+    }
+
     /// Append the parsed transcript `t` over `[lo, hi)` to `out`, as 2-bit codes.
     pub fn tx_codes_into(&self, t: u32, lo: u32, hi: u32, out: &mut Vec<u8>) {
         let words = &self.tx_seq()[self.tx_seq_off()[t as usize] as usize..];
@@ -674,6 +748,16 @@ impl Index {
             ulo,
             len,
         )
+    }
+
+    /// Borrow transcript `t`'s packed raw bases `[lo, hi)`, given as raw positions (see
+    /// [`Self::tx_raw_pos`]), or None if the index has no raw sequence for `t`.
+    pub fn tx_raw_slice(&self, t: u32, lo: u32, hi: u32) -> Option<PackedRange<'_>> {
+        Some(PackedRange {
+            words: self.raw_words(t)?.0,
+            lo,
+            hi,
+        })
     }
 
     /// Raw 2-bit codes of transcript `t` over the raw span of its parsed bases `[lo, hi)`
@@ -696,6 +780,17 @@ impl Index {
         Some(match p % RAW_CK {
             0 => r,
             q => nth_run_start(words, rlen, r, q),
+        })
+    }
+
+    /// Raw position of transcript `t` where the parsed base `q` bases after the one starting
+    /// at raw position `r` starts: [`Self::tx_raw_pos`] of that base, found from `r` (cheaper
+    /// when `q` is small and the bases after `r` are read anyway).
+    pub fn tx_raw_after(&self, t: u32, r: u32, q: u32) -> Option<u32> {
+        let (words, _) = self.raw_words(t)?;
+        Some(match q {
+            0 => r,
+            q => nth_run_start(words, self.tx_len()[t as usize], r, q),
         })
     }
 

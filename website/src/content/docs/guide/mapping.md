@@ -30,9 +30,10 @@ setting.
 
 | Preset | Reads | What it sets |
 | --- | --- | --- |
-| `ont` (default) | ONT cDNA (PCR-cDNA and direct cDNA) | Both orientations; minimap2 `map-ont` scores; read ends aligned in uncompressed sequence; spans extended to the read ends; low-coverage rescue. |
+| `ont` (default) | ONT cDNA (PCR-cDNA and direct cDNA) | Both orientations; minimap2 `map-ont` scores; read ends aligned in uncompressed sequence; spans extended to the read ends; low-coverage rescue and rescue-level work for doubtful reads (see [Doubtful reads](#doubtful-reads)). |
 | `drna` | ONT direct RNA | Sense orientation only; read ends in compressed sequence (no template-switch Gs to correct); shorter poly(A) tails recognized (10 bases); spans end at the outermost anchors. |
-| `hifi` | PacBio HiFi (Kinnex, Iso-Seq) | minimap2 `map-hifi` scores; tied hits without a shared anchor grouped by the anchors they share; read-end bands kept on the anchor diagonal; no rescue, since accurate reads rarely need it; spans end at the outermost anchors. |
+| `hifi` | PacBio HiFi (Kinnex, Iso-Seq) | Both orientations, the one ending in a poly(A) tail first; minimap2 `map-hifi` scores; read-end bands kept on the anchor diagonal; no rescue and no raw-base or exact-alignment comparisons of near ties (`--raw-mid`, `--orient-exact`), since accurate reads rarely need them; spans end at the outermost anchors. |
+| `ont-fast`, `drna-fast`, `hifi-fast` | As the preset each is named for | That preset as spearfish 0.1.0 mapped it: every read with a chain is reported ([no read is rejected](/spearfish/guide/output/#mapped-or-not)), doubtful reads get no extra work, and near ties are compared as they were then. ONT cDNA reads map in about a fifth to a quarter less CPU time and 1.5 to 2 GB less memory, less accurately when reads have many errors; for direct RNA and HiFi reads the time is about the same. |
 
 With every preset, a poly(A) tail at a read's 3′ end is found (a run of A's with at most one
 other base) and trimmed before the read end is aligned, and isoforms whose annotated 3′ end lies
@@ -42,6 +43,70 @@ another gene), the orientation that ends in the poly(A) tail is preferred (`--or
 LCP parsing is not strand-symmetric, so a read's two orientations draw different seeds; both are
 compared whenever the other orientation's best chain scores within 35% of the chosen one's
 (`--orient-margin-rel`).
+
+The `hifi` preset also uses the tail to save work (`--tail-first`). A read that ends in a
+poly(A) tail of 20 bases or more in one orientation, and not in the other, is mapped in that
+orientation first, and the other orientation is mapped only if the first one's best hit spans
+less than 80% of the read. Most reads of a library that keeps its tails then need one
+orientation, which is about a fifth less mapping work, and well under 1% of reads report a
+different set of transcripts. Reads without such a tail are mapped in both orientations as
+before, so a library whose tails were trimmed loses nothing and gains nothing.
+`--no-tail-first` always maps both.
+
+### Oriented reads
+
+Some reads are oriented before they are mapped, so that every read is its transcript's sense
+strand: Iso-Seq FLNC reads (`isoseq refine` orients them, and usually trims their tails), cDNA
+reads turned by a tool that finds their primers, and direct RNA reads. For these,
+`--strands fwd` is the setting to use with any preset (`drna` has it already): it maps one
+orientation of every read, with or without a tail, where `--tail-first` saves the second
+orientation only for reads that kept theirs. `--strands fwd` or `rev` takes precedence:
+with one orientation mapped there is nothing for `--tail-first` to order, and it is off.
+
+Use it only for reads that are oriented. A read of the other strand is not simply left
+unmapped: if part of it matches some transcript in the mapped orientation (a gene on the
+opposite strand, a repeat), that weak, partial hit is all the read has, and it is reported
+when it passes `--min-score`. In a human cDNA library of both strands, about a third of the
+reads of the other orientation are reported this way, each to a transcript it did not come
+from.
+
+A FASTA or FASTQ file does not say whether its reads were oriented, and a trimmed tail leaves
+no trace, so spearfish does not guess. The mapping shows it: reads of both strands split about
+evenly between `+` and `-`, and oriented reads map `+` nearly always. When both orientations
+were mapped and at least 99% of the mapped reads map to one strand, the summary says so and
+names the `--strands` value to use; the run record has the count (`forward` in
+[`stats`](/spearfish/guide/output/#run-records)). Mapping the first hundred thousand reads of
+a library is enough to find out:
+
+```sh
+head -n 400000 reads.fastq | spearfish map transcripts.sfi - --preset hifi -o /dev/null
+```
+
+## Doubtful reads
+
+Most reads are settled by their base-level chain: it covers the read well, and the other
+orientation has nothing close. The rest are mostly reads with many errors (10% and more), on
+which few base-level seeds survive, so that the chain covers a small part of the read and a
+paralog, a pseudogene or the other orientation can win by one seed. With the `ont` and `drna`
+presets these reads get more work at the rescue level, whose seeds are shorter and denser:
+
+- their best transcripts are chained again with rescue seeds (`--rescue-rechain`);
+- they are seeded against the whole transcriptome, through a table of every transcript's runs
+  of three consecutive rescue seeds, which names transcripts the base-level seeds never
+  reached (`--rescue-global`);
+- the other orientation is chained in the transcripts that share seeds, reverse-complemented,
+  with the best hit (`--rescue-antisense`).
+
+`--rescue-settled` sets how well a chain must cover its read for the read to skip all this.
+The table, every transcript's rescue seeds (`--rescue-store`) and the transcripts' antisense
+mates are read in place from the index, where `spearfish index` keeps them: about 1.5 GB of the
+file for a human transcriptome, which is the memory these presets take over the `-fast` ones.
+It is the file's own pages, which processes mapping against the same index share. With an
+index that lacks them (built with `--no-rescue-tables`, or by spearfish 0.1.0) the table and
+the seeds are made when mapping starts, which takes about half a second on 32 threads, and a
+transcript's mates when a read first needs them; the peak is then about 1.4 GB higher.
+`--no-rescue-global --no-rescue-store` gives most of the memory back, at some cost in
+accuracy on high-error reads; `--no-rescue` turns the rescue off altogether, tables included.
 
 ## Changing settings
 
@@ -63,9 +128,11 @@ Settings you may want to change:
 | --- | --- | --- |
 | `-t, --threads` | all CPUs | Worker threads. |
 | `--report-within` | `0.3` | Report transcripts scoring within this fraction of the read's best. Quantifiers usually keep a tighter set (95% of the best), so the default is generous. |
+| `--min-score` | `36` | Report a read unmapped when its best chain scores under this for a 1,000-base read: no better than a chance match (see [Mapped or not](/spearfish/guide/output/#mapped-or-not)). `0` maps every read with a chain. |
 | `--extend-ends`, `--no-extend-ends` | preset | Extend each reported span past its outermost anchors to where the read's alignment ends. Needed by models that use read positions, such as oarfish's truncation model. |
 | `--extend-within` | `0.05` | Extend only hits within this fraction of the best score. |
-| `--strands` | preset | Orientations mapped: `both`, `fwd` or `rev`. |
+| `--strands` | preset | Orientations mapped: `both`, `fwd` or `rev`. `fwd` for [oriented reads](#oriented-reads). |
+| `--tail-first`, `--no-tail-first` | preset | Map the orientation that ends in a poly(A) tail first, and the other only when the first one's best hit spans less than `--tail-first-span` (0.8) of the read. Only with `--strands both`. |
 | `--rescue`, `--no-rescue` | preset | Re-seed reads whose best chain covers less than half the read at a lower LCP level. Reads shorter than `--rescue-genes-len` (350 compressed bases) re-seed proportionally more candidate genes. |
 | `--tail-trim`, `--no-tail-trim` | on | Trim poly(A) tails before aligning read ends. |
 | `--tail-run` | preset | Shortest poly(A) tail recognized. |
@@ -73,6 +140,23 @@ Settings you may want to change:
 
 The remaining settings tune gene selection, chaining, the tie-break and the rescue; they are
 listed under their headings in `--help`.
+
+Where Linux has transparent huge pages always on, the allocator's memory uses them, and each
+2 MB stretch that mapping touches is resident whole. If memory is tight, `MIMALLOC_ALLOW_THP=0`
+in the environment turns that off, which lowers the peak by several hundred megabytes.
+
+`--bump-alloc` takes the mapper's small allocations (up to 8 KB) from memory that belongs to
+each thread, instead of from the general allocator. Mapping a read makes a few hundred of
+them and frees nearly all before the next read, so a thread stays in the same few pages. It
+is off by default: mapping takes about 3% less CPU time with it, for 3 to 8 MB of memory a
+thread, and the output is the same. It is there on 64-bit Linux and macOS. Up to 256 threads
+have such memory at a time; with `-v`, the summary says how many did and how often a thread
+went without.
+
+The option takes the largest allocation to serve this way as a value, joined by `=`:
+`--bump-alloc=1KB`, or a number of bytes, up to 32 KB. 8 KB, what the option means without a
+value, was the best of the limits measured, so a value is for trying another.
+`--bump-alloc=off` (or `none`) is the same as leaving the option out.
 
 ## Messages
 

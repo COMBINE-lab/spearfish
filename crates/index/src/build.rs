@@ -774,6 +774,7 @@ pub fn build(mut txs: Vec<TxInput>, p: &BuildParams) -> Result<(IndexData, Build
         tx_names: txs.into_iter().map(|t| t.name).collect(),
         gene_names: gene_names.clone(),
         manifest: None,
+        extra: Vec::new(),
     };
     rep.tx_gene = data.tx_gene.clone();
     rep.gene_names = gene_names;

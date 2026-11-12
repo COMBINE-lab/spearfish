@@ -94,9 +94,9 @@ Environment variables:
 
 ## Releasing
 
-Every crate shares the workspace version (`[workspace.package] version`), and the Python
-package takes it too. `bump_and_publish.sh` cuts a release from a clean `main` that is in sync
-with `origin`:
+The spearfish crates share the workspace version (`[workspace.package] version`), and the
+Python package takes it too. `bump_and_publish.sh` cuts a release from a clean `main` that is
+in sync with `origin`:
 
 1. Write the release notes in `CHANGELOG.md` under `## X.Y.Z (unreleased)`, and merge them.
 2. Log in to crates.io once (`cargo login`, with an API token), and check the plan:
@@ -126,6 +126,14 @@ with `origin`:
 
 4. The script prints the release tarball's URL and `sha256` for the bioconda recipe. bioconda's
    bot proposes the version bump for later releases.
+
+`crates/nudgy` has a version of its own (in its `Cargo.toml`), since it does not depend on
+spearfish and seldom changes. A change to anything in that directory comes with a new version
+there, and in `crates/spearfish-cli/Cargo.toml` when the old requirement no longer admits it.
+The release script publishes the crate with the others when its version is not on crates.io
+yet, and stops before changing anything if the directory no longer holds the files that
+version was published with. Between spearfish releases, `cargo publish -p nudgy` publishes it
+alone.
 
 oarfish's spearfish backend depends on `spearfish` and `long-read-rad` from crates.io, so an
 oarfish release that needs a new spearfish follows the crates.

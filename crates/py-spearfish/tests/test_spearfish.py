@@ -323,7 +323,7 @@ def test_threads(index, reads):
 
 
 def test_presets_and_settings(index):
-    assert spearfish.presets() == ["ont", "drna", "hifi"]
+    assert spearfish.presets() == ["ont", "drna", "hifi", "ont-fast", "drna-fast", "hifi-fast"]
     assert "extend_ends" in spearfish.SETTINGS and "preset" not in spearfish.SETTINGS
     m = spearfish.Mapper(index, "hifi", extend_ends=True, tie_kappa=5, rescue_window="10,50")
     assert m.preset == "hifi"

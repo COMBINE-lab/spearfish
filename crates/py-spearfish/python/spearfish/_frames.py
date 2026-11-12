@@ -62,6 +62,7 @@ def batch_to_pandas(batch, unmapped=False):
         df[k] = hits.pop(k)
     df["low_coverage"] = reads["low_coverage"][row_read]
     df["rescued"] = reads["rescued"][row_read]
+    df["low_score"] = reads["low_score"][row_read]
     if unmapped:
         none = tx < 0
         df.loc[none, "strand"] = None

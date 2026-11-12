@@ -268,8 +268,12 @@ impl PyIndex {
     /// :param collapse: Graph nodes per ``"gene"`` (label, gene) or ``"global"`` (label).
     /// :param threads: Build threads (0: every available CPU).
     /// :param allow_collisions: Build even if two seed contents share a label.
+    /// :param rescue_tables: Keep the rescue tables the ``"ont"`` and ``"drna"`` presets map
+    ///     with in the index (a little over half of the file); without them every
+    ///     :class:`Mapper` of those presets makes them, when it is built and as reads need
+    ///     them.
     #[staticmethod]
-    #[pyo3(signature = (transcripts, output=None, *, t2g=None, infer_genes=None, scheme="lcp:K=3", hpc=true, mask_genes=20, collapse="gene", threads=0, allow_collisions=false))]
+    #[pyo3(signature = (transcripts, output=None, *, t2g=None, infer_genes=None, scheme="lcp:K=3", hpc=true, mask_genes=20, collapse="gene", threads=0, allow_collisions=false, rescue_tables=true))]
     #[allow(clippy::too_many_arguments)]
     fn build(
         py: Python<'_>,
@@ -283,6 +287,7 @@ impl PyIndex {
         collapse: &str,
         threads: usize,
         allow_collisions: bool,
+        rescue_tables: bool,
     ) -> PyResult<Self> {
         let per_gene = match collapse {
             "gene" => true,
@@ -356,6 +361,7 @@ impl PyIndex {
             .f_max(mask_genes)
             .per_gene(per_gene)
             .allow_collisions(allow_collisions)
+            .rescue_tables(rescue_tables)
             .maybe_infer_genes(infer)
             .build();
         let pool = pool(threads)?;
@@ -582,7 +588,7 @@ fn settings_from(preset: &str, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<M
 /// The complete parameters a preset and settings resolve to, as a dict (what ``spearfish map
 /// --print-params`` prints).
 ///
-/// :param preset: ``"ont"``, ``"drna"`` or ``"hifi"``.
+/// :param preset: ``"ont"``, ``"drna"`` or ``"hifi"``, or one of them with ``-fast``.
 /// :param settings: Settings changed from the preset (see :data:`SETTINGS`).
 #[pyfunction]
 #[pyo3(signature = (preset="ont", **settings))]
@@ -709,6 +715,10 @@ struct PyMappedRead {
     /// Hits came from the lower-level rescue.
     #[pyo3(get)]
     rescued: bool,
+    /// The best chain scored no better than a chance match (``min_score``): the read is
+    /// unmapped unless ``keep_low_score`` is set.
+    #[pyo3(get)]
+    low_score: bool,
     scores: Vec<f32>,
 }
 
@@ -749,6 +759,7 @@ fn to_py_read(
         hits: PyTuple::new(py, hits)?.unbind(),
         low_coverage: r.low_coverage,
         rescued: r.rescued,
+        low_score: r.low_score,
         scores: r.hits.iter().map(|h| h.score).collect(),
     })
 }
@@ -966,7 +977,7 @@ impl PyBatch {
     }
 
     /// One row per read, as a dict of NumPy arrays: ``length``, ``num_hits``,
-    /// ``low_coverage``, ``rescued``, and ``hit_offset`` (one longer than the batch: read
+    /// ``low_coverage``, ``rescued``, ``low_score``, and ``hit_offset`` (one longer than the batch: read
     /// ``i``'s rows in :meth:`hit_columns` are ``hit_offset[i]:hit_offset[i + 1]``).
     fn read_columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let n = self.reads.len();
@@ -974,6 +985,7 @@ impl PyBatch {
         let mut nh = Vec::with_capacity(n);
         let mut low = Vec::with_capacity(n);
         let mut resc = Vec::with_capacity(n);
+        let mut lows = Vec::with_capacity(n);
         let mut off = Vec::with_capacity(n + 1);
         let mut o = 0u64;
         off.push(0u64);
@@ -982,6 +994,7 @@ impl PyBatch {
             nh.push(r.hits.len() as u32);
             low.push(r.low_coverage);
             resc.push(r.rescued);
+            lows.push(r.low_score);
             o += r.hits.len() as u64;
             off.push(o);
         }
@@ -990,6 +1003,7 @@ impl PyBatch {
         d.set_item("num_hits", nh.into_pyarray(py))?;
         d.set_item("low_coverage", low.into_pyarray(py))?;
         d.set_item("rescued", resc.into_pyarray(py))?;
+        d.set_item("low_score", lows.into_pyarray(py))?;
         d.set_item("hit_offset", off.into_pyarray(py))?;
         Ok(d)
     }
@@ -1022,7 +1036,7 @@ impl PyBatch {
 
     /// One row per hit as a :class:`pandas.DataFrame`, like ``spearfish map``'s TSV: read
     /// (name, or position in the batch), read_length, rank, transcript (categorical), strand,
-    /// score, spans, anchors, anchored, max_discrepancy, extended, low_coverage, rescued.
+    /// score, spans, anchors, anchored, max_discrepancy, extended, low_coverage, rescued, low_score.
     ///
     /// :param unmapped: Also give each unmapped read one row, with no transcript.
     #[pyo3(signature = (*, unmapped=false))]
@@ -1136,7 +1150,8 @@ impl PyMapper {
 impl PyMapper {
     /// :param index: The :class:`Index` to map against.
     /// :param preset: ``"ont"`` (ONT cDNA, the default), ``"drna"`` (ONT direct RNA) or
-    ///     ``"hifi"`` (PacBio HiFi).
+    ///     ``"hifi"`` (PacBio HiFi); ``"ont-fast"``, ``"drna-fast"`` and ``"hifi-fast"`` map
+    ///     as 0.1.0 did, faster and less accurately, and report every read with a chain.
     /// :param threads: Threads for :meth:`map_batch` and :meth:`map_file` (0: every
     ///     available CPU).
     /// :param settings: Settings changed from the preset.

@@ -72,14 +72,48 @@ pub struct MapSettings {
     /// Read orientations to map.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strands: Option<Strands>,
+    /// With both orientations: map first the one whose read ends in a poly(A) tail, if exactly
+    /// one does, and the other only if the first maps poorly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_first: Option<bool>,
+    /// With `tail_first`: the other orientation is mapped if the tailed one's best hit spans
+    /// less than this fraction of the read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_first_span: Option<f32>,
+    /// With `tail_first`: shortest poly(A) tail that orders the orientations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_first_run: Option<usize>,
 
     // Reported hits.
     /// Report transcripts scoring within this fraction of the read's best.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_within: Option<f32>,
+    /// ...or within this many score points of it, if that is more: a weak read's best hit
+    /// leads its alternates by a few points whichever is right.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_within_abs: Option<f32>,
     /// Flag a read `low_coverage` when its best hit spans less than this fraction of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_coverage: Option<f32>,
+    /// Report a read unmapped (`low_score`) when its best chain scores under this for a
+    /// 1,000-base read: no better than a chance match (0: every read with a chain is mapped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f32>,
+    /// The `min_score` threshold grows by this per e-fold of read length, as the best chance
+    /// chain does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_score_ln_len: Option<f32>,
+    /// A best chain of this many base-level seeds or more is mapped at any score (0: none
+    /// is): separate seeds rarely line up on one transcript by chance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_score_anchors: Option<u32>,
+    /// A best hit that only the rescue found, and that scores near the threshold or spans
+    /// little of the read, must also align: the read is `low_score` if it does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_score_verify: Option<bool>,
+    /// Keep the hits of `low_score` reads (flagged only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_low_score: Option<bool>,
     /// Extend reported spans past the outermost seeds to where the read's alignment ends.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extend_ends: Option<bool>,
@@ -221,6 +255,16 @@ pub struct MapSettings {
     /// Relative margin within which both read orientations are tie-broken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_margin_rel: Option<f32>,
+    /// Near-tied read orientations whose clipped alignment scores differ by at most this are
+    /// compared by exact local alignment around each chain (0: never).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_exact: Option<f32>,
+    /// With `raw_ends`, also align the stretches between shared anchors in raw bases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_mid: Option<bool>,
+    /// A read's poly(A) tail is trimmed only past the A's its transcript has there itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_templated: Option<bool>,
 
     // Rescue.
     /// Re-seed reads that map poorly at a lower LCP level within their candidate genes.
@@ -251,9 +295,37 @@ pub struct MapSettings {
     /// Rescue: re-seed the other orientation regardless of its score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_other_always: Option<bool>,
-    /// Rescue: skip transcripts longer than this (compressed bases).
+    /// Rescue: skip transcript parts longer than this (compressed bases).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescue_max_tx_len: Option<u32>,
+    /// Rescue: map with every transcript's rescue seeds (read from the index, or made when
+    /// the mapper is built) instead of parsing transcript windows per read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_store: Option<bool>,
+    /// Rescue: chain a read's best hits again at the rescue level, those scoring within
+    /// this fraction of the best (0: only reads that map poorly are re-seeded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_rechain: Option<f32>,
+    /// Rescue: reads whose best chain covers at least this fraction of them, with no rival
+    /// on the other orientation, are taken as they stand (0: no read is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_settled: Option<f32>,
+    /// Rescue: also chain the other read orientation in up to this many transcripts
+    /// sharing seeds, reverse-complemented, with the best hit's region (0: off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_antisense: Option<usize>,
+    /// Rescue: seed doubtful reads against every transcript at the rescue level, by a
+    /// table made when the mapper is built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_global: Option<bool>,
+    /// Rescue: transcripts from the whole transcriptome chained per orientation of a read
+    /// that maps poorly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_global_cands: Option<usize>,
+    /// Rescue: transcripts from the whole transcriptome chained next to the candidates of
+    /// any other read that is not settled (0: none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_extra_cands: Option<usize>,
 }
 
 /// Set `$dst` from an optional setting.
@@ -280,8 +352,17 @@ impl MapSettings {
     pub const FIELDS: &[&str] = &[
         "preset",
         "strands",
+        "tail_first",
+        "tail_first_span",
+        "tail_first_run",
         "report_within",
+        "report_within_abs",
         "min_coverage",
+        "min_score",
+        "min_score_ln_len",
+        "min_score_anchors",
+        "min_score_verify",
+        "keep_low_score",
         "extend_ends",
         "extend_within",
         "keep_genes",
@@ -325,6 +406,9 @@ impl MapSettings {
         "tail_bonus",
         "orient_tail",
         "orient_margin_rel",
+        "orient_exact",
+        "raw_mid",
+        "tail_templated",
         "rescue",
         "rescue_scheme",
         "rescue_genes",
@@ -335,6 +419,13 @@ impl MapSettings {
         "rescue_other_margin",
         "rescue_other_always",
         "rescue_max_tx_len",
+        "rescue_store",
+        "rescue_rechain",
+        "rescue_settled",
+        "rescue_antisense",
+        "rescue_global",
+        "rescue_global_cands",
+        "rescue_extra_cands",
     ];
 
     /// The preset's settings, nothing changed.
@@ -368,6 +459,9 @@ impl MapSettings {
             tail_bonus,
             orient_tail,
             orient_margin_rel,
+            orient_exact,
+            raw_mid,
+            tail_templated,
             end_diagonal,
         )
     }
@@ -384,6 +478,13 @@ impl MapSettings {
             rescue_other_margin,
             rescue_other_always,
             rescue_max_tx_len,
+            rescue_store,
+            rescue_rechain,
+            rescue_settled,
+            rescue_antisense,
+            rescue_global,
+            rescue_global_cands,
+            rescue_extra_cands,
         )
     }
 
@@ -399,8 +500,68 @@ impl MapSettings {
         let mut o = MapOptions::preset(self.preset);
         let p = &mut o.params;
         set!(self.strands => p.strands);
+        match (self.tail_first, p.tail_first.is_some()) {
+            (Some(false), _) => p.tail_first = None,
+            (Some(true), false) => p.tail_first = Some(Default::default()),
+            _ => {}
+        }
+        let unused = set_names!(self: tail_first_span, tail_first_run);
+        match p.tail_first.as_mut() {
+            Some(t) if p.strands == Strands::Both => {
+                set!(self.tail_first_span => t.span);
+                set!(self.tail_first_run => t.run);
+                ensure!(
+                    t.span > 0.0 && t.span <= 1.0,
+                    "tail_first_span must be above 0 and at most 1"
+                );
+                ensure!(t.run >= 2, "tail_first_run must be at least 2");
+            }
+            Some(_) => {
+                // One orientation is mapped: nothing to stage.
+                if self.tail_first == Some(true) {
+                    log::warn!("one read orientation is mapped; ignoring tail_first");
+                }
+                p.tail_first = None;
+            }
+            None if !unused.is_empty() => {
+                log::warn!("tail_first is off; ignoring {}", unused.join(", "));
+            }
+            None => {}
+        }
         set!(self.report_within => p.delta_rep);
+        set!(self.report_within_abs => p.rep_abs);
+        ensure!(p.rep_abs >= 0.0, "report_within_abs must not be negative");
         set!(self.min_coverage => p.pi_cov);
+        if let Some(s) = self.min_score {
+            ensure!(s >= 0.0, "min_score must not be negative");
+            p.min_score = (s > 0.0).then(|| map::MinScore {
+                at_1kb: s,
+                ..p.min_score.unwrap_or_default()
+            });
+        }
+        match p.min_score.as_mut() {
+            Some(m) => {
+                set!(self.min_score_ln_len => m.per_ln_len);
+                set!(self.min_score_anchors => m.anchors);
+                match (self.min_score_verify, m.verify.is_some()) {
+                    (Some(false), _) => m.verify = None,
+                    (Some(true), false) => m.verify = Some(Default::default()),
+                    _ => {}
+                }
+                set!(self.keep_low_score => m.keep);
+            }
+            None => {
+                let unused = set_names!(self:
+                    min_score_ln_len,
+                    min_score_anchors,
+                    min_score_verify,
+                    keep_low_score,
+                );
+                if !unused.is_empty() {
+                    log::warn!("min_score is off; ignoring {}", unused.join(", "));
+                }
+            }
+        }
         set!(self.merge_anchors => p.merge_collinear);
 
         let a = &mut p.anchor;
@@ -466,6 +627,10 @@ impl MapSettings {
             set!(self.tail_bonus => tb.tail_bonus);
             set!(self.orient_tail => tb.orient_tail);
             set!(self.orient_margin_rel => tb.orient_margin_rel);
+            set!(self.orient_exact => tb.orient_exact);
+            set!(self.raw_mid => tb.raw_mid);
+            set!(self.tail_templated => tb.tail_templated);
+            ensure!(tb.orient_exact >= 0.0, "orient_exact must not be negative");
             ensure!(tb.pad_div >= 1, "pad_div must be at least 1");
             ensure!(tb.max_cands >= 1, "tie_cands must be at least 1");
             ensure!(tb.tail_run >= 2, "tail_run must be at least 2");
@@ -504,6 +669,36 @@ impl MapSettings {
                 r.other_margin = None;
             } else if self.rescue_other_margin.is_some() {
                 r.other_margin = self.rescue_other_margin;
+            }
+            set!(self.rescue_store => r.store);
+            set!(self.rescue_antisense => r.antisense);
+            if let Some(w) = self.rescue_rechain {
+                ensure!(w >= 0.0, "rescue_rechain must not be negative");
+                r.rechain = (w > 0.0).then_some(w);
+            }
+            if let Some(a) = self.rescue_settled {
+                ensure!((0.0..=1.0).contains(&a), "rescue_settled must be within 0..=1");
+                r.settled = (a > 0.0).then(|| map::rescue::Settled {
+                    anchored: a,
+                    ..r.settled.unwrap_or_default()
+                });
+            }
+            match (self.rescue_global, r.global.is_some()) {
+                (Some(false), _) => r.global = None,
+                (Some(true), false) => r.global = Some(Default::default()),
+                _ => {}
+            }
+            match r.global.as_mut() {
+                Some(g) => {
+                    set!(self.rescue_global_cands => g.weak_cands);
+                    set!(self.rescue_extra_cands => g.extra_cands);
+                }
+                None => {
+                    let unused = set_names!(self: rescue_global_cands, rescue_extra_cands);
+                    if !unused.is_empty() {
+                        log::warn!("rescue_global is off; ignoring {}", unused.join(", "));
+                    }
+                }
             }
         } else {
             let unused = self.rescue_only();
@@ -571,7 +766,7 @@ mod tests {
 
     #[test]
     fn unset_settings_are_the_preset() {
-        for p in [Preset::Ont, Preset::Drna, Preset::Hifi] {
+        for p in Preset::ALL {
             assert_eq!(MapSettings::preset(p).resolve().unwrap(), MapOptions::preset(p));
             assert_eq!(MapSettings::builder(p).build(), MapSettings::preset(p));
         }
@@ -637,6 +832,113 @@ mod tests {
                 .resolve()
                 .is_err()
         );
+        // Read rejection: every preset has it, by the same rule, but the `-fast` ones.
+        for p in Preset::ALL {
+            let rule = MapOptions::preset(p).params.min_score;
+            assert_eq!(rule, (!p.fast()).then(map::MinScore::default));
+        }
+        let o = MapSettings::builder(Preset::Hifi)
+            .min_score(50.0)
+            .min_score_ln_len(0.0)
+            .min_score_anchors(3)
+            .min_score_verify(false)
+            .keep_low_score(true)
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            o.params.min_score,
+            Some(map::MinScore {
+                at_1kb: 50.0,
+                per_ln_len: 0.0,
+                anchors: 3,
+                keep: true,
+                verify: None,
+            })
+        );
+        // Changing the threshold keeps the preset's other parts; 0 turns rejection off.
+        let o = MapSettings::builder(Preset::Hifi)
+            .min_score(40.0)
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            o.params.min_score,
+            Some(map::MinScore {
+                at_1kb: 40.0,
+                ..Default::default()
+            })
+        );
+        let o = MapSettings::builder(Preset::Ont)
+            .min_score(0.0)
+            .resolve()
+            .unwrap();
+        assert_eq!(o.params.min_score, None);
+        assert!(
+            MapSettings::builder(Preset::Ont)
+                .min_score(-1.0)
+                .resolve()
+                .is_err()
+        );
+        // The rescue's parts switch off one by one.
+        let o = MapSettings::builder(Preset::Ont)
+            .rescue_rechain(0.0)
+            .rescue_settled(0.0)
+            .rescue_global(false)
+            .rescue_antisense(0)
+            .rescue_store(false)
+            .resolve()
+            .unwrap();
+        let r = o.params.rescue.unwrap();
+        assert_eq!((r.rechain, r.settled, r.global), (None, None, None));
+        assert!(!r.store && r.antisense == 0);
+        let o = MapSettings::builder(Preset::Ont)
+            .rescue_settled(0.5)
+            .rescue_global_cands(16)
+            .rescue_extra_cands(0)
+            .resolve()
+            .unwrap();
+        let r = o.params.rescue.unwrap();
+        assert_eq!(r.settled.unwrap().anchored, 0.5);
+        let g = r.global.unwrap();
+        assert_eq!((g.weak_cands, g.extra_cands), (16, 0));
+        assert!(
+            MapSettings::builder(Preset::Ont)
+                .rescue_settled(1.5)
+                .resolve()
+                .is_err()
+        );
+        // Tail-first staging: on for HiFi, its settings apply where it is on, and it needs
+        // both orientations.
+        let on = |s: MapSettings| s.resolve().unwrap().params.tail_first;
+        assert_eq!(on(MapSettings::preset(Preset::Ont)), None);
+        assert_eq!(
+            on(MapSettings::builder(Preset::Hifi).tail_first(false).build()),
+            None
+        );
+        assert_eq!(
+            on(MapSettings::builder(Preset::Ont)
+                .tail_first(true)
+                .tail_first_span(0.7)
+                .build()),
+            Some(map::TailFirst { span: 0.7, run: 20 })
+        );
+        assert_eq!(
+            on(MapSettings::builder(Preset::Hifi).tail_first_run(25).build()),
+            Some(map::TailFirst { span: 0.8, run: 25 })
+        );
+        assert_eq!(
+            on(MapSettings::builder(Preset::Hifi)
+                .strands(Strands::Forward)
+                .build()),
+            None
+        );
+        for span in [0.0, 1.5] {
+            assert!(
+                MapSettings::builder(Preset::Hifi)
+                    .tail_first_span(span)
+                    .resolve()
+                    .is_err()
+            );
+        }
         let w: RescueWindow = "10,50".parse().unwrap();
         assert_eq!(w, RescueWindow::Window { pad: 10, div: 50 });
         assert_eq!("full".parse::<RescueWindow>().unwrap(), RescueWindow::Full);

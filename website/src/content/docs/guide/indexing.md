@@ -29,17 +29,21 @@ transcripts belong together. There are three ways to tell it:
 If your transcripts carry no gene IDs and you have no table, use `--infer-genes`: on human
 GENCODE, inferred groups do as well as the annotated genes. On simulated ONT reads (95%
 accuracy), 98.7% of reads rank their true transcript first and 99.4% keep it among the reported
-transcripts with either, and the index is the same size (1.3 GB).
+transcripts with either, and the index is the same size (1.3 GB without the rescue tables).
 
 Without any of these, every transcript is its own gene and `spearfish index` prints a warning.
-Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB, mapping takes more
+Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB (rescue tables
+left out of both), mapping takes more
 time and memory, and fewer reads are assigned to the right transcript (top-1 falls from 98.7% to
 97.6% on the same reads, and the true transcript is among those reported for 98.2% instead of
 99.4%), because the per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
 writes the grouping that was used.
 
-For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in about 4 seconds on
-32 threads. Map against an index built from the same transcript FASTA you quantify against.
+For human GENCODE v50 (670,670 transcripts) the index is 2.8 GB and builds in about 7 seconds on
+32 threads. A little over half of the file is the rescue tables, which the `ont` and `drna`
+presets map doubtful reads with ([Doubtful reads](/spearfish/guide/mapping/#doubtful-reads));
+`--no-rescue-tables` leaves them out, and mapping with those presets then makes them, at every
+start and as reads need them. Map against an index built from the same transcript FASTA you quantify against.
 
 ## What the index holds
 
@@ -48,6 +52,9 @@ For human GENCODE v50 (670,670 transcripts) the index is 1.3 GB and builds in ab
 - For every unitig, the transcripts that contain it and where.
 - The homopolymer-compressed sequence of every transcript, and its raw sequence, used to align
   read ends where isoforms differ.
+- The **rescue tables** of the `ont` and `drna` presets: every transcript's rescue seeds, a
+  table of their runs of three, and each transcript's antisense mates (the transcripts that
+  hold stretches of its reverse complement). Mapping reads them in place from the file.
 
 [Inside spearfish](/spearfish/concepts/inside/) explains why this structure is small.
 
@@ -81,6 +88,7 @@ giving wrong results.
 | `--no-hpc` | | Don't homopolymer-compress transcripts (and reads at mapping time). |
 | `--collapse` | `gene` | Collapse seeds per (label, gene) or globally (`global`, larger and slower). |
 | `--mask-genes` | `20` | Mask unitigs shared by more than this many genes (repeats). |
+| `--no-rescue-tables` | | Leave the rescue tables out of the index (a little over half its size); the `ont` and `drna` presets then make them, at every start and as reads need them. |
 | `--t2g` | | Transcript-to-gene table (see above). |
 | `--infer-genes [N]` | off (N = 64) | Infer genes from shared seed runs, ignoring runs in more than N transcripts. |
 | `--infer-span` | `12` | Consecutive seeds a shared run must span. |

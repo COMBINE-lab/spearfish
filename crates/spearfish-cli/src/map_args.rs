@@ -15,8 +15,14 @@ pub enum PresetArg {
     Ont,
     /// ONT direct RNA (sense orientation only).
     Drna,
-    /// PacBio HiFi (minimap2 map-hifi scores).
+    /// PacBio HiFi (minimap2 map-hifi scores; the poly(A)-tailed orientation first).
     Hifi,
+    /// ONT cDNA as 0.1.0 mapped it: faster, less accurate, reports every read with a chain.
+    OntFast,
+    /// ONT direct RNA as 0.1.0 mapped it.
+    DrnaFast,
+    /// PacBio HiFi as 0.1.0 mapped it.
+    HifiFast,
 }
 
 impl From<PresetArg> for Preset {
@@ -25,6 +31,9 @@ impl From<PresetArg> for Preset {
             PresetArg::Ont => Preset::Ont,
             PresetArg::Drna => Preset::Drna,
             PresetArg::Hifi => Preset::Hifi,
+            PresetArg::OntFast => Preset::OntFast,
+            PresetArg::DrnaFast => Preset::DrnaFast,
+            PresetArg::HifiFast => Preset::HifiFast,
         }
     }
 }
@@ -76,9 +85,28 @@ pub struct MapArgs {
     /// Read type; sets the defaults of every other setting.
     #[arg(long, value_enum, default_value = "ont", help_heading = "Settings")]
     pub preset: PresetArg,
-    /// Read orientations to map [default: drna fwd, others both].
+    /// Read orientations to map [default: drna fwd, others both]. For reads already oriented
+    /// to the transcripts' strand (Iso-Seq FLNC reads, for example), fwd maps the one
+    /// orientation; with fwd or rev, --tail-first has nothing to order and is off. Reads of
+    /// the other orientation are not all left unmapped (some have a weak hit in this one), so
+    /// use fwd or rev only when the reads are oriented.
     #[arg(long, value_enum, help_heading = "Settings")]
     pub strands: Option<StrandsArg>,
+    /// Map first the read orientation that ends in a poly(A) tail, and the other only if the
+    /// first maps poorly [default: hifi]. Only with --strands both.
+    #[arg(long, overrides_with = "no_tail_first", help_heading = "Settings")]
+    pub tail_first: bool,
+    /// Always map both read orientations.
+    #[arg(long, overrides_with = "tail_first", help_heading = "Settings")]
+    pub no_tail_first: bool,
+    /// With --tail-first: map the other orientation when the tailed one's best hit spans less
+    /// than this fraction of the read [default: 0.8].
+    #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Settings")]
+    pub tail_first_span: Option<f32>,
+    /// With --tail-first: shortest poly(A) tail that orders the orientations, in bases
+    /// [default: 20].
+    #[arg(long, hide_short_help = true, help_heading = "Settings")]
+    pub tail_first_run: Option<usize>,
     /// Report transcripts scoring within this fraction of the read's best [default: 0.3].
     #[arg(long, alias = "delta-rep", value_name = "FRAC", help_heading = "Settings")]
     pub report_within: Option<f32>,
@@ -116,6 +144,15 @@ pub struct MapArgs {
         help_heading = "Reported hits"
     )]
     pub extend_within: Option<f32>,
+    /// Also report transcripts within this many score points of the read's best, if that is
+    /// more than --report-within of it [default: 30].
+    #[arg(
+        long,
+        value_name = "SCORE",
+        hide_short_help = true,
+        help_heading = "Reported hits"
+    )]
+    pub report_within_abs: Option<f32>,
     /// Flag reads whose best hit spans less than this fraction of them [default: 0.5].
     #[arg(
         long,
@@ -124,6 +161,47 @@ pub struct MapArgs {
         help_heading = "Reported hits"
     )]
     pub min_coverage: Option<f32>,
+    /// Report a read unmapped when its best chain scores under this for a 1,000-base read
+    /// (no better than a chance match); 0: off [default: 36].
+    #[arg(long, value_name = "SCORE", help_heading = "Reported hits")]
+    pub min_score: Option<f32>,
+    /// Growth of the --min-score threshold per e-fold of read length [default: 4].
+    #[arg(
+        long,
+        value_name = "SCORE",
+        hide_short_help = true,
+        help_heading = "Reported hits"
+    )]
+    pub min_score_ln_len: Option<f32>,
+    /// Map a read whose best chain joins this many base-level seeds or more at any score;
+    /// 0: none [default: 0].
+    #[arg(
+        long,
+        value_name = "N",
+        hide_short_help = true,
+        help_heading = "Reported hits"
+    )]
+    pub min_score_anchors: Option<u32>,
+    /// A best hit only the rescue found, scoring near --min-score or spanning little of the
+    /// read, must also align, or the read is unmapped [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_min_score_verify",
+        hide_short_help = true,
+        help_heading = "Reported hits"
+    )]
+    pub min_score_verify: bool,
+    /// Decide rescued reads by --min-score alone.
+    #[arg(
+        long,
+        overrides_with = "min_score_verify",
+        hide_short_help = true,
+        help_heading = "Reported hits"
+    )]
+    pub no_min_score_verify: bool,
+    /// Keep the hits of reads under --min-score, flagged `low_score`.
+    #[arg(long, hide_short_help = true, help_heading = "Reported hits")]
+    pub keep_low_score: bool,
 
     // Candidate genes.
     /// Candidate genes kept per read, best first [default: 8].
@@ -220,7 +298,7 @@ pub struct MapArgs {
         help_heading = "Tie-break"
     )]
     pub tie_affine_within: Option<u32>,
-    /// Group tied hits without a shared anchor by the anchors they share [default: hifi].
+    /// Group tied hits without a shared anchor by the anchors they share [default: on].
     #[arg(
         long,
         overrides_with = "no_tie_group",
@@ -336,6 +414,48 @@ pub struct MapArgs {
     /// of the best (or the tie margin) [default: 0.35].
     #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Tie-break")]
     pub orient_margin_rel: Option<f32>,
+    /// Compare near-tied read orientations by exact local alignment around each chain when
+    /// their clipped scores differ by at most this (0: never) [default: hifi 0, others 150].
+    #[arg(
+        long,
+        value_name = "SCORE",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub orient_exact: Option<f32>,
+    /// With raw read ends, also align the stretches between shared anchors in raw bases
+    /// [default: on except hifi].
+    #[arg(
+        long,
+        overrides_with = "no_raw_mid",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub raw_mid: bool,
+    /// Align the stretches between shared anchors in homopolymer-compressed bases.
+    #[arg(
+        long,
+        overrides_with = "raw_mid",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub no_raw_mid: bool,
+    /// Trim a read's poly(A) tail only past the A's its transcript has there [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_tail_templated",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub tail_templated: bool,
+    /// Trim the whole A-run at the read end as its poly(A) tail.
+    #[arg(
+        long,
+        overrides_with = "tail_templated",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub no_tail_templated: bool,
 
     // Rescue.
     /// Rescue seed scheme [default: lcp:K=2].
@@ -376,9 +496,63 @@ pub struct MapArgs {
     /// Re-seed the other orientation regardless of its score.
     #[arg(long, hide_short_help = true, help_heading = "Rescue")]
     pub rescue_other_always: bool,
-    /// Skip transcripts longer than this, in compressed bases [default: 50000].
+    /// Skip transcript parts longer than this, in compressed bases [default: 50000].
     #[arg(long, hide_short_help = true, help_heading = "Rescue")]
     pub rescue_max_tx_len: Option<u32>,
+    /// Map with every transcript's rescue seeds, read from the index or made at startup
+    /// [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_rescue_store",
+        hide_short_help = true,
+        help_heading = "Rescue"
+    )]
+    pub rescue_store: bool,
+    /// Parse transcript windows into rescue seeds per read (less memory, slower rescue).
+    #[arg(
+        long,
+        overrides_with = "rescue_store",
+        hide_short_help = true,
+        help_heading = "Rescue"
+    )]
+    pub no_rescue_store: bool,
+    /// Chain a read's best hits again at the rescue level: those within this fraction of the
+    /// best (0: only reads that map poorly are re-seeded) [default: 0.5].
+    #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Rescue")]
+    pub rescue_rechain: Option<f32>,
+    /// Reads whose best chain covers this fraction of them, with no rival on the other
+    /// orientation, skip the rescue-level work (0: no read does) [default: 0.3].
+    #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Rescue")]
+    pub rescue_settled: Option<f32>,
+    /// Also chain the other orientation in up to this many transcripts sharing seeds,
+    /// reverse-complemented, with the best hit (0: off) [default: 16].
+    #[arg(long, value_name = "N", hide_short_help = true, help_heading = "Rescue")]
+    pub rescue_antisense: Option<usize>,
+    /// Seed doubtful reads against every transcript at the rescue level, by a table read
+    /// from the index or made at startup [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_rescue_global",
+        hide_short_help = true,
+        help_heading = "Rescue"
+    )]
+    pub rescue_global: bool,
+    /// Rescue only within the candidates the base-level seeds name.
+    #[arg(
+        long,
+        overrides_with = "rescue_global",
+        hide_short_help = true,
+        help_heading = "Rescue"
+    )]
+    pub no_rescue_global: bool,
+    /// Transcripts from the whole transcriptome chained per orientation of a read that maps
+    /// poorly [default: 64].
+    #[arg(long, value_name = "N", hide_short_help = true, help_heading = "Rescue")]
+    pub rescue_global_cands: Option<usize>,
+    /// Transcripts from the whole transcriptome chained next to the candidates of other
+    /// reads that are not settled (0: none) [default: 8].
+    #[arg(long, value_name = "N", hide_short_help = true, help_heading = "Rescue")]
+    pub rescue_extra_cands: Option<usize>,
 }
 
 impl MapArgs {
@@ -390,8 +564,17 @@ impl MapArgs {
         });
         MapSettings::builder(self.preset.into())
             .maybe_strands(self.strands.map(Into::into))
+            .maybe_tail_first(onoff!(self.tail_first / no_tail_first))
+            .maybe_tail_first_span(self.tail_first_span)
+            .maybe_tail_first_run(self.tail_first_run)
             .maybe_report_within(self.report_within)
+            .maybe_report_within_abs(self.report_within_abs)
             .maybe_min_coverage(self.min_coverage)
+            .maybe_min_score(self.min_score)
+            .maybe_min_score_ln_len(self.min_score_ln_len)
+            .maybe_min_score_anchors(self.min_score_anchors)
+            .maybe_min_score_verify(onoff!(self.min_score_verify / no_min_score_verify))
+            .maybe_keep_low_score(self.keep_low_score.then_some(true))
             .maybe_extend_ends(onoff!(self.extend_ends / no_extend_ends))
             .maybe_extend_within(self.extend_within)
             .maybe_keep_genes(self.keep_genes)
@@ -435,6 +618,9 @@ impl MapArgs {
             .maybe_tail_bonus(self.tail_bonus)
             .maybe_orient_tail(self.orient_tail)
             .maybe_orient_margin_rel(self.orient_margin_rel)
+            .maybe_orient_exact(self.orient_exact)
+            .maybe_raw_mid(onoff!(self.raw_mid / no_raw_mid))
+            .maybe_tail_templated(onoff!(self.tail_templated / no_tail_templated))
             .maybe_rescue(onoff!(self.rescue / no_rescue))
             .maybe_rescue_scheme(self.rescue_scheme.clone())
             .maybe_rescue_genes(self.rescue_genes)
@@ -445,6 +631,13 @@ impl MapArgs {
             .maybe_rescue_other_margin(self.rescue_other_margin)
             .maybe_rescue_other_always(self.rescue_other_always.then_some(true))
             .maybe_rescue_max_tx_len(self.rescue_max_tx_len)
+            .maybe_rescue_store(onoff!(self.rescue_store / no_rescue_store))
+            .maybe_rescue_rechain(self.rescue_rechain)
+            .maybe_rescue_settled(self.rescue_settled)
+            .maybe_rescue_antisense(self.rescue_antisense)
+            .maybe_rescue_global(onoff!(self.rescue_global / no_rescue_global))
+            .maybe_rescue_global_cands(self.rescue_global_cands)
+            .maybe_rescue_extra_cands(self.rescue_extra_cands)
             .build()
     }
 }
@@ -577,8 +770,17 @@ mod tests {
     fn every_setting_has_a_flag() {
         let s = settings(&[
             "--strands=fwd",
+            "--tail-first",
+            "--tail-first-span=0.7",
+            "--tail-first-run=20",
             "--report-within=0.2",
+            "--report-within-abs=10",
             "--min-coverage=0.4",
+            "--min-score=30",
+            "--min-score-ln-len=3",
+            "--min-score-anchors=3",
+            "--no-min-score-verify",
+            "--keep-low-score",
             "--no-extend-ends",
             "--extend-within=0.1",
             "--keep-genes=4",
@@ -623,6 +825,9 @@ mod tests {
             "--tail-bonus=0",
             "--orient-tail=0",
             "--orient-margin-rel=0.2",
+            "--orient-exact=0",
+            "--no-raw-mid",
+            "--no-tail-templated",
             "--rescue",
             "--rescue-scheme=lcp:K=2",
             "--rescue-genes=8",
@@ -632,6 +837,13 @@ mod tests {
             "--rescue-window=full",
             "--rescue-other-margin=-1",
             "--rescue-max-tx-len=1000",
+            "--no-rescue-store",
+            "--rescue-rechain=0",
+            "--rescue-settled=0",
+            "--rescue-antisense=0",
+            "--rescue-global",
+            "--rescue-global-cands=16",
+            "--rescue-extra-cands=0",
         ]);
         let j = serde_json::to_value(&s).unwrap();
         let missing: Vec<_> = MapSettings::FIELDS

@@ -31,6 +31,12 @@ pub struct AnchorParams {
     pub f_tie: f32,
     /// Hard cap on kept genes (ties in large multi-copy families).
     pub f_max: usize,
+    /// In a gene's score, an anchor that overlaps the previous one counts for the part of it
+    /// that extends past it (off: for nothing, as in 0.1.0, so that a run of overlapping seeds
+    /// scores as its first one and a gene with one long exact stretch can rank below one
+    /// with two scattered seeds).
+    #[serde(default)]
+    pub overlap_credit: bool,
 }
 
 impl Default for AnchorParams {
@@ -46,6 +52,7 @@ impl Default for AnchorParams {
             f_keep: 8,
             f_tie: 0.01,
             f_max: 64,
+            overlap_credit: true,
         }
     }
 }
@@ -94,14 +101,19 @@ pub fn anchors(idx: &Index, seeds: &[Seed], p: &AnchorParams) -> Vec<Anchor> {
     out
 }
 
-/// Sum of weights over a greedy, query-increasing, non-overlapping subset of anchors (sorted by
-/// query start): a cheap family score.
-fn greedy_score(anchors: &[Anchor]) -> f32 {
+/// A cheap family score: the sum of weights over a greedy, query-increasing pass over the
+/// anchors (sorted by query start). An anchor that overlaps the previous one counts for the
+/// part of it that extends past it (with `overlap`, [`AnchorParams::overlap_credit`]), so
+/// consecutive overlapping seeds score more than one.
+fn greedy_score(anchors: &[Anchor], overlap: bool) -> f32 {
     let mut end = 0;
     let mut score = 0.0;
     for a in anchors {
         if a.qs >= end {
             score += a.weight;
+            end = a.qe;
+        } else if overlap && a.qe > end {
+            score += a.weight * (a.qe - end) as f32 / (a.qe - a.qs) as f32;
             end = a.qe;
         }
     }
@@ -142,7 +154,7 @@ pub fn candidates(idx: &Index, anchors: Vec<Anchor>, p: &AnchorParams) -> Vec<Ca
         if !g.is_sorted_by_key(|a| (a.qs, a.qe, a.node)) {
             g.sort_unstable_by_key(|a| (a.qs, a.qe, a.node));
         }
-        groups.push((f, lo..hi, greedy_score(g)));
+        groups.push((f, lo..hi, greedy_score(g, p.overlap_credit)));
         lo = hi;
     }
     crate::stats::add(&crate::stats::ANCHORS, anchors.len() as u64);
@@ -250,6 +262,7 @@ fn select_with(
 ) -> (Vec<Candidate>, u32) {
     sc.touched.clear();
     sc.seeds.clear();
+    let overlap = p.overlap_credit;
     let mut n_anchors = 0u32;
     let mut best = f32::NEG_INFINITY;
     // Label lookups miss in cache twice (directory entry, then labels): pipeline them as
@@ -304,6 +317,11 @@ fn select_with(
                 st.score += weight;
                 st.end = qe;
                 // Comparison form (a single max instruction; scores are never NaN).
+                best = if st.score > best { st.score } else { best };
+            } else if overlap && qe > st.end {
+                // Overlaps the family's previous anchor: the part past it counts.
+                st.score += weight * (qe - st.end) as f32 / (qe - qs) as f32;
+                st.end = qe;
                 best = if st.score > best { st.score } else { best };
             }
         }
@@ -424,4 +442,32 @@ fn merge_collinear_with(
     }
     crate::stats::add(&crate::stats::MERGED_ANCHORS, out.len() as u64);
     c.anchors = out;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anchor(qs: u32, qe: u32) -> Anchor {
+        Anchor {
+            qs,
+            qe,
+            node: 0,
+            weight: (qe - qs) as f32,
+        }
+    }
+
+    #[test]
+    fn overlapping_anchors_count_for_what_they_add() {
+        // Disjoint anchors count in full.
+        assert_eq!(greedy_score(&[anchor(0, 10), anchor(10, 30)], true), 30.0);
+        // An overlapping one counts for the part past the previous anchor's end.
+        assert_eq!(greedy_score(&[anchor(0, 10), anchor(5, 25)], true), 25.0);
+        assert_eq!(greedy_score(&[anchor(0, 10), anchor(5, 25)], false), 10.0);
+        // A contained one adds nothing.
+        assert_eq!(
+            greedy_score(&[anchor(0, 20), anchor(5, 15), anchor(20, 30)], true),
+            30.0
+        );
+    }
 }

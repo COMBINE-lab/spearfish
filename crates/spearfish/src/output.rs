@@ -28,8 +28,11 @@ pub const TSV_HEADER: &str = "read\tread_len\tstrand\trank\ttranscript\tscore\tq
 
 /// Append `x` in decimal (as `{}` would).
 fn push_uint(buf: &mut Vec<u8>, mut x: u64) {
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
+    // The digits end at byte 20. Twenty bytes are copied from the first digit on and the
+    // surplus cut off again: a copy of fixed length is a few moves, one of the digits alone
+    // a call.
+    let mut tmp = [0u8; 40];
+    let mut i = 20;
     loop {
         i -= 1;
         tmp[i] = b'0' + (x % 10) as u8;
@@ -38,7 +41,10 @@ fn push_uint(buf: &mut Vec<u8>, mut x: u64) {
             break;
         }
     }
-    buf.extend_from_slice(&tmp[i..]);
+    let at = buf.len();
+    let from: &[u8; 20] = tmp[i..i + 20].try_into().unwrap();
+    buf.extend_from_slice(from);
+    buf.truncate(at + 20 - i);
 }
 
 /// Append `v` with `dec` (at most 4) decimals, digit for digit as `{:.dec$}` would: `v * 10^dec`
@@ -73,8 +79,13 @@ pub fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
     if r.hits.is_empty() {
         let _ = writeln!(
             buf,
-            "{name}\t{}\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped",
-            r.len
+            "{name}\t{}\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\t{}",
+            r.len,
+            if r.low_score {
+                "unmapped,low_score"
+            } else {
+                "unmapped"
+            }
         );
         return;
     }
@@ -110,13 +121,18 @@ pub fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
     }
 }
 
-/// The flags every TSV line of a read carries: `rescued`, `low_coverage`, both, or `-`.
+/// The flags every TSV line of a mapped read carries: those of `rescued`, `low_coverage` and
+/// `low_score` that apply, or `-`.
 pub fn read_flags(r: &MappedRead) -> &'static str {
-    match (r.low_coverage, r.rescued) {
-        (true, true) => "rescued,low_coverage",
-        (true, false) => "low_coverage",
-        (false, true) => "rescued",
-        (false, false) => "-",
+    match (r.rescued, r.low_coverage, r.low_score) {
+        (true, true, true) => "rescued,low_coverage,low_score",
+        (true, true, false) => "rescued,low_coverage",
+        (true, false, true) => "rescued,low_score",
+        (true, false, false) => "rescued",
+        (false, true, true) => "low_coverage,low_score",
+        (false, true, false) => "low_coverage",
+        (false, false, true) => "low_score",
+        (false, false, false) => "-",
     }
 }
 
@@ -241,7 +257,8 @@ pub fn rad_record(rec: &mut long_read_rad::ReadRecord, r: &MappedRead) -> bool {
         read_flags::LOW_COVERAGE
     } else {
         0
-    } | if r.rescued { read_flags::RESCUED } else { 0 };
+    } | if r.rescued { read_flags::RESCUED } else { 0 }
+        | if r.low_score { read_flags::LOW_SCORE } else { 0 };
     for h in &r.hits {
         rec.push(Aln {
             tid: h.tx,

@@ -59,7 +59,7 @@ index = spearfish.Index.build("transcripts.fa", infer_genes=True)
 ```
 
 `Index.build` takes the options of `spearfish index`: `scheme`, `hpc`, `mask_genes`,
-`collapse`, `threads`, and `allow_collisions`. An index tells you about itself:
+`collapse`, `threads`, `allow_collisions`, and `rescue_tables`. An index tells you about itself:
 `num_transcripts`, `num_genes`, `transcript_names()`, `transcript_lengths()`,
 `transcript_gene(i)`, `gene_names()`, `transcript_id(name)`, `scheme`, `hpc`, `id`, `manifest`
 (what built it and from what), and `build_report` (construction statistics, for an index built
@@ -102,7 +102,7 @@ Most settings are numbers or booleans. A few take strings:
 Results come back in input order. A `MappedRead` has the following fields:
 - `name` and `length`;
 - `hits` (a tuple of `Hit`, best first) and `best`;
-- `is_mapped`, `low_coverage` and `rescued`;
+- `is_mapped`, `low_coverage`, `rescued` and `low_score` (the best chain scored no better than a chance match, so the read is unmapped);
 - `probabilities()`, the hits' relative likelihoods, `exp(-(best - score) / SCORE_DENOM)` normalized to sum to 1.
 
 A `Hit` has the following fields:

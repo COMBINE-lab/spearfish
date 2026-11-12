@@ -19,8 +19,8 @@ alignment is restricted to the read segments where tied isoforms differ.
 Documentation: https://combine-lab.github.io/spearfish/ (source in `website/`; preview locally
 with `cd website && npm install && npm run dev`).
 
-**Status:** 0.1.0, the first release. Interfaces may change before 1.0; see
-[CHANGELOG.md](CHANGELOG.md).
+**Status:** 0.2.0. The default presets map reads differently from 0.1.0, and the library
+gained fields and presets: see [CHANGELOG.md](CHANGELOG.md). Interfaces may change before 1.0.
 
 ## Install
 
@@ -62,9 +62,10 @@ spearfish map transcripts.sfi reads.fq.gz --preset ont -o reads.tsv   # and/or -
 | `doctor` | Report the build and machine and run a self-test; `--index` also checks an index. |
 | `completions`, `man` | Shell completions and man pages. |
 
-Presets (`--preset ont|drna|hifi`) set every default; any setting can be changed with its
-flag, and `spearfish map --print-params` prints the parameters a run would use. `-h` lists
-the common flags, `--help` all of them.
+Presets (`--preset ont|drna|hifi`) set every default (`ont-fast`, `drna-fast` and `hifi-fast`
+map as 0.1.0 did: faster, less accurate); any setting can be changed with its flag, and
+`spearfish map --print-params` prints the parameters a run would use. `-h` lists the common
+flags, `--help` all of them.
 
 Every index records how it was built (`<index>.json`, and `spearfish inspect`), and every
 mapping run writes `<output>.meta.json`: the build, command line, index, settings, every
@@ -87,9 +88,12 @@ spearfish map transcripts.sfi reads.fq.gz --preset ont --rad sample.rad
 oarfish -a sample.rad -o sample
 ```
 
+oarfish 0.11.0 maps in process with spearfish 0.1; until an oarfish release embeds 0.2, the RAD
+route is how to quantify this version's mappings.
+
 ## As a library
 
-`spearfish = "0.1"` in `Cargo.toml`:
+`spearfish = "0.2"` in `Cargo.toml`:
 
 ```rust
 use std::sync::Arc;
@@ -114,6 +118,7 @@ for hit in mapper.map(b"ACGT...").hits {
 | `crates/rad` (`long-read-rad`) | `bulk_long_read` RAD records, shared with oarfish |
 | `crates/spearfish` (`spearfish`) | the library: index, settings, mapper, output formats, provenance |
 | `crates/spearfish-cli` (`spearfish-cli`) | the `spearfish` binary |
+| `crates/nudgy` (`nudgy`) | the allocator behind `spearfish map --bump-alloc`: per-thread bump arenas in front of any global allocator (independent of spearfish, with its own version) |
 | `crates/py-spearfish` | the Python package (`spearfish` on PyPI; built with maturin) |
 | `fixtures/toy` | toy transcriptome with an exon skip, an alternative 3′ site and a paralog pair |
 
