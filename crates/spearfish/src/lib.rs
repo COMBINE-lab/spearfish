@@ -261,6 +261,7 @@ impl MapOptions {
             tb.mid_inset = 0;
             tb.clip_pieces = false;
             tb.tail_templated = false;
+            tb.end_bonus_cut = false;
             if let Some(r) = &mut params.rescue {
                 r.cap_window = false;
                 r.store = false;

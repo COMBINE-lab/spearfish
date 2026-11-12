@@ -37,7 +37,11 @@ setting.
 
 With every preset, a poly(A) tail at a read's 3′ end is found (a run of A's with at most one
 other base) and trimmed before the read end is aligned, and isoforms whose annotated 3′ end lies
-where the tail starts gain a few points (`--tail-bonus`). When a read's two orientations align
+where the tail starts gain a few points (`--tail-bonus`). A read end also earns a few points
+for aligning through to the read's end (`--end-bonus`); where one candidate's transcript ends
+inside the read end and another's goes on, those points count only for reaching the read's end
+within the shorter one, so a couple of unaligned bases after the read's true end do not favour
+an isoform that continues (`--end-bonus-cut`, off in the `-fast` presets). When a read's two orientations align
 almost equally well (sequence shared antisense, as with antisense isoforms or a pseudogene inside
 another gene), the orientation that ends in the poly(A) tail is preferred (`--orient-tail`).
 LCP parsing is not strand-symmetric, so a read's two orientations draw different seeds; both are

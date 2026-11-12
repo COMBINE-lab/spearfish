@@ -456,6 +456,23 @@ pub struct MapArgs {
         help_heading = "Read ends"
     )]
     pub no_tail_templated: bool,
+    /// Where a candidate's transcript ends inside a read end, count the end bonus only for
+    /// reaching the read's end within that transcript's length [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_end_bonus_cut",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub end_bonus_cut: bool,
+    /// Count the end bonus wherever an alignment reaches the read's end.
+    #[arg(
+        long,
+        overrides_with = "end_bonus_cut",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub no_end_bonus_cut: bool,
 
     // Rescue.
     /// Rescue seed scheme [default: lcp:K=2].
@@ -621,6 +638,7 @@ impl MapArgs {
             .maybe_orient_exact(self.orient_exact)
             .maybe_raw_mid(onoff!(self.raw_mid / no_raw_mid))
             .maybe_tail_templated(onoff!(self.tail_templated / no_tail_templated))
+            .maybe_end_bonus_cut(onoff!(self.end_bonus_cut / no_end_bonus_cut))
             .maybe_rescue(onoff!(self.rescue / no_rescue))
             .maybe_rescue_scheme(self.rescue_scheme.clone())
             .maybe_rescue_genes(self.rescue_genes)
@@ -828,6 +846,7 @@ mod tests {
             "--orient-exact=0",
             "--no-raw-mid",
             "--no-tail-templated",
+            "--no-end-bonus-cut",
             "--rescue",
             "--rescue-scheme=lcp:K=2",
             "--rescue-genes=8",

@@ -868,6 +868,31 @@ pub fn affine_extend_sorted_cut(
     window: usize,
     cut: usize,
 ) -> Vec<(i32, i32, usize)> {
+    affine_extend_sorted_cut_bonus(
+        pattern, texts, sc, band, end_bonus, xdrop, diagonal, window, cut, true, false,
+    )
+}
+
+/// [`affine_extend_sorted_cut`]; with `bonus_within_cut` (and a cut), the whole text's score
+/// earns `end_bonus` only where the pattern's end is reached within the first `cut` text bases:
+/// past the cut (where a shorter candidate's transcript has ended) the pattern's end is reached
+/// in the longer texts only, and reaching it there is no evidence for them. Without
+/// `track_cut`, the cut score (second value) and the text bases covered (third) are not
+/// computed: the bonus needs only the last row's best within the cut.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_extend_sorted_cut_bonus(
+    pattern: &[u8],
+    texts: &[&[u8]],
+    sc: &Affine,
+    band: usize,
+    end_bonus: i32,
+    xdrop: i32,
+    diagonal: bool,
+    window: usize,
+    cut: usize,
+    track_cut: bool,
+    bonus_within_cut: bool,
+) -> Vec<(i32, i32, usize)> {
     let m = pattern.len();
     let geom = |n: usize| if diagonal { m.min(n) } else { n.max(window) };
     affine_dp_sorted(
@@ -876,13 +901,17 @@ pub fn affine_extend_sorted_cut(
         Mode::Prefix,
         sc,
         band,
-        Some((xdrop, cut != usize::MAX)),
+        Some((xdrop, track_cut && cut != usize::MAX)),
         geom,
         cut,
     )
     .into_iter()
     .map(|d| {
-        let end = d.score.saturating_add(end_bonus);
+        let end = if bonus_within_cut && cut != usize::MAX {
+            d.score.max(d.cut_score.saturating_add(end_bonus))
+        } else {
+            d.score.saturating_add(end_bonus)
+        };
         let whole = d.clip_best.max(end);
         let cols = if d.clip_best >= end {
             d.clip_cell.1
@@ -1347,7 +1376,7 @@ fn run16_avx512<const TRACK: bool>(
     const MIN: i16 = i16::MIN;
     let (m, n) = (pattern.len(), text.len());
     debug_assert!(narrow(m, mode, sc, (band, geom), clip));
-    debug_assert!(TRACK || (cut == usize::MAX && !clip.is_some_and(|(_, cell)| cell)));
+    debug_assert!(TRACK || !clip.is_some_and(|(_, cell)| cell));
     let (below, above) = (
         band.saturating_add(m.saturating_sub(geom)),
         band.saturating_add(geom.saturating_sub(m)),
@@ -2073,7 +2102,8 @@ struct Dp {
     /// The last row computed: the pattern length, or the row where the pass stopped.
     last_row: usize,
     /// With a cut: `clip_best` and the Prefix-mode score over text columns up to the cut only
-    /// (the pass over the text cut there, X-drop aside).
+    /// (the pass over the text cut there, X-drop aside). `cut_best` only with cell tracking
+    /// (`clip`'s flag): the 16-bit kernel computes it only then.
     cut_best: i32,
     cut_score: i32,
 }
@@ -2287,7 +2317,9 @@ fn run(
         Level::Avx512 => unsafe {
             if !narrow(pattern.len(), mode, sc, bg, clip) {
                 run_avx512(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
-            } else if cut != usize::MAX || clip.is_some_and(|(_, cell)| cell) {
+            } else if clip.is_some_and(|(_, cell)| cell) {
+                // Cut maxima and clip cells are tracked only on request: a cut alone needs
+                // just the last row (`Dp::cut_score`).
                 run16_avx512::<true>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
             } else {
                 run16_avx512::<false>(pattern, text, mode, sc, bg, clip, cut, b, resume, snaps)
@@ -3413,8 +3445,18 @@ mod tests {
                 for (xdrop, cell) in [(xdrop * scale, false), (xdrop * scale, true), (i32::MAX, false)] {
                     for cut in [usize::MAX, cut] {
                         let clip = Some((xdrop, cell));
-                        keep(affine_dp_sorted(&p, &refs, Mode::Prefix, &sc, band, clip, |n| m.min(n), cut));
-                        keep(affine_dp_sorted(&p, &refs, Mode::Prefix, &sc, band, clip, |n| n.max(w), cut));
+                        // Without cell tracking a cut gives only `cut_score` (the narrow kernel
+                        // does not track `cut_best` then).
+                        let mut keep_cut = |ds: Vec<Dp>| {
+                            keep(ds.into_iter().map(|mut d| {
+                                if !cell {
+                                    d.cut_best = 0;
+                                }
+                                d
+                            }).collect())
+                        };
+                        keep_cut(affine_dp_sorted(&p, &refs, Mode::Prefix, &sc, band, clip, |n| m.min(n), cut));
+                        keep_cut(affine_dp_sorted(&p, &refs, Mode::Prefix, &sc, band, clip, |n| n.max(w), cut));
                     }
                 }
                 WIDE_ONLY.with(|x| x.set(false));
