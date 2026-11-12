@@ -2295,8 +2295,21 @@ fn ends_in_tail(codes: &[u8], run: usize) -> bool {
 /// most one other base. Returns its first A and the end of the A-run from there (as
 /// [`tail_start`]).
 fn own_run(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usize, usize)> {
-    let i = (lo..=hi.min(text.len().checked_sub(run)?))
-        .find(|&i| text[i..i + run].iter().filter(|&&c| c != a).count() <= 1)?;
+    let last = hi.min(text.len().checked_sub(run)?);
+    if lo > last {
+        return None;
+    }
+    // The other bases in the window at `i`, counted on as it slides instead of again at each
+    // start: a read end's windows are searched for every candidate of a tie set.
+    let mut other = text[lo..lo + run].iter().filter(|&&c| c != a).count();
+    let mut i = lo;
+    while other > 1 {
+        if i == last {
+            return None;
+        }
+        other = other + usize::from(text[i + run] != a) - usize::from(text[i] != a);
+        i += 1;
+    }
     let s = i + text[i..].iter().position(|&c| c == a)?;
     let (mut end, mut non) = (s, 0);
     for (k, &c) in text.iter().enumerate().skip(s) {
@@ -2684,6 +2697,66 @@ mod segmented_tests {
         // One base in a window may be a sequencing error.
         assert_eq!(tail_start(&codes(b"CGAAAAAAACAAAAAAAGT"), a, 15), Some((2, 17)));
         assert_eq!(tail_start(&codes(b"CGTCAAAAAAAAAAGTCAAAA"), a, 15), None);
+    }
+
+    #[test]
+    fn own_run_finds_the_first_window_as_a_scan_of_every_start_does() {
+        // The window search as one scan per start, then the run's end as `own_run` finds it.
+        fn scan(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usize, usize)> {
+            let i = (lo..=hi.min(text.len().checked_sub(run)?))
+                .find(|&i| text[i..i + run].iter().filter(|&&c| c != a).count() <= 1)?;
+            let s = i + text[i..].iter().position(|&c| c == a)?;
+            let (mut end, mut non) = (s, 0);
+            for (k, &c) in text.iter().enumerate().skip(s) {
+                non += usize::from(c != a);
+                if c == a && non * 10 <= k + 1 - s {
+                    end = k + 1;
+                }
+            }
+            Some((s, end))
+        }
+        let a = codes(b"A")[0];
+        let check = |text: &[u8], run: usize, lo: usize, hi: usize| {
+            assert_eq!(
+                own_run(text, a, run, lo, hi),
+                scan(text, a, run, lo, hi),
+                "{text:?} run {run} in [{lo}, {hi}]"
+            );
+        };
+        // A text shorter than the window, a run at either end, no A at all, an empty range.
+        for t in [
+            &b"AAAA"[..],
+            b"AAAAAAAAAAAAAAACGT",
+            b"CGTCGTAAAAAAAAAAAAAAA",
+            b"CGTCGTCGTCGTCGTCGTCG",
+            b"",
+        ] {
+            let t = codes(t);
+            for run in [0, 1, 5, 15, 30] {
+                for (lo, hi) in [(0, 0), (0, 40), (3, 2), (5, 10), (20, 100)] {
+                    check(&t, run, lo, hi);
+                }
+            }
+        }
+        // Random A-rich texts (a fixed xorshift sequence).
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2000 {
+            let n = (next() % 80) as usize;
+            let rich = next() % 4;
+            let t: Vec<u8> = (0..n)
+                .map(|_| if next() % 4 <= rich { a } else { (next() % 4) as u8 })
+                .collect();
+            let run = (next() % 20) as usize;
+            let lo = (next() % 60) as usize;
+            let hi = lo + (next() % 40) as usize;
+            check(&t, run, lo, hi);
+        }
     }
 
     #[test]
