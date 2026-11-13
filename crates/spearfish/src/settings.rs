@@ -265,6 +265,10 @@ pub struct MapSettings {
     /// A read's poly(A) tail is trimmed only past the A's its transcript has there itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_templated: Option<bool>,
+    /// Read ends: where a candidate's transcript ends inside the read end, the end bonus counts
+    /// only for reaching the read's end within that shortest window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_bonus_cut: Option<bool>,
 
     // Rescue.
     /// Re-seed reads that map poorly at a lower LCP level within their candidate genes.
@@ -409,6 +413,7 @@ impl MapSettings {
         "orient_exact",
         "raw_mid",
         "tail_templated",
+        "end_bonus_cut",
         "rescue",
         "rescue_scheme",
         "rescue_genes",
@@ -462,6 +467,7 @@ impl MapSettings {
             orient_exact,
             raw_mid,
             tail_templated,
+            end_bonus_cut,
             end_diagonal,
         )
     }
@@ -630,6 +636,7 @@ impl MapSettings {
             set!(self.orient_exact => tb.orient_exact);
             set!(self.raw_mid => tb.raw_mid);
             set!(self.tail_templated => tb.tail_templated);
+            set!(self.end_bonus_cut => tb.end_bonus_cut);
             ensure!(tb.orient_exact >= 0.0, "orient_exact must not be negative");
             ensure!(tb.pad_div >= 1, "pad_div must be at least 1");
             ensure!(tb.max_cands >= 1, "tie_cands must be at least 1");

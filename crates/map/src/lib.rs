@@ -146,6 +146,13 @@ pub struct TieBreak {
     /// after the run gain against its continuation.
     #[serde(default)]
     pub tail_templated: bool,
+    /// Read ends: where the candidates' windows include one stopping at its transcript's end
+    /// and longer ones, `end_bonus` counts only for reaching the read's end within the
+    /// shortest such window. Past a transcript's end that candidate has no bases, so reaching
+    /// the read's end there (through a few junk or adapter bases aligned into a longer
+    /// candidate's flank) is no evidence for the longer one.
+    #[serde(default)]
+    pub end_bonus_cut: bool,
 }
 
 impl TieBreak {
@@ -190,6 +197,7 @@ impl Default for TieBreak {
             clip_pieces: true,
             tail_templated: true,
             flank_min: 0,
+            end_bonus_cut: true,
         }
     }
 }
@@ -1185,7 +1193,7 @@ impl<C: Chainer> Mapper<C> {
                         // and sorted texts share rows.
                         let window = (tb.window(read.len() as u32) as usize)
                             .max(tx.iter().map(|t| t.len()).max().unwrap_or(0));
-                        align::affine_extend_sorted_cut(
+                        align::affine_extend_sorted_cut_bonus(
                             read,
                             &tx,
                             sc,
@@ -1195,6 +1203,8 @@ impl<C: Chainer> Mapper<C> {
                             diag,
                             window,
                             cut.unwrap_or(usize::MAX),
+                            tb.flank_min > 0,
+                            tb.end_bonus_cut,
                         )
                     } else {
                         align::affine_sorted(read, &tx, mode, sc, tb.band)
@@ -1263,9 +1273,15 @@ impl<C: Chainer> Mapper<C> {
                 .filter(|&(_, &s)| s)
                 .map(|(t, _)| t.len())
                 .min();
-            let Some(cut) = cut.filter(|&c| tb.flank_min > 0 && texts.iter().any(|t| t.len() > c)) else {
+            let Some(cut) =
+                cut.filter(|&c| (tb.flank_min > 0 || tb.end_bonus_cut) && texts.iter().any(|t| t.len() > c))
+            else {
                 return seg(texts, read, align::Mode::Prefix, rev, None).map(|(d, _, _)| d);
             };
+            // With `end_bonus_cut` alone: the end bonus counts only within the cut.
+            if tb.flank_min <= 0 {
+                return seg(texts, read, align::Mode::Prefix, rev, Some(cut)).map(|(d, _, _)| d);
+            }
             // The cut counts from the read end's start (a left-end window is aligned backwards,
             // so it keeps the bases next to the block).
             let long: Vec<bool> = texts.iter().map(|t| t.len() > cut).collect();
@@ -2635,6 +2651,7 @@ mod segmented_tests {
         // Per-segment alignments of the example, without the flank rule.
         let tb = TieBreak {
             flank_min: 0,
+            end_bonus_cut: false,
             ..Default::default()
         };
         let mut totals = vec![0; 4];
@@ -2767,11 +2784,41 @@ mod segmented_tests {
         let hits = [hit(0, 10., &[(2, 0, 30)]), hit(1, 10., &[(2, 2, 30)])];
         let tb = TieBreak {
             flank_min: 10,
+            end_bonus_cut: false,
             ..Default::default()
         };
         let read: Vec<u8> = [b"GT", body].concat();
         let c = m.segmented(&tb, &codes(&read), None, &hits).unwrap().0;
         assert!(c[1] < c[0]);
+    }
+
+    #[test]
+    fn end_bonus_counts_only_where_every_candidate_has_sequence() {
+        // t0 ends where t1 goes on. A read from t0 with one unaligned base after its end
+        // reaches its end in t1 only, through a mismatch; that is no evidence for t1.
+        let body: &[u8] = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
+        let t1: Vec<u8> = [body, b"GTCAGTACGT"].concat();
+        let m = mapper(&[body, &t1], false);
+        let hits = [hit(0, 10., &[(0, 0, 30)]), hit(1, 10., &[(0, 0, 30)])];
+        let cost = |read: &[u8], end_bonus_cut| {
+            let tb = TieBreak {
+                end_bonus_cut,
+                ..Default::default()
+            };
+            m.segmented(&tb, &codes(read), None, &hits).unwrap().0
+        };
+        let junk: Vec<u8> = [body, b"C"].concat();
+        let (off, on) = (cost(&junk, false), cost(&junk, true));
+        // Without the rule t1 wins by the end bonus less a mismatch.
+        let tb = TieBreak::default();
+        let mis = i64::from(tb.affine.as_ref().unwrap().mis);
+        assert_eq!(off[0] - off[1], i64::from(tb.end_bonus) - mis);
+        assert_eq!(on[0], on[1]);
+        // A read that goes on along t1 still prefers it, by its matched bases.
+        let longer: Vec<u8> = [body, b"GTC"].concat();
+        let (off, on) = (cost(&longer, false), cost(&longer, true));
+        assert!(on[1] < on[0]);
+        assert_eq!(on[0] - on[1], off[0] - off[1] - i64::from(tb.end_bonus));
     }
 
     #[test]
@@ -2840,6 +2887,7 @@ mod segmented_tests {
         );
         let mut tb = TieBreak {
             flank_min: 0,
+            end_bonus_cut: false,
             ..Default::default()
         };
         let parsed = codes(&raw.hpc.seq);

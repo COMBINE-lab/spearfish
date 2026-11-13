@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Tie-break: the end bonus no longer rewards bases past another candidate's transcript end**
+  (`--end-bonus-cut`, on in every preset except the `-fast` ones). A read end earns
+  `--end-bonus` points when its alignment reaches the read's end, and the bonus is larger than
+  a mismatch costs. A read that ends at its transcript's end followed by one or two unaligned
+  bases (adapter, primer, basecalling junk) could reach its end only in a longer isoform,
+  through those bases aligned as mismatches into the isoform's continuation, and the longer
+  isoform won by a point or more where the read fits both equally. When some candidates'
+  windows stop at their transcript's end and others go on, the bonus now counts only for
+  reaching the read's end within the shortest such window; past it, a longer candidate is
+  credited for the bases it aligns and nothing more. Such reads now tie between the two
+  isoforms, as with minimap2, and leave the choice to the quantifier. On simulated ONT cDNA
+  reads at several error rates with sparse expression, fewer reads are placed on unexpressed
+  isoforms and abundance estimates follow the truth more closely; on spike-in isoforms that are
+  a prefix of a longer one, reads move to the shorter isoform. Mapping costs the same.
+  `--no-end-bonus-cut` maps as 0.2.0 did.
+
 ## 0.2.0 (2026-11-11)
 
 - **A 0.2, not a 0.1.1: mapping results and the library change.** The default presets map
