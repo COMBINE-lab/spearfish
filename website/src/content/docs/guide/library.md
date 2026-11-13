@@ -45,10 +45,12 @@ for hit in &read.hits {
   `tsv_lines`), PAF (`paf_lines`) and, with the default `rad` feature, RAD records for oarfish
   (`rad_writer`, `rad_record`). The text writers append to a byte buffer, so each thread can
   format its own batch.
-- The optional allocator behind `spearfish map --bump-alloc` is a crate of its own,
-  [`nudgy`](https://crates.io/crates/nudgy) (`crates/nudgy` in the repository):
-  `nudgy::Bump` wraps a program's global allocator and serves small blocks from per-thread
-  arenas. Only a program can choose its global allocator, so an embedding opts in itself: it
+- The allocator behind `spearfish map`'s per-thread arenas (`--bump-alloc`, on by default in
+  the binary) is a crate of its own, [`nudgy`](https://crates.io/crates/nudgy) (`crates/nudgy`
+  in the repository): `nudgy::Bump` wraps a program's global allocator and serves small
+  blocks from per-thread arenas. The library never turns them on, and the Python package
+  does without them. Only a program can choose its global allocator, so an embedding opts in
+  itself: it
   depends on `nudgy`, declares `Bump` around the allocator it uses, and calls
   `nudgy::enable()` before mapping. Until that call every allocation goes to the wrapped
   allocator. Afterwards `nudgy::stats()` says how many arenas were in use and how often a
