@@ -30,6 +30,15 @@
   own full), and leaves the field out when they were off. Only the `spearfish` binary
   changes: the library never turns the arenas on, the Python package does not use them, and
   a program that embeds the mapper keeps its own choice.
+- **Mapping asks the caches for more of the index ahead of use.** The raw-position lookups of
+  the tie-break and of the output, the comparison of tied candidates' blocks, a label's
+  directory bucket beyond its first line, and the occurrence lists of unitigs shared by many
+  isoforms were read one cache miss after another; they are now prefetched in batches. The
+  output is the same and mapping takes less time, most on high-accuracy reads. This applies
+  to the library and the Python package as well as the binary.
+- **Tie-break: the search for a candidate's own A-run at a poly(A) read end carries its count
+  from one start position to the next** instead of counting each window again. Same result,
+  slightly less work on cDNA and HiFi reads.
 
 ## 0.2.0 (2026-11-11)
 
