@@ -1022,6 +1022,20 @@ impl<C: Chainer> Mapper<C> {
         align::distance(codes, &text, align::Mode::Infix, k).unwrap_or(k.saturating_add(1))
     }
 
+    /// Ask the caches for the raw positions [`Self::raw_ranges`] looks up for `spans`: their
+    /// starts (`lo`) and ends, or only their ends where the starts were asked for already.
+    fn prefetch_spans(&self, tb: &TieBreak, raw: Option<&RawRead>, spans: &[(u32, u32, u32)], lo: bool) {
+        if raw.is_none() || !tb.raw_ends {
+            return;
+        }
+        let q: Vec<(u32, u32)> = if lo {
+            spans.iter().flat_map(|&(t, lo, hi)| [(t, lo), (t, hi)]).collect()
+        } else {
+            spans.iter().map(|&(t, _, hi)| (t, hi)).collect()
+        };
+        self.idx.prefetch_raw(&q);
+    }
+
     /// [`Self::raw_texts`], as packed ranges of the index (nothing decoded).
     fn raw_ranges<'a, 'r>(
         &'a self,
@@ -1371,6 +1385,17 @@ impl<C: Chainer> Mapper<C> {
             let d = between(r, (b.query.start + c0, b.query.start + c1), &at, &to);
             (to, d)
         };
+        // The first cut's raw positions are looked up for every candidate at once: ask for their
+        // lines first (later cuts count on from these, through bases read anyway).
+        if raw_mid.is_some() {
+            let c0 = cuts(&blocks[0]).0;
+            let q: Vec<(u32, u32)> = hits
+                .iter()
+                .zip(&blocks[0].targets)
+                .map(|(h, t)| (h.tx, t.start + c0))
+                .collect();
+            self.idx.prefetch_raw(&q);
+        }
         let mut prev = raw_mid.map(|r| {
             let at = starts(&blocks[0], cuts(&blocks[0]).0, None);
             let (at, d) = inside(r, &blocks[0], at);
@@ -1395,6 +1420,14 @@ impl<C: Chainer> Mapper<C> {
             let (left, right) = (&pair[0], &pair[1]);
             let lo0 = left.targets[0].end;
             let len0 = right.targets[0].start - lo0;
+            // Every candidate's segment is compared with the first's: ask for all their lines
+            // before the first comparison waits on one.
+            let q: Vec<(u32, u32)> = hits
+                .iter()
+                .zip(&left.targets)
+                .map(|(h, t)| (h.tx, t.end))
+                .collect();
+            self.idx.prefetch_codes(&q);
             if hits.iter().enumerate().skip(1).all(|(i, h)| {
                 let lo = left.targets[i].end;
                 let len = right.targets[i].start - lo;
@@ -1431,6 +1464,7 @@ impl<C: Chainer> Mapper<C> {
                 .map(|(h, t)| (h.tx, (t.start + h0).saturating_sub(tb.window(q0)), t.start + h0))
                 .collect();
             let short: Vec<bool> = spans.iter().map(|&(_, lo, _)| lo == 0).collect();
+            self.prefetch_spans(tb, raw, &spans, true);
             add(match self.raw_ranges(tb, raw, &spans) {
                 Some((r, texts)) => end(texts, &r.codes[..r.pos(q0)], true, &short),
                 None => end(
@@ -1449,6 +1483,15 @@ impl<C: Chainer> Mapper<C> {
         // last block (homopolymer run lengths), the raw read end is aligned through it.
         let last = blocks.last().unwrap();
         let t0 = &last.targets[0];
+        // The last block's raw ranges (compared below) and the right-end windows starting there.
+        if raw.is_some() && tb.raw_ends {
+            let q: Vec<(u32, u32)> = hits
+                .iter()
+                .zip(&last.targets)
+                .flat_map(|(h, t)| [(h.tx, t.start), (h.tx, t.end)])
+                .collect();
+            self.idx.prefetch_raw(&q);
+        }
         let through = raw.is_some()
             && tb.raw_ends
             && self
@@ -1518,6 +1561,7 @@ impl<C: Chainer> Mapper<C> {
             .iter()
             .map(|&(tx, _, hi)| hi == self.idx.tx_plen()[tx as usize])
             .collect();
+        self.prefetch_spans(tb, raw, &spans, false);
         let ends = match self.raw_ranges(tb, raw, &spans) {
             Some((r, texts)) => {
                 let rest = &r.codes[r.pos(ql)..];

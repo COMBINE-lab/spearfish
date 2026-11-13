@@ -346,3 +346,79 @@ proptest! {
         }
     }
 }
+
+/// The prefetch helpers are hints: nothing for an empty batch, no read past the last transcript,
+/// checkpoint or raw word (whatever the query), and no change to what the lookups return.
+#[test]
+fn prefetches_change_nothing_and_stay_in_bounds() {
+    let mut txs = toy();
+    // A transcript without raw sequence ("AN" packs as "AA"), last.
+    txs.push(TxInput {
+        name: "n".into(),
+        gene: "gn".into(),
+        seq: b"ACGTTGCAANCCGGTTAACGTAGCATGCATCGA".to_vec(),
+    });
+    let p = BuildParams {
+        spec: "lcp:K=3".into(),
+        hpc: true,
+        f_max: 20,
+        allow_collisions: false,
+        collapse: Collapse::Gene,
+        infer_genes: None,
+    };
+    let idx = Index::from_data(&build(txs, &p).unwrap().0).unwrap();
+    let n = idx.n_transcripts() as u32;
+    let lookups = |idx: &Index| -> Vec<Option<u32>> {
+        (0..n)
+            .flat_map(|t| (0..=idx.tx_plen()[t as usize]).map(move |q| (t, q)))
+            .map(|(t, q)| idx.tx_raw_pos(t, q))
+            .collect()
+    };
+    let before = lookups(&idx);
+    idx.prefetch_raw(&[]);
+    idx.prefetch_codes(&[]);
+    // Every position of every transcript, the end of each, and past the last transcript.
+    let mut q: Vec<(u32, u32)> = (0..n)
+        .flat_map(|t| (0..=idx.tx_plen()[t as usize]).map(move |p| (t, p)))
+        .collect();
+    q.extend([(n - 1, u32::MAX), (n, 0), (n, u32::MAX), (u32::MAX, 7)]);
+    idx.prefetch_raw(&q);
+    idx.prefetch_codes(&q);
+    for x in &q {
+        idx.prefetch_raw(std::slice::from_ref(x));
+        idx.prefetch_codes(std::slice::from_ref(x));
+    }
+    assert_eq!(lookups(&idx), before);
+}
+
+/// The label prefetches read only the directory and stay inside the label table, for present
+/// labels, absent ones and the extremes (first and last directory bucket).
+#[test]
+fn label_prefetches_stay_in_bounds() {
+    let idx = check_roundtrip(&toy(), "lcp:K=3", true, Collapse::Gene);
+    let mut labels: Vec<u64> = idx.labels().to_vec();
+    labels.extend([0, 1, u64::MAX, u64::MAX - 1, 0x8000_0000_0000_0000]);
+    let before: Vec<_> = labels.iter().map(|&l| idx.lookup(l)).collect();
+    for &l in &labels {
+        idx.prefetch_dir(l);
+        idx.prefetch_labels(l);
+        idx.prefetch_flags(l);
+    }
+    let after: Vec<_> = labels.iter().map(|&l| idx.lookup(l)).collect();
+    assert_eq!(before, after);
+    // Occurrence lists: every unitig, the last one included.
+    let occ = |idx: &Index| -> Vec<(Vec<u32>, Vec<u32>)> {
+        (0..idx.n_unitigs() as u32)
+            .map(|u| {
+                let (t, p) = idx.occurrences(u);
+                (t.to_vec(), p.to_vec())
+            })
+            .collect()
+    };
+    let before = occ(&idx);
+    for u in 0..idx.n_unitigs() as u32 {
+        idx.prefetch_occ_off(u);
+        idx.prefetch_occurrences(u);
+    }
+    assert_eq!(occ(&idx), before);
+}

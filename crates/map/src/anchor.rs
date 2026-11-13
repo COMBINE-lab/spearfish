@@ -78,6 +78,7 @@ pub fn anchors(idx: &Index, seeds: &[Seed], p: &AnchorParams) -> Vec<Anchor> {
         }
         if let Some(x) = seeds.get(i + AHEAD) {
             idx.prefetch_labels(x.label);
+            idx.prefetch_flags(x.label);
         }
         let r = idx.lookup(s.label);
         let genes = r.len();

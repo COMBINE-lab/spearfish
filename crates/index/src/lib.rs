@@ -24,6 +24,26 @@ pub const FLAG_MASKED: u8 = 1;
 /// Parsed bases between raw-position checkpoints (`tx_raw_ck`).
 pub const RAW_CK: u32 = 64;
 
+/// Labels (8 bytes) per cache line.
+const LABELS_PER_LINE: usize = 8;
+/// Lines of a directory bucket [`Index::prefetch_labels`] asks for. Most buckets hold a label
+/// or two, but a label found in many genes has one entry per gene, and the binary search of
+/// [`Index::lookup`] then reads several lines of its bucket; four cover buckets of up to 32
+/// labels, and the search of a longer one reads its later lines only near the label's place.
+const BUCKET_LINES: usize = 4;
+
+/// Occurrence entries (4 bytes) per cache line.
+const OCC_PER_LINE: usize = 16;
+/// Lines of each occurrence list [`Index::prefetch_occurrences`] asks for: lists of up to 64
+/// transcripts, which covers the unitigs of all but the largest isoform families; the chainer
+/// reads a longer list in order, which the hardware prefetcher follows.
+const OCC_LINES: usize = 4;
+
+/// Queries between the steps of a pipelined prefetch ([`Index::prefetch_raw`]): enough work in
+/// between for a step's line to arrive from memory before the next step reads it, and few enough
+/// that a call's lookups (some dozens) keep the pipeline full.
+const PREFETCH_LAG: usize = 4;
+
 /// Base `i` of 2-bit packed `words`.
 #[inline]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -662,13 +682,29 @@ impl Index {
         prefetch(self.label_dir().as_ptr().wrapping_add(b));
     }
 
-    /// Ask the caches for the labels and node flags `lookup(label)` scans (reads the directory
-    /// entry, so call it after [`Self::prefetch_dir`] has had time to land).
+    /// Ask the caches for the labels `lookup(label)` searches: its directory bucket, up to
+    /// four lines of it (reads the directory entry, so call it after
+    /// [`Self::prefetch_dir`] has had time to land).
     #[inline]
     pub fn prefetch_labels(&self, label: u64) {
         let b = (label >> self.dir_shift) as usize;
+        let dir = self.label_dir();
+        let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
+        let labels = self.labels().as_ptr();
+        prefetch(labels.wrapping_add(lo));
+        let mut k = lo + LABELS_PER_LINE;
+        while k < hi.min(lo + BUCKET_LINES * LABELS_PER_LINE) {
+            prefetch(labels.wrapping_add(k));
+            k += LABELS_PER_LINE;
+        }
+    }
+
+    /// Ask the caches for the node flags of `label`'s nodes (reads the directory entry, as
+    /// [`Self::prefetch_labels`]).
+    #[inline]
+    pub fn prefetch_flags(&self, label: u64) {
+        let b = (label >> self.dir_shift) as usize;
         let lo = self.label_dir()[b] as usize;
-        prefetch(self.labels().as_ptr().wrapping_add(lo));
         prefetch(self.node_flags().as_ptr().wrapping_add(lo));
     }
 
@@ -794,6 +830,80 @@ impl Index {
         })
     }
 
+    /// Ask the caches for what [`Self::tx_raw_pos`] reads for each `(transcript, parsed
+    /// position)` of `q`, to be called with a call's lookups before it makes them. A lookup reads
+    /// three places in turn, each rarely in the caches: the transcript's offsets, its run
+    /// checkpoint, and the raw words from the checkpoint on. Each step's address needs the step
+    /// before landed, so the steps are pipelined over the queries, a few queries apart.
+    pub fn prefetch_raw(&self, q: &[(u32, u32)]) {
+        let Some(r) = self.raw.as_ref() else {
+            return;
+        };
+        // SAFETY: borrowed from self.store, which outlives these slices.
+        let (off, words, ck_off, ck) =
+            unsafe { (r.off.slice(), r.words.slice(), r.ck_off.slice(), r.ck.slice()) };
+        // The checkpoint of a query, if its transcript has raw sequence (read by steps 2 and 3).
+        let checkpoint = |(t, p): (u32, u32)| -> Option<usize> {
+            let (t, c) = (t as usize, (p / RAW_CK) as usize);
+            let (lo, hi) = (*ck_off.get(t)? as usize, *ck_off.get(t + 1)? as usize);
+            (lo + c < hi).then_some(lo + c)
+        };
+        let lag = PREFETCH_LAG;
+        for i in 0..q.len() + 2 * lag {
+            if let Some(&(t, _)) = q.get(i) {
+                let t = t as usize;
+                if t + 1 < off.len() {
+                    prefetch(off.as_ptr().wrapping_add(t));
+                    prefetch(ck_off.as_ptr().wrapping_add(t));
+                    prefetch(self.tx_len().as_ptr().wrapping_add(t));
+                }
+            }
+            if let Some(&x) = i.checked_sub(lag).and_then(|j| q.get(j))
+                && let Some(c) = checkpoint(x)
+            {
+                prefetch(ck.as_ptr().wrapping_add(c));
+            }
+            if let Some(&x) = i.checked_sub(2 * lag).and_then(|j| q.get(j))
+                && let Some(c) = checkpoint(x)
+            {
+                let t = x.0 as usize;
+                let (Some(&w0), Some(&w1)) = (off.get(t), off.get(t + 1)) else {
+                    continue;
+                };
+                let (w, w1) = (w0 as usize + (ck[c] / 32) as usize, w1 as usize);
+                // The run scan reads at most a checkpoint's worth of runs: the first word's line
+                // and, for long runs, the next.
+                for k in [w, w + 8] {
+                    if k < w1 {
+                        prefetch(words.as_ptr().wrapping_add(k));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask the caches for the parsed bases of transcript `t` from position `lo` on, for each
+    /// `(t, lo)` of `q` (what [`Self::tx_codes_eq`] reads): the transcript's offset, then its
+    /// word at `lo`, pipelined as in [`Self::prefetch_raw`].
+    pub fn prefetch_codes(&self, q: &[(u32, u32)]) {
+        let (seq, off) = (self.tx_seq(), self.tx_seq_off());
+        for i in 0..q.len() + PREFETCH_LAG {
+            if let Some(&(t, _)) = q.get(i)
+                && (t as usize) < off.len()
+            {
+                prefetch(off.as_ptr().wrapping_add(t as usize));
+            }
+            if let Some(&(t, lo)) = i.checked_sub(PREFETCH_LAG).and_then(|j| q.get(j))
+                && let Some(&o) = off.get(t as usize)
+            {
+                let w = o as usize + (lo / 32) as usize;
+                if w < seq.len() {
+                    prefetch(seq.as_ptr().wrapping_add(w));
+                }
+            }
+        }
+    }
+
     /// Transcript `t`'s packed raw bases and run checkpoints, if present.
     fn raw_words(&self, t: u32) -> Option<(&[u64], &[u32])> {
         let r = self.raw.as_ref()?;
@@ -824,9 +934,18 @@ impl Index {
     /// [`Self::prefetch_occ_off`] has had time to land).
     #[inline]
     pub fn prefetch_occurrences(&self, u: u32) {
-        let o = self.occ_off()[u as usize] as usize;
-        prefetch(self.occ_tx().as_ptr().wrapping_add(o));
-        prefetch(self.occ_pos().as_ptr().wrapping_add(o));
+        let off = self.occ_off();
+        let (o, end) = (off[u as usize] as usize, off[u as usize + 1] as usize);
+        let (tx, pos) = (self.occ_tx().as_ptr(), self.occ_pos().as_ptr());
+        prefetch(tx.wrapping_add(o));
+        prefetch(pos.wrapping_add(o));
+        // A unitig shared by many isoforms has a list of several lines: up to OCC_LINES of each.
+        let mut k = o + OCC_PER_LINE;
+        while k < end.min(o + OCC_LINES * OCC_PER_LINE) {
+            prefetch(tx.wrapping_add(k));
+            prefetch(pos.wrapping_add(k));
+            k += OCC_PER_LINE;
+        }
     }
 
     /// Occurrences of unitig `u`: transcripts (sorted) and the position of its first seed.

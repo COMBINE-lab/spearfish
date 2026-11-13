@@ -811,6 +811,14 @@ impl Mapper {
             }
         };
         let idx = self.index.raw();
+        // Every hit's two raw positions are known now: ask for their lines before the first
+        // lookup waits on one.
+        let q: Vec<(u32, u32)> = r
+            .hits
+            .iter()
+            .flat_map(|h| [(h.tx, h.tstart), (h.tx, h.tend)])
+            .collect();
+        idx.prefetch_raw(&q);
         let hits = r
             .hits
             .iter()
