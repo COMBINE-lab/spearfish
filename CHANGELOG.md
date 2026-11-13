@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-11-12)
 
 - **Tie-break: the end bonus no longer rewards bases past another candidate's transcript end**
   (`--end-bonus-cut`, on in every preset except the `-fast` ones). A read end earns
