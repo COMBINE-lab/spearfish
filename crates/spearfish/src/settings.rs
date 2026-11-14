@@ -252,6 +252,10 @@ pub struct MapSettings {
     /// Near-tied read orientations: points for the one whose read ends in a poly(A) tail (0: off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_tail: Option<i32>,
+    /// With `orient_tail`: most read bases after a poly(A) tail that starts at the best hit's
+    /// transcript end (an A-run elsewhere may have at most 80 after it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_tail_after: Option<u32>,
     /// Relative margin within which both read orientations are tie-broken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_margin_rel: Option<f32>,
@@ -259,6 +263,14 @@ pub struct MapSettings {
     /// compared by exact local alignment around each chain (0: never).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_exact: Option<f32>,
+    /// Read orientations whose best hits are one sequence on opposite strands are compared by
+    /// exact local alignments of the whole read instead of being reported as tied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_same_exact: Option<bool>,
+    /// With `orient_same_exact`: a read end earns the end bonus in those alignments only where
+    /// both transcripts have sequence up to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_same_end_cut: Option<bool>,
     /// With `raw_ends`, also align the stretches between shared anchors in raw bases.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_mid: Option<bool>,
@@ -424,8 +436,11 @@ impl MapSettings {
         "tail_run",
         "tail_bonus",
         "orient_tail",
+        "orient_tail_after",
         "orient_margin_rel",
         "orient_exact",
+        "orient_same_exact",
+        "orient_same_end_cut",
         "raw_mid",
         "tail_templated",
         "end_bonus_cut",
@@ -481,8 +496,11 @@ impl MapSettings {
             tail_run,
             tail_bonus,
             orient_tail,
+            orient_tail_after,
             orient_margin_rel,
             orient_exact,
+            orient_same_exact,
+            orient_same_end_cut,
             raw_mid,
             tail_templated,
             end_bonus_cut,
@@ -653,8 +671,11 @@ impl MapSettings {
             set!(self.tail_run => tb.tail_run);
             set!(self.tail_bonus => tb.tail_bonus);
             set!(self.orient_tail => tb.orient_tail);
+            set!(self.orient_tail_after => tb.orient_tail_after);
             set!(self.orient_margin_rel => tb.orient_margin_rel);
             set!(self.orient_exact => tb.orient_exact);
+            set!(self.orient_same_exact => tb.orient_same_exact);
+            set!(self.orient_same_end_cut => tb.orient_same_end_cut);
             set!(self.raw_mid => tb.raw_mid);
             set!(self.tail_templated => tb.tail_templated);
             set!(self.end_bonus_cut => tb.end_bonus_cut);
@@ -939,6 +960,27 @@ mod tests {
                 .resolve()
                 .is_err()
         );
+        // The comparison of antisense pairs that are one sequence under the read: on in every
+        // preset but the `-fast` ones, and each part switches off on its own.
+        for p in Preset::ALL {
+            let tb = MapOptions::preset(p).params.tiebreak.unwrap();
+            let on = !p.fast();
+            assert_eq!((tb.orient_same_exact, tb.orient_same_end_cut), (on, on));
+            assert_eq!(tb.orient_tail_after, if on { 120 } else { 80 });
+        }
+        let o = MapSettings::builder(Preset::Ont)
+            .orient_same_end_cut(false)
+            .orient_tail_after(80)
+            .resolve()
+            .unwrap();
+        let tb = o.params.tiebreak.unwrap();
+        assert!(tb.orient_same_exact && !tb.orient_same_end_cut);
+        assert_eq!(tb.orient_tail_after, 80);
+        let o = MapSettings::builder(Preset::Hifi)
+            .orient_same_exact(false)
+            .resolve()
+            .unwrap();
+        assert!(!o.params.tiebreak.unwrap().orient_same_exact);
         // The rescue's parts switch off one by one.
         let o = MapSettings::builder(Preset::Ont)
             .rescue_rechain(0.0)

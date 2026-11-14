@@ -410,6 +410,16 @@ pub struct MapArgs {
     /// [default: 30].
     #[arg(long, hide_short_help = true, help_heading = "Read ends")]
     pub orient_tail: Option<i32>,
+    /// With --orient-tail: most read bases after a poly(A) tail that starts at the best hit's
+    /// transcript end, as a cDNA read's primer and sequencing adapter (an A-run elsewhere may
+    /// have at most 80 after it) [default: 120].
+    #[arg(
+        long,
+        value_name = "BASES",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub orient_tail_after: Option<u32>,
     /// Tie-break both read orientations when the other's best chain is within this fraction
     /// of the best (or the tie margin) [default: 0.35].
     #[arg(long, value_name = "FRAC", hide_short_help = true, help_heading = "Tie-break")]
@@ -423,6 +433,40 @@ pub struct MapArgs {
         help_heading = "Tie-break"
     )]
     pub orient_exact: Option<f32>,
+    /// Compare read orientations whose best hits are one sequence on opposite strands by exact
+    /// local alignments of the whole read, instead of reporting them tied [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_orient_same_exact",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub orient_same_exact: bool,
+    /// Report read orientations whose best hits are one sequence on opposite strands tied.
+    #[arg(
+        long,
+        overrides_with = "orient_same_exact",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub no_orient_same_exact: bool,
+    /// With --orient-same-exact: a read end earns the end bonus only where both transcripts have
+    /// sequence up to it [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_orient_same_end_cut",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub orient_same_end_cut: bool,
+    /// With --orient-same-exact: every read end the alignment reaches earns the end bonus.
+    #[arg(
+        long,
+        overrides_with = "orient_same_end_cut",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub no_orient_same_end_cut: bool,
     /// With raw read ends, also align the stretches between shared anchors in raw bases
     /// [default: on except hifi].
     #[arg(
@@ -671,8 +715,11 @@ impl MapArgs {
             .maybe_tail_run(self.tail_run)
             .maybe_tail_bonus(self.tail_bonus)
             .maybe_orient_tail(self.orient_tail)
+            .maybe_orient_tail_after(self.orient_tail_after)
             .maybe_orient_margin_rel(self.orient_margin_rel)
             .maybe_orient_exact(self.orient_exact)
+            .maybe_orient_same_exact(onoff!(self.orient_same_exact / no_orient_same_exact))
+            .maybe_orient_same_end_cut(onoff!(self.orient_same_end_cut / no_orient_same_end_cut))
             .maybe_raw_mid(onoff!(self.raw_mid / no_raw_mid))
             .maybe_tail_templated(onoff!(self.tail_templated / no_tail_templated))
             .maybe_end_bonus_cut(onoff!(self.end_bonus_cut / no_end_bonus_cut))
@@ -882,8 +929,11 @@ mod tests {
             "--tail-run=12",
             "--tail-bonus=0",
             "--orient-tail=0",
+            "--orient-tail-after=80",
             "--orient-margin-rel=0.2",
             "--orient-exact=0",
+            "--no-orient-same-exact",
+            "--no-orient-same-end-cut",
             "--no-raw-mid",
             "--no-tail-templated",
             "--no-end-bonus-cut",

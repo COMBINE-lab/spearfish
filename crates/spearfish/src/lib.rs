@@ -272,6 +272,9 @@ impl MapOptions {
             let tb = params.tiebreak.as_mut().expect("tie-break on by default");
             tb.group_fallback = p == Preset::HifiFast;
             tb.orient_same = false;
+            tb.orient_same_exact = false;
+            tb.orient_same_end_cut = false;
+            tb.orient_tail_after = map::TAIL_AFTER as u32;
             tb.orient_exact = 0.0;
             tb.raw_mid = false;
             tb.mid_inset = 0;

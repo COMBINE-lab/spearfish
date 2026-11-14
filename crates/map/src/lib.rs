@@ -101,6 +101,12 @@ pub struct TieBreak {
     /// antisense inside another's (antisense isoforms, a pseudogene in a host gene's intron),
     /// both orientations align equally well and the tail is the evidence of strand (0: off).
     pub orient_tail: i32,
+    /// With `orient_tail`: most read bases after a poly(A) tail that starts where the best
+    /// hit's transcript ends, for the orientation comparison. A cDNA read that kept its adapters
+    /// carries the RT primer and the sequencing adapter after its tail, more than the
+    /// [`TAIL_AFTER`] bases any A-run may have after it (`TAIL_AFTER` or less: that alone).
+    #[serde(default = "tail_after")]
+    pub orient_tail_after: u32,
     /// Both read orientations are tie-broken when the other's best chain scores within
     /// max(`margin_abs`, this × best) of the chosen one's. Wider than `margin_rel`: LCP parsing
     /// is not strand-symmetric, so the two orientations of a read draw different seeds, and
@@ -115,6 +121,23 @@ pub struct TieBreak {
     /// would follow those reads. With equal scores it follows the transcripts' other reads
     /// (and `orient_tail`).
     pub orient_same: bool,
+    /// With `orient_same`: such a pair is compared by exact local alignments of the whole read
+    /// (as [`TieBreak::orient_exact`] does) instead of being reported as tied. Under the chains
+    /// the two transcripts are one sequence, which scores the same against both read
+    /// orientations whatever the chains; the scores differ only by what the read holds beyond
+    /// that sequence: bases of one transcript's own (a short antisense isoform's first bases)
+    /// and how far each transcript reaches into the read's ends. Where the two are one
+    /// sequence under the whole read as well, both alignments score the same and are skipped.
+    /// The pair stands at the better of the two chain scores, whichever orientation leads.
+    #[serde(default)]
+    pub orient_same_exact: bool,
+    /// With `orient_same_exact`: a read end earns `end_bonus` in those alignments only where
+    /// both transcripts have sequence up to it (as `end_bonus_cut` within an orientation).
+    /// Where a read ends at one transcript's end and the other goes on, the other could reach
+    /// the read's end only through a junk base or two aligned into its continuation, which is
+    /// no evidence for it.
+    #[serde(default)]
+    pub orient_same_end_cut: bool,
     /// Near-tied orientations whose clipped alignments leave a lead of at most this many
     /// points are compared again by exact local alignment: every diagonal within
     /// [`ORIENT_EXACT_BAND`] (and a twentieth of the read) of each chain's, so the chain only
@@ -216,8 +239,11 @@ impl Default for TieBreak {
             tail_trim: true,
             tail_run: 15,
             orient_tail: 30,
+            orient_tail_after: 120,
             orient_margin_rel: 0.35,
             orient_same: true,
+            orient_same_exact: true,
+            orient_same_end_cut: true,
             orient_exact: 150.0,
             raw_mid: true,
             mid_inset: 8,
@@ -608,6 +634,29 @@ struct Strand {
     seeds: Vec<seeds::Seed>,
 }
 
+/// Orders a read's two orientations by `lead`, the first's over the second's in score points:
+/// the one it favours comes first (`reverse` follows it), and the other's hits are shifted so
+/// that its best lies `|lead|` below the first's best. With `level` the first's hits are first
+/// raised so that its best is at least that.
+fn rank_orientations(st: &mut Strand, other: &mut Strand, reverse: &mut bool, lead: f32, level: Option<f32>) {
+    if lead < 0.0 {
+        std::mem::swap(st, other);
+        *reverse = !*reverse;
+    }
+    if let Some(level) = level
+        && st.hits[0].score < level
+    {
+        let up = level - st.hits[0].score;
+        st.hits.iter_mut().for_each(|h| h.score += up);
+    }
+    let target = st.hits[0].score - lead.abs();
+    let shift = target - other.hits[0].score;
+    for h in &mut other.hits {
+        h.score += shift;
+        h.reverse = !*reverse;
+    }
+}
+
 /// A strand's `codes`, made from its `seq` on first use (a function of the two fields rather
 /// than a method, so the strand's hits can be borrowed mutably meanwhile).
 fn strand_codes<'a>(codes: &'a std::cell::OnceCell<Vec<u8>>, seq: &[u8]) -> &'a [u8] {
@@ -867,13 +916,21 @@ impl<C: Chainer> Mapper<C> {
     /// opposite strands (antisense transcripts sharing sequence): each transcript's bases
     /// under the read span of both chains occur reverse-complemented in the other's padded
     /// region. Compared in raw bases where the index has them.
-    fn same_antisense(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit) -> bool {
-        // A hit's transcript interval projected to the read span of both chains, with `pad`
-        // more bases on each side.
+    /// With `whole`, the transcripts are compared projected to the whole read instead of the
+    /// chains' span: the read then scores the same against both, as far as its alignments stay
+    /// within the projections.
+    fn same_antisense(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit, whole: bool) -> bool {
+        // A hit's transcript interval projected to the read span of both chains (or the whole
+        // read), with `pad` more bases on each side.
         let region = |h: &TxHit, o: &TxHit, pad: u32| {
             let tlen = self.idx.tx_plen()[h.tx as usize];
-            let lo = h.qstart.min(plen.saturating_sub(o.qend));
-            let hi = h.qend.max(plen.saturating_sub(o.qstart));
+            let (lo, hi) = match whole {
+                true => (0, plen),
+                false => (
+                    h.qstart.min(plen.saturating_sub(o.qend)),
+                    h.qend.max(plen.saturating_sub(o.qstart)),
+                ),
+            };
             (
                 h.tstart.saturating_sub(h.qstart - lo + pad),
                 (h.tend + (hi - h.qend) + pad).min(tlen),
@@ -899,6 +956,101 @@ impl<C: Chainer> Mapper<C> {
             !needle.is_empty() && text.windows(needle.len()).any(|w| w == &needle[..])
         };
         within(a, b) && within(b, a)
+    }
+
+    /// Whether a read orientation ends in a poly(A) tail, for the orientation comparison: an
+    /// A-run followed by at most [`TAIL_AFTER`] read bases, or by at most
+    /// [`TieBreak::orient_tail_after`] where the A-run starts at the end of the best hit's
+    /// transcript (projected through the hit's last anchor). A cDNA read that kept its
+    /// adapters carries the RT primer and the sequencing adapter after its tail, more than
+    /// `TAIL_AFTER`; an A-run that far from the read's end that the transcript goes on past is
+    /// the transcript's own sequence.
+    fn orient_tailed(&self, tb: &TieBreak, s: &Strand) -> bool {
+        // Without HPC the parsed read is the raw read.
+        let (codes, raw) = match &s.raw {
+            Some(r) => (&r.codes[..], Some(r)),
+            None if !self.seeder.hpc => (strand_codes(&s.codes, &s.seq), None),
+            None => return false,
+        };
+        let a = lcp_core::encode::CODE[b'A' as usize] & 3;
+        let w0 = codes.len().saturating_sub(TAIL_WINDOW);
+        if tail_start_within(&codes[w0..], a, tb.tail_run, TAIL_AFTER).is_some() {
+            return true;
+        }
+        let after = tb.orient_tail_after as usize;
+        let (Some(h), true) = (s.hits.first(), after > TAIL_AFTER) else {
+            return false;
+        };
+        let Some((c, _)) = tail_start_within(&codes[w0..], a, tb.tail_run, after) else {
+            return false;
+        };
+        let (rq, rt, tlen) = match raw {
+            Some(r) => match self.idx.tx_raw_pos(h.tx, h.tend) {
+                Some(rt) => (
+                    r.pos(h.qend),
+                    rt as usize,
+                    self.idx.tx_len()[h.tx as usize] as usize,
+                ),
+                None => return false,
+            },
+            None => (
+                h.qend as usize,
+                h.tend as usize,
+                self.idx.tx_plen()[h.tx as usize] as usize,
+            ),
+        };
+        let delta = (w0 + c) as i64 - rq as i64;
+        let tol = (TAIL_TOL + delta.max(0) as usize / 10) as i64;
+        rt as i64 + delta + tol >= tlen as i64
+    }
+
+    /// A mirrored pair's lead in alignment points (`TieBreak::orient_same_exact`): the exact
+    /// local alignment of the whole read in orientation `a` against its best hit, less that of
+    /// orientation `b` against its own. Each orientation is `(strand, parsed codes)`, and both
+    /// best hits are one sequence under the chains, so the difference is what the read holds
+    /// beyond it. `None` where the hits are one sequence under the whole read too: the two
+    /// alignments then score the same.
+    fn mirror_exact(
+        &self,
+        tb: &TieBreak,
+        plen: u32,
+        a: (&Strand, &[u8]),
+        b: (&Strand, &[u8]),
+    ) -> Option<i32> {
+        let sc = tb.affine.as_ref()?;
+        let (ha, hb) = (a.0.hits.first()?, b.0.hits.first()?);
+        if self.same_antisense(tb, plen, ha, hb, true) {
+            return None;
+        }
+        let w = ORIENT_EXACT_BAND + plen / 20;
+        let (ba, bb) = self.mirror_end_bonus(tb, plen, ha, hb);
+        let xa = self.local_exact(tb, sc, a.1, a.0.raw.as_ref(), ha, w, ba);
+        let xb = self.local_exact(tb, sc, b.1, b.0.raw.as_ref(), hb, w, bb);
+        Some(xa - xb)
+    }
+
+    /// The end bonuses (read start, read end) of a mirrored pair's two alignments, `a`'s and
+    /// `b`'s. `a`'s read start is `b`'s read end and the other way round. With
+    /// `TieBreak::orient_same_end_cut` a read end earns the bonus only where both transcripts,
+    /// projected through their hits, reach it; otherwise every read end can.
+    fn mirror_end_bonus(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit) -> ((i32, i32), (i32, i32)) {
+        if !tb.orient_same_end_cut {
+            let both = (tb.end_bonus, tb.end_bonus);
+            return (both, both);
+        }
+        let p = i64::from(plen);
+        let tlen = |h: &TxHit| i64::from(self.idx.tx_plen()[h.tx as usize]);
+        // Transcript bases before the hit's read start, and after its read end, beyond the
+        // read bases there.
+        let before = |h: &TxHit| i64::from(h.tstart) - i64::from(h.qstart);
+        let after = |h: &TxHit| (tlen(h) - i64::from(h.tend)) - (p - i64::from(h.qend));
+        let at_a_start = before(a) >= 0 && after(b) >= 0;
+        let at_a_end = after(a) >= 0 && before(b) >= 0;
+        let bonus = |reached: bool| if reached { tb.end_bonus } else { 0 };
+        (
+            (bonus(at_a_start), bonus(at_a_end)),
+            (bonus(at_a_end), bonus(at_a_start)),
+        )
     }
 
     /// A hit's transcript region projected to the ends of the read span `[lo, hi)`, padded.
@@ -1003,9 +1155,11 @@ impl<C: Chainer> Mapper<C> {
         mid + left + right
     }
 
-    /// Local affine score of the whole read (ends free to clip, a bonus per read end reached)
-    /// against one hit's transcript, over every diagonal within `w` of the chain's: the chain
-    /// only places the search, it forces nothing into the alignment.
+    /// Local affine score of the whole read (ends free to clip, `bonus.0` for reaching the
+    /// read's start and `bonus.1` for its end) against one hit's transcript, over every
+    /// diagonal within `w` of the chain's: the chain only places the search, it forces nothing
+    /// into the alignment.
+    #[allow(clippy::too_many_arguments)]
     fn local_exact(
         &self,
         tb: &TieBreak,
@@ -1014,6 +1168,7 @@ impl<C: Chainer> Mapper<C> {
         raw: Option<&RawRead>,
         h: &TxHit,
         w: u32,
+        bonus: (i32, i32),
     ) -> i32 {
         let plen = codes.len() as u32;
         let tlen = self.idx.tx_plen()[h.tx as usize];
@@ -1049,7 +1204,7 @@ impl<C: Chainer> Mapper<C> {
             d.iter().min().unwrap() - i64::from(w),
             d.iter().max().unwrap() + i64::from(w),
         );
-        align::local_band(read, &text, sc, dlo, dhi, tb.end_bonus)
+        align::local_band_ends(read, &text, sc, dlo, dhi, bonus)
     }
 
     /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
@@ -1974,10 +2129,14 @@ impl<C: Chainer> Mapper<C> {
         let tailed = match (&self.p.tail_first, self.p.strands) {
             (Some(t), Strands::Both) => {
                 let tail = |p: &(Vec<u8>, Option<RawRead>)| match &p.1 {
-                    Some(r) => ends_in_tail(&r.codes, t.run),
+                    Some(r) => ends_in_tail(&r.codes, t.run, TAIL_AFTER),
                     // Without HPC the parsed read is the raw read.
                     None if self.seeder.hpc => false,
-                    None => ends_in_tail(&codes(&p.0[p.0.len().saturating_sub(TAIL_WINDOW)..]), t.run),
+                    None => ends_in_tail(
+                        &codes(&p.0[p.0.len().saturating_sub(TAIL_WINDOW)..]),
+                        t.run,
+                        TAIL_AFTER,
+                    ),
                 };
                 match (tail(&pf), tail(&pr)) {
                     (true, false) => Some((false, t.span)),
@@ -2282,7 +2441,7 @@ impl<C: Chainer> Mapper<C> {
             // The two best hits are one sequence on opposite strands: the read fits both
             // equally, however far apart seed luck leaves the two chains.
             let same = |a: &Strand, b: &Strand| match (a.hits.first(), b.hits.first()) {
-                (Some(a), Some(b)) => self.same_antisense(tb, plen, a, b),
+                (Some(a), Some(b)) => self.same_antisense(tb, plen, a, b, false),
                 _ => false,
             };
             let mut mirror = tb.orient_same && same(&st, &other);
@@ -2326,13 +2485,17 @@ impl<C: Chainer> Mapper<C> {
                 // poly(A) tail where one orientation shows it and the other doesn't.
                 let mut lead = unit * (cb - ca) as f32;
                 if tb.orient_tail > 0 {
-                    // Without HPC the parsed read is the raw read.
-                    let tailed = |s: &Strand| match &s.raw {
-                        Some(r) => ends_in_tail(&r.codes, tb.tail_run),
-                        None => !self.seeder.hpc && ends_in_tail(strand_codes(&s.codes, &s.seq), tb.tail_run),
-                    };
+                    let tailed = |s: &Strand| self.orient_tailed(tb, s);
                     lead += tb.orient_tail as f32
                         * (f32::from(u8::from(tailed(&st))) - f32::from(u8::from(tailed(&other))));
+                }
+                // One sequence on opposite strands: exact local alignments of the whole read
+                // tell the pair apart by what lies beyond it (`TieBreak::orient_same_exact`).
+                if mirror
+                    && tb.orient_same_exact
+                    && let Some(x) = self.mirror_exact(tb, plen, (&st, qa), (&other, qb))
+                {
+                    lead += tb.lambda * x as f32;
                 }
                 // A close call is decided by exact local alignments instead of the clipped
                 // ones (`TieBreak::orient_exact`); the tail term stands.
@@ -2344,20 +2507,16 @@ impl<C: Chainer> Mapper<C> {
                 {
                     let w = ORIENT_EXACT_BAND + plen / 20;
                     let tail = lead - unit * (cb - ca) as f32;
-                    let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w);
-                    let xb = self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w);
+                    let both = (tb.end_bonus, tb.end_bonus);
+                    let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w, both);
+                    let xb = self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w, both);
                     lead = unit * (xa - xb) as f32 + tail;
                 }
-                if lead < 0.0 {
-                    std::mem::swap(&mut st, &mut other);
-                    reverse = !reverse;
-                }
-                let target = st.hits[0].score - lead.abs();
-                let shift = target - other.hits[0].score;
-                for h in &mut other.hits {
-                    h.score += shift;
-                    h.reverse = !reverse;
-                }
+                // One sequence scores the same whichever orientation's chain found it: the pair
+                // stands at the better chain's score, not at the one seed luck left lower.
+                let level =
+                    (mirror && tb.orient_same_exact).then(|| st.hits[0].score.max(other.hits[0].score));
+                rank_orientations(&mut st, &mut other, &mut reverse, lead, level);
             }
         }
         for h in &mut st.hits {
@@ -2490,11 +2649,11 @@ impl<C: Chainer> Mapper<C> {
         // Without HPC the parsed read is the raw read; an orientation that was not mapped has
         // no sequence.
         let tailed = |s: &Strand| match &s.raw {
-            Some(r) => ends_in_tail(&r.codes, tb.tail_run),
+            Some(r) => ends_in_tail(&r.codes, tb.tail_run, TAIL_AFTER),
             None => {
                 !self.seeder.hpc
                     && !s.seq.is_empty()
-                    && ends_in_tail(strand_codes(&s.codes, &s.seq), tb.tail_run)
+                    && ends_in_tail(strand_codes(&s.codes, &s.seq), tb.tail_run, TAIL_AFTER)
             }
         };
         if tailed(st) || tailed(other) {
@@ -2662,15 +2821,21 @@ pub const ORIENT_EXACT_BAND: u32 = 100;
 /// Bases between a transcript's 3' end and a read's tail start treated as the same end.
 const TAIL_TOL: usize = 15;
 /// Most read bases after a poly(A) tail (adapter and the like).
-const TAIL_AFTER: usize = 80;
+pub const TAIL_AFTER: usize = 80;
+
+/// Serde default of [`TieBreak::orient_tail_after`]: options recorded without it map as they
+/// did then.
+fn tail_after() -> u32 {
+    TAIL_AFTER as u32
+}
 /// Raw read bases searched for a poly(A) tail when comparing read orientations.
 const TAIL_WINDOW: usize = 200;
 
 /// Whether a raw read (2-bit codes) ends in a poly(A) tail: a `run`-base window of A's within its
-/// last `TAIL_WINDOW` bases, followed by at most `TAIL_AFTER` bases.
-fn ends_in_tail(codes: &[u8], run: usize) -> bool {
+/// last `TAIL_WINDOW` bases, followed by at most `after` bases.
+fn ends_in_tail(codes: &[u8], run: usize, after: usize) -> bool {
     let a = lcp_core::encode::CODE[b'A' as usize] & 3;
-    tail_start(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run).is_some()
+    tail_start_within(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run, after).is_some()
 }
 
 /// The first A-run of `text` (raw codes) starting in `[lo, hi]`: a window of `run` bases with at
@@ -2708,6 +2873,11 @@ fn own_run(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usiz
 /// the end of the A-run from there (the longest stretch ending in A with at most one other base
 /// per ten).
 fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
+    tail_start_within(rest, a, run, TAIL_AFTER)
+}
+
+/// [`tail_start`] with at most `after` read bases after the tail.
+fn tail_start_within(rest: &[u8], a: u8, run: usize, after: usize) -> Option<(usize, usize)> {
     let others = |w: &[u8]| w.iter().filter(|&&c| c != a).count();
     let (mut i, mut other) = (0, others(rest.get(..run)?));
     loop {
@@ -2720,7 +2890,7 @@ fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
                     end = k + 1;
                 }
             }
-            if rest.len() - end <= TAIL_AFTER {
+            if rest.len() - end <= after {
                 return Some((s, end));
             }
             // A tail is followed only by adapter: an A-run with more of the read after it is
@@ -3151,21 +3321,30 @@ mod segmented_tests {
         let a = codes(b"A")[0];
         assert_eq!(tail_start(&codes(&read), a, 15).map(|t| t.0), Some(136));
         let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
-        assert!(ends_in_tail(&codes(&[&body[..], &read].concat()), 15));
+        assert!(ends_in_tail(&codes(&[&body[..], &read].concat()), 15, TAIL_AFTER));
     }
 
     #[test]
     fn only_a_poly_a_near_the_read_end_marks_its_orientation() {
         let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT".repeat(10);
         let tail = [b"A".repeat(20), b"GTACTCTGCGTTGATACCACTGCTT".to_vec()].concat();
-        assert!(ends_in_tail(&codes(&[&body[..], &tail].concat()), 15));
+        assert!(ends_in_tail(&codes(&[&body[..], &tail].concat()), 15, TAIL_AFTER));
         // A tail at the read's start is the other orientation's 3' end.
-        assert!(!ends_in_tail(&codes(&[&tail[..], &body].concat()), 15));
-        // An A-run with more than `TAIL_AFTER` read bases after it is transcript sequence.
+        assert!(!ends_in_tail(
+            &codes(&[&tail[..], &body].concat()),
+            15,
+            TAIL_AFTER
+        ));
+        // An A-run with more than `after` read bases after it is transcript sequence.
         assert!(!ends_in_tail(
             &codes(&[&body[..], &tail, &body[..100]].concat()),
-            15
+            15,
+            120
         ));
+        // The orientation comparison accepts a longer adapter after the tail than the tie-break.
+        let long = [&body[..], &tail, &body[..60]].concat();
+        assert!(!ends_in_tail(&codes(&long), 15, TAIL_AFTER));
+        assert!(ends_in_tail(&codes(&long), 15, 120));
     }
 
     #[test]
@@ -3365,6 +3544,154 @@ mod segmented_tests {
         let (off, on) = (cost(&longer, false), cost(&longer, true));
         assert!(on[1] < on[0]);
         assert_eq!(on[0] - on[1], off[0] - off[1] - i64::from(tb.end_bonus));
+    }
+
+    /// A deterministic sequence without long repeats (xorshift).
+    fn random_seq(n: usize, mut x: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x >> 33) as usize & 3]
+            })
+            .collect()
+    }
+
+    /// One read orientation with the given hits (the parsed read is the raw read, no HPC).
+    fn strand(seq: &[u8], hits: Vec<TxHit>) -> Strand {
+        Strand {
+            hits,
+            seq: seq.to_vec(),
+            codes: Default::default(),
+            raw: None,
+            seeds: Vec::new(),
+        }
+    }
+
+    /// The mirrored-pair comparison of read orientation `a` (codes `qa`) against `b`.
+    fn mirror(m: &Mapper<OracleChainer>, tb: &TieBreak, a: &Strand, b: &Strand) -> Option<i32> {
+        let (qa, qb) = (codes(&a.seq), codes(&b.seq));
+        m.mirror_exact(tb, qa.len() as u32, (a, &qa), (b, &qb))
+    }
+
+    #[test]
+    fn a_mirrored_pair_is_told_apart_by_what_lies_beyond_the_shared_sequence() {
+        // t1 is 8 bases of its own, then the reverse complement of t0[100..250): a short
+        // antisense isoform. A read of t1 fits both orientations equally under the chains.
+        let t0 = random_seq(300, 7);
+        let own: &[u8] = b"GTACCAAA";
+        let t1 = [own, &revcomp(&t0[100..250])].concat();
+        let m = mapper(&[&t0, &t1], false);
+        let tb = TieBreak::default();
+        let fwd = strand(&t1, vec![hit(1, 50., &[(8, 8, 150)])]);
+        let rev = strand(&revcomp(&t1), vec![hit(0, 50., &[(0, 100, 150)])]);
+        // Exact alignments of the whole read: t1's own bases decide, for t1.
+        let lead = mirror(&m, &tb, &fwd, &rev).unwrap();
+        let mat = tb.affine.as_ref().unwrap().mat;
+        assert!(lead > 0 && lead <= 8 * mat + tb.end_bonus, "{lead}");
+        // The comparison does not depend on which orientation is asked first.
+        assert_eq!(mirror(&m, &tb, &rev, &fwd), Some(-lead));
+        // Without the own bases the read is one sequence with both transcripts under its whole
+        // length: both alignments score the same, and they are skipped.
+        let read = revcomp(&t0[100..250]);
+        let fwd = strand(&read, vec![hit(1, 50., &[(0, 8, 150)])]);
+        let rev = strand(&revcomp(&read), vec![hit(0, 50., &[(0, 100, 150)])]);
+        assert_eq!(mirror(&m, &tb, &fwd, &rev), None);
+        let both = (tb.end_bonus, tb.end_bonus);
+        let sc = tb.affine.as_ref().unwrap();
+        let x = |s: &Strand| m.local_exact(&tb, sc, &codes(&s.seq), None, &s.hits[0], 100, both);
+        assert_eq!(x(&fwd), x(&rev));
+    }
+
+    #[test]
+    fn a_mirrored_pair_earns_the_end_bonus_only_where_both_transcripts_reach_the_read_end() {
+        // t1 is t0[100..250) reverse complemented, wholly inside t0. A read of t1 with one junk
+        // base after t1's 3' end reaches that end only in t0's orientation, through the junk
+        // base aligned as a mismatch into t0's continuation.
+        let mut t0 = random_seq(300, 11);
+        t0[99] = b'A';
+        let t1 = revcomp(&t0[100..250]);
+        let m = mapper(&[&t0, &t1], false);
+        let read = [&t1[..], b"C"].concat();
+        let fwd = strand(&read, vec![hit(1, 50., &[(0, 0, 150)])]);
+        let rev = strand(&revcomp(&read), vec![hit(0, 50., &[(1, 100, 150)])]);
+        let lead = |orient_same_end_cut| {
+            let tb = TieBreak {
+                orient_same_end_cut,
+                ..Default::default()
+            };
+            mirror(&m, &tb, &fwd, &rev).unwrap()
+        };
+        // Without the rule t0 wins by the end bonus less a mismatch.
+        let tb = TieBreak::default();
+        let mis = tb.affine.as_ref().unwrap().mis;
+        assert_eq!(lead(false), -(tb.end_bonus - mis));
+        // With it neither alignment earns a bonus at that read end: a tie.
+        assert_eq!(lead(true), 0);
+        // Where both transcripts reach both read ends, every read end earns it.
+        let (a, b) = (&fwd.hits[0], &rev.hits[0]);
+        let e = tb.end_bonus;
+        assert_eq!(m.mirror_end_bonus(&tb, 151, a, b), ((e, 0), (0, e)));
+        let (a, b) = (hit(1, 50., &[(0, 0, 150)]), hit(0, 50., &[(0, 100, 150)]));
+        assert_eq!(m.mirror_end_bonus(&tb, 150, &a, &b), ((e, e), (e, e)));
+    }
+
+    #[test]
+    fn a_long_adapter_after_the_tail_counts_only_at_the_transcript_end() {
+        // A cDNA read that kept its adapters: the tail, then 100 bases of primer and adapter.
+        let body = random_seq(400, 13);
+        let adapter = b"GTACTCTGCGTTGATCCCACTGCTT".repeat(4);
+        let read = [&body[..], &b"A".repeat(20), &adapter].concat();
+        let ends_at_tail = body.clone();
+        let goes_on = [&body[..], &random_seq(300, 17)].concat();
+        let m = mapper(&[&ends_at_tail, &goes_on], false);
+        let tailed = |tx: u32, orient_tail_after: u32, read: &[u8]| {
+            let tb = TieBreak {
+                orient_tail_after,
+                ..Default::default()
+            };
+            m.orient_tailed(&tb, &strand(read, vec![hit(tx, 50., &[(0, 0, 400)])]))
+        };
+        // The A-run starts at the hit transcript's 3' end: a tail, with up to 120 bases after.
+        assert!(tailed(0, 120, &read));
+        assert!(!tailed(0, TAIL_AFTER as u32, &read));
+        // Where the transcript goes on past it, an A-run that far from the read's end is not.
+        assert!(!tailed(1, 120, &read));
+        // With at most `TAIL_AFTER` bases after it, any A-run marks the tail, as before.
+        let short = [&body[..], &b"A".repeat(20), &adapter[..60]].concat();
+        assert!(tailed(1, 120, &short) && tailed(1, TAIL_AFTER as u32, &short));
+    }
+
+    #[test]
+    fn a_mirrored_pair_stands_at_the_better_chain_score() {
+        let hits = |tx: u32, scores: &[f32]| -> Vec<TxHit> {
+            scores.iter().map(|&s| hit(tx, s, &[(0, 0, 10)])).collect()
+        };
+        let rank = |lead: f32, level: Option<f32>| {
+            let mut st = strand(b"ACGT", hits(0, &[50., 48.]));
+            let mut other = strand(b"ACGT", hits(1, &[40., 35.]));
+            let mut reverse = false;
+            rank_orientations(&mut st, &mut other, &mut reverse, lead, level);
+            let sc = |s: &Strand| s.hits.iter().map(|h| (h.tx, h.score)).collect::<Vec<_>>();
+            // The other's hits are marked with the other orientation.
+            assert!(other.hits.iter().all(|h| h.reverse == !reverse));
+            (sc(&st), sc(&other), reverse)
+        };
+        // The alignments favour the orientation seed luck left 10 points lower, by 6: it comes
+        // first, at its own chain score or, for a mirrored pair, at the better one.
+        let (st, other, reverse) = rank(-6.0, None);
+        assert!(reverse);
+        assert_eq!(st, [(1, 40.), (1, 35.)]);
+        assert_eq!(other, [(0, 34.), (0, 32.)]);
+        let (st, other, _) = rank(-6.0, Some(50.));
+        assert_eq!(st, [(1, 50.), (1, 45.)]);
+        assert_eq!(other, [(0, 44.), (0, 42.)]);
+        // A lead for the first orientation keeps the order; the level is then its own.
+        let (st, other, reverse) = rank(3.0, Some(50.));
+        assert!(!reverse);
+        assert_eq!(st, [(0, 50.), (0, 48.)]);
+        assert_eq!(other, [(1, 47.), (1, 42.)]);
     }
 
     #[test]

@@ -733,6 +733,19 @@ pub fn affine_extend(
 /// ends free to clip: the best global alignment of a piece of the read with a piece of the
 /// text, plus `end_bonus` for each read end the piece reaches (0 if nothing scores above it).
 pub fn local_band(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+    local_band_ends(read, text, sc, dlo, dhi, (end_bonus, end_bonus))
+}
+
+/// [`local_band`] with a bonus of its own for each read end: `end_bonus.0` for reaching the
+/// read's start, `end_bonus.1` for reaching its end.
+pub fn local_band_ends(
+    read: &[u8],
+    text: &[u8],
+    sc: &Affine,
+    dlo: i64,
+    dhi: i64,
+    end_bonus: (i32, i32),
+) -> i32 {
     debug_assert!(text.iter().all(|&b| b < 4));
     match simd_level() {
         // SAFETY: the CPU has the active level's features.
@@ -748,13 +761,20 @@ pub fn local_band(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-fn local_band_avx512(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+fn local_band_avx512(
+    read: &[u8],
+    text: &[u8],
+    sc: &Affine,
+    dlo: i64,
+    dhi: i64,
+    end_bonus: (i32, i32),
+) -> i32 {
     local_band_core::<Avx512Rows>(read, text, sc, dlo, dhi, end_bonus)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,bmi1,bmi2,popcnt,lzcnt")]
-fn local_band_avx2(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: i32) -> i32 {
+fn local_band_avx2(read: &[u8], text: &[u8], sc: &Affine, dlo: i64, dhi: i64, end_bonus: (i32, i32)) -> i32 {
     local_band_core::<Avx2Rows>(read, text, sc, dlo, dhi, end_bonus)
 }
 
@@ -766,7 +786,7 @@ fn local_band_core<R: Rows>(
     sc: &Affine,
     dlo: i64,
     dhi: i64,
-    end_bonus: i32,
+    end_bonus: (i32, i32),
 ) -> i32 {
     let (m, n) = (read.len(), text.len());
     if m == 0 || dlo > dhi {
@@ -786,7 +806,7 @@ fn local_band_core<R: Rows>(
         (lo, hi.max(lo))
     };
     let (lo, hi) = rng(0);
-    hp[lo..hi].fill(end_bonus);
+    hp[lo..hi].fill(end_bonus.0);
     let mut best = 0;
     for i in 1..=m {
         let (lo, hi) = rng(i);
@@ -823,7 +843,7 @@ fn local_band_core<R: Rows>(
         }
         best = best.max(rowmax);
         if i == m {
-            best = best.max(rowmax.saturating_add(end_bonus));
+            best = best.max(rowmax.saturating_add(end_bonus.1));
         }
         std::mem::swap(&mut hp, &mut h);
         std::mem::swap(&mut fp, &mut f);
@@ -2944,17 +2964,17 @@ mod tests {
             .unwrap()
     }
 
-    /// [`local_band`] by its definition: the best global alignment of a piece of the read
-    /// with a piece of the text, plus the bonus per read end reached (no band).
-    fn naive_local(p: &[u8], t: &[u8], sc: &Affine, bonus: i32) -> i32 {
+    /// [`local_band_ends`] by its definition: the best global alignment of a piece of the
+    /// read with a piece of the text, plus the bonus of each read end reached (no band).
+    fn naive_local(p: &[u8], t: &[u8], sc: &Affine, bonus: (i32, i32)) -> i32 {
         let mut best = 0;
         for i0 in 0..p.len() {
             for i1 in i0 + 1..=p.len() {
-                let ends = (i0 == 0) as i32 + (i1 == p.len()) as i32;
+                let ends = bonus.0 * (i0 == 0) as i32 + bonus.1 * (i1 == p.len()) as i32;
                 for j0 in 0..=t.len() {
                     for j1 in j0..=t.len() {
                         let x = naive_affine(&p[i0..i1], &t[j0..j1], Mode::Global, sc);
-                        best = best.max(x + bonus * ends);
+                        best = best.max(x + ends);
                     }
                 }
             }
@@ -2962,8 +2982,9 @@ mod tests {
         best
     }
 
-    /// [`local_band`] over whole matrices: cells off the diagonals `dlo..=dhi` do not exist.
-    fn naive_local_band(p: &[u8], t: &[u8], sc: &Affine, dlo: i64, dhi: i64, bonus: i32) -> i32 {
+    /// [`local_band_ends`] over whole matrices: cells off the diagonals `dlo..=dhi` do not
+    /// exist.
+    fn naive_local_band(p: &[u8], t: &[u8], sc: &Affine, dlo: i64, dhi: i64, bonus: (i32, i32)) -> i32 {
         let (m, n) = (p.len(), t.len());
         let go = sc.open + sc.ext;
         let inside = |i: usize, j: usize| (dlo..=dhi).contains(&(j as i64 - i as i64));
@@ -2972,7 +2993,7 @@ mod tests {
         let mut f = vec![vec![NEG; n + 1]; m + 1];
         for (j, x) in h[0].iter_mut().enumerate() {
             if inside(0, j) {
-                *x = bonus;
+                *x = bonus.0;
             }
         }
         let mut best = 0;
@@ -2986,7 +3007,7 @@ mod tests {
                     x = x.max(e[i][j]).max(h[i - 1][j - 1] + s);
                 }
                 h[i][j] = if i < m { x.max(0) } else { x };
-                best = best.max(h[i][j] + if i == m { bonus } else { 0 });
+                best = best.max(h[i][j] + if i == m { bonus.1 } else { 0 });
             }
         }
         best
@@ -3010,6 +3031,15 @@ mod tests {
         assert_eq!(local_band(&[4, 4, 4], &[0, 0, 0], &sc, -3, 3, 0), 0);
         assert_eq!(local_band(&[], &t, &sc, -3, 3, 5), 0);
         assert_eq!(local_band(&p, &t, &sc, 3, 2, 5), 0);
+        // Each read end earns its own bonus.
+        assert_eq!(local_band_ends(&p, &t, &sc, 2, 2, (5, 0)), 12 + 5);
+        assert_eq!(local_band_ends(&p, &t, &sc, 2, 2, (0, 3)), 12 + 3);
+        // A read whose last base runs past the text reaches only its start.
+        assert_eq!(local_band_ends(&[0, 1, 2, 2], &[0, 1, 2], &sc, 0, 0, (0, 5)), 6);
+        assert_eq!(
+            local_band_ends(&[0, 1, 2, 2], &[0, 1, 2], &sc, 0, 0, (5, 0)),
+            6 + 5
+        );
     }
 
     proptest! {
@@ -3019,12 +3049,14 @@ mod tests {
         #[test]
         fn local_band_matches_definition(
             p in prop::collection::vec(0u8..4, 0..8), t in prop::collection::vec(0u8..4, 0..8),
-            bonus in 0i32..8,
+            bonus in (0i32..8, 0i32..8),
         ) {
             each_level(|l| {
                 for sc in [Affine::default(), Affine::HIFI] {
                     let (m, n) = (p.len() as i64, t.len() as i64);
-                    prop_assert_eq!(local_band(&p, &t, &sc, -m, n, bonus), naive_local(&p, &t, &sc, bonus), "at {}", l);
+                    prop_assert_eq!(local_band_ends(&p, &t, &sc, -m, n, bonus), naive_local(&p, &t, &sc, bonus), "at {}", l);
+                    let same = local_band(&p, &t, &sc, -m, n, bonus.0);
+                    prop_assert_eq!(same, local_band_ends(&p, &t, &sc, -m, n, (bonus.0, bonus.0)), "at {}", l);
                 }
                 Ok(())
             })?;
@@ -3037,7 +3069,7 @@ mod tests {
             base in prop::collection::vec(0u8..4, 1..60),
             edits in prop::collection::vec((0usize..60, 0u8..4, 0u8..3), 0..10),
             cut in (0usize..60, 0usize..60),
-            dlo in -70i64..70, width in 0i64..40, bonus in 0i32..8,
+            dlo in -70i64..70, width in 0i64..40, bonus in (0i32..8, 0i32..8),
         ) {
             let mut p = base[cut.0 % base.len()..].to_vec();
             p.truncate(p.len().saturating_sub(cut.1 % 20));
@@ -3048,9 +3080,9 @@ mod tests {
             }
             each_level(|l| {
                 for sc in [Affine::default(), Affine::HIFI] {
-                    let got = local_band(&p, &base, &sc, dlo, dlo + width, bonus);
+                    let got = local_band_ends(&p, &base, &sc, dlo, dlo + width, bonus);
                     prop_assert_eq!(got, naive_local_band(&p, &base, &sc, dlo, dlo + width, bonus), "at {}", l);
-                    prop_assert!(got <= local_band(&p, &base, &sc, dlo - 3, dlo + width + 5, bonus));
+                    prop_assert!(got <= local_band_ends(&p, &base, &sc, dlo - 3, dlo + width + 5, bonus));
                 }
                 Ok(())
             })?;
@@ -3063,7 +3095,7 @@ mod tests {
             edits in prop::collection::vec((0usize..300, 0u8..5, 0u8..3), 0..30),
             cut in (0usize..300, 0usize..100),
             junk in (prop::collection::vec(0u8..4, 0..30), prop::collection::vec(0u8..4, 0..30)),
-            dlo in -320i64..320, width in 0i64..200, bonus in 0i32..8,
+            dlo in -320i64..320, width in 0i64..200, bonus in (0i32..8, 0i32..8),
         ) {
             let mut p = base[cut.0 % base.len()..].to_vec();
             p.truncate(p.len().saturating_sub(cut.1));
@@ -3075,7 +3107,7 @@ mod tests {
             let p = [junk.0, p, junk.1].concat();
             each_level(|l| {
                 for sc in [Affine::default(), Affine::HIFI] {
-                    let got = local_band(&p, &base, &sc, dlo, dlo + width, bonus);
+                    let got = local_band_ends(&p, &base, &sc, dlo, dlo + width, bonus);
                     prop_assert_eq!(got, naive_local_band(&p, &base, &sc, dlo, dlo + width, bonus), "at {}", l);
                 }
                 Ok(())

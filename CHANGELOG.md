@@ -24,6 +24,24 @@
   are left out when the end fit is off (`--end-fit 0`, the `-fast` presets), so output is then
   as before. See the new docs page "Mapping and quantification scores".
 
+- **Read orientation: antisense pairs that are one sequence under the read are compared, not
+  tied** (`--orient-same-exact`, `--orient-same-end-cut`, `--orient-tail-after`; on in every
+  preset except the `-fast` ones). When a read's two orientations have best hits that are one
+  sequence on opposite strands, as with a short antisense isoform contained in a longer one,
+  0.2.1 reported the two orientations tied and let only the poly(A) tail separate them. The
+  read often holds more: bases one transcript has of its own (a short isoform's first bases),
+  and a tail the detector missed. Such a pair is now compared by exact local alignments of the
+  whole read; the shared sequence scores the same in both, so the difference is what the read
+  holds beyond it. The alignments are skipped where the two transcripts are one sequence under
+  the whole read as well, a read end earns the end bonus there only where both transcripts
+  reach it (as `--end-bonus-cut` does within an orientation), and the pair stands at the better
+  of the two chain scores. In every orientation comparison, a poly(A) tail followed by more
+  than 80 read bases now counts too, up to 120, where it starts at the hit transcript's 3′ end:
+  cDNA reads that kept their primer and sequencing adapter after the tail have that much. On
+  spike-in isoforms antisense to a longer one, many more reads go to the short isoform.
+  Mapping costs slightly more. `--no-orient-same-exact --orient-tail-after=80` turns the change
+  off.
+
 ## 0.2.1 (2026-11-12)
 
 - **Tie-break: the end bonus no longer rewards bases past another candidate's transcript end**
