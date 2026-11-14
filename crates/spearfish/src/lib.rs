@@ -543,6 +543,28 @@ impl Index {
     pub fn id(&self) -> String {
         provenance::index_id(&self.inner)
     }
+
+    /// Number of genes (the groups isoforms are collapsed and candidates are picked by).
+    pub fn n_genes(&self) -> usize {
+        self.inner.gene_name_off().len().saturating_sub(1)
+    }
+
+    /// Whether the index groups transcripts into genes. `false` when every transcript is its
+    /// own gene: the FASTA headers carried no gene IDs and neither a transcript-to-gene table
+    /// nor gene inference was used (the manifest's `genes_from` is `none`), or the grouping
+    /// left every transcript alone. The per-gene candidate limits then act on isoforms, and
+    /// ties among isoforms are broken by their order in the FASTA; a quantifier may want to
+    /// warn. An index of one transcript counts as grouped.
+    pub fn has_gene_groups(&self) -> bool {
+        let genes_from = self.manifest().map(|m| m.input.genes_from);
+        has_gene_groups(genes_from.as_deref(), self.n_transcripts(), self.n_genes())
+    }
+}
+
+/// [`Index::has_gene_groups`] from an index's counts and its manifest's `genes_from` (`None`
+/// for an index without a manifest), e.g. for a build report.
+pub fn has_gene_groups(genes_from: Option<&str>, transcripts: usize, genes: usize) -> bool {
+    transcripts <= 1 || (genes_from != Some("none") && genes < transcripts)
 }
 
 /// Name and gene from a FASTA ID, up to the first whitespace (a description is ignored):

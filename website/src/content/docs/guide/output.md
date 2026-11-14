@@ -122,6 +122,9 @@ regular file, as when everything goes to standard output or `/dev/null`). It hol
 - `reads` and `outputs`;
 - `settings`: the preset and the settings given; `parameters`: every parameter used;
   `score_denom`;
+- `warnings`, when there are any: each with a `code` and the `message` shown. Today the one
+  warning is `no_gene_groups`, for an index whose every transcript is its own gene
+  ([Gene membership](/spearfish/guide/indexing/#gene-membership));
 - `stats`: reads, mapped, unmapped, multi-mapped, rescued, low-coverage and low-score reads,
   mapped reads whose best hit is forward (`forward`), hits, bases, mean read length, hits per mapped read, index load and mapping time, reads and megabases per
   second, CPU time and peak memory, and, when the per-thread arenas were on, what they did

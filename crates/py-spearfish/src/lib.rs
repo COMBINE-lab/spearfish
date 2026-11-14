@@ -227,7 +227,7 @@ impl PyIndex {
     }
 
     fn n_genes(&self) -> usize {
-        self.inner.raw().gene_name_off().len().saturating_sub(1)
+        self.inner.n_genes()
     }
 }
 
@@ -350,9 +350,9 @@ impl PyIndex {
         } else if t2g_table.is_none() && txs.iter().all(|(n, g, _)| n == g) {
             input.genes_from = "none".into();
         }
-        if infer.is_none() && per_gene && txs.len() > 1 && txs.iter().all(|(n, g, _)| n == g) {
+        if infer.is_none() && txs.len() > 1 && txs.iter().all(|(n, g, _)| n == g) {
             log::warn!(
-                "every transcript is its own gene: isoforms are not collapsed, so the index is larger and mapping less accurate; give t2g or infer_genes"
+                "the index has no gene groups: every transcript is its own gene. spearfish keeps a few candidate genes per read, so isoforms then compete for those places one by one and ties among them go by input order, which costs accuracy; give t2g or infer_genes"
             );
         }
         let opts = IndexOptions::builder()
@@ -402,6 +402,15 @@ impl PyIndex {
     #[getter]
     fn num_genes(&self) -> usize {
         self.n_genes()
+    }
+
+    /// Whether the index groups transcripts into genes. ``False`` when every transcript is its
+    /// own gene (no gene IDs in the input, and neither ``t2g`` nor ``infer_genes``): spearfish
+    /// then keeps a few candidate transcripts per read instead of a few genes, and ties among
+    /// isoforms go by input order, which costs accuracy.
+    #[getter]
+    fn has_gene_groups(&self) -> bool {
+        self.inner.has_gene_groups()
     }
 
     /// The base seed scheme the index was built with.

@@ -47,6 +47,20 @@
   With them on, a `qscore` is written even with `--end-fit 0`. Mapping costs slightly more.
   `--no-orient-same-exact --orient-tail-after=80` turns the change off.
 
+- **Warnings for an index without gene groups, at index and at map time.** When the FASTA
+  headers carry no gene IDs (a RefSeq FASTA, for example) and neither `--t2g` nor
+  `--infer-genes` is given, every transcript is its own gene. spearfish keeps a few candidate
+  genes per read, so the isoforms of a gene then compete for those places one by one, and ties
+  among them are broken by FASTA order, which costs accuracy. `spearfish index` warned about
+  this before, but `-q` hid the warning and `spearfish map` said nothing. Now `spearfish index`
+  warns under `-q` too, names `--t2g FILE` and `--infer-genes`, and says why they matter;
+  `spearfish map` warns once per run when the index it loads has no gene groups (the manifest's
+  `genes_from` is `none`, or there are as many genes as transcripts), also under `-q`, and the
+  run record lists the warning under a new `warnings` key (code `no_gene_groups`), which is left
+  out when there are none. The library has `Index::has_gene_groups()`, `Index::n_genes()` and
+  `spearfish::has_gene_groups()`, and Python `Index.has_gene_groups`, so a quantifier such as
+  oarfish can warn too. Mapping output is unchanged.
+
 ## 0.2.1 (2026-11-12)
 
 - **Tie-break: the end bonus no longer rewards bases past another candidate's transcript end**

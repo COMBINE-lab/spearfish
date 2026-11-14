@@ -77,6 +77,7 @@ def test_index_metadata(index, records):
     assert index.transcript_id(names[2]) == 2
     assert index.transcript_name(1) == names[1]
     assert index.scheme == "lcp:K=3" and index.hpc and index.has_raw_sequence
+    assert index.has_gene_groups
     assert index.path is None
     rep = index.build_report
     assert rep["transcripts"] == len(records) and rep["genes"] == index.num_genes
@@ -126,11 +127,13 @@ def test_genes(records):
     names = [h.split("|")[0] for h, _ in records]
     one = spearfish.Index.build(TOY, t2g={n: "G" for n in names})
     assert one.num_genes == 1 and one.manifest["input"]["genes_from"] == "t2g"
+    assert one.has_gene_groups
     plain = [(n, s) for n, (_, s) in zip(names, records)]
     alone = spearfish.Index.build(plain)
     assert alone.num_genes == len(records)
+    assert alone.manifest["input"]["genes_from"] == "none" and not alone.has_gene_groups
     inferred = spearfish.Index.build(plain, infer_genes=True)
-    assert inferred.num_genes < len(records)
+    assert inferred.num_genes < len(records) and inferred.has_gene_groups
     assert spearfish.Index.build(plain, infer_genes={"span": 12}).num_genes == inferred.num_genes
 
 

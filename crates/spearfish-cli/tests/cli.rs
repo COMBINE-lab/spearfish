@@ -413,6 +413,8 @@ fn simulate_and_map_on_toy() {
     assert_eq!(meta["parameters"]["preset"], "ont");
     assert_eq!(meta["index"]["index_id"].as_str().unwrap(), h.meta.index_id);
     assert!(meta["index"]["manifest"]["built_by"]["version"].is_string());
+    // The toy headers give genes: no warnings.
+    assert!(meta.get("warnings").is_none(), "{}", meta["warnings"]);
 
     // Output to a device: no run record beside it; the first regular output file gets it.
     #[cfg(unix)]
@@ -962,4 +964,105 @@ fn final_flush_errors_are_reported() {
             "{args:?}"
         );
     }
+}
+
+/// An index whose every transcript is its own gene (headers without gene IDs, no --t2g or
+/// --infer-genes): `index` and `map` both warn, under `-q` too, `map` once per run, and the run
+/// record lists the warning. With genes, `-q` stays silent.
+#[test]
+fn warns_on_index_without_gene_groups() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("geneless");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_spearfish");
+    let run = |args: &[&std::ffi::OsStr]| {
+        let o = Command::new(bin).args(args).output().unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stderr).unwrap()
+    };
+    let os = |s: &'static str| std::ffi::OsStr::new(s);
+    // The toy transcripts, headers cut to the transcript name.
+    let plain = dir.join("plain.fa");
+    let fa: String = std::fs::read_to_string(toy())
+        .unwrap()
+        .lines()
+        .map(|l| match l.strip_prefix('>') {
+            Some(h) => format!(">{}\n", h.split('|').next().unwrap()),
+            None => format!("{l}\n"),
+        })
+        .collect();
+    std::fs::write(&plain, fa).unwrap();
+    let reads = dir.join("reads.fa");
+    run(&[
+        os("simulate"),
+        toy().as_os_str(),
+        os("-n"),
+        os("20"),
+        os("-q"),
+        os("-o"),
+        reads.as_os_str(),
+    ]);
+
+    let warning = "has no gene groups: every transcript is its own gene";
+    let idx = dir.join("plain.sfi");
+    for quiet in [false, true] {
+        let mut args = vec![os("index"), plain.as_os_str(), os("-o"), idx.as_os_str()];
+        if quiet {
+            args.push(os("-q"));
+        }
+        let err = run(&args);
+        assert_eq!(err.matches(warning).count(), 1, "quiet {quiet}: {err}");
+        assert!(
+            err.contains("--t2g FILE") && err.contains("--infer-genes"),
+            "{err}"
+        );
+        assert_eq!(quiet, err.lines().count() == 1, "{err}");
+    }
+
+    let out = dir.join("plain.tsv");
+    let err = run(&[
+        os("map"),
+        idx.as_os_str(),
+        reads.as_os_str(),
+        os("-q"),
+        os("-t"),
+        os("2"),
+        os("-o"),
+        out.as_os_str(),
+    ]);
+    assert_eq!(err.matches(warning).count(), 1, "{err}");
+    assert!(err.contains("rebuild it with --t2g FILE"), "{err}");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("plain.tsv.meta.json")).unwrap()).unwrap();
+    let w = meta["warnings"].as_array().unwrap();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!(w[0]["code"], "no_gene_groups");
+    assert!(w[0]["message"].as_str().unwrap().contains(warning));
+
+    // Inferred genes group the toy's isoforms: no warning.
+    let inferred = dir.join("inferred.sfi");
+    let err = run(&[
+        os("index"),
+        plain.as_os_str(),
+        os("--infer-genes"),
+        os("-q"),
+        os("-o"),
+        inferred.as_os_str(),
+    ]);
+    assert!(err.is_empty(), "{err}");
+    let err = run(&[
+        os("map"),
+        inferred.as_os_str(),
+        reads.as_os_str(),
+        os("-q"),
+        os("-o"),
+        out.as_os_str(),
+    ]);
+    assert!(err.is_empty(), "{err}");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("plain.tsv.meta.json")).unwrap()).unwrap();
+    assert!(meta.get("warnings").is_none());
 }
