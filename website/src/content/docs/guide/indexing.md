@@ -31,13 +31,31 @@ GENCODE, inferred groups do as well as the annotated genes. On simulated ONT rea
 accuracy), 98.7% of reads rank their true transcript first and 99.4% keep it among the reported
 transcripts with either, and the index is the same size (1.3 GB without the rescue tables).
 
-Without any of these, every transcript is its own gene and `spearfish index` prints a warning.
-Isoforms are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB (rescue tables
+Without any of these, every transcript is its own gene: the index has no gene groups. This
+happens, for example, with a RefSeq FASTA indexed without `--t2g` or `--infer-genes`. Isoforms
+are then not collapsed: the GENCODE index grows from 1.3 to 3.1 GB (rescue tables
 left out of both), mapping takes more
 time and memory, and fewer reads are assigned to the right transcript (top-1 falls from 98.7% to
 97.6% on the same reads, and the true transcript is among those reported for 98.2% instead of
-99.4%), because the per-read candidate set holds a few transcripts instead of a few genes. `--write-t2g out.tsv`
-writes the grouping that was used.
+99.4%), because the per-read candidate set holds a few transcripts instead of a few genes. The isoforms
+of a gene then compete for those places one by one, and ties among them are broken by their order
+in the FASTA. `--write-t2g out.tsv` writes the grouping that was used.
+
+So `spearfish index` warns when an index has no gene groups, and `spearfish map` warns again,
+once per run, when it loads such an index. Both warnings show under `-q` too, and the map run
+record lists it under `warnings` (code `no_gene_groups`):
+
+```text
+warning: the index has no gene groups: every transcript is its own gene (the FASTA headers
+carry no gene IDs, and neither --t2g nor --infer-genes was given). spearfish keeps a few
+candidate genes per read, so isoforms then compete for those places one by one and ties among
+them go by FASTA order, which costs accuracy; give --t2g FILE (a transcript-to-gene table) or
+--infer-genes
+```
+
+When you see it, rebuild the index with `--t2g` if you have a transcript-to-gene table for the
+annotation, and with `--infer-genes` otherwise. A program using spearfish as a library can check
+`Index::has_gene_groups()` (in Python, `Index.has_gene_groups`).
 
 For human GENCODE v50 (670,670 transcripts) the index is 2.8 GB and builds in about 7 seconds on
 32 threads. A little over half of the file is the rescue tables, which the `ont` and `drna`

@@ -294,3 +294,40 @@ fn output_formats() {
         assert_eq!((meta.preset.as_str(), meta.index_id), ("ont", index.id()));
     }
 }
+
+/// `has_gene_groups`: false when every transcript is its own gene, whether the manifest says
+/// so (`genes_from: none`) or only the counts do (a table or inference that grouped nothing).
+#[test]
+fn gene_groups_detected() {
+    let fa = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/toy/transcripts.fa");
+    let txs = read_transcripts(&fa).unwrap();
+    let opts = IndexOptions::default();
+    let build = |txs: Vec<(String, String, Vec<u8>)>, genes_from: &str| {
+        let input = spearfish::provenance::InputInfo {
+            genes_from: genes_from.into(),
+            ..Default::default()
+        };
+        Index::build_with(txs, &opts, input).unwrap().0
+    };
+    let grouped = build(txs.clone(), "fasta");
+    assert!(grouped.n_genes() < grouped.n_transcripts());
+    assert!(grouped.has_gene_groups());
+
+    let own: Vec<_> = txs
+        .iter()
+        .map(|(n, _, s)| (n.clone(), n.clone(), s.clone()))
+        .collect();
+    for genes_from in ["none", "t2g"] {
+        let idx = build(own.clone(), genes_from);
+        assert_eq!(idx.n_genes(), idx.n_transcripts());
+        assert!(!idx.has_gene_groups(), "{genes_from}");
+    }
+    // A single transcript has nothing to group.
+    assert!(build(own[..1].to_vec(), "none").has_gene_groups());
+
+    // From the manifest alone, and from counts alone (an index without a manifest).
+    assert!(!spearfish::has_gene_groups(Some("none"), 6, 3));
+    assert!(!spearfish::has_gene_groups(None, 6, 6));
+    assert!(spearfish::has_gene_groups(None, 6, 3));
+    assert!(spearfish::has_gene_groups(Some("inferred"), 1, 1));
+}

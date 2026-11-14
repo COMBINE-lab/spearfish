@@ -176,8 +176,21 @@ pub fn run(args: Args) -> Result<()> {
     let hpc = opts.hpc;
     let collapse_gene = opts.per_gene;
 
+    // Shown under -q too, after the summary, so it is the last thing on the screen.
+    let geneless = !spearfish::has_gene_groups(Some(&manifest.input.genes_from), rep.transcripts, rep.genes);
+    let warn_geneless = || {
+        if geneless {
+            crate::logging::warn_always(format_args!(
+                "{}",
+                no_gene_groups_warning(&manifest.input.genes_from, None)
+            ));
+        }
+    };
+
     let mut e = std::io::stderr().lock();
     if log::max_level() < log::LevelFilter::Info {
+        drop(e);
+        warn_geneless();
         return Ok(());
     }
     writeln!(
@@ -203,13 +216,6 @@ pub fn run(args: Args) -> Result<()> {
         writeln!(
             e,
             "  warning: {missing} transcripts not in --t2g; their gene IDs come from the FASTA"
-        )?;
-    }
-    if args.infer_genes.is_none() && collapse_gene && rep.transcripts > 1 && rep.genes == rep.transcripts {
-        writeln!(
-            e,
-            "  warning: every transcript is its own gene (no gene IDs in the headers): isoforms are \
-             not collapsed, so the index is larger and mapping less accurate; give --t2g or --infer-genes"
         )?;
     }
     writeln!(
@@ -247,7 +253,44 @@ pub fn run(args: Args) -> Result<()> {
         phases.join(", ")
     )?;
     writeln!(e, "  size {:.1} MB", bytes as f64 / 1e6)?;
+    if geneless && collapse_gene {
+        writeln!(e, "  isoforms not collapsed: every transcript is its own gene")?;
+    }
+    drop(e);
+    warn_geneless();
     Ok(())
+}
+
+/// The warning for an index whose every transcript is its own gene, by where its genes came
+/// from (the manifest's `genes_from`); `index` names the index file at map time (`None` when
+/// building it).
+pub fn no_gene_groups_warning(genes_from: &str, index: Option<&std::path::Path>) -> String {
+    let (cause, fix) = match genes_from {
+        "t2g" => (
+            "the --t2g table puts each transcript in a gene of its own",
+            "a --t2g table that groups isoforms, or --infer-genes",
+        ),
+        "inferred" => (
+            "gene inference (--infer-genes) grouped no transcripts",
+            "--t2g FILE (a transcript-to-gene table)",
+        ),
+        _ => (
+            "the FASTA headers carry no gene IDs, and neither --t2g nor --infer-genes was given",
+            "--t2g FILE (a transcript-to-gene table) or --infer-genes",
+        ),
+    };
+    let (what, verb) = match index {
+        Some(p) => (
+            format!("the index {} has no gene groups", p.display()),
+            "rebuild it with",
+        ),
+        None => ("the index has no gene groups".to_string(), "give"),
+    };
+    format!(
+        "{what}: every transcript is its own gene ({cause}). spearfish keeps a few candidate genes \
+         per read, so isoforms then compete for those places one by one and ties among them go \
+         by FASTA order, which costs accuracy; {verb} {fix}"
+    )
 }
 
 pub fn inspect(args: InspectArgs) -> Result<()> {

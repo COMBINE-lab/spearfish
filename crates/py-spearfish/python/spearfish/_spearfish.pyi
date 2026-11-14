@@ -54,6 +54,7 @@ class Index:
     path: str | None
     num_transcripts: int
     num_genes: int
+    has_gene_groups: bool
     scheme: str
     hpc: bool
     has_raw_sequence: bool
