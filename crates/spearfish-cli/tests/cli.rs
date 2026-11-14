@@ -363,6 +363,15 @@ fn simulate_and_map_on_toy() {
     assert_eq!(h.counts.reads, 200);
     assert_eq!(h.counts.mapped, 200);
     assert_eq!(h.ref_names.len(), h.ref_lengths.len());
+    // The toy headers give genes, which group its isoforms.
+    let info = long_read_rad::IndexInfo::from_file_tags(&r.file_tag_map).unwrap();
+    assert_eq!(info.genes_from, "fasta");
+    assert_eq!(info.num_transcripts, h.ref_names.len() as u64);
+    assert!(
+        info.num_genes > 0 && info.num_genes < info.num_transcripts,
+        "{info:?}"
+    );
+    assert!(info.gene_groups);
     let rad_hits = std::sync::Mutex::new(Vec::new());
     r.process_parallel(std::num::NonZeroUsize::new(2).unwrap(), |mc| {
         for c in mc.iter() {
@@ -413,6 +422,9 @@ fn simulate_and_map_on_toy() {
     assert_eq!(meta["parameters"]["preset"], "ont");
     assert_eq!(meta["index"]["index_id"].as_str().unwrap(), h.meta.index_id);
     assert!(meta["index"]["manifest"]["built_by"]["version"].is_string());
+    assert_eq!(meta["index"]["genes"], info.num_genes);
+    assert_eq!(meta["index"]["gene_groups"], true);
+    assert_eq!(meta["index"]["manifest"]["input"]["genes_from"], "fasta");
     // The toy headers give genes: no warnings.
     assert!(meta.get("warnings").is_none(), "{}", meta["warnings"]);
 
@@ -968,7 +980,8 @@ fn final_flush_errors_are_reported() {
 
 /// An index whose every transcript is its own gene (headers without gene IDs, no --t2g or
 /// --infer-genes): `index` and `map` both warn, under `-q` too, `map` once per run, and the run
-/// record lists the warning. With genes, `-q` stays silent.
+/// record lists the warning. With genes, `-q` stays silent. The RAD header and the run record
+/// carry the gene labels' provenance in both cases.
 #[test]
 fn warns_on_index_without_gene_groups() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("geneless");
@@ -1023,6 +1036,7 @@ fn warns_on_index_without_gene_groups() {
     }
 
     let out = dir.join("plain.tsv");
+    let rad = dir.join("plain.rad");
     let err = run(&[
         os("map"),
         idx.as_os_str(),
@@ -1032,6 +1046,8 @@ fn warns_on_index_without_gene_groups() {
         os("2"),
         os("-o"),
         out.as_os_str(),
+        os("--rad"),
+        rad.as_os_str(),
     ]);
     assert_eq!(err.matches(warning).count(), 1, "{err}");
     assert!(err.contains("rebuild it with --t2g FILE"), "{err}");
@@ -1041,6 +1057,14 @@ fn warns_on_index_without_gene_groups() {
     assert_eq!(w.len(), 1, "{w:?}");
     assert_eq!(w[0]["code"], "no_gene_groups");
     assert!(w[0]["message"].as_str().unwrap().contains(warning));
+    // The RAD header and the run record say the index has no gene groups, and why.
+    let n_tx = long_read_rad::read_header(&rad).unwrap().ref_names.len() as u64;
+    assert_eq!(
+        long_read_rad::read_index_info(&rad).unwrap(),
+        Some(long_read_rad::IndexInfo::new("none", n_tx, n_tx, false))
+    );
+    assert_eq!(meta["index"]["genes"], n_tx);
+    assert_eq!(meta["index"]["gene_groups"], false);
 
     // Inferred genes group the toy's isoforms: no warning.
     let inferred = dir.join("inferred.sfi");
@@ -1060,9 +1084,18 @@ fn warns_on_index_without_gene_groups() {
         os("-q"),
         os("-o"),
         out.as_os_str(),
+        os("--rad"),
+        rad.as_os_str(),
     ]);
     assert!(err.is_empty(), "{err}");
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("plain.tsv.meta.json")).unwrap()).unwrap();
     assert!(meta.get("warnings").is_none());
+    let info = long_read_rad::read_index_info(&rad).unwrap().unwrap();
+    assert_eq!(info.genes_from, "inferred");
+    assert_eq!(info.num_transcripts, n_tx);
+    assert!(info.num_genes < n_tx, "{info:?}");
+    assert!(info.gene_groups);
+    assert_eq!(meta["index"]["genes"], info.num_genes);
+    assert_eq!(meta["index"]["gene_groups"], true);
 }

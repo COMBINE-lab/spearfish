@@ -26,6 +26,11 @@
 //! when present, is the score a quantifier should weigh alignments by: the mapper may add
 //! evidence there that it does not let decide its own ranking (spearfish: the end fit of reads
 //! without a poly(A) tail). A file written with it has the file tag `quant_scores` set to 1. Reads without alignments are not written; [`Counts`] records how many there were.
+//!
+//! A file may also describe the gene labels of the index it was mapped against, in the
+//! optional file tags `index_genes_from`, `index_num_genes`, `index_num_transcripts` and
+//! `index_gene_groups` ([`IndexInfo`]; written by [`RadWriter::create_with_index`], read by
+//! [`IndexInfo::from_file_tags`] and [`read_index_info`]). Files without them read as `None`.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -514,6 +519,79 @@ pub struct Meta {
     pub quant_scores: bool,
 }
 
+/// How the index mapped against labels transcripts with genes, from the optional file tags
+/// `index_genes_from` (string), `index_num_genes` (u64), `index_num_transcripts` (u64) and
+/// `index_gene_groups` (u8, 0 or 1). A quantifier can tell from them whether a gene-level
+/// summary means anything, and warn when it does not.
+///
+/// Written by [`RadWriter::create_with_index`]; read by [`IndexInfo::from_file_tags`] or
+/// [`read_index_info`], which give `None` for a file without these tags (one written by
+/// [`RadWriter::create`], or before they existed). Readers that do not know the tags skip them.
+/// Further fields may be added; build one with [`IndexInfo::new`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndexInfo {
+    /// Where the index's gene labels came from. spearfish: `fasta` (the FASTA headers), `t2g`
+    /// (a transcript-to-gene table), `inferred` (gene inference), or `none` (every transcript
+    /// its own gene); `given` for genes passed in through its Python API; empty when the index
+    /// does not record it.
+    pub genes_from: String,
+    /// Genes in the index.
+    pub num_genes: u64,
+    /// Transcripts in the index.
+    pub num_transcripts: u64,
+    /// The index groups transcripts into genes: false when every transcript is its own gene
+    /// (spearfish: `spearfish::has_gene_groups`), so gene-level grouping did nothing.
+    pub gene_groups: bool,
+}
+
+impl IndexInfo {
+    pub fn new(
+        genes_from: impl Into<String>,
+        num_genes: u64,
+        num_transcripts: u64,
+        gene_groups: bool,
+    ) -> Self {
+        IndexInfo {
+            genes_from: genes_from.into(),
+            num_genes,
+            num_transcripts,
+            gene_groups,
+        }
+    }
+
+    /// The index description in a file's tags (e.g. a [`ParallelRadReader`]'s
+    /// `file_tag_map`); `None` unless all four tags are present with the right types.
+    pub fn from_file_tags(tags: &TagMap) -> Option<Self> {
+        let int = |k: &str| match tags.get(k)? {
+            TagValue::U8(v) => Some(*v as u64),
+            TagValue::U16(v) => Some(*v as u64),
+            TagValue::U32(v) => Some(*v as u64),
+            TagValue::U64(v) => Some(*v),
+            _ => None,
+        };
+        let genes_from = match tags.get("index_genes_from")? {
+            TagValue::String(s) => s.clone(),
+            _ => return None,
+        };
+        Some(IndexInfo {
+            genes_from,
+            num_genes: int("index_num_genes")?,
+            num_transcripts: int("index_num_transcripts")?,
+            gene_groups: int("index_gene_groups")? != 0,
+        })
+    }
+
+    fn tags(&self) -> [(&'static str, TagValue); 4] {
+        [
+            ("index_genes_from", TagValue::String(self.genes_from.clone())),
+            ("index_num_genes", TagValue::U64(self.num_genes)),
+            ("index_num_transcripts", TagValue::U64(self.num_transcripts)),
+            ("index_gene_groups", TagValue::U8(self.gene_groups as u8)),
+        ]
+    }
+}
+
 /// Read counts, patched into the file when it is finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -525,31 +603,37 @@ pub struct Counts {
     pub bases: u64,
 }
 
-fn file_tags(meta: &Meta, ref_lengths: &[u32], codec: ChunkCodec) -> (TagSection, TagMap) {
+fn file_tags(
+    meta: &Meta,
+    index: Option<&IndexInfo>,
+    ref_lengths: &[u32],
+    codec: ChunkCodec,
+) -> (TagSection, TagMap) {
     let s = |x: &str| TagValue::String(x.to_string());
-    TagSection::from_tag_values(
-        TagSectionLabel::FileTags,
-        &[
-            ("known_rad_type", s(KNOWN_RAD_TYPE)),
-            ("schema_version", TagValue::U32(SCHEMA_VERSION)),
-            (CHUNK_CODEC_TAG, TagValue::U8(codec.as_u8())),
-            ("ref_lengths", TagValue::ArrayU32(ref_lengths.to_vec())),
-            ("mapper", s(&meta.mapper)),
-            ("mapper_version", s(&meta.mapper_version)),
-            ("cmdline", s(&meta.cmdline)),
-            ("params", s(&meta.params)),
-            ("preset", s(&meta.preset)),
-            ("seq_tech", s(&meta.seq_tech)),
-            ("score_denom", TagValue::F32(meta.score_denom)),
-            ("ends_extended", TagValue::U8(meta.ends_extended as u8)),
-            ("strands", s(&meta.strands)),
-            ("index_id", s(&meta.index_id)),
-            ("quant_scores", TagValue::U8(meta.quant_scores as u8)),
-            ("num_reads", TagValue::U64(0)),
-            ("num_mapped", TagValue::U64(0)),
-            ("num_bases", TagValue::U64(0)),
-        ],
-    )
+    let mut tags = vec![
+        ("known_rad_type", s(KNOWN_RAD_TYPE)),
+        ("schema_version", TagValue::U32(SCHEMA_VERSION)),
+        (CHUNK_CODEC_TAG, TagValue::U8(codec.as_u8())),
+        ("ref_lengths", TagValue::ArrayU32(ref_lengths.to_vec())),
+        ("mapper", s(&meta.mapper)),
+        ("mapper_version", s(&meta.mapper_version)),
+        ("cmdline", s(&meta.cmdline)),
+        ("params", s(&meta.params)),
+        ("preset", s(&meta.preset)),
+        ("seq_tech", s(&meta.seq_tech)),
+        ("score_denom", TagValue::F32(meta.score_denom)),
+        ("ends_extended", TagValue::U8(meta.ends_extended as u8)),
+        ("strands", s(&meta.strands)),
+        ("index_id", s(&meta.index_id)),
+        ("quant_scores", TagValue::U8(meta.quant_scores as u8)),
+        ("num_reads", TagValue::U64(0)),
+        ("num_mapped", TagValue::U64(0)),
+        ("num_bases", TagValue::U64(0)),
+    ];
+    if let Some(i) = index {
+        tags.extend(i.tags());
+    }
+    TagSection::from_tag_values(TagSectionLabel::FileTags, &tags)
 }
 
 /// Records are gathered into chunks of about this many bytes (before compression).
@@ -598,10 +682,32 @@ impl RadWriter {
         meta: &Meta,
         codec: ChunkCodec,
     ) -> Result<Self> {
+        Self::create_inner(path, refs, meta, None, codec)
+    }
+
+    /// [`RadWriter::create`], with the file tags that describe the index's gene labels
+    /// ([`IndexInfo`]).
+    pub fn create_with_index<S: AsRef<str>>(
+        path: &Path,
+        refs: &[(S, u32)],
+        meta: &Meta,
+        index: &IndexInfo,
+        codec: ChunkCodec,
+    ) -> Result<Self> {
+        Self::create_inner(path, refs, meta, Some(index), codec)
+    }
+
+    fn create_inner<S: AsRef<str>>(
+        path: &Path,
+        refs: &[(S, u32)],
+        meta: &Meta,
+        index: Option<&IndexInfo>,
+        codec: ChunkCodec,
+    ) -> Result<Self> {
         let mut hdr = RadHeader::from_ref_names(refs.iter().map(|(n, _)| n.as_ref()));
         hdr.version = SpecVersion::current();
         let lens: Vec<u32> = refs.iter().map(|(_, l)| *l).collect();
-        let (ft, values) = file_tags(meta, &lens, codec);
+        let (ft, values) = file_tags(meta, index, &lens, codec);
         let ctx = Context::canonical_with(meta.quant_scores);
         let (rt, at) = ctx.sections();
         let prelude = RadPrelude::from_header_and_tag_sections(hdr, ft, rt, at);
@@ -772,8 +878,8 @@ impl Header {
     }
 }
 
-/// Read a file's header without its records.
-pub fn read_header(path: &Path) -> Result<Header> {
+/// A file's prelude and file tags.
+fn read_prelude(path: &Path) -> Result<(RadPrelude, TagMap)> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut r = BufReader::new(f);
     let prelude = RadPrelude::from_bytes(&mut r).context("reading the RAD prelude")?;
@@ -781,7 +887,22 @@ pub fn read_header(path: &Path) -> Result<Header> {
         .file_tags
         .try_parse_tags_from_bytes(&mut r)
         .context("reading the RAD file tags")?;
+    Ok((prelude, tags))
+}
+
+/// Read a file's header without its records.
+pub fn read_header(path: &Path) -> Result<Header> {
+    let (prelude, tags) = read_prelude(path)?;
     Header::from_parts(&prelude, &tags)
+}
+
+/// Read a file's description of the index's gene labels ([`IndexInfo`]), without its
+/// records; `Ok(None)` if the file has none. A reader opened with [`open`] gets the same from
+/// [`IndexInfo::from_file_tags`] on its `file_tag_map`.
+pub fn read_index_info(path: &Path) -> Result<Option<IndexInfo>> {
+    let (prelude, tags) = read_prelude(path)?;
+    Header::from_parts(&prelude, &tags)?;
+    Ok(IndexInfo::from_file_tags(&tags))
 }
 
 /// A parallel reader over a file's records, and its header. Records arrive in chunks, in
@@ -882,7 +1003,10 @@ mod tests {
         assert_eq!(h.codec, codec);
         assert_eq!(h.ref_names, vec!["tA", "tB", "tC"]);
         assert_eq!(h.ref_lengths, vec![2000, 1500, 3000]);
+        // Written by `create`: no index description.
+        assert_eq!(read_index_info(&path).unwrap(), None);
         let (_, mut r) = open(&path, std::num::NonZeroUsize::new(3).unwrap()).unwrap();
+        assert_eq!(IndexInfo::from_file_tags(&r.file_tag_map), None);
         let got = Mutex::new(Vec::new());
         r.process_parallel(std::num::NonZeroUsize::new(3).unwrap(), |mc| {
             let mut v = Vec::new();
@@ -923,6 +1047,78 @@ mod tests {
         drop(sink);
         assert_eq!(files(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The index description round-trips through `create_with_index`, leaves the header as
+    /// `create` writes it, and reads back through both `read_index_info` and `open`.
+    #[test]
+    fn index_info_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("lrrad-index-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let refs = [("tA", 2000u32), ("tB", 1500), ("tC", 3000)];
+        let meta = Meta {
+            mapper: "test".into(),
+            index_id: "0123456789abcdef".into(),
+            ..Default::default()
+        };
+        for (i, info) in [
+            IndexInfo::new("none", 3, 3, false),
+            IndexInfo::new("t2g", 2, 3, true),
+            IndexInfo::new("", 0, 0, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.join(format!("t{i}.rad"));
+            let w = RadWriter::create_with_index(&path, &refs, &meta, &info, ChunkCodec::Lz4).unwrap();
+            let mut sink = w.sink();
+            sink.push(&rec(1)).unwrap();
+            sink.flush().unwrap();
+            drop(sink);
+            let counts = Counts {
+                reads: 2,
+                mapped: 1,
+                bases: 3,
+            };
+            w.finish(counts).unwrap();
+            let h = read_header(&path).unwrap();
+            assert_eq!((h.meta, h.counts), (meta.clone(), counts));
+            assert_eq!(read_index_info(&path).unwrap(), Some(info.clone()));
+            let (_, mut r) = open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+            assert_eq!(IndexInfo::from_file_tags(&r.file_tag_map), Some(info));
+            let n = std::sync::atomic::AtomicUsize::new(0);
+            r.process_parallel(std::num::NonZeroUsize::new(1).unwrap(), |mc| {
+                for c in mc.iter() {
+                    n.fetch_add(c.reads.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+            assert_eq!(n.into_inner(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The index description needs all four tags with integer or string types as written.
+    #[test]
+    fn index_info_needs_every_tag() {
+        let full = IndexInfo::new("fasta", 2, 5, true);
+        let (_, tags) = TagSection::from_tag_values(TagSectionLabel::FileTags, &full.tags());
+        assert_eq!(IndexInfo::from_file_tags(&tags), Some(full.clone()));
+        for skip in 0..4 {
+            let some: Vec<_> = full
+                .tags()
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i != skip)
+                .map(|(_, t)| t)
+                .collect();
+            let (_, tags) = TagSection::from_tag_values(TagSectionLabel::FileTags, &some);
+            assert_eq!(IndexInfo::from_file_tags(&tags), None, "without tag {skip}");
+        }
+        let mut wrong = full.tags();
+        wrong[0].1 = TagValue::U8(1);
+        let (_, tags) = TagSection::from_tag_values(TagSectionLabel::FileTags, &wrong);
+        assert_eq!(IndexInfo::from_file_tags(&tags), None);
     }
 
     #[test]

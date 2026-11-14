@@ -110,6 +110,20 @@ extended to the read ends (`ends_extended`), the orientations mapped, the index'
 (`index_id`), and the numbers of reads, mapped reads and bases. Unmapped reads are counted but get no
 record, and records carry no read names.
 
+Since 0.3.1, four more file tags say how the index labels transcripts with genes, so that a
+quantifier reading the file can tell whether its gene groups mean anything:
+
+| Tag | Type | Meaning |
+| --- | --- | --- |
+| `index_genes_from` | string | Where the gene labels came from, as the index manifest's `genes_from` says: `fasta` (the FASTA headers), `t2g` (`--t2g`), `inferred` (`--infer-genes`) or `none` (every transcript its own gene); empty for an index without a manifest. |
+| `index_num_genes` | u64 | Genes in the index. |
+| `index_num_transcripts` | u64 | Transcripts in the index. |
+| `index_gene_groups` | u8 | 1 if the index groups transcripts into genes, 0 if every transcript is its own gene (the case `spearfish map` warns about; see [Gene membership](/spearfish/guide/indexing/#gene-membership)). |
+
+Files written before 0.3.1 lack them; readers that do not know them skip them. In the
+`long-read-rad` crate, `long_read_rad::read_index_info(path)` and
+`IndexInfo::from_file_tags(&reader.file_tag_map)` read them, as `None` when a file has none.
+
 ## Run records
 
 Every `spearfish map` run writes a JSON record next to its first output file
@@ -118,7 +132,9 @@ regular file, as when everything goes to standard output or `/dev/null`). It hol
 
 - `spearfish`: version, git revision, target and build profile; `simd`: the kernels used;
 - `command_line`, `working_directory`, start and finish times, threads and CPUs available;
-- `index`: its path, identifier and manifest (what built it, from which transcripts);
+- `index`: its path, identifier, numbers of transcripts and genes, whether the genes group
+  the transcripts (`gene_groups`), and its manifest (what built it, from which transcripts;
+  `input.genes_from` says where the gene labels came from);
 - `reads` and `outputs`;
 - `settings`: the preset and the settings given; `parameters`: every parameter used;
   `score_denom`;
