@@ -58,7 +58,7 @@ def batch_to_pandas(batch, unmapped=False):
     reverse = hits.pop("reverse")
     df["strand"] = pd.Categorical(np.where(reverse, "-", "+"), categories=["+", "-"])
     for k in ("score", "query_start", "query_end", "target_start", "target_end", "anchors",
-              "anchored", "max_discrepancy", "extended"):
+              "anchored", "max_discrepancy", "extended", "quant_score"):
         df[k] = hits.pop(k)
     df["low_coverage"] = reads["low_coverage"][row_read]
     df["rescued"] = reads["rescued"][row_read]

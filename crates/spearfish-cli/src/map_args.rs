@@ -473,6 +473,43 @@ pub struct MapArgs {
         help_heading = "Read ends"
     )]
     pub no_end_bonus_cut: bool,
+    /// Quantification score: points for hits whose annotated 3' end a read without a poly(A)
+    /// tail reaches, where the candidates' ends are distinguishable; the mapping score, best set
+    /// and orientation do not change (0: off; -fast presets: 0) [default: 5].
+    #[arg(
+        long,
+        value_name = "SCORE",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub end_fit: Option<f32>,
+    /// With --end-fit: measurement error of where a read ends on a transcript, in parsed bases;
+    /// ends closer than this are not told apart [default: 4].
+    #[arg(
+        long,
+        value_name = "BASES",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub end_fit_tol: Option<u32>,
+    /// With --end-fit: measure where a read ends on each candidate from its chain, without
+    /// aligning the read's right end [default: on in drna, off with --extend-ends].
+    #[arg(
+        long,
+        overrides_with = "no_end_fit_chain",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub end_fit_chain: bool,
+    /// With --end-fit: measure where a read ends on each candidate by aligning the read's right
+    /// end.
+    #[arg(
+        long,
+        overrides_with = "end_fit_chain",
+        hide_short_help = true,
+        help_heading = "Read ends"
+    )]
+    pub no_end_fit_chain: bool,
 
     // Rescue.
     /// Rescue seed scheme [default: lcp:K=2].
@@ -639,6 +676,9 @@ impl MapArgs {
             .maybe_raw_mid(onoff!(self.raw_mid / no_raw_mid))
             .maybe_tail_templated(onoff!(self.tail_templated / no_tail_templated))
             .maybe_end_bonus_cut(onoff!(self.end_bonus_cut / no_end_bonus_cut))
+            .maybe_end_fit(self.end_fit)
+            .maybe_end_fit_tol(self.end_fit_tol)
+            .maybe_end_fit_chain(onoff!(self.end_fit_chain / no_end_fit_chain))
             .maybe_rescue(onoff!(self.rescue / no_rescue))
             .maybe_rescue_scheme(self.rescue_scheme.clone())
             .maybe_rescue_genes(self.rescue_genes)
@@ -847,6 +887,9 @@ mod tests {
             "--no-raw-mid",
             "--no-tail-templated",
             "--no-end-bonus-cut",
+            "--end-fit=3",
+            "--end-fit-tol=6",
+            "--end-fit-chain",
             "--rescue",
             "--rescue-scheme=lcp:K=2",
             "--rescue-genes=8",

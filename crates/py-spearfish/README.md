@@ -90,6 +90,20 @@ Most settings are numbers or booleans. A few take strings:
 - `rescue_window`: `"full"`, `"PAD,DIV"` or `(pad, div)`.
 - `chainer`: `"oracle"`, `"refine"` or `("refine", beam)`.
 
+The end fit, which sets `Hit.quant_score` for reads without a poly(A) tail, has three settings,
+as `spearfish map`'s `--end-fit`, `--end-fit-tol` and `--end-fit-chain` / `--no-end-fit-chain`:
+- `end_fit`: points for the candidates whose annotated 3' end the read reaches (`0` turns it off);
+- `end_fit_tol`: how far, in parsed bases, a read's end may lie from a 3' end and still fit it;
+- `end_fit_chain`: `True` measures where the read ends on each candidate from its chain,
+  `False` by aligning the read's right end. The `drna` preset measures from the chain and the
+  others align. Turning span extension on (`extend_ends=True`) in `drna` measures by alignment
+  unless `end_fit_chain=True` is also given.
+
+```python
+spearfish.Mapper(index, "drna", end_fit_chain=False)  # measure the end fit by alignment
+spearfish.Mapper(index, "ont", end_fit=0)             # quant_score == score
+```
+
 ## Mapping
 
 | Call | Input | Returns | Use it for |
@@ -109,7 +123,9 @@ A `Hit` has the following fields:
 - the transcript: `transcript`, `transcript_id`, `gene` and `transcript_length`;
 - the match: `rank`, `strand` (or `reverse`) and `score`;
 - the spans: `query_start`, `query_end`, `target_start` and `target_end`, in raw bases, half-open, with query spans on the read's forward strand;
-- the chain: `anchors`, `anchored`, `max_discrepancy` and `extended`.
+- the chain: `anchors`, `anchored`, `max_discrepancy` and `extended`;
+- `quant_score`, the score to weigh the hit by in quantification: `score` plus the end fit (see
+  below), and equal to `score` when the end fit is off or does not apply.
 
 A `MappingBatch` keeps its results in Rust until you ask for them:
 - `batch[i]` and iteration give `MappedRead` objects;
@@ -123,7 +139,7 @@ A batch writes exactly what `spearfish map` writes, through the same library cod
 ```python
 with open("reads.tsv", "wb") as tsv, open("reads.paf", "wb") as paf, \
         spearfish.RadWriter("reads.rad", mapper) as rad:
-    tsv.write(spearfish.TSV_HEADER.encode())
+    tsv.write(mapper.tsv_header.encode())
     for batch in mapper.map_file("reads.fq.gz"):
         batch.write_tsv(tsv)          # or batch.to_tsv() -> bytes
         batch.write_paf(paf)          # or batch.to_paf()

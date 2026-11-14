@@ -653,6 +653,11 @@ struct PyHit {
     /// anchors.
     #[pyo3(get)]
     extended: bool,
+    /// Quantification score: ``score`` plus the end-fit adjustment for reads without a
+    /// poly(A) tail (equal to ``score`` otherwise). ``score`` alone ranks the hits; weigh
+    /// hits for quantification by this.
+    #[pyo3(get)]
+    quant_score: f32,
 }
 
 #[pymethods]
@@ -749,6 +754,7 @@ fn to_py_read(
                     anchored: h.anchored,
                     max_discrepancy: h.max_discrepancy,
                     extended: h.extended,
+                    quant_score: h.quant_score,
                 },
             )
         })
@@ -860,7 +866,8 @@ impl PyBatch {
 
     fn formatted(&self, py: Python<'_>, paf: bool, header: bool) -> Vec<u8> {
         let mut out = if header {
-            spearfish::output::TSV_HEADER.as_bytes().to_vec()
+            let q = self.reads.first().is_some_and(|r| r.quant_scores);
+            spearfish::output::tsv_header(q).as_bytes().to_vec()
         } else {
             Vec::new()
         };
@@ -925,8 +932,8 @@ impl PyBatch {
     /// One row per hit, as a dict of NumPy arrays: ``read`` (the read's position in the
     /// batch), ``rank``, ``transcript_id``, ``reverse``, ``score``, ``query_start``,
     /// ``query_end``, ``target_start``, ``target_end``, ``anchors``, ``anchored``,
-    /// ``max_discrepancy`` and ``extended``. A read's hits are contiguous, best first;
-    /// unmapped reads have no rows.
+    /// ``max_discrepancy``, ``extended`` and ``quant_score``. A read's hits are contiguous,
+    /// best first; unmapped reads have no rows.
     fn hit_columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let n = self.num_hits();
         let mut read = Vec::with_capacity(n);
@@ -942,6 +949,7 @@ impl PyBatch {
         let mut anchored = Vec::with_capacity(n);
         let mut disc = Vec::with_capacity(n);
         let mut extended = Vec::with_capacity(n);
+        let mut quant = Vec::with_capacity(n);
         for (i, r) in self.reads.iter().enumerate() {
             for (k, h) in r.hits.iter().enumerate() {
                 read.push(i as u32);
@@ -957,6 +965,7 @@ impl PyBatch {
                 anchored.push(h.anchored);
                 disc.push(h.max_discrepancy);
                 extended.push(h.extended);
+                quant.push(h.quant_score);
             }
         }
         let d = PyDict::new(py);
@@ -973,6 +982,7 @@ impl PyBatch {
         d.set_item("anchored", anchored.into_pyarray(py))?;
         d.set_item("max_discrepancy", disc.into_pyarray(py))?;
         d.set_item("extended", extended.into_pyarray(py))?;
+        d.set_item("quant_score", quant.into_pyarray(py))?;
         Ok(d)
     }
 
@@ -1012,7 +1022,7 @@ impl PyBatch {
     /// ``*`` line per unmapped read. Reads given without names are named by their position in
     /// the batch.
     ///
-    /// :param header: Start with the header line (:data:`TSV_HEADER`).
+    /// :param header: Start with the header line (the mapper's :attr:`Mapper.tsv_header`).
     #[pyo3(signature = (*, header=false))]
     fn to_tsv<'py>(&self, py: Python<'py>, header: bool) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.formatted(py, false, header))
@@ -1334,6 +1344,13 @@ impl PyMapper {
     #[getter]
     fn score_denom(&self) -> f32 {
         spearfish::SCORE_DENOM
+    }
+
+    /// The header line of this mapper's TSV (newline included): :data:`TSV_HEADER`, with the
+    /// ``qscore`` column when the end fit is on (the ``end_fit`` setting).
+    #[getter]
+    fn tsv_header(&self) -> &'static str {
+        spearfish::output::tsv_header(self.inner.quant_scores())
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {

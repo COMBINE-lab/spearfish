@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+- **A second score per hit, the quantification score (`qscore`), with an end fit for reads
+  without a poly(A) tail** (`--end-fit`, 5 points; on in every preset except the `-fast` ones).
+  The poly(A) tail is spearfish's evidence for where a read ends and, between near-tied
+  orientations, for its strand. Without it (poly(A)-trimmed reads, or reads that lost their
+  tail), isoforms that differ only in their 3' end and antisense transcripts overlapping on
+  opposite strands tie, and the quantifier tends to give such reads to whichever transcript has
+  more unique reads. The quantification score is the mapping score plus `--end-fit` points for
+  the candidates whose annotated 3' end the read reaches, when the read has no tail and the
+  candidates' ends lie farther apart than `--end-fit-tol` (4 compressed bases). The mapping
+  score is unchanged and still decides the ranks, the best set, the primary hit and the
+  orientation, so mapping output is the same as in 0.2.1; only the weights a quantifier gives a
+  read's hits change. Where a read ends is measured from the alignment of its right end, or,
+  in the `drna` preset (whose spans are not extended), from each candidate's chain
+  (`--end-fit-chain`; `--no-end-fit-chain` aligns instead, at a higher mapping cost; span
+  extension implies alignment). On simulated ONT cDNA and real spike-in data with
+  poly(A)-trimmed reads, much of the accuracy lost to trimming comes back; on reads with tails
+  results are about the same. Mapping costs well under 1% more. Output: a 15th TSV column
+  `qscore`, a PAF tag `qs:f`, an optional RAD alignment tag `qscore` (file tag `quant_scores`),
+  `Hit::quant_score` in the library and `Hit.quant_score` / `Mapper.tsv_header` in Python; all
+  are left out when the end fit is off (`--end-fit 0`, the `-fast` presets), so output is then
+  as before. See the new docs page "Mapping and quantification scores".
+
 ## 0.2.1 (2026-11-12)
 
 - **Tie-break: the end bonus no longer rewards bases past another candidate's transcript end**

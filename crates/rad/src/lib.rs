@@ -16,10 +16,16 @@
 //! | alignment | `query_start`, `query_end`   | u32  | aligned span on the read's forward strand    |
 //! | alignment | `score`                      | f32  | alignment score, higher is better            |
 //! | alignment | `aln_flags`                  | u8   | [`aln_flags`] bits                           |
+//! | alignment | `qscore` (optional)          | f32  | quantification score, see below              |
 //!
 //! A reader finds tags by name and skips the ones it does not know, so a producer can add
 //! tags. `ref_ori`, `ref_start`, `ref_end` and `score` are required; the others read as 0 when
-//! absent. Reads without alignments are not written; [`Counts`] records how many there were.
+//! absent, except `qscore`, which reads as the alignment's `score`.
+//!
+//! `score` is the mapper's alignment score, by which it ranks a read's alignments. `qscore`,
+//! when present, is the score a quantifier should weigh alignments by: the mapper may add
+//! evidence there that it does not let decide its own ranking (spearfish: the end fit of reads
+//! without a poly(A) tail). A file written with it has the file tag `quant_scores` set to 1. Reads without alignments are not written; [`Counts`] records how many there were.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -70,6 +76,8 @@ pub struct Aln {
     pub query_end: u32,
     pub score: f32,
     pub flags: u8,
+    /// The quantification score (`qscore`; the `score` where the file has none).
+    pub quant_score: f32,
 }
 
 /// A read and its alignments, stored by field.
@@ -85,6 +93,7 @@ pub struct ReadRecord {
     pub query_end: Vec<u32>,
     pub score: Vec<f32>,
     pub aln_flags: Vec<u8>,
+    pub quant_score: Vec<f32>,
 }
 
 impl ReadRecord {
@@ -100,6 +109,7 @@ impl ReadRecord {
         self.query_end.clear();
         self.score.clear();
         self.aln_flags.clear();
+        self.quant_score.clear();
     }
 
     pub fn push(&mut self, a: Aln) {
@@ -111,6 +121,7 @@ impl ReadRecord {
         self.query_end.push(a.query_end);
         self.score.push(a.score);
         self.aln_flags.push(a.flags);
+        self.quant_score.push(a.quant_score);
     }
 
     pub fn len(&self) -> usize {
@@ -131,6 +142,7 @@ impl ReadRecord {
             query_end: self.query_end[i],
             score: self.score[i],
             flags: self.aln_flags[i],
+            quant_score: self.quant_score[i],
         }
     }
 
@@ -151,6 +163,7 @@ enum Field {
     QueryEnd,
     Score,
     AlnFlags,
+    QuantScore,
     /// A tag this crate does not know: skipped when reading, written as zero or empty.
     Other,
 }
@@ -173,9 +186,14 @@ fn u8_tag(name: &str) -> TagDesc {
 }
 
 impl Context {
-    /// The schema this crate writes.
+    /// The schema this crate writes, without quantification scores.
     pub fn canonical() -> Self {
-        Context {
+        Self::canonical_with(false)
+    }
+
+    /// The schema this crate writes, with the optional `qscore` alignment tag if `quant_scores`.
+    pub fn canonical_with(quant_scores: bool) -> Self {
+        let mut c = Context {
             read: vec![
                 (Field::ReadLen, u32_tag("read_len")),
                 (Field::ReadFlags, u8_tag("read_flags")),
@@ -195,7 +213,14 @@ impl Context {
                 ),
                 (Field::AlnFlags, u8_tag("aln_flags")),
             ],
+        };
+        if quant_scores {
+            c.aln.push((
+                Field::QuantScore,
+                TagDesc::new("qscore", RadType::Float(RadFloatId::F32)),
+            ));
         }
+        c
     }
 
     fn sections(&self) -> (TagSection, TagSection) {
@@ -215,7 +240,7 @@ impl Context {
 fn check_type(field: Field, d: &TagDesc) -> Result<()> {
     let ok = match field {
         Field::Other => true,
-        Field::Score => matches!(d.typeid, RadType::Int(_) | RadType::Float(_)),
+        Field::Score | Field::QuantScore => matches!(d.typeid, RadType::Int(_) | RadType::Float(_)),
         _ => matches!(d.typeid, RadType::Int(_)),
     };
     if !ok {
@@ -248,6 +273,7 @@ impl RecordContext for Context {
                     "query_end" => Field::QueryEnd,
                     "score" => Field::Score,
                     "aln_flags" => Field::AlnFlags,
+                    "qscore" => Field::QuantScore,
                     _ => Field::Other,
                 };
                 check_type(f, d).map(|_| (f, d.clone()))
@@ -344,8 +370,10 @@ impl MappedRecord for ReadRecord {
             query_end: Vec::with_capacity(n),
             score: Vec::with_capacity(n),
             aln_flags: Vec::with_capacity(n),
+            quant_score: Vec::with_capacity(n),
             ..Default::default()
         };
+        let has_quant = ctx.aln.iter().any(|(f, _)| *f == Field::QuantScore);
         for (f, d) in &ctx.read {
             match (f, d.typeid) {
                 (Field::ReadLen, RadType::Int(id)) => rec.read_len = read_int(id, r) as u32,
@@ -373,11 +401,15 @@ impl MappedRecord for ReadRecord {
                     Field::QueryStart => a.query_start = int(r) as u32,
                     Field::QueryEnd => a.query_end = int(r) as u32,
                     Field::Score => a.score = read_score(d.typeid, r),
+                    Field::QuantScore => a.quant_score = read_score(d.typeid, r),
                     Field::AlnFlags => a.flags = int(r) as u8,
                     _ => {
                         d.value_from_bytes(r);
                     }
                 }
+            }
+            if !has_quant {
+                a.quant_score = a.score;
             }
             rec.push(a);
         }
@@ -402,13 +434,16 @@ impl MappedRecord for ReadRecord {
                     Field::QueryStart => a.query_start as u64,
                     Field::QueryEnd => a.query_end as u64,
                     Field::AlnFlags => a.flags as u64,
-                    Field::Score => {
+                    Field::Score | Field::QuantScore => {
+                        let v = if *f == Field::Score {
+                            a.score
+                        } else {
+                            a.quant_score
+                        };
                         match d.typeid {
-                            RadType::Float(RadFloatId::F32) => w.write_all(&a.score.to_le_bytes())?,
-                            RadType::Float(RadFloatId::F64) => {
-                                w.write_all(&(a.score as f64).to_le_bytes())?
-                            }
-                            RadType::Int(id) => write_int(id, a.score.round() as i64 as u64, w)?,
+                            RadType::Float(RadFloatId::F32) => w.write_all(&v.to_le_bytes())?,
+                            RadType::Float(RadFloatId::F64) => w.write_all(&(v as f64).to_le_bytes())?,
+                            RadType::Int(id) => write_int(id, v.round() as i64 as u64, w)?,
                             _ => unreachable!("checked in get_context_from_tag_section"),
                         }
                         continue;
@@ -474,6 +509,9 @@ pub struct Meta {
     /// An identifier of the index mapped against (spearfish: a hash of its inputs and build
     /// parameters), or empty.
     pub index_id: String,
+    /// The alignments carry quantification scores (`qscore`), which may differ from their
+    /// scores; without them a reader takes the score.
+    pub quant_scores: bool,
 }
 
 /// Read counts, patched into the file when it is finished.
@@ -506,6 +544,7 @@ fn file_tags(meta: &Meta, ref_lengths: &[u32], codec: ChunkCodec) -> (TagSection
             ("ends_extended", TagValue::U8(meta.ends_extended as u8)),
             ("strands", s(&meta.strands)),
             ("index_id", s(&meta.index_id)),
+            ("quant_scores", TagValue::U8(meta.quant_scores as u8)),
             ("num_reads", TagValue::U64(0)),
             ("num_mapped", TagValue::U64(0)),
             ("num_bases", TagValue::U64(0)),
@@ -563,7 +602,7 @@ impl RadWriter {
         hdr.version = SpecVersion::current();
         let lens: Vec<u32> = refs.iter().map(|(_, l)| *l).collect();
         let (ft, values) = file_tags(meta, &lens, codec);
-        let ctx = Context::canonical();
+        let ctx = Context::canonical_with(meta.quant_scores);
         let (rt, at) = ctx.sections();
         let prelude = RadPrelude::from_header_and_tag_sections(hdr, ft, rt, at);
         let mut tmp = path.as_os_str().to_owned();
@@ -721,6 +760,7 @@ impl Header {
                 ends_extended: int("ends_extended") != 0,
                 strands: string("strands"),
                 index_id: string("index_id"),
+                quant_scores: int("quant_scores") != 0,
             },
             counts: Counts {
                 reads: int("num_reads"),
@@ -777,13 +817,25 @@ mod tests {
                 query_end: 950 + k,
                 score: 1234.5 - k as f32 * 3.25,
                 flags: (k % 2) as u8,
+                quant_score: 1234.5 - k as f32 * 3.25 + (k % 2) as f32 * 5.0,
             });
         }
         r
     }
 
     fn roundtrip(codec: ChunkCodec) {
-        let dir = std::env::temp_dir().join(format!("lrrad-{}-{}", std::process::id(), codec.as_u8()));
+        roundtrip_with(codec, false);
+    }
+
+    /// Records written with or without the `qscore` tag read back as written; without it, each
+    /// alignment's quantification score is its score.
+    fn roundtrip_with(codec: ChunkCodec, quant_scores: bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "lrrad-{}-{}-{}",
+            std::process::id(),
+            codec.as_u8(),
+            quant_scores
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.rad");
         let refs = [("tA", 2000u32), ("tB", 1500), ("tC", 3000)];
@@ -796,6 +848,7 @@ mod tests {
             ends_extended: true,
             strands: "both".into(),
             index_id: "0123456789abcdef".into(),
+            quant_scores,
             ..Default::default()
         };
         let w = RadWriter::create(&path, &refs, &meta, codec).unwrap();
@@ -843,7 +896,11 @@ mod tests {
         got.sort_by_key(|r| r.read_len);
         assert_eq!(got.len(), n as usize);
         for (i, r) in got.iter().enumerate() {
-            assert_eq!(*r, rec(i as u32));
+            let mut want = rec(i as u32);
+            if !quant_scores {
+                want.quant_score = want.score.clone();
+            }
+            assert_eq!(*r, want);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -879,6 +936,11 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_quant_scores() {
+        roundtrip_with(ChunkCodec::Lz4, true);
+    }
+
+    #[test]
     fn roundtrip_zstd() {
         roundtrip(ChunkCodec::Zstd);
     }
@@ -900,6 +962,8 @@ mod tests {
         let read = Context::get_context_from_tag_section(&ft, &rt, &at).unwrap();
         let mut r = rec(3);
         r.score.iter_mut().for_each(|s| *s = s.round());
+        // Without the `qscore` tag the quantification score reads as the score.
+        r.quant_score = r.score.clone();
         let mut bytes = Vec::new();
         r.write(&mut bytes, &ctx).unwrap();
         let back = ReadRecord::from_bytes_with_context(&mut bytes.as_slice(), &read);

@@ -222,6 +222,7 @@ def test_columns(mapper, reads):
         assert list(h["transcript_id"][lo:hi]) == [x.transcript_id for x in read.hits]
         assert list(h["rank"][lo:hi]) == list(range(read.num_hits))
         assert np.allclose(h["score"][lo:hi], [x.score for x in read.hits])
+        assert np.allclose(h["quant_score"][lo:hi], [x.quant_score for x in read.hits])
         assert list(h["reverse"][lo:hi]) == [x.reverse for x in read.hits]
     assert h["transcript_id"].dtype == np.uint32 and h["reverse"].dtype == np.bool_
 
@@ -237,6 +238,7 @@ def test_to_pandas(mapper, reads, index):
     hit = batch[0].best
     assert first["read"] == names[0] and first["transcript"] == hit.transcript
     assert first["strand"] == hit.strand and first["query_end"] == hit.query_end
+    assert first["quant_score"] == pytest.approx(hit.quant_score)
     assert isinstance(df["transcript"].dtype, pd.CategoricalDtype)
     full = batch.to_pandas(unmapped=True)
     assert len(full) == len(df) + 1
@@ -364,6 +366,39 @@ def test_setting_errors(index):
     assert spearfish.Mapper(index, "ont", strands="fwd").options["params"]["strands"] == "fwd"
 
 
+def test_end_fit_settings(index, reads):
+    for k in ("end_fit", "end_fit_tol", "end_fit_chain"):
+        assert k in spearfish.SETTINGS
+    tb = lambda p, **kw: spearfish.resolve_settings(p, **kw)["params"]["tiebreak"]
+    # The drna preset measures the end fit from the chain, the others align.
+    assert tb("drna")["end_fit_chain"] is True
+    assert tb("ont")["end_fit_chain"] is False and tb("hifi")["end_fit_chain"] is False
+    assert tb("drna")["end_fit"] > 0 and tb("ont-fast")["end_fit"] == 0
+    # The alignment instead of the chain, and the other way round.
+    assert tb("drna", end_fit_chain=False)["end_fit_chain"] is False
+    assert tb("ont", end_fit_chain=True)["end_fit_chain"] is True
+    # Span extension measures by alignment unless the chain is asked for.
+    assert tb("drna", extend_ends=True)["end_fit_chain"] is False
+    assert tb("drna", extend_ends=True, end_fit_chain=True)["end_fit_chain"] is True
+    t = tb("ont", end_fit=2.5, end_fit_tol=6)
+    assert (t["end_fit"], t["end_fit_tol"]) == (2.5, 6)
+    assert tb("drna", end_fit=None) == tb("drna")
+    m = spearfish.Mapper(index, "drna", end_fit=3, end_fit_tol=2, end_fit_chain=False)
+    assert m.settings == {"end_fit": 3.0, "end_fit_tol": 2, "end_fit_chain": False}
+    with pytest.raises(ValueError):
+        spearfish.Mapper(index, "ont", end_fit=-1)
+    with pytest.raises(ValueError):
+        spearfish.Mapper(index, "ont", end_fit_tol=-1)
+    # Off, the quantification score is the score.
+    off = spearfish.Mapper(index, "ont", end_fit=0)
+    seqs = [r[1] for r in reads]
+    for r in off.map_batch(seqs):
+        assert all(h.quant_score == h.score for h in r.hits)
+    cols = spearfish.Mapper(index, "drna", end_fit_chain=False).map_batch(seqs).hit_columns()
+    assert len(cols["quant_score"]) == len(cols["score"])
+    assert (cols["quant_score"] >= cols["score"]).all()
+
+
 def test_settings_change_results(index, reads):
     _, seq, tx, _ = reads[1]  # a reverse-complemented read
     assert all(not h.reverse for h in spearfish.Mapper(index, "ont", strands="fwd").map(seq).hits)
@@ -432,15 +467,24 @@ def test_tsv_and_paf(mapper, reads, index, tmp_path):
     tsv = batch.to_tsv().decode()
     lines = tsv.splitlines()
     assert len(lines) == batch.num_hits + 1  # the unmapped read's `*` line
-    assert lines[-1] == "junk\t40\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped"
+    # The end fit is on in the default preset: a 15th column, `qscore` (0 when unmapped).
+    assert lines[-1] == "junk\t40\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped\t0"
     best = batch[0].best
     f = lines[0].split("\t")
     assert f[:5] == [names[0], str(len(seqs[0])), best.strand, "0", best.transcript]
     assert f[5] == f"{best.score:.2f}"
     assert [int(x) for x in f[6:10]] == [best.query_start, best.query_end, best.target_start,
                                          best.target_end]
-    assert batch.to_tsv(header=True).decode() == spearfish.TSV_HEADER + tsv
+    assert f[14] == f"{best.quant_score:.2f}"
+    assert batch.to_tsv(header=True).decode() == mapper.tsv_header + tsv
+    assert mapper.tsv_header == spearfish.TSV_HEADER.replace("\n", "\tqscore\n")
     assert spearfish.TSV_HEADER.startswith("read\tread_len\t") and spearfish.TSV_HEADER.endswith("\n")
+    # With the end fit off the TSV is as before.
+    off = spearfish.Mapper(index, mapper.preset, end_fit=0)
+    assert off.tsv_header == spearfish.TSV_HEADER
+    ob = off.map_batch(seqs, names=names)
+    assert ob.to_tsv(header=True).decode().startswith(spearfish.TSV_HEADER)
+    assert ob.to_tsv().decode().splitlines()[-1].endswith("\tunmapped")
     paf = batch.to_paf().decode().splitlines()
     assert len(paf) == batch.num_hits and not any(l.startswith("junk\t") for l in paf)
     p = paf[0].split("\t")
@@ -450,7 +494,7 @@ def test_tsv_and_paf(mapper, reads, index, tmp_path):
         batch.write_tsv(fb, header=True)
     with open(tmp_path / "o.paf", "w") as ft:
         batch.write_paf(ft)
-    assert (tmp_path / "o.tsv").read_text() == spearfish.TSV_HEADER + tsv
+    assert (tmp_path / "o.tsv").read_text() == mapper.tsv_header + tsv
     assert (tmp_path / "o.paf").read_bytes() == batch.to_paf()
     # Unnamed reads are named by their position in the batch.
     assert mapper.map_batch(seqs[:2]).to_tsv().decode().startswith("0\t")
@@ -464,13 +508,23 @@ def test_output_matches_cli(mapper, reads, tmp_path):
     idx = tmp_path / "toy.sfi"
     spearfish.Index.build(TOY, idx)
     cli_tsv, cli_paf = tmp_path / "cli.tsv", tmp_path / "cli.paf"
-    subprocess.run([os.environ["SPEARFISH_BIN"], "map", str(idx), str(fq), "-t", "1", "-q",
-                    "-o", str(cli_tsv), "--paf", str(cli_paf)], check=True)
-    m = spearfish.Mapper(spearfish.Index.load(idx), "ont")
-    batches = list(m.map_file(fq, chunk_size=7))
-    tsv = spearfish.TSV_HEADER.encode() + b"".join(b.to_tsv() for b in batches)
-    assert tsv == cli_tsv.read_bytes()
-    assert b"".join(b.to_paf() for b in batches) == cli_paf.read_bytes()
+    # The end-fit settings as keyword arguments and as flags.
+    cases = [
+        ("ont", {}, []),
+        ("drna", {"end_fit_chain": False}, ["--no-end-fit-chain"]),
+        ("ont", {"end_fit": 3, "end_fit_tol": 2, "end_fit_chain": True},
+         ["--end-fit=3", "--end-fit-tol=2", "--end-fit-chain"]),
+        ("ont", {"end_fit": 0}, ["--end-fit=0"]),
+    ]
+    for preset, kw, flags in cases:
+        subprocess.run([os.environ["SPEARFISH_BIN"], "map", str(idx), str(fq), "-t", "1", "-q",
+                        "--preset", preset, *flags, "-o", str(cli_tsv), "--paf", str(cli_paf)],
+                       check=True)
+        m = spearfish.Mapper(spearfish.Index.load(idx), preset, **kw)
+        batches = list(m.map_file(fq, chunk_size=7))
+        tsv = m.tsv_header.encode() + b"".join(b.to_tsv() for b in batches)
+        assert tsv == cli_tsv.read_bytes(), (preset, kw)
+        assert b"".join(b.to_paf() for b in batches) == cli_paf.read_bytes(), (preset, kw)
 
 
 def test_rad_writer(mapper, reads, tmp_path, index):

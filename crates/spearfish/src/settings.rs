@@ -269,6 +269,21 @@ pub struct MapSettings {
     /// only for reaching the read's end within that shortest window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_bonus_cut: Option<bool>,
+    /// Quantification score: points for the hits whose annotated 3' end a read without a
+    /// poly(A) tail reaches, where its candidates end at distinguishable places (0: off). The
+    /// mapping score, best set and orientation do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_fit: Option<f32>,
+    /// With `end_fit`: how far (parsed bases) where a read ends may lie from an annotated 3'
+    /// end and still fit it; ends this close to each other are not told apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_fit_tol: Option<u32>,
+    /// With `end_fit`: measure where a read ends on each candidate from its chain (the read
+    /// taken to go on along the transcript from the last anchor without gaps) instead of by
+    /// aligning the read's right end. On in drna; `extend_ends` turning span extension on
+    /// turns it off unless it is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_fit_chain: Option<bool>,
 
     // Rescue.
     /// Re-seed reads that map poorly at a lower LCP level within their candidate genes.
@@ -414,6 +429,9 @@ impl MapSettings {
         "raw_mid",
         "tail_templated",
         "end_bonus_cut",
+        "end_fit",
+        "end_fit_tol",
+        "end_fit_chain",
         "rescue",
         "rescue_scheme",
         "rescue_genes",
@@ -468,6 +486,9 @@ impl MapSettings {
             raw_mid,
             tail_templated,
             end_bonus_cut,
+            end_fit,
+            end_fit_tol,
+            end_fit_chain,
             end_diagonal,
         )
     }
@@ -637,6 +658,10 @@ impl MapSettings {
             set!(self.raw_mid => tb.raw_mid);
             set!(self.tail_templated => tb.tail_templated);
             set!(self.end_bonus_cut => tb.end_bonus_cut);
+            set!(self.end_fit => tb.end_fit);
+            set!(self.end_fit_tol => tb.end_fit_tol);
+            set!(self.end_fit_chain => tb.end_fit_chain);
+            ensure!(tb.end_fit >= 0.0, "end_fit must not be negative");
             ensure!(tb.orient_exact >= 0.0, "orient_exact must not be negative");
             ensure!(tb.pad_div >= 1, "pad_div must be at least 1");
             ensure!(tb.max_cands >= 1, "tie_cands must be at least 1");
@@ -716,6 +741,10 @@ impl MapSettings {
 
         if let Some(on) = self.extend_ends {
             o.set_extend_ends(on);
+            // Turning extension on turns the chain measurement off; a setting of it stands.
+            if let (Some(c), Some(tb)) = (self.end_fit_chain, o.params.tiebreak.as_mut()) {
+                tb.end_fit_chain = c;
+            }
         }
         match o.params.ends.as_mut() {
             Some(e) => {
@@ -777,6 +806,31 @@ mod tests {
             assert_eq!(MapSettings::preset(p).resolve().unwrap(), MapOptions::preset(p));
             assert_eq!(MapSettings::builder(p).build(), MapSettings::preset(p));
         }
+    }
+
+    #[test]
+    fn extension_measures_the_end_fit_by_alignment_unless_the_chain_is_set() {
+        let chain = |s: MapSettings| {
+            let o = s.resolve().unwrap();
+            o.params.tiebreak.as_ref().unwrap().end_fit_chain
+        };
+        let drna = || MapSettings::builder(Preset::Drna);
+        assert!(chain(drna().build()));
+        assert!(!chain(drna().extend_ends(true).build()));
+        assert!(chain(drna().extend_ends(true).end_fit_chain(true).build()));
+        assert!(!chain(drna().end_fit_chain(false).build()));
+        // Extension already on (the ont preset) leaves the setting as it is.
+        let ont = MapSettings::builder(Preset::Ont);
+        assert!(chain(ont.end_fit_chain(true).extend_ends(true).build()));
+        let mut o = MapOptions::preset(Preset::Drna);
+        o.extend_ends(Preset::Drna);
+        assert!(!o.params.tiebreak.as_ref().unwrap().end_fit_chain);
+        let o = drna().end_fit(2.5).end_fit_tol(6).resolve().unwrap();
+        let tb = o.params.tiebreak.as_ref().unwrap();
+        assert_eq!((tb.end_fit, tb.end_fit_tol), (2.5, 6));
+        assert!(o.quant_scores());
+        assert!(!drna().end_fit(0.0).resolve().unwrap().quant_scores());
+        assert!(drna().end_fit(-1.0).resolve().is_err());
     }
 
     #[test]

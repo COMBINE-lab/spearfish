@@ -234,6 +234,11 @@ fn output_formats() {
 
     assert_eq!(output::TSV_HEADER.matches('\t').count(), 13);
     assert!(output::TSV_HEADER.ends_with("flags\n"));
+    // The accurate presets compute quantification scores: a 15th column, `qscore`.
+    assert!(mapper.quant_scores() && r.quant_scores);
+    assert_eq!(output::tsv_header(true).matches('\t').count(), 14);
+    assert!(output::tsv_header(true).ends_with("flags\tqscore\n"));
+    assert_eq!(output::tsv_header(false), output::TSV_HEADER);
     let mut buf = Vec::new();
     output::tsv_lines(&mut buf, "r1", &r, &index);
     let text = String::from_utf8(buf).unwrap();
@@ -241,7 +246,8 @@ fn output_formats() {
     assert_eq!(lines.len(), r.hits.len());
     for (rank, (line, h)) in lines.iter().zip(&r.hits).enumerate() {
         let f: Vec<&str> = line.split('\t').collect();
-        assert_eq!(f.len(), 14);
+        assert_eq!(f.len(), 15);
+        assert_eq!(f[14], format!("{:.2}", h.quant_score));
         assert_eq!(f[0], "r1");
         assert_eq!(f[1], "800");
         assert_eq!(f[2], if h.reverse { "-" } else { "+" });
@@ -258,7 +264,19 @@ fn output_formats() {
     output::tsv_lines(&mut buf, "u", &unmapped, &index);
     assert_eq!(
         String::from_utf8(buf).unwrap(),
-        "u\t10\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped\n"
+        "u\t10\t*\t0\t*\t0\t0\t0\t0\t0\t0\t0\t0\tunmapped\t0\n"
+    );
+    // A -fast preset reproduces 0.1.0: no quantification scores, 14 columns.
+    let fast = Mapper::new(index.clone(), &MapOptions::preset(Preset::OntFast)).unwrap();
+    let rf = fast.map(&seq[100..900]);
+    assert!(!fast.quant_scores() && rf.hits.iter().all(|h| h.quant_score == h.score));
+    let mut buf = Vec::new();
+    output::tsv_lines(&mut buf, "r1", &rf, &index);
+    assert!(
+        String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .all(|l| l.split('\t').count() == 14)
     );
 
     let mut buf = Vec::new();
@@ -278,6 +296,10 @@ fn output_formats() {
     );
     assert_eq!(first[6], index.tx_len(r.hits[0].tx).to_string());
     assert!(first.contains(&"tp:A:P") && first.contains(&"rk:i:0"));
+    assert_eq!(
+        *first.last().unwrap(),
+        format!("qs:f:{:.2}", r.hits[0].quant_score)
+    );
     let mut buf = Vec::new();
     output::paf_lines(&mut buf, "u", &unmapped, &index);
     assert!(buf.is_empty());
@@ -289,8 +311,13 @@ fn output_formats() {
         assert_eq!((rec.read_len, rec.len()), (800, r.hits.len()));
         assert_eq!(rec.refs, r.hits.iter().map(|h| h.tx).collect::<Vec<_>>());
         assert_eq!(rec.fw, r.hits.iter().map(|h| !h.reverse).collect::<Vec<_>>());
+        assert_eq!(
+            rec.quant_score,
+            r.hits.iter().map(|h| h.quant_score).collect::<Vec<_>>()
+        );
         assert!(!output::rad_record(&mut rec, &unmapped) && rec.is_empty());
         let meta = output::rad_meta(&mapper, None, "test").unwrap();
         assert_eq!((meta.preset.as_str(), meta.index_id), ("ont", index.id()));
+        assert!(meta.quant_scores);
     }
 }

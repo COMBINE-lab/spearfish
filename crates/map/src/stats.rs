@@ -77,6 +77,7 @@ counters!(
     MATE_CALLS,
     MATE_SEEDS,
     MATE_FOUND,
+    END_FIT,
 );
 
 #[inline]

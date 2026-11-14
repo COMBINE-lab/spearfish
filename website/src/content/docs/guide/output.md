@@ -22,6 +22,7 @@ they finish, not input order. An unmapped read gets one line with transcript `*`
 | `anchored` | Read bases covered by those seeds (homopolymer-compressed). |
 | `max_disc` | Largest gap discrepancy between consecutive anchors in the chain. |
 | `flags` | Comma-separated flags, or `-`. |
+| `qscore` | Quantification score: `score` plus the end-fit adjustment for reads without a poly(A) tail. Written only when the end fit is on (every preset except the `-fast` ones); `0` on an unmapped read's line. `rank` and the best set follow `score`. See [Mapping and quantification scores](/spearfish/concepts/scores/). |
 
 ## Flags
 
@@ -76,7 +77,8 @@ Unmapped reads are left out.
 
 Tags: `tp:A:P` on the best hit and `tp:A:S` on the others, `AS:i` the score rounded, `sc:f`
 the score, `cm:i` the anchors in the chain, `rk:i` the rank, and `fl:Z` the TSV flags when there
-are any.
+are any. When the end fit is on, `qs:f` is the quantification score; `AS:i` and `sc:f` stay
+the mapping score.
 
 ## RAD output
 
@@ -99,6 +101,7 @@ long-read mappers can write it too:
 | alignment | `query_start`, `query_end` | u32 | Span on the read (`qstart`, `qend`). |
 | alignment | `score` | f32 | The score column. |
 | alignment | `aln_flags` | u8 | Bit 0: `anchor_span`. |
+| alignment | `qscore` | f32 | The `qscore` column. Present only when the file tag `quant_scores` is 1 (end fit on); readers that do not know it skip it, and readers that do should weigh alignments by it, falling back to `score`. |
 
 File-level tags give the transcript lengths (`ref_lengths`), the mapper, its version and git
 revision, command line, the settings and every parameter used (`params`, JSON), the preset, the
@@ -132,3 +135,9 @@ Only differences between a read's scores carry meaning: they are the "delta" of
 probabilities, P(read | transcript) ∝ `exp((s - s_max) / D)`. spearfish suggests D = 2
 (`spearfish::SCORE_DENOM`), which the RAD file records and oarfish reads there; for minimap2's
 alignment scores oarfish uses 3.
+
+For quantification, use the quantification score (`qscore`) where it is reported: it equals the
+mapping score except for reads without a poly(A) tail whose candidates end at distinguishable
+places, where it tilts the read toward the candidates whose annotated 3' end it reaches.
+oarfish does this both in process and from RAD files. See
+[Mapping and quantification scores](/spearfish/concepts/scores/).
