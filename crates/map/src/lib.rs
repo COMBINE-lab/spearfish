@@ -101,6 +101,12 @@ pub struct TieBreak {
     /// antisense inside another's (antisense isoforms, a pseudogene in a host gene's intron),
     /// both orientations align equally well and the tail is the evidence of strand (0: off).
     pub orient_tail: i32,
+    /// With `orient_tail`: most read bases after a poly(A) tail that starts where the best
+    /// hit's transcript ends, for the orientation comparison. A cDNA read that kept its adapters
+    /// carries the RT primer and the sequencing adapter after its tail, more than the
+    /// [`TAIL_AFTER`] bases any A-run may have after it (`TAIL_AFTER` or less: that alone).
+    #[serde(default = "tail_after")]
+    pub orient_tail_after: u32,
     /// Both read orientations are tie-broken when the other's best chain scores within
     /// max(`margin_abs`, this × best) of the chosen one's. Wider than `margin_rel`: LCP parsing
     /// is not strand-symmetric, so the two orientations of a read draw different seeds, and
@@ -115,6 +121,30 @@ pub struct TieBreak {
     /// would follow those reads. With equal scores it follows the transcripts' other reads
     /// (and `orient_tail`).
     pub orient_same: bool,
+    /// With `orient_same`: such a pair is compared by exact local alignments of the whole read
+    /// (as [`TieBreak::orient_exact`] does) instead of being reported as tied. Under the chains
+    /// the two transcripts are one sequence, which scores the same against both read
+    /// orientations whatever the chains; the scores differ only by what the read holds beyond
+    /// that sequence: bases of one transcript's own (a short antisense isoform's first bases)
+    /// and how far each transcript reaches into the read's ends. Where the two are one
+    /// sequence under the whole read as well, both alignments score the same and are skipped.
+    /// The pair stands at the better of the two chain scores, whichever orientation leads.
+    #[serde(default)]
+    pub orient_same_exact: bool,
+    /// With `orient_same_exact`: a read end earns `end_bonus` in those alignments only where
+    /// both transcripts have sequence up to it (as `end_bonus_cut` within an orientation).
+    /// Where a read ends at one transcript's end and the other goes on, the other could reach
+    /// the read's end only through a junk base or two aligned into its continuation, which is
+    /// no evidence for it.
+    #[serde(default)]
+    pub orient_same_end_cut: bool,
+    /// Apply `orient_same_exact` and `orient_tail_after` to the read orientation through the
+    /// quantification score only. The mapping score, the orientation, the reported hits and
+    /// their ranks are then decided as without the two; each hit's quantification score is
+    /// moved by what the two would have moved its mapping score. A quantifier weighs the read
+    /// by that evidence, while every mapping decision stays as it was.
+    #[serde(default)]
+    pub orient_quant: bool,
     /// Near-tied orientations whose clipped alignments leave a lead of at most this many
     /// points are compared again by exact local alignment: every diagonal within
     /// [`ORIENT_EXACT_BAND`] (and a twentieth of the read) of each chain's, so the chain only
@@ -153,7 +183,34 @@ pub struct TieBreak {
     /// candidate's flank) is no evidence for the longer one.
     #[serde(default)]
     pub end_bonus_cut: bool,
+    /// Quantification score only: points added to the hits whose annotated 3' end the read's
+    /// right end reaches, for a read without a poly(A) tail in either orientation (0: off).
+    /// The mapping score, the best set and the orientation are unchanged; the adjustment is
+    /// reported next to the score ([`ReadResult::end_fit`]) for a quantifier's weights. See
+    /// `Mapper::end_fit`.
+    #[serde(default)]
+    pub end_fit: f32,
+    /// With `end_fit`: the measurement error of where a read ends on a transcript, in parsed
+    /// bases. A hit fits its 3' end if its right-end alignment stops within this many bases of
+    /// it and reaches as far into the read as the other candidates' do, within as many;
+    /// candidates whose annotated ends lie within it of each other get no relative adjustment.
+    #[serde(default)]
+    pub end_fit_tol: u32,
+    /// With `end_fit`: measure where the read ends on each candidate from its chain instead of
+    /// aligning the read's right flank: the read is taken to go on along the transcript from
+    /// the last anchor, base for base, to the read's end or the transcript's, whichever comes
+    /// first. No alignment is run for the end fit, which presets that do not extend spans would
+    /// otherwise run for it alone. Candidates whose spans were extended are measured from
+    /// their extension's alignment either way.
+    #[serde(default)]
+    pub end_fit_chain: bool,
 }
+
+/// Default [`TieBreak::end_fit`] in score points (2 points weigh a factor e at a score
+/// denominator of 2).
+pub const END_FIT: f32 = 5.0;
+/// Default [`TieBreak::end_fit_tol`] in parsed bases.
+pub const END_FIT_TOL: u32 = 4;
 
 impl TieBreak {
     /// Transcript bases searched for an unanchored read end of `x` bases: `x + pad + x / pad_div`.
@@ -189,8 +246,12 @@ impl Default for TieBreak {
             tail_trim: true,
             tail_run: 15,
             orient_tail: 30,
+            orient_tail_after: 120,
             orient_margin_rel: 0.35,
             orient_same: true,
+            orient_same_exact: true,
+            orient_same_end_cut: true,
+            orient_quant: true,
             orient_exact: 150.0,
             raw_mid: true,
             mid_inset: 8,
@@ -198,6 +259,9 @@ impl Default for TieBreak {
             tail_templated: true,
             flank_min: 0,
             end_bonus_cut: true,
+            end_fit: END_FIT,
+            end_fit_tol: END_FIT_TOL,
+            end_fit_chain: false,
         }
     }
 }
@@ -363,7 +427,14 @@ pub struct Ends {
 /// End extensions of one read, keyed by (left side, reverse, read position): the transcript
 /// flank prefix each extension read, whether that was the whole flank, and the read and
 /// transcript bases it covers.
-type EndCache = rustc_hash::FxHashMap<(bool, bool, u32), Vec<(Vec<u8>, bool, (u32, u32))>>;
+type EndCache = rustc_hash::FxHashMap<(bool, bool, u32), Vec<(Flank, bool, (u32, u32))>>;
+
+/// The transcript flank prefix an end extension read: decoded (left ends, read backwards), or
+/// where it lies in a transcript (right ends: transcript, start, length), compared packed.
+enum Flank {
+    Codes(Vec<u8>),
+    Tx(u32, u32, u32),
+}
 
 impl Default for Ends {
     fn default() -> Self {
@@ -443,6 +514,11 @@ pub struct ReadResult {
     /// With HPC, the read's homopolymer runs, forward orientation: parsed query positions to
     /// raw ones (`to_raw`; its `seq` is not kept).
     pub hpc: Option<lcp_core::hpc::Hpc>,
+    /// Adjustment of each hit's quantification score, in the order of `hits`: the end fit
+    /// ([`TieBreak::end_fit`]) and the orientation evidence kept out of the mapping score
+    /// ([`TieBreak::orient_quant`]); empty if no hit is adjusted. A hit's quantification
+    /// score is its mapping score plus this.
+    pub end_fit: Vec<f32>,
 }
 
 pub struct Mapper<C: Chainer> {
@@ -565,6 +641,42 @@ struct Strand {
     codes: std::cell::OnceCell<Vec<u8>>,
     raw: Option<RawRead>,
     seeds: Vec<seeds::Seed>,
+}
+
+/// Orders a read's two orientations by `lead`, the first's over the second's in score points:
+/// the one it favours comes first (`reverse` follows it), and the other's hits are shifted so
+/// that its best lies `|lead|` below the first's best. With `level` the first's hits are first
+/// raised so that its best is at least that.
+fn rank_orientations(st: &mut Strand, other: &mut Strand, reverse: &mut bool, lead: f32, level: Option<f32>) {
+    if lead < 0.0 {
+        std::mem::swap(st, other);
+        *reverse = !*reverse;
+    }
+    if let Some(level) = level
+        && st.hits[0].score < level
+    {
+        let up = level - st.hits[0].score;
+        st.hits.iter_mut().for_each(|h| h.score += up);
+    }
+    let target = st.hits[0].score - lead.abs();
+    let shift = target - other.hits[0].score;
+    for h in &mut other.hits {
+        h.score += shift;
+        h.reverse = !*reverse;
+    }
+}
+
+/// The best scores `rank_orientations` leaves the two orientations, in the order given, from
+/// their best scores `tops` before it.
+fn ranked_tops(tops: (f32, f32), lead: f32, level: Option<f32>) -> (f32, f32) {
+    let up = |s: f32| level.map_or(s, |l| s.max(l));
+    if lead < 0.0 {
+        let b = up(tops.1);
+        (b - lead.abs(), b)
+    } else {
+        let a = up(tops.0);
+        (a, a - lead.abs())
+    }
 }
 
 /// A strand's `codes`, made from its `seq` on first use (a function of the two fields rather
@@ -826,13 +938,21 @@ impl<C: Chainer> Mapper<C> {
     /// opposite strands (antisense transcripts sharing sequence): each transcript's bases
     /// under the read span of both chains occur reverse-complemented in the other's padded
     /// region. Compared in raw bases where the index has them.
-    fn same_antisense(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit) -> bool {
-        // A hit's transcript interval projected to the read span of both chains, with `pad`
-        // more bases on each side.
+    /// With `whole`, the transcripts are compared projected to the whole read instead of the
+    /// chains' span: the read then scores the same against both, as far as its alignments stay
+    /// within the projections.
+    fn same_antisense(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit, whole: bool) -> bool {
+        // A hit's transcript interval projected to the read span of both chains (or the whole
+        // read), with `pad` more bases on each side.
         let region = |h: &TxHit, o: &TxHit, pad: u32| {
             let tlen = self.idx.tx_plen()[h.tx as usize];
-            let lo = h.qstart.min(plen.saturating_sub(o.qend));
-            let hi = h.qend.max(plen.saturating_sub(o.qstart));
+            let (lo, hi) = match whole {
+                true => (0, plen),
+                false => (
+                    h.qstart.min(plen.saturating_sub(o.qend)),
+                    h.qend.max(plen.saturating_sub(o.qstart)),
+                ),
+            };
             (
                 h.tstart.saturating_sub(h.qstart - lo + pad),
                 (h.tend + (hi - h.qend) + pad).min(tlen),
@@ -858,6 +978,101 @@ impl<C: Chainer> Mapper<C> {
             !needle.is_empty() && text.windows(needle.len()).any(|w| w == &needle[..])
         };
         within(a, b) && within(b, a)
+    }
+
+    /// Whether a read orientation ends in a poly(A) tail, for the orientation comparison: an
+    /// A-run followed by at most [`TAIL_AFTER`] read bases, or by at most
+    /// [`TieBreak::orient_tail_after`] where the A-run starts at the end of the best hit's
+    /// transcript (projected through the hit's last anchor). A cDNA read that kept its
+    /// adapters carries the RT primer and the sequencing adapter after its tail, more than
+    /// `TAIL_AFTER`; an A-run that far from the read's end that the transcript goes on past is
+    /// the transcript's own sequence.
+    fn orient_tailed(&self, tb: &TieBreak, s: &Strand, after: u32) -> bool {
+        // Without HPC the parsed read is the raw read.
+        let (codes, raw) = match &s.raw {
+            Some(r) => (&r.codes[..], Some(r)),
+            None if !self.seeder.hpc => (strand_codes(&s.codes, &s.seq), None),
+            None => return false,
+        };
+        let a = lcp_core::encode::CODE[b'A' as usize] & 3;
+        let w0 = codes.len().saturating_sub(TAIL_WINDOW);
+        if tail_start_within(&codes[w0..], a, tb.tail_run, TAIL_AFTER).is_some() {
+            return true;
+        }
+        let after = after as usize;
+        let (Some(h), true) = (s.hits.first(), after > TAIL_AFTER) else {
+            return false;
+        };
+        let Some((c, _)) = tail_start_within(&codes[w0..], a, tb.tail_run, after) else {
+            return false;
+        };
+        let (rq, rt, tlen) = match raw {
+            Some(r) => match self.idx.tx_raw_pos(h.tx, h.tend) {
+                Some(rt) => (
+                    r.pos(h.qend),
+                    rt as usize,
+                    self.idx.tx_len()[h.tx as usize] as usize,
+                ),
+                None => return false,
+            },
+            None => (
+                h.qend as usize,
+                h.tend as usize,
+                self.idx.tx_plen()[h.tx as usize] as usize,
+            ),
+        };
+        let delta = (w0 + c) as i64 - rq as i64;
+        let tol = (TAIL_TOL + delta.max(0) as usize / 10) as i64;
+        rt as i64 + delta + tol >= tlen as i64
+    }
+
+    /// A mirrored pair's lead in alignment points (`TieBreak::orient_same_exact`): the exact
+    /// local alignment of the whole read in orientation `a` against its best hit, less that of
+    /// orientation `b` against its own. Each orientation is `(strand, parsed codes)`, and both
+    /// best hits are one sequence under the chains, so the difference is what the read holds
+    /// beyond it. `None` where the hits are one sequence under the whole read too: the two
+    /// alignments then score the same.
+    fn mirror_exact(
+        &self,
+        tb: &TieBreak,
+        plen: u32,
+        a: (&Strand, &[u8]),
+        b: (&Strand, &[u8]),
+    ) -> Option<i32> {
+        let sc = tb.affine.as_ref()?;
+        let (ha, hb) = (a.0.hits.first()?, b.0.hits.first()?);
+        if self.same_antisense(tb, plen, ha, hb, true) {
+            return None;
+        }
+        let w = ORIENT_EXACT_BAND + plen / 20;
+        let (ba, bb) = self.mirror_end_bonus(tb, plen, ha, hb);
+        let xa = self.local_exact(tb, sc, a.1, a.0.raw.as_ref(), ha, w, ba);
+        let xb = self.local_exact(tb, sc, b.1, b.0.raw.as_ref(), hb, w, bb);
+        Some(xa - xb)
+    }
+
+    /// The end bonuses (read start, read end) of a mirrored pair's two alignments, `a`'s and
+    /// `b`'s. `a`'s read start is `b`'s read end and the other way round. With
+    /// `TieBreak::orient_same_end_cut` a read end earns the bonus only where both transcripts,
+    /// projected through their hits, reach it; otherwise every read end can.
+    fn mirror_end_bonus(&self, tb: &TieBreak, plen: u32, a: &TxHit, b: &TxHit) -> ((i32, i32), (i32, i32)) {
+        if !tb.orient_same_end_cut {
+            let both = (tb.end_bonus, tb.end_bonus);
+            return (both, both);
+        }
+        let p = i64::from(plen);
+        let tlen = |h: &TxHit| i64::from(self.idx.tx_plen()[h.tx as usize]);
+        // Transcript bases before the hit's read start, and after its read end, beyond the
+        // read bases there.
+        let before = |h: &TxHit| i64::from(h.tstart) - i64::from(h.qstart);
+        let after = |h: &TxHit| (tlen(h) - i64::from(h.tend)) - (p - i64::from(h.qend));
+        let at_a_start = before(a) >= 0 && after(b) >= 0;
+        let at_a_end = after(a) >= 0 && before(b) >= 0;
+        let bonus = |reached: bool| if reached { tb.end_bonus } else { 0 };
+        (
+            (bonus(at_a_start), bonus(at_a_end)),
+            (bonus(at_a_end), bonus(at_a_start)),
+        )
     }
 
     /// A hit's transcript region projected to the ends of the read span `[lo, hi)`, padded.
@@ -962,9 +1177,11 @@ impl<C: Chainer> Mapper<C> {
         mid + left + right
     }
 
-    /// Local affine score of the whole read (ends free to clip, a bonus per read end reached)
-    /// against one hit's transcript, over every diagonal within `w` of the chain's: the chain
-    /// only places the search, it forces nothing into the alignment.
+    /// Local affine score of the whole read (ends free to clip, `bonus.0` for reaching the
+    /// read's start and `bonus.1` for its end) against one hit's transcript, over every
+    /// diagonal within `w` of the chain's: the chain only places the search, it forces nothing
+    /// into the alignment.
+    #[allow(clippy::too_many_arguments)]
     fn local_exact(
         &self,
         tb: &TieBreak,
@@ -973,6 +1190,7 @@ impl<C: Chainer> Mapper<C> {
         raw: Option<&RawRead>,
         h: &TxHit,
         w: u32,
+        bonus: (i32, i32),
     ) -> i32 {
         let plen = codes.len() as u32;
         let tlen = self.idx.tx_plen()[h.tx as usize];
@@ -1008,7 +1226,7 @@ impl<C: Chainer> Mapper<C> {
             d.iter().min().unwrap() - i64::from(w),
             d.iter().max().unwrap() + i64::from(w),
         );
-        align::local_band(read, &text, sc, dlo, dhi, tb.end_bonus)
+        align::local_band_ends(read, &text, sc, dlo, dhi, bonus)
     }
 
     /// Whole-read infix distance against one hit's region, capped: `k + 1` if above `k`.
@@ -1800,50 +2018,99 @@ impl<C: Chainer> Mapper<C> {
     /// through the bases it read (and, if it read them all, the flank's length), so isoforms
     /// whose flanks agree there share it; `seen` holds the read's extensions.
     fn extend_ends(&self, e: &Ends, codes: &[u8], h: &mut TxHit, seen: &mut EndCache) {
-        let plen = codes.len() as u32;
-        let tlen = self.idx.tx_plen()[h.tx as usize];
         let window = |x: u32| x + e.pad + x / e.pad_div;
-        let mut ext = |left: bool, q: u32, read: &[u8], text: Vec<u8>| -> (u32, u32) {
-            stats::add(&stats::SPAN_ENDS, 1);
-            let done = seen.entry((left, h.reverse, q)).or_default();
-            let hit = done
-                .iter()
-                .find(|(p, all, _)| text.starts_with(p) && (!*all || text.len() == p.len()));
-            if let Some((_, _, r)) = hit {
-                return *r;
-            }
-            let (m, w) = (read.len() as u64, window(read.len() as u32) as usize);
-            stats::add(&stats::SPAN_END_CALLS, 1);
-            stats::add(&stats::SPAN_END_CELLS, m * (2 * e.band as u64 + w as u64 - m + 1));
-            let w0 = align::dp_work();
-            let (_, qi, tj, used) =
-                align::affine_extend_window(read, &text, w, &e.sc, e.band, e.end_bonus, e.xdrop);
-            if stats::on() {
-                let w1 = align::dp_work();
-                stats::add(&stats::DP_SPAN_CELLS, w1.0 - w0.0);
-                stats::add(&stats::DP_SPAN_ROWS, w1.1 - w0.1);
-            }
-            let r = (qi as u32, tj as u32);
-            done.push((text[..used].to_vec(), used == text.len(), r));
-            r
-        };
         if h.qstart > 0 && h.tstart > 0 {
             let lo = h.tstart.saturating_sub(window(h.qstart));
             let mut text = self.idx.tx_codes(h.tx, lo, h.tstart);
             text.reverse();
             let read: Vec<u8> = codes[..h.qstart as usize].iter().rev().copied().collect();
-            let (qi, tj) = ext(true, h.qstart, &read, text);
+            let (qi, tj) = Self::extend_one(e, seen, (true, h.reverse, h.qstart), &read, text);
             h.qstart -= qi;
             h.tstart -= tj;
         }
+        (h.qend, h.tend) = self.right_reach(e, codes, h, seen);
+    }
+
+    /// Whether [`Self::right_reach`] of `h` aligns (rather than returning `h`'s own end, or
+    /// its span extension's).
+    fn right_aligns(&self, codes_len: u32, h: &TxHit) -> bool {
+        !h.extended && codes_len > h.qend && h.tend < self.idx.tx_plen()[h.tx as usize]
+    }
+
+    /// Where `h`'s span extension over the read's right flank ends: the read and transcript
+    /// positions of its last aligned base (as [`Self::extend_ends`] extends the right end).
+    fn right_reach(&self, e: &Ends, codes: &[u8], h: &TxHit, seen: &mut EndCache) -> (u32, u32) {
+        let plen = codes.len() as u32;
+        let tlen = self.idx.tx_plen()[h.tx as usize];
         let rest = plen - h.qend;
         if rest > 0 && h.tend < tlen {
-            let hi = (h.tend + window(rest)).min(tlen);
+            stats::add(&stats::SPAN_ENDS, 1);
+            let hi = (h.tend + rest + e.pad + rest / e.pad_div).min(tlen);
+            let len = hi - h.tend;
+            // The flank is compared packed with those of earlier extensions from the same read
+            // position, and decoded only if none read a prefix of it.
+            let done = seen.entry((false, h.reverse, h.qend)).or_default();
+            let hit = done.iter().find(|(p, all, _)| match *p {
+                Flank::Tx(t, lo, used) => {
+                    used <= len && (!*all || len == used) && self.idx.tx_codes_eq(h.tx, h.tend, t, lo, used)
+                }
+                Flank::Codes(_) => false,
+            });
+            if let Some((_, _, (qi, tj))) = hit {
+                return (h.qend + qi, h.tend + tj);
+            }
             let text = self.idx.tx_codes(h.tx, h.tend, hi);
-            let (qi, tj) = ext(false, h.qend, &codes[h.qend as usize..], text);
-            h.qend += qi;
-            h.tend += tj;
+            let (r, used) = Self::extend_dp(e, &codes[h.qend as usize..], &text);
+            done.push((Flank::Tx(h.tx, h.tend, used as u32), used == text.len(), r));
+            (h.qend + r.0, h.tend + r.1)
+        } else {
+            (h.qend, h.tend)
         }
+    }
+
+    /// One read-end extension of `read` into `text` (see [`Self::extend_ends`]), cached in
+    /// `seen` under `key` (left side, reverse, read position): the read and text bases it covers.
+    fn extend_one(
+        e: &Ends,
+        seen: &mut EndCache,
+        key: (bool, bool, u32),
+        read: &[u8],
+        text: Vec<u8>,
+    ) -> (u32, u32) {
+        stats::add(&stats::SPAN_ENDS, 1);
+        let done = seen.entry(key).or_default();
+        let hit = done.iter().find(|(p, all, _)| match p {
+            Flank::Codes(p) => text.starts_with(p) && (!*all || text.len() == p.len()),
+            Flank::Tx(..) => false,
+        });
+        if let Some((_, _, r)) = hit {
+            return *r;
+        }
+        let (r, used) = Self::extend_dp(e, read, &text);
+        let all = used == text.len();
+        let mut text = text;
+        text.truncate(used);
+        done.push((Flank::Codes(text), all, r));
+        r
+    }
+
+    /// The X-drop extension of `read` into `text` (a window of the read's length plus slack,
+    /// cut short at the transcript's end): the read and text bases it covers, and the text
+    /// bases it read.
+    fn extend_dp(e: &Ends, read: &[u8], text: &[u8]) -> ((u32, u32), usize) {
+        let window = |x: u32| x + e.pad + x / e.pad_div;
+        let (m, w) = (read.len() as u64, window(read.len() as u32) as usize);
+        stats::add(&stats::SPAN_END_CALLS, 1);
+        stats::add(&stats::SPAN_END_CELLS, m * (2 * e.band as u64 + w as u64 - m + 1));
+        let w0 = align::dp_work();
+        let (_, qi, tj, used) =
+            align::affine_extend_window(read, text, w, &e.sc, e.band, e.end_bonus, e.xdrop);
+        if stats::on() {
+            let w1 = align::dp_work();
+            stats::add(&stats::DP_SPAN_CELLS, w1.0 - w0.0);
+            stats::add(&stats::DP_SPAN_ROWS, w1.1 - w0.1);
+        }
+        ((qi as u32, tj as u32), used)
     }
 
     fn span_frac(h: Option<&TxHit>, plen: usize) -> f32 {
@@ -1884,10 +2151,14 @@ impl<C: Chainer> Mapper<C> {
         let tailed = match (&self.p.tail_first, self.p.strands) {
             (Some(t), Strands::Both) => {
                 let tail = |p: &(Vec<u8>, Option<RawRead>)| match &p.1 {
-                    Some(r) => ends_in_tail(&r.codes, t.run),
+                    Some(r) => ends_in_tail(&r.codes, t.run, TAIL_AFTER),
                     // Without HPC the parsed read is the raw read.
                     None if self.seeder.hpc => false,
-                    None => ends_in_tail(&codes(&p.0[p.0.len().saturating_sub(TAIL_WINDOW)..]), t.run),
+                    None => ends_in_tail(
+                        &codes(&p.0[p.0.len().saturating_sub(TAIL_WINDOW)..]),
+                        t.run,
+                        TAIL_AFTER,
+                    ),
                 };
                 match (tail(&pf), tail(&pr)) {
                     (true, false) => Some((false, t.span)),
@@ -2179,9 +2450,14 @@ impl<C: Chainer> Mapper<C> {
                 rescued,
                 low_score: true,
                 hpc: if reverse { other.raw } else { st.raw }.map(|r| r.hpc),
+                end_fit: Vec::new(),
             };
         }
         let mut both = false;
+        // With `TieBreak::orient_quant`: the orientation (`reverse`) that came first, and what
+        // the orientation rules it leaves out of the mapping score add to the quantification
+        // scores of that orientation's hits and of the other's.
+        let mut orient_q = None;
         if let Some(tb) = &self.p.tiebreak {
             let margin = |s: f32| tb.margin_abs.max(tb.orient_margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
@@ -2191,7 +2467,7 @@ impl<C: Chainer> Mapper<C> {
             // The two best hits are one sequence on opposite strands: the read fits both
             // equally, however far apart seed luck leaves the two chains.
             let same = |a: &Strand, b: &Strand| match (a.hits.first(), b.hits.first()) {
-                (Some(a), Some(b)) => self.same_antisense(tb, plen, a, b),
+                (Some(a), Some(b)) => self.same_antisense(tb, plen, a, b, false),
                 _ => false,
             };
             let mut mirror = tb.orient_same && same(&st, &other);
@@ -2232,47 +2508,72 @@ impl<C: Chainer> Mapper<C> {
                     }
                 };
                 // This orientation's lead over the other, in score points: alignment, then the
-                // poly(A) tail where one orientation shows it and the other doesn't.
-                let mut lead = unit * (cb - ca) as f32;
-                if tb.orient_tail > 0 {
-                    // Without HPC the parsed read is the raw read.
-                    let tailed = |s: &Strand| match &s.raw {
-                        Some(r) => ends_in_tail(&r.codes, tb.tail_run),
-                        None => !self.seeder.hpc && ends_in_tail(strand_codes(&s.codes, &s.seq), tb.tail_run),
-                    };
-                    lead += tb.orient_tail as f32
-                        * (f32::from(u8::from(tailed(&st))) - f32::from(u8::from(tailed(&other))));
-                }
+                // poly(A) tail where one orientation shows it and the other doesn't. `lead`
+                // takes a tail limit (`TieBreak::orient_tail_after`, or `TAIL_AFTER` as
+                // before it) and whether a mirrored pair is compared (`orient_same_exact`).
+                let aligned = unit * (cb - ca) as f32;
+                let tail = |after: u32| {
+                    if tb.orient_tail == 0 {
+                        return 0.0;
+                    }
+                    let tailed = |s: &Strand| f32::from(u8::from(self.orient_tailed(tb, s, after)));
+                    tb.orient_tail as f32 * (tailed(&st) - tailed(&other))
+                };
+                // One sequence on opposite strands: exact local alignments of the whole read
+                // tell the pair apart by what lies beyond it (`TieBreak::orient_same_exact`).
+                let same_x = (mirror && tb.orient_same_exact)
+                    .then(|| self.mirror_exact(tb, plen, (&st, qa), (&other, qb)))
+                    .flatten();
                 // A close call is decided by exact local alignments instead of the clipped
-                // ones (`TieBreak::orient_exact`); the tail term stands.
-                if let Some(sc) = &tb.affine
-                    && !mirror
-                    && tb.orient_clipped
-                    && tb.orient_exact > 0.0
-                    && lead.abs() <= tb.orient_exact
-                {
-                    let w = ORIENT_EXACT_BAND + plen / 20;
-                    let tail = lead - unit * (cb - ca) as f32;
-                    let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w);
-                    let xb = self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w);
-                    lead = unit * (xa - xb) as f32 + tail;
-                }
-                if lead < 0.0 {
-                    std::mem::swap(&mut st, &mut other);
-                    reverse = !reverse;
-                }
-                let target = st.hits[0].score - lead.abs();
-                let shift = target - other.hits[0].score;
-                for h in &mut other.hits {
-                    h.score += shift;
-                    h.reverse = !reverse;
+                // ones (`TieBreak::orient_exact`); the tail term stands. Aligned once, for
+                // either lead that asks.
+                let mut exact = None;
+                let mut lead = |after: u32, same: bool| {
+                    let t = tail(after);
+                    let mut lead = aligned + t;
+                    if same && let Some(x) = same_x {
+                        lead += tb.lambda * x as f32;
+                    }
+                    if let Some(sc) = &tb.affine
+                        && !mirror
+                        && tb.orient_clipped
+                        && tb.orient_exact > 0.0
+                        && lead.abs() <= tb.orient_exact
+                    {
+                        let x = *exact.get_or_insert_with(|| {
+                            let w = ORIENT_EXACT_BAND + plen / 20;
+                            let both = (tb.end_bonus, tb.end_bonus);
+                            let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w, both);
+                            let xb =
+                                self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w, both);
+                            xa - xb
+                        });
+                        lead = unit * x as f32 + t;
+                    }
+                    lead
+                };
+                let full = lead(tb.orient_tail_after, true);
+                // One sequence scores the same whichever orientation's chain found it: the pair
+                // stands at the better chain's score, not at the one seed luck left lower.
+                let tops = (st.hits[0].score, other.hits[0].score);
+                let level = (mirror && tb.orient_same_exact).then(|| tops.0.max(tops.1));
+                if tb.orient_quant {
+                    // The mapping decision as without the two rules; the quantification
+                    // score takes the difference they make to each orientation's scores.
+                    let plain = lead(TAIL_AFTER as u32, false);
+                    let (a, b) = ranked_tops(tops, full, level);
+                    let (a0, b0) = ranked_tops(tops, plain, None);
+                    orient_q = Some((reverse, a - a0, b - b0));
+                    rank_orientations(&mut st, &mut other, &mut reverse, plain, None);
+                } else {
+                    rank_orientations(&mut st, &mut other, &mut reverse, full, level);
                 }
             }
         }
         for h in &mut st.hits {
             h.reverse = reverse;
         }
-        let mut hits = st.hits;
+        let mut hits = std::mem::take(&mut st.hits);
         if both {
             hits.append(&mut other.hits);
             sort_hits(&mut hits, salt);
@@ -2306,8 +2607,8 @@ impl<C: Chainer> Mapper<C> {
             low_coverage = ((top.qend - top.qstart) as f32) < self.p.pi_cov * plen as f32;
             hits.retain(|h| h.score >= floor);
         }
+        let mut seen = rustc_hash::FxHashMap::default();
         if let Some(e) = &self.p.ends {
-            let mut seen = rustc_hash::FxHashMap::default();
             let floor = hits.first().map_or(0.0, |t| t.score - e.within * t.score.abs());
             for h in hits.iter_mut().filter(|h| h.score >= floor) {
                 // The other orientation's hits are reported only if both were tie-broken.
@@ -2320,6 +2621,23 @@ impl<C: Chainer> Mapper<C> {
                 h.extended = true;
             }
         }
+        // The quantification score's end fit: after everything that decides the hits and
+        // their scores, which it leaves as they are.
+        let mut end_fit = match &self.p.tiebreak {
+            Some(tb) if tb.end_fit > 0.0 && hits.len() >= 2 => {
+                self.end_fit(tb, &hits, reverse, (&st, &other), &mut seen)
+            }
+            _ => Vec::new(),
+        };
+        if let Some((first, a, b)) = orient_q
+            && (a != 0.0 || b != 0.0)
+            && !hits.is_empty()
+        {
+            end_fit.resize(hits.len(), 0.0);
+            for (q, h) in end_fit.iter_mut().zip(&hits) {
+                *q += if h.reverse == first { a } else { b };
+            }
+        }
         ReadResult {
             len: raw.len() as u32,
             plen,
@@ -2330,7 +2648,230 @@ impl<C: Chainer> Mapper<C> {
             low_score,
             // `st` is the orientation `reverse` names (swapped together), `other` the opposite.
             hpc: if reverse { other.raw } else { st.raw }.map(|r| r.hpc),
+            end_fit,
         }
+    }
+
+    /// End-fit adjustments of the quantification scores of `hits` (reported, best first;
+    /// `reverse`: the orientation of `st`, the first of `strands`), or none.
+    ///
+    /// Without a poly(A) tail a read carries no strand or 3'-end evidence in its mapping
+    /// score, and isoforms that differ only in where they end tie there. Where the read ends on
+    /// each candidate is measured from its right-end alignment (the span extension's, run here
+    /// for candidates not extended, unless its result cannot change the outcome; with
+    /// [`TieBreak::end_fit_chain`], the chain's gapless continuation to the read's end instead):
+    /// `q`, the read position of its last aligned base, and `d`, the transcript bases left from
+    /// there to the candidate's annotated 3' end. A
+    /// candidate fits if `d` is at most `end_fit_tol` and its alignment reaches as far into
+    /// the read (in its own orientation) as the farthest-reaching candidate's, within
+    /// `end_fit_tol`: a shorter isoform that ends inside the read does not fit.
+    ///
+    /// Each candidate's annotated end is placed on the read, relative to that orientation's
+    /// read end (`q + d` minus the farthest `q`); ends within `end_fit_tol` of a fitting
+    /// candidate's are not told apart from it and gain as it does (transitively). The
+    /// candidates are the hits within the tie-break margin of the best, of either orientation,
+    /// so near-tied orientations are weighed by which one's transcript ends where the read
+    /// does. Nothing is adjusted if the read has a tail in either orientation (the tail is
+    /// in the mapping score), if no candidate fits, or if every candidate gains.
+    fn end_fit(
+        &self,
+        tb: &TieBreak,
+        hits: &[TxHit],
+        reverse: bool,
+        (st, other): (&Strand, &Strand),
+        seen: &mut EndCache,
+    ) -> Vec<f32> {
+        let best = hits[0].score;
+        let margin = tb.margin_abs.max(tb.margin_rel * best.abs());
+        let n = hits
+            .iter()
+            .take(tb.max_cands)
+            .take_while(|h| h.score >= best - margin)
+            .count();
+        if n < 2 {
+            return Vec::new();
+        }
+        let tol = tb.end_fit_tol;
+        let e = self.p.ends.clone().unwrap_or_else(|| Ends {
+            sc: tb.affine.unwrap_or(align::Affine::ONT),
+            ..Default::default()
+        });
+        let plen = st.seq.len() as u32;
+        let tlen = |h: &TxHit| self.idx.tx_plen()[h.tx as usize];
+        // Only a candidate whose 3' end lies within reach of its right-end extension can fit.
+        let reachable = |h: &TxHit| {
+            let rest = plen.saturating_sub(h.qend);
+            tlen(h) - h.tend <= rest + e.pad + rest / e.pad_div + tol
+        };
+        if !hits[..n].iter().any(reachable) {
+            return Vec::new();
+        }
+        // Without HPC the parsed read is the raw read; an orientation that was not mapped has
+        // no sequence.
+        let tailed = |s: &Strand| match &s.raw {
+            Some(r) => ends_in_tail(&r.codes, tb.tail_run, TAIL_AFTER),
+            None => {
+                !self.seeder.hpc
+                    && !s.seq.is_empty()
+                    && ends_in_tail(strand_codes(&s.codes, &s.seq), tb.tail_run, TAIL_AFTER)
+            }
+        };
+        if tailed(st) || tailed(other) {
+            return Vec::new();
+        }
+        let side = |h: &TxHit| usize::from(h.reverse != reverse);
+        let strand = |h: &TxHit| if side(h) == 0 { st } else { other };
+        let mut reach_of = |h: &TxHit| {
+            let s = strand(h);
+            if h.extended {
+                (h.qend, h.tend)
+            } else if tb.end_fit_chain {
+                let k = (s.seq.len() as u32).saturating_sub(h.qend).min(tlen(h) - h.tend);
+                (h.qend + k, h.tend + k)
+            } else {
+                self.right_reach(&e, strand_codes(&s.codes, &s.seq), h, seen)
+            }
+        };
+        // The reachable candidates first: if none of their alignments ends within the tolerance
+        // of its 3' end, none fits, and the others need no alignment. (Candidates without an
+        // alignment to run come along: they cost nothing; with `end_fit_chain`, none has one.)
+        let mut reach: Vec<Option<(u32, u32)>> = hits[..n]
+            .iter()
+            .map(|h| {
+                let slen = strand(h).seq.len() as u32;
+                (reachable(h) || tb.end_fit_chain || !self.right_aligns(slen, h)).then(|| reach_of(h))
+            })
+            .collect();
+        if !hits[..n]
+            .iter()
+            .zip(&reach)
+            .any(|(h, r)| r.is_some_and(|(_, t)| tlen(h) - t <= tol))
+        {
+            return Vec::new();
+        }
+        let tol = i64::from(tol);
+        // A candidate left is not reachable, so it cannot fit. Where its alignment can end is
+        // bounded by the band (`Ends::band` cells either side of the diagonals the window's
+        // slack spans): its read position `q` lies within `qend` + min(flank, window + band),
+        // and the read position of its annotated end, `q + d`, at least `qend` + the
+        // transcript bases left − min(window, band + slack). Such a candidate is aligned only
+        // if that bound lets it raise the farthest reach of its orientation, or lie within the
+        // tolerance of a gaining candidate's end; otherwise its alignment cannot change the
+        // outcome. (None: aligned anyway, e.g. if its own orientation's flank is longer.)
+        let bound: Vec<Option<(u32, i64)>> = hits[..n]
+            .iter()
+            .zip(&reach)
+            .map(|(h, r)| {
+                let rest = (strand(h).seq.len() as u32).checked_sub(h.qend)?;
+                let w = rest + e.pad + rest / e.pad_div;
+                let tl = tlen(h) - h.tend;
+                (r.is_none() && i64::from(tl) > i64::from(w) + tol).then(|| {
+                    let l = w.min(tl);
+                    let band = u32::try_from(e.band).unwrap_or(u32::MAX);
+                    let qub = h.qend + rest.min(l.saturating_add(band));
+                    let slack = i64::from(w - rest);
+                    let la = i64::from(h.qend) + i64::from(tl) - i64::from(l).min(i64::from(band) + slack);
+                    (qub, la)
+                })
+            })
+            .collect();
+        for (h, (r, b)) in hits[..n].iter().zip(reach.iter_mut().zip(&bound)) {
+            if r.is_none() && b.is_none() {
+                *r = Some(reach_of(h));
+            }
+        }
+        let gain = loop {
+            let (mut far, mut known, mut qhi) = ([0u32; 2], [false; 2], [0u32; 2]);
+            for ((h, r), b) in hits[..n].iter().zip(&reach).zip(&bound) {
+                match (r, b) {
+                    (Some((q, _)), _) => {
+                        far[side(h)] = far[side(h)].max(*q);
+                        known[side(h)] = true;
+                    }
+                    (None, Some((qub, _))) => qhi[side(h)] = qhi[side(h)].max(*qub),
+                    (None, None) => unreachable!("aligned above"),
+                }
+            }
+            // The farthest reach of an orientation with aligned candidates must be final.
+            let mut grew = false;
+            for ((h, r), b) in hits[..n].iter().zip(reach.iter_mut()).zip(&bound) {
+                if r.is_none() && known[side(h)] && b.is_some_and(|(qub, _)| qub > far[side(h)]) {
+                    *r = Some(reach_of(h));
+                    grew = true;
+                }
+            }
+            if grew {
+                continue;
+            }
+            // Bases from the last aligned base to the annotated end, and that end's place
+            // relative to the read's end, of the aligned candidates.
+            let (d, at): (Vec<i64>, Vec<i64>) = hits[..n]
+                .iter()
+                .zip(&reach)
+                .map(|(h, r)| {
+                    r.map_or((i64::MAX, i64::MAX), |(q, t)| {
+                        let d = i64::from(tlen(h)) - i64::from(t);
+                        (d, i64::from(q) + d - i64::from(far[side(h)]))
+                    })
+                })
+                .unzip();
+            let mut gain: Vec<bool> = (0..n)
+                .map(|i| {
+                    reach[i].is_some_and(|(q, _)| {
+                        d[i] <= tol && i64::from(q) + tol >= i64::from(far[side(&hits[i])])
+                    })
+                })
+                .collect();
+            if !gain.contains(&true) {
+                return Vec::new();
+            }
+            loop {
+                let mut grew = false;
+                for j in 0..n {
+                    if !gain[j]
+                        && reach[j].is_some()
+                        && (0..n).any(|i| gain[i] && (at[i] - at[j]).abs() <= tol)
+                    {
+                        gain[j] = true;
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            // A candidate not aligned gains only if its end can lie within the tolerance of a
+            // gaining one's.
+            let top = (0..n)
+                .filter(|&i| gain[i])
+                .map(|i| at[i])
+                .max()
+                .unwrap_or(i64::MIN);
+            for ((h, r), b) in hits[..n].iter().zip(reach.iter_mut()).zip(&bound) {
+                if let (None, Some((_, la))) = (&r, b) {
+                    let s = side(h);
+                    let lb = la - i64::from(if known[s] { far[s] } else { qhi[s] });
+                    if lb <= top + tol {
+                        *r = Some(reach_of(h));
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break gain;
+            }
+        };
+        if gain.iter().all(|&g| g) {
+            return Vec::new();
+        }
+        stats::add(&stats::END_FIT, 1);
+        let mut out = vec![0.0; hits.len()];
+        for (o, &g) in out.iter_mut().zip(&gain) {
+            if g {
+                *o = tb.end_fit;
+            }
+        }
+        out
     }
 }
 
@@ -2340,15 +2881,21 @@ pub const ORIENT_EXACT_BAND: u32 = 100;
 /// Bases between a transcript's 3' end and a read's tail start treated as the same end.
 const TAIL_TOL: usize = 15;
 /// Most read bases after a poly(A) tail (adapter and the like).
-const TAIL_AFTER: usize = 80;
+pub const TAIL_AFTER: usize = 80;
+
+/// Serde default of [`TieBreak::orient_tail_after`]: options recorded without it map as they
+/// did then.
+fn tail_after() -> u32 {
+    TAIL_AFTER as u32
+}
 /// Raw read bases searched for a poly(A) tail when comparing read orientations.
 const TAIL_WINDOW: usize = 200;
 
 /// Whether a raw read (2-bit codes) ends in a poly(A) tail: a `run`-base window of A's within its
-/// last `TAIL_WINDOW` bases, followed by at most `TAIL_AFTER` bases.
-fn ends_in_tail(codes: &[u8], run: usize) -> bool {
+/// last `TAIL_WINDOW` bases, followed by at most `after` bases.
+fn ends_in_tail(codes: &[u8], run: usize, after: usize) -> bool {
     let a = lcp_core::encode::CODE[b'A' as usize] & 3;
-    tail_start(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run).is_some()
+    tail_start_within(&codes[codes.len().saturating_sub(TAIL_WINDOW)..], a, run, after).is_some()
 }
 
 /// The first A-run of `text` (raw codes) starting in `[lo, hi]`: a window of `run` bases with at
@@ -2386,6 +2933,11 @@ fn own_run(text: &[u8], a: u8, run: usize, lo: usize, hi: usize) -> Option<(usiz
 /// the end of the A-run from there (the longest stretch ending in A with at most one other base
 /// per ten).
 fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
+    tail_start_within(rest, a, run, TAIL_AFTER)
+}
+
+/// [`tail_start`] with at most `after` read bases after the tail.
+fn tail_start_within(rest: &[u8], a: u8, run: usize, after: usize) -> Option<(usize, usize)> {
     let others = |w: &[u8]| w.iter().filter(|&&c| c != a).count();
     let (mut i, mut other) = (0, others(rest.get(..run)?));
     loop {
@@ -2398,7 +2950,7 @@ fn tail_start(rest: &[u8], a: u8, run: usize) -> Option<(usize, usize)> {
                     end = k + 1;
                 }
             }
-            if rest.len() - end <= TAIL_AFTER {
+            if rest.len() - end <= after {
                 return Some((s, end));
             }
             // A tail is followed only by adapter: an A-run with more of the read after it is
@@ -2829,21 +3381,30 @@ mod segmented_tests {
         let a = codes(b"A")[0];
         assert_eq!(tail_start(&codes(&read), a, 15).map(|t| t.0), Some(136));
         let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT";
-        assert!(ends_in_tail(&codes(&[&body[..], &read].concat()), 15));
+        assert!(ends_in_tail(&codes(&[&body[..], &read].concat()), 15, TAIL_AFTER));
     }
 
     #[test]
     fn only_a_poly_a_near_the_read_end_marks_its_orientation() {
         let body = b"ACGTCGATCGTACGATCGTCAGCTAGCTGACTGCATGCAT".repeat(10);
         let tail = [b"A".repeat(20), b"GTACTCTGCGTTGATACCACTGCTT".to_vec()].concat();
-        assert!(ends_in_tail(&codes(&[&body[..], &tail].concat()), 15));
+        assert!(ends_in_tail(&codes(&[&body[..], &tail].concat()), 15, TAIL_AFTER));
         // A tail at the read's start is the other orientation's 3' end.
-        assert!(!ends_in_tail(&codes(&[&tail[..], &body].concat()), 15));
-        // An A-run with more than `TAIL_AFTER` read bases after it is transcript sequence.
+        assert!(!ends_in_tail(
+            &codes(&[&tail[..], &body].concat()),
+            15,
+            TAIL_AFTER
+        ));
+        // An A-run with more than `after` read bases after it is transcript sequence.
         assert!(!ends_in_tail(
             &codes(&[&body[..], &tail, &body[..100]].concat()),
-            15
+            15,
+            120
         ));
+        // The orientation comparison accepts a longer adapter after the tail than the tie-break.
+        let long = [&body[..], &tail, &body[..60]].concat();
+        assert!(!ends_in_tail(&codes(&long), 15, TAIL_AFTER));
+        assert!(ends_in_tail(&codes(&long), 15, 120));
     }
 
     #[test]
@@ -2870,6 +3431,113 @@ mod segmented_tests {
             assert_eq!(off[0], off[1]);
             assert_eq!(on[0], off[0] - 10);
             assert_eq!(on[1], off[1]);
+        }
+    }
+
+    #[test]
+    fn end_fit_favours_the_isoform_whose_end_the_tailless_read_reaches() {
+        // A pseudo-random body; t0 ends with it, t1 continues 200 bases, t2 only 3.
+        let mut x = 7u64;
+        let mut base = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"ACGT"[(x >> 62) as usize]
+        };
+        let body: Vec<u8> = (0..300).map(|_| base()).collect();
+        let more: Vec<u8> = (0..200).map(|_| base()).collect();
+        let t1: Vec<u8> = [&body[..], &more].concat();
+        let t2: Vec<u8> = [&body[..], &more[..3]].concat();
+        let m = mapper(&[&body, &t1, &t2], false);
+        let tb = TieBreak::default();
+        // Hits of a read of `body[100..end]` (plus `tail`), aligned to `end` on each candidate.
+        let fit = |txs: &[u32], end: u32, tail: &[u8]| {
+            let read: Vec<u8> = [&body[100..end as usize], tail].concat();
+            let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &read);
+            let strand = |seq: Vec<u8>, raw| Strand {
+                hits: Vec::new(),
+                seq,
+                codes: Default::default(),
+                raw,
+                seeds: Vec::new(),
+            };
+            let rc = revcomp(&read);
+            let (st, other) = (strand(seq, raw), strand(rc, None));
+            let hits: Vec<TxHit> = txs
+                .iter()
+                .map(|&t| {
+                    let mut h = hit(t, 100.0, &[(0, 100, 40)]);
+                    (h.qend, h.tend, h.extended) = (end - 100, end, true);
+                    h
+                })
+                .collect();
+            m.end_fit(&tb, &hits, false, (&st, &other), &mut Default::default())
+        };
+        // The read stops at t0's end: t0 gains, t1 (200 bases on) does not.
+        assert_eq!(fit(&[0, 1], 300, b""), vec![tb.end_fit, 0.0]);
+        assert_eq!(fit(&[1, 0], 300, b""), vec![0.0, tb.end_fit]);
+        // A poly(A) tail is the mapping score's evidence: nothing here.
+        assert!(fit(&[0, 1], 300, &[b'A'; 30]).is_empty());
+        // The read stops inside both: neither fits.
+        assert!(fit(&[0, 1], 250, b"").is_empty());
+        // Ends 3 bases apart are within the measurement error: no relative adjustment, and t2
+        // keeps t1 apart from t0 by no more than it is itself.
+        assert!(fit(&[0, 2], 300, b"").is_empty());
+        assert_eq!(fit(&[0, 2, 1], 300, b""), vec![tb.end_fit, tb.end_fit, 0.0]);
+        // One candidate only: nothing to weigh.
+        assert!(fit(&[0], 300, b"").is_empty());
+    }
+
+    #[test]
+    fn end_fit_of_unextended_hits_by_alignment_and_by_chain() {
+        // As above: t0 ends with the body, t1 continues 200 bases, t2 only 3. The hits end at
+        // their last anchor, 40 bases before the read's end (which is t0's), so the end fit
+        // places their ends itself: t1's lies far past the read's end (no alignment needed to
+        // rule it out), t0's and t2's within reach.
+        let mut x = 7u64;
+        let mut base = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"ACGT"[(x >> 62) as usize]
+        };
+        let body: Vec<u8> = (0..300).map(|_| base()).collect();
+        let more: Vec<u8> = (0..200).map(|_| base()).collect();
+        let t1: Vec<u8> = [&body[..], &more].concat();
+        let t2: Vec<u8> = [&body[..], &more[..3]].concat();
+        let m = mapper(&[&body, &t1, &t2], false);
+        let fit = |txs: &[u32], end: u32, chain: bool| {
+            let tb = TieBreak {
+                end_fit_chain: chain,
+                ..Default::default()
+            };
+            let read: Vec<u8> = body[100..end as usize].to_vec();
+            let (seq, raw) = Mapper::<OracleChainer>::parse(&m.seeder, &read);
+            let strand = |seq: Vec<u8>, raw| Strand {
+                hits: Vec::new(),
+                seq,
+                codes: Default::default(),
+                raw,
+                seeds: Vec::new(),
+            };
+            let rc = revcomp(&read);
+            let (st, other) = (strand(seq, raw), strand(rc, None));
+            let hits: Vec<TxHit> = txs
+                .iter()
+                .map(|&t| {
+                    let mut h = hit(t, 100.0, &[(0, 100, 40)]);
+                    (h.qend, h.tend) = (end - 140, end - 40);
+                    h
+                })
+                .collect();
+            m.end_fit(&tb, &hits, false, (&st, &other), &mut Default::default())
+        };
+        for chain in [false, true] {
+            let g = TieBreak::default().end_fit;
+            assert_eq!(fit(&[0, 1], 300, chain), vec![g, 0.0]);
+            assert_eq!(fit(&[1, 0, 2], 300, chain), vec![0.0, g, g]);
+            // The read stops inside every candidate: none fits.
+            assert!(fit(&[0, 1], 250, chain).is_empty());
         }
     }
 
@@ -2936,6 +3604,187 @@ mod segmented_tests {
         let (off, on) = (cost(&longer, false), cost(&longer, true));
         assert!(on[1] < on[0]);
         assert_eq!(on[0] - on[1], off[0] - off[1] - i64::from(tb.end_bonus));
+    }
+
+    /// A deterministic sequence without long repeats (xorshift).
+    fn random_seq(n: usize, mut x: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x >> 33) as usize & 3]
+            })
+            .collect()
+    }
+
+    /// One read orientation with the given hits (the parsed read is the raw read, no HPC).
+    fn strand(seq: &[u8], hits: Vec<TxHit>) -> Strand {
+        Strand {
+            hits,
+            seq: seq.to_vec(),
+            codes: Default::default(),
+            raw: None,
+            seeds: Vec::new(),
+        }
+    }
+
+    /// The mirrored-pair comparison of read orientation `a` (codes `qa`) against `b`.
+    fn mirror(m: &Mapper<OracleChainer>, tb: &TieBreak, a: &Strand, b: &Strand) -> Option<i32> {
+        let (qa, qb) = (codes(&a.seq), codes(&b.seq));
+        m.mirror_exact(tb, qa.len() as u32, (a, &qa), (b, &qb))
+    }
+
+    #[test]
+    fn a_mirrored_pair_is_told_apart_by_what_lies_beyond_the_shared_sequence() {
+        // t1 is 8 bases of its own, then the reverse complement of t0[100..250): a short
+        // antisense isoform. A read of t1 fits both orientations equally under the chains.
+        let t0 = random_seq(300, 7);
+        let own: &[u8] = b"GTACCAAA";
+        let t1 = [own, &revcomp(&t0[100..250])].concat();
+        let m = mapper(&[&t0, &t1], false);
+        let tb = TieBreak::default();
+        let fwd = strand(&t1, vec![hit(1, 50., &[(8, 8, 150)])]);
+        let rev = strand(&revcomp(&t1), vec![hit(0, 50., &[(0, 100, 150)])]);
+        // Exact alignments of the whole read: t1's own bases decide, for t1.
+        let lead = mirror(&m, &tb, &fwd, &rev).unwrap();
+        let mat = tb.affine.as_ref().unwrap().mat;
+        assert!(lead > 0 && lead <= 8 * mat + tb.end_bonus, "{lead}");
+        // The comparison does not depend on which orientation is asked first.
+        assert_eq!(mirror(&m, &tb, &rev, &fwd), Some(-lead));
+        // Without the own bases the read is one sequence with both transcripts under its whole
+        // length: both alignments score the same, and they are skipped.
+        let read = revcomp(&t0[100..250]);
+        let fwd = strand(&read, vec![hit(1, 50., &[(0, 8, 150)])]);
+        let rev = strand(&revcomp(&read), vec![hit(0, 50., &[(0, 100, 150)])]);
+        assert_eq!(mirror(&m, &tb, &fwd, &rev), None);
+        let both = (tb.end_bonus, tb.end_bonus);
+        let sc = tb.affine.as_ref().unwrap();
+        let x = |s: &Strand| m.local_exact(&tb, sc, &codes(&s.seq), None, &s.hits[0], 100, both);
+        assert_eq!(x(&fwd), x(&rev));
+    }
+
+    #[test]
+    fn a_mirrored_pair_earns_the_end_bonus_only_where_both_transcripts_reach_the_read_end() {
+        // t1 is t0[100..250) reverse complemented, wholly inside t0. A read of t1 with one junk
+        // base after t1's 3' end reaches that end only in t0's orientation, through the junk
+        // base aligned as a mismatch into t0's continuation.
+        let mut t0 = random_seq(300, 11);
+        t0[99] = b'A';
+        let t1 = revcomp(&t0[100..250]);
+        let m = mapper(&[&t0, &t1], false);
+        let read = [&t1[..], b"C"].concat();
+        let fwd = strand(&read, vec![hit(1, 50., &[(0, 0, 150)])]);
+        let rev = strand(&revcomp(&read), vec![hit(0, 50., &[(1, 100, 150)])]);
+        let lead = |orient_same_end_cut| {
+            let tb = TieBreak {
+                orient_same_end_cut,
+                ..Default::default()
+            };
+            mirror(&m, &tb, &fwd, &rev).unwrap()
+        };
+        // Without the rule t0 wins by the end bonus less a mismatch.
+        let tb = TieBreak::default();
+        let mis = tb.affine.as_ref().unwrap().mis;
+        assert_eq!(lead(false), -(tb.end_bonus - mis));
+        // With it neither alignment earns a bonus at that read end: a tie.
+        assert_eq!(lead(true), 0);
+        // Where both transcripts reach both read ends, every read end earns it.
+        let (a, b) = (&fwd.hits[0], &rev.hits[0]);
+        let e = tb.end_bonus;
+        assert_eq!(m.mirror_end_bonus(&tb, 151, a, b), ((e, 0), (0, e)));
+        let (a, b) = (hit(1, 50., &[(0, 0, 150)]), hit(0, 50., &[(0, 100, 150)]));
+        assert_eq!(m.mirror_end_bonus(&tb, 150, &a, &b), ((e, e), (e, e)));
+    }
+
+    #[test]
+    fn a_long_adapter_after_the_tail_counts_only_at_the_transcript_end() {
+        // A cDNA read that kept its adapters: the tail, then 100 bases of primer and adapter.
+        let body = random_seq(400, 13);
+        let adapter = b"GTACTCTGCGTTGATCCCACTGCTT".repeat(4);
+        let read = [&body[..], &b"A".repeat(20), &adapter].concat();
+        let ends_at_tail = body.clone();
+        let goes_on = [&body[..], &random_seq(300, 17)].concat();
+        let m = mapper(&[&ends_at_tail, &goes_on], false);
+        let tailed = |tx: u32, orient_tail_after: u32, read: &[u8]| {
+            let tb = TieBreak::default();
+            m.orient_tailed(
+                &tb,
+                &strand(read, vec![hit(tx, 50., &[(0, 0, 400)])]),
+                orient_tail_after,
+            )
+        };
+        // The A-run starts at the hit transcript's 3' end: a tail, with up to 120 bases after.
+        assert!(tailed(0, 120, &read));
+        assert!(!tailed(0, TAIL_AFTER as u32, &read));
+        // Where the transcript goes on past it, an A-run that far from the read's end is not.
+        assert!(!tailed(1, 120, &read));
+        // With at most `TAIL_AFTER` bases after it, any A-run marks the tail, as before.
+        let short = [&body[..], &b"A".repeat(20), &adapter[..60]].concat();
+        assert!(tailed(1, 120, &short) && tailed(1, TAIL_AFTER as u32, &short));
+    }
+
+    #[test]
+    fn a_mirrored_pair_stands_at_the_better_chain_score() {
+        let hits = |tx: u32, scores: &[f32]| -> Vec<TxHit> {
+            scores.iter().map(|&s| hit(tx, s, &[(0, 0, 10)])).collect()
+        };
+        let rank = |lead: f32, level: Option<f32>| {
+            let mut st = strand(b"ACGT", hits(0, &[50., 48.]));
+            let mut other = strand(b"ACGT", hits(1, &[40., 35.]));
+            let mut reverse = false;
+            rank_orientations(&mut st, &mut other, &mut reverse, lead, level);
+            let sc = |s: &Strand| s.hits.iter().map(|h| (h.tx, h.score)).collect::<Vec<_>>();
+            // The other's hits are marked with the other orientation.
+            assert!(other.hits.iter().all(|h| h.reverse == !reverse));
+            (sc(&st), sc(&other), reverse)
+        };
+        // The alignments favour the orientation seed luck left 10 points lower, by 6: it comes
+        // first, at its own chain score or, for a mirrored pair, at the better one.
+        let (st, other, reverse) = rank(-6.0, None);
+        assert!(reverse);
+        assert_eq!(st, [(1, 40.), (1, 35.)]);
+        assert_eq!(other, [(0, 34.), (0, 32.)]);
+        let (st, other, _) = rank(-6.0, Some(50.));
+        assert_eq!(st, [(1, 50.), (1, 45.)]);
+        assert_eq!(other, [(0, 44.), (0, 42.)]);
+        // A lead for the first orientation keeps the order; the level is then its own.
+        let (st, other, reverse) = rank(3.0, Some(50.));
+        assert!(!reverse);
+        assert_eq!(st, [(0, 50.), (0, 48.)]);
+        assert_eq!(other, [(1, 47.), (1, 42.)]);
+    }
+
+    #[test]
+    fn the_quantification_score_takes_the_orientation_scores_the_rules_would_give() {
+        // `ranked_tops` gives each orientation the best score `rank_orientations` leaves it
+        // (in the order given), so the quantification score can carry what the orientation
+        // rules would move without moving the mapping scores.
+        for lead in [-31.0, -6.0, 0.0, 3.0, 30.0] {
+            for level in [None, Some(40.), Some(50.), Some(60.)] {
+                let mut st = strand(b"ACGT", vec![hit(0, 50., &[(0, 0, 10)])]);
+                let mut other = strand(b"ACGT", vec![hit(1, 40., &[(0, 0, 10)])]);
+                let mut reverse = false;
+                rank_orientations(&mut st, &mut other, &mut reverse, lead, level);
+                // `st` and `other` swap with the order; tx 0 is the first given.
+                let top = |tx: u32| [&st, &other].iter().find(|s| s.hits[0].tx == tx).unwrap().hits[0].score;
+                assert_eq!(
+                    ranked_tops((50., 40.), lead, level),
+                    (top(0), top(1)),
+                    "{lead} {level:?}"
+                );
+            }
+        }
+        // A mirrored pair the rules part by 16 points (own bases), against a tie: the leading
+        // orientation's quantification scores stay, the other's fall by the lead.
+        let (a, b) = ranked_tops((50., 46.), 16.0, Some(50.));
+        let (a0, b0) = ranked_tops((50., 46.), 0.0, None);
+        assert_eq!((a - a0, b - b0), (0.0, -16.0));
+        // The rules reverse the order (a tail after a long adapter, 30 points, against the
+        // other orientation's 6-point alignment lead).
+        let (a, b) = ranked_tops((50., 48.), -24.0, None);
+        let (a0, b0) = ranked_tops((50., 48.), 6.0, None);
+        assert_eq!((a - a0, b - b0), (-26.0, 4.0));
     }
 
     #[test]

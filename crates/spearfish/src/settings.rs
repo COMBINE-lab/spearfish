@@ -252,6 +252,10 @@ pub struct MapSettings {
     /// Near-tied read orientations: points for the one whose read ends in a poly(A) tail (0: off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_tail: Option<i32>,
+    /// With `orient_tail`: most read bases after a poly(A) tail that starts at the best hit's
+    /// transcript end (an A-run elsewhere may have at most 80 after it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_tail_after: Option<u32>,
     /// Relative margin within which both read orientations are tie-broken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_margin_rel: Option<f32>,
@@ -259,6 +263,18 @@ pub struct MapSettings {
     /// compared by exact local alignment around each chain (0: never).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_exact: Option<f32>,
+    /// Read orientations whose best hits are one sequence on opposite strands are compared by
+    /// exact local alignments of the whole read instead of being reported as tied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_same_exact: Option<bool>,
+    /// With `orient_same_exact`: a read end earns the end bonus in those alignments only where
+    /// both transcripts have sequence up to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_same_end_cut: Option<bool>,
+    /// `orient_same_exact` and `orient_tail_after` move only the quantification scores; the
+    /// mapping scores and the orientation are decided as without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_quant: Option<bool>,
     /// With `raw_ends`, also align the stretches between shared anchors in raw bases.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_mid: Option<bool>,
@@ -269,6 +285,21 @@ pub struct MapSettings {
     /// only for reaching the read's end within that shortest window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_bonus_cut: Option<bool>,
+    /// Quantification score: points for the hits whose annotated 3' end a read without a
+    /// poly(A) tail reaches, where its candidates end at distinguishable places (0: off). The
+    /// mapping score, best set and orientation do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_fit: Option<f32>,
+    /// With `end_fit`: how far (parsed bases) where a read ends may lie from an annotated 3'
+    /// end and still fit it; ends this close to each other are not told apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_fit_tol: Option<u32>,
+    /// With `end_fit`: measure where a read ends on each candidate from its chain (the read
+    /// taken to go on along the transcript from the last anchor without gaps) instead of by
+    /// aligning the read's right end. On in drna; `extend_ends` turning span extension on
+    /// turns it off unless it is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_fit_chain: Option<bool>,
 
     // Rescue.
     /// Re-seed reads that map poorly at a lower LCP level within their candidate genes.
@@ -409,11 +440,18 @@ impl MapSettings {
         "tail_run",
         "tail_bonus",
         "orient_tail",
+        "orient_tail_after",
         "orient_margin_rel",
         "orient_exact",
+        "orient_same_exact",
+        "orient_same_end_cut",
+        "orient_quant",
         "raw_mid",
         "tail_templated",
         "end_bonus_cut",
+        "end_fit",
+        "end_fit_tol",
+        "end_fit_chain",
         "rescue",
         "rescue_scheme",
         "rescue_genes",
@@ -463,11 +501,18 @@ impl MapSettings {
             tail_run,
             tail_bonus,
             orient_tail,
+            orient_tail_after,
             orient_margin_rel,
             orient_exact,
+            orient_same_exact,
+            orient_same_end_cut,
+            orient_quant,
             raw_mid,
             tail_templated,
             end_bonus_cut,
+            end_fit,
+            end_fit_tol,
+            end_fit_chain,
             end_diagonal,
         )
     }
@@ -632,11 +677,19 @@ impl MapSettings {
             set!(self.tail_run => tb.tail_run);
             set!(self.tail_bonus => tb.tail_bonus);
             set!(self.orient_tail => tb.orient_tail);
+            set!(self.orient_tail_after => tb.orient_tail_after);
             set!(self.orient_margin_rel => tb.orient_margin_rel);
             set!(self.orient_exact => tb.orient_exact);
+            set!(self.orient_same_exact => tb.orient_same_exact);
+            set!(self.orient_same_end_cut => tb.orient_same_end_cut);
+            set!(self.orient_quant => tb.orient_quant);
             set!(self.raw_mid => tb.raw_mid);
             set!(self.tail_templated => tb.tail_templated);
             set!(self.end_bonus_cut => tb.end_bonus_cut);
+            set!(self.end_fit => tb.end_fit);
+            set!(self.end_fit_tol => tb.end_fit_tol);
+            set!(self.end_fit_chain => tb.end_fit_chain);
+            ensure!(tb.end_fit >= 0.0, "end_fit must not be negative");
             ensure!(tb.orient_exact >= 0.0, "orient_exact must not be negative");
             ensure!(tb.pad_div >= 1, "pad_div must be at least 1");
             ensure!(tb.max_cands >= 1, "tie_cands must be at least 1");
@@ -716,6 +769,10 @@ impl MapSettings {
 
         if let Some(on) = self.extend_ends {
             o.set_extend_ends(on);
+            // Turning extension on turns the chain measurement off; a setting of it stands.
+            if let (Some(c), Some(tb)) = (self.end_fit_chain, o.params.tiebreak.as_mut()) {
+                tb.end_fit_chain = c;
+            }
         }
         match o.params.ends.as_mut() {
             Some(e) => {
@@ -777,6 +834,33 @@ mod tests {
             assert_eq!(MapSettings::preset(p).resolve().unwrap(), MapOptions::preset(p));
             assert_eq!(MapSettings::builder(p).build(), MapSettings::preset(p));
         }
+    }
+
+    #[test]
+    fn extension_measures_the_end_fit_by_alignment_unless_the_chain_is_set() {
+        let chain = |s: MapSettings| {
+            let o = s.resolve().unwrap();
+            o.params.tiebreak.as_ref().unwrap().end_fit_chain
+        };
+        let drna = || MapSettings::builder(Preset::Drna);
+        assert!(chain(drna().build()));
+        assert!(!chain(drna().extend_ends(true).build()));
+        assert!(chain(drna().extend_ends(true).end_fit_chain(true).build()));
+        assert!(!chain(drna().end_fit_chain(false).build()));
+        // Extension already on (the ont preset) leaves the setting as it is.
+        let ont = MapSettings::builder(Preset::Ont);
+        assert!(chain(ont.end_fit_chain(true).extend_ends(true).build()));
+        let mut o = MapOptions::preset(Preset::Drna);
+        o.extend_ends(Preset::Drna);
+        assert!(!o.params.tiebreak.as_ref().unwrap().end_fit_chain);
+        let o = drna().end_fit(2.5).end_fit_tol(6).resolve().unwrap();
+        let tb = o.params.tiebreak.as_ref().unwrap();
+        assert_eq!((tb.end_fit, tb.end_fit_tol), (2.5, 6));
+        assert!(o.quant_scores());
+        assert!(drna().end_fit(0.0).resolve().unwrap().quant_scores());
+        let off = drna().end_fit(0.0).orient_quant(false).resolve().unwrap();
+        assert!(!off.quant_scores());
+        assert!(drna().end_fit(-1.0).resolve().is_err());
     }
 
     #[test]
@@ -885,6 +969,43 @@ mod tests {
                 .resolve()
                 .is_err()
         );
+        // The comparison of antisense pairs that are one sequence under the read: on in every
+        // preset but the `-fast` ones, and each part switches off on its own.
+        for p in Preset::ALL {
+            let tb = MapOptions::preset(p).params.tiebreak.unwrap();
+            let on = !p.fast();
+            assert_eq!((tb.orient_same_exact, tb.orient_same_end_cut), (on, on));
+            assert_eq!(tb.orient_quant, on);
+            assert_eq!(tb.orient_tail_after, if on { 120 } else { 80 });
+            assert_eq!(MapOptions::preset(p).quant_scores(), on);
+        }
+        // Through the mapping score instead, and with nothing to route, no quantification
+        // score of their own.
+        let o = MapSettings::builder(Preset::Ont)
+            .orient_quant(false)
+            .resolve()
+            .unwrap();
+        assert!(!o.params.tiebreak.unwrap().orient_quant);
+        let o = MapSettings::builder(Preset::Ont)
+            .end_fit(0.0)
+            .orient_same_exact(false)
+            .orient_tail_after(80)
+            .resolve()
+            .unwrap();
+        assert!(o.params.tiebreak.as_ref().unwrap().orient_quant && !o.quant_scores());
+        let o = MapSettings::builder(Preset::Ont)
+            .orient_same_end_cut(false)
+            .orient_tail_after(80)
+            .resolve()
+            .unwrap();
+        let tb = o.params.tiebreak.unwrap();
+        assert!(tb.orient_same_exact && !tb.orient_same_end_cut);
+        assert_eq!(tb.orient_tail_after, 80);
+        let o = MapSettings::builder(Preset::Hifi)
+            .orient_same_exact(false)
+            .resolve()
+            .unwrap();
+        assert!(!o.params.tiebreak.unwrap().orient_same_exact);
         // The rescue's parts switch off one by one.
         let o = MapSettings::builder(Preset::Ont)
             .rescue_rechain(0.0)

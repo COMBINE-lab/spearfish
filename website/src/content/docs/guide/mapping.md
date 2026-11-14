@@ -44,6 +44,17 @@ within the shorter one, so a couple of unaligned bases after the read's true end
 an isoform that continues (`--end-bonus-cut`, off in the `-fast` presets). When a read's two orientations align
 almost equally well (sequence shared antisense, as with antisense isoforms or a pseudogene inside
 another gene), the orientation that ends in the poly(A) tail is preferred (`--orient-tail`).
+A tail counts with at most 80 read bases after it, or with up to 120 where it starts at the
+hit transcript's 3′ end, as when a cDNA read kept its primer and sequencing adapter after the
+tail (`--orient-tail-after`). Where the two orientations' best hits are one sequence on
+opposite strands under the read, as with a short antisense isoform inside a longer one, they
+are compared by exact local alignments of the whole read, so that what the read holds beyond
+the shared sequence decides: bases one transcript has of its own, and the tail
+(`--orient-same-exact`); a read end earns the end bonus there only where both transcripts reach
+it (`--orient-same-end-cut`). By default the long-adapter tail and the exact comparison of such
+pairs move only the quantification score, not the orientation or the mapping score
+(`--orient-quant`; see [Mapping and quantification scores](/spearfish/concepts/scores/)). All
+four are off in the `-fast` presets.
 LCP parsing is not strand-symmetric, so a read's two orientations draw different seeds; both are
 compared whenever the other orientation's best chain scores within 35% of the chosen one's
 (`--orient-margin-rel`).

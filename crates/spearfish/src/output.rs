@@ -9,11 +9,17 @@
 //!   anchors for hits within `extend_within` of the best score (with `extend_ends`); other
 //!   hits' spans run between their outermost anchors and carry the flag `anchor_span`.
 //!   anchored counts compressed bases. An unmapped read gets one line with transcript `*`.
-//! - **PAF** ([`paf_lines`]): the same hits as PAF lines (no CIGAR; unmapped reads omitted).
+//!   When the mapper computes quantification scores ([`crate::Hit::quant_score`]; the
+//!   `end_fit` setting, on in the accurate presets), a 15th column `qscore` follows `flags`
+//!   ([`tsv_header`]; `0` on an unmapped read's line). `score` alone decides the rank and the
+//!   best set; `qscore` is what a quantifier should weigh hits by.
+//! - **PAF** ([`paf_lines`]): the same hits as PAF lines (no CIGAR; unmapped reads omitted),
+//!   with the quantification score as the tag `qs:f` under the same condition.
 //! - **RAD** (feature `rad`; `rad_writer`, `rad_record`): `bulk_long_read` records (see
 //!   the `long-read-rad` crate), one per mapped read, which oarfish quantifies directly. The
 //!   file's tags carry the preset, the score scale, the index identifier, and whether spans
-//!   were extended to the read ends.
+//!   were extended to the read ends; with quantification scores, each alignment also carries
+//!   the optional `qscore` tag, which readers that do not know it skip.
 //!
 //! The text writers append to a byte buffer, so a caller can format a batch of reads on each
 //! thread and write the buffers whole. Numbers are written digit for digit as Rust's `{}` and
@@ -23,8 +29,21 @@ use std::io::Write;
 
 use crate::{Index, MappedRead};
 
-/// The TSV header line, newline included.
+/// The TSV header line, newline included, without the quantification score column.
 pub const TSV_HEADER: &str = "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n";
+
+/// The TSV header line with the quantification score column `qscore` last.
+pub const TSV_HEADER_QSCORE: &str = "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\tqscore\n";
+
+/// The TSV header line for reads mapped by a mapper that does (`quant_scores`, see
+/// [`crate::Mapper::quant_scores`]) or does not compute quantification scores.
+pub fn tsv_header(quant_scores: bool) -> &'static str {
+    if quant_scores {
+        TSV_HEADER_QSCORE
+    } else {
+        TSV_HEADER
+    }
+}
 
 /// Append `x` in decimal (as `{}` would).
 fn push_uint(buf: &mut Vec<u8>, mut x: u64) {
@@ -87,6 +106,10 @@ pub fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
                 "unmapped"
             }
         );
+        if r.quant_scores {
+            buf.pop();
+            buf.extend_from_slice(b"\t0\n");
+        }
         return;
     }
     let read_flags = read_flags(r);
@@ -99,7 +122,9 @@ pub fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
         buf.push(b'\t');
         buf.extend_from_slice(idx.tx_name(h.tx).as_bytes());
         buf.push(b'\t');
+        let score = buf.len();
         push_fixed(buf, h.score, 2);
+        let score = score..buf.len();
         for x in [
             h.query_start,
             h.query_end,
@@ -116,6 +141,15 @@ pub fn tsv_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
         buf.push(b'\t');
         if !push_hit_flags(buf, read_flags, h.extended) {
             buf.push(b'-');
+        }
+        if r.quant_scores {
+            buf.push(b'\t');
+            // Most hits' quantification score is their score, written already.
+            if h.quant_score.to_bits() == h.score.to_bits() {
+                buf.extend_from_within(score);
+            } else {
+                push_fixed(buf, h.quant_score, 2);
+            }
         }
         buf.push(b'\n');
     }
@@ -154,7 +188,8 @@ fn push_hit_flags(buf: &mut Vec<u8>, read_flags: &str, extended: bool) -> bool {
 /// block length the longer of the two spans, and the mapping quality 255 (not computed: tied
 /// isoforms are reported as hits instead). Tags: `tp:A` P for the best hit, S for the others;
 /// `AS:i` the score rounded; `sc:f` the score; `cm:i` anchors in the chain; `rk:i` the rank;
-/// `fl:Z` the TSV flags, when any.
+/// `fl:Z` the TSV flags, when any; `qs:f` the quantification score, when the mapper computes
+/// them.
 pub fn paf_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
     let read_flags = read_flags(r);
     for (rank, h) in r.hits.iter().enumerate() {
@@ -193,6 +228,10 @@ pub fn paf_lines(buf: &mut Vec<u8>, name: &str, r: &MappedRead, idx: &Index) {
         if !push_hit_flags(buf, read_flags, h.extended) {
             buf.truncate(mark);
         }
+        if r.quant_scores {
+            buf.extend_from_slice(b"\tqs:f:");
+            push_fixed(buf, h.quant_score, 2);
+        }
         buf.push(b'\n');
     }
 }
@@ -222,6 +261,7 @@ pub fn rad_meta(
         ends_extended: opts.params.ends.is_some(),
         strands: opts.params.strands.name().into(),
         index_id: mapper.index().id(),
+        quant_scores: mapper.quant_scores(),
     })
 }
 
@@ -269,6 +309,7 @@ pub fn rad_record(rec: &mut long_read_rad::ReadRecord, r: &MappedRead) -> bool {
             query_end: h.query_end,
             score: h.score,
             flags: if h.extended { 0 } else { aln_flags::ANCHOR_SPAN },
+            quant_score: h.quant_score,
         });
     }
     true

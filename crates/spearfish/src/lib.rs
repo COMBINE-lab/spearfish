@@ -175,6 +175,11 @@ pub struct MapOptions {
 impl MapOptions {
     /// Turn on span extension (if it is off), scored as preset `p` scores. Prefer
     /// [`MapOptions::set_extend_ends`], which uses the options' own preset.
+    ///
+    /// Turning it on also turns the end fit's chain measurement off
+    /// ([`map::TieBreak::end_fit_chain`], the drna preset's default): extended spans come with
+    /// their right-end alignments, so the end fit measures every candidate from its alignment,
+    /// as the presets that extend do. Set `end_fit_chain` after this call to keep the chain.
     pub fn extend_ends(&mut self, p: Preset) {
         if self.params.ends.is_none() {
             let sc = match p.accurate() {
@@ -185,6 +190,9 @@ impl MapOptions {
                 sc,
                 ..Default::default()
             });
+            if let Some(tb) = &mut self.params.tiebreak {
+                tb.end_fit_chain = false;
+            }
         }
     }
 
@@ -200,6 +208,17 @@ impl MapOptions {
     /// The scale of score differences ([`SCORE_DENOM`]).
     pub fn score_denom(&self) -> f32 {
         SCORE_DENOM
+    }
+
+    /// Whether quantification scores may differ from the scores: the end fit is on, or the
+    /// orientation rules that go to the quantification score alone
+    /// ([`map::TieBreak::orient_quant`]) are.
+    pub fn quant_scores(&self) -> bool {
+        self.params.tiebreak.as_ref().is_some_and(|tb| {
+            tb.end_fit > 0.0
+                || (tb.orient_quant
+                    && (tb.orient_same_exact || tb.orient_tail_after > map::TAIL_AFTER as u32))
+        })
     }
 
     /// A preset's options.
@@ -220,6 +239,9 @@ impl MapOptions {
                 // the default model and cost 31% more instructions. Positional models
                 // turn them back on.
                 params.ends = None;
+                // Without span extension, aligning each candidate's right end would be run for
+                // the end fit alone: measure it from the chains instead.
+                tb.end_fit_chain = true;
             }
             Preset::Hifi => {
                 tb.affine = Some(Affine::HIFI);
@@ -256,12 +278,17 @@ impl MapOptions {
             let tb = params.tiebreak.as_mut().expect("tie-break on by default");
             tb.group_fallback = p == Preset::HifiFast;
             tb.orient_same = false;
+            tb.orient_same_exact = false;
+            tb.orient_same_end_cut = false;
+            tb.orient_quant = false;
+            tb.orient_tail_after = map::TAIL_AFTER as u32;
             tb.orient_exact = 0.0;
             tb.raw_mid = false;
             tb.mid_inset = 0;
             tb.clip_pieces = false;
             tb.tail_templated = false;
             tb.end_bonus_cut = false;
+            tb.end_fit = 0.0;
             if let Some(r) = &mut params.rescue {
                 r.cap_window = false;
                 r.store = false;
@@ -745,6 +772,11 @@ pub struct Hit {
     /// The span reaches the read's alignment ends; otherwise it runs from the first to the
     /// last anchor (hits scoring well below the best, or extension off).
     pub extended: bool,
+    /// Quantification score: `score` plus the end-fit adjustment (the `end_fit` setting), for
+    /// a quantifier's alignment weights. Equal to `score` unless the read has no poly(A) tail
+    /// and its near-best candidates end at distinguishable places, some where the read ends.
+    /// `score` alone decides the best hit, the best set and the orientation.
+    pub quant_score: f32,
 }
 
 /// All hits of one read, best first.
@@ -762,6 +794,9 @@ pub struct MappedRead {
     /// The best chain scored no better than a chance match (under the `min_score` setting):
     /// the read is reported unmapped, with no hits, unless `keep_low_score` is set.
     pub low_score: bool,
+    /// The mapper computes quantification scores that may differ from the scores (the
+    /// `end_fit` setting is on); the output formats then report them.
+    pub quant_scores: bool,
 }
 
 /// A mapper over one index; `Send + Sync`.
@@ -817,6 +852,11 @@ impl Mapper {
         SCORE_DENOM
     }
 
+    /// Whether quantification scores may differ from the scores (see [`Hit::quant_score`]).
+    pub fn quant_scores(&self) -> bool {
+        self.opts.quant_scores()
+    }
+
     /// Map one read (ASCII bases; `U` is read as `T`).
     pub fn map(&self, seq: &[u8]) -> MappedRead {
         let r = self.inner.map(seq);
@@ -844,7 +884,8 @@ impl Mapper {
         let hits = r
             .hits
             .iter()
-            .map(|h| {
+            .enumerate()
+            .map(|(i, h)| {
                 let (qs, qe) = q_raw(h.qstart, h.qend, h.reverse);
                 let (tl, tpl) = (
                     idx.tx_len()[h.tx as usize] as u64,
@@ -852,6 +893,7 @@ impl Mapper {
                 );
                 let scale = |x: u32| idx.tx_raw_pos(h.tx, x).unwrap_or(((x as u64 * tl) / tpl) as u32);
                 let ts = scale(h.tstart);
+                let adj = r.end_fit.get(i).copied().unwrap_or(0.0);
                 Hit {
                     tx: h.tx,
                     reverse: h.reverse,
@@ -864,6 +906,7 @@ impl Mapper {
                     anchored: h.anchored,
                     max_discrepancy: h.max_discrepancy,
                     extended: h.extended,
+                    quant_score: h.score + adj,
                 }
             })
             .collect();
@@ -873,6 +916,7 @@ impl Mapper {
             low_coverage: r.low_coverage,
             rescued: r.rescued,
             low_score: r.low_score,
+            quant_scores: self.quant_scores(),
         }
     }
 }

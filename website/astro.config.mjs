@@ -56,6 +56,7 @@ export default defineConfig({
           label: 'How it works',
           items: [
             { label: 'Delta mapping', slug: 'concepts/delta-mapping' },
+            { label: 'Mapping and quantification scores', slug: 'concepts/scores' },
             { label: 'Inside spearfish', slug: 'concepts/inside' },
           ],
         },

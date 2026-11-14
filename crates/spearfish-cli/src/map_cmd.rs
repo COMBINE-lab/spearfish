@@ -573,7 +573,9 @@ pub fn execute(args: Job) -> Result<Counts> {
     let tsv = match &tsv_path {
         Some(p) => {
             let out = sink(p)?;
-            out.lock().unwrap().write_all(output::TSV_HEADER.as_bytes())?;
+            out.lock()
+                .unwrap()
+                .write_all(output::tsv_header(mapper.quant_scores()).as_bytes())?;
             Some((out, Vec::new()))
         }
         None => None,

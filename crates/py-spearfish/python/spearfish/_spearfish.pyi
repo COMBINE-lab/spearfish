@@ -15,7 +15,8 @@ times as likely."""
 SETTINGS: tuple[str, ...]
 """Every mapping setting a :class:`Mapper` takes as a keyword argument."""
 TSV_HEADER: str
-"""The header line of ``spearfish map``'s TSV (newline included)."""
+"""The header line of ``spearfish map``'s TSV without the ``qscore`` column, as written with the
+end fit off (newline included); :attr:`Mapper.tsv_header` is a mapper's own."""
 
 PathLike = Union[str, os.PathLike]
 Seq = Union[str, bytes, bytearray, memoryview]
@@ -93,6 +94,7 @@ class Hit:
     anchored: int
     max_discrepancy: float
     extended: bool
+    quant_score: float
 
 class MappedRead:
     """All hits of one read, best first."""
@@ -148,6 +150,7 @@ class Mapper:
     settings: dict[str, Any]
     options: dict[str, Any]
     score_denom: float
+    tsv_header: str
 
     def map(self, seq: Seq, name: str | None = None) -> MappedRead: ...
     def map_batch(
