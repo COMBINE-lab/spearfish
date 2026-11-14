@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-14)
 
 - **A second score per hit, the quantification score (`qscore`), with an end fit for reads
   without a poly(A) tail** (`--end-fit`, 5 points; on in every preset except the `-fast` ones).

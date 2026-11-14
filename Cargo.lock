@@ -640,7 +640,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lcp-oracle-sys"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
@@ -727,7 +727,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "long-read-rad"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bio-types",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "py-spearfish"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1418,7 +1418,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "spearfish"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bon",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "spearfish-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "spearfish-index"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "spearfish-lcp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "lcp-oracle-sys",
  "proptest",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "spearfish-map"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "proptest",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "spearfish-seeds"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "spearfish-lcp",
  "xxhash-rust",
