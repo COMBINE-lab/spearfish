@@ -1347,7 +1347,8 @@ impl PyMapper {
     }
 
     /// The header line of this mapper's TSV (newline included): :data:`TSV_HEADER`, with the
-    /// ``qscore`` column when the end fit is on (the ``end_fit`` setting).
+    /// ``qscore`` column when quantification scores are on (the ``end_fit`` and
+    /// ``orient_quant`` settings).
     #[getter]
     fn tsv_header(&self) -> &'static str {
         spearfish::output::tsv_header(self.inner.quant_scores())

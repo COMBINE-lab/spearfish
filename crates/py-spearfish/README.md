@@ -97,11 +97,14 @@ as `spearfish map`'s `--end-fit`, `--end-fit-tol` and `--end-fit-chain` / `--no-
 - `end_fit_chain`: `True` measures where the read ends on each candidate from its chain,
   `False` by aligning the read's right end. The `drna` preset measures from the chain and the
   others align. Turning span extension on (`extend_ends=True`) in `drna` measures by alignment
-  unless `end_fit_chain=True` is also given.
+  unless `end_fit_chain=True` is also given;
+- `orient_quant`: `True` (the default) lets the orientation evidence of `orient_same_exact` and
+  `orient_tail_after` move only `quant_score`; `False` moves the mapping score and the
+  orientation with it.
 
 ```python
 spearfish.Mapper(index, "drna", end_fit_chain=False)  # measure the end fit by alignment
-spearfish.Mapper(index, "ont", end_fit=0)             # quant_score == score
+spearfish.Mapper(index, "ont", end_fit=0, orient_quant=False)  # quant_score == score
 ```
 
 ## Mapping

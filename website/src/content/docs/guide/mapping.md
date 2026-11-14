@@ -51,7 +51,10 @@ opposite strands under the read, as with a short antisense isoform inside a long
 are compared by exact local alignments of the whole read, so that what the read holds beyond
 the shared sequence decides: bases one transcript has of its own, and the tail
 (`--orient-same-exact`); a read end earns the end bonus there only where both transcripts reach
-it (`--orient-same-end-cut`). All three are off in the `-fast` presets.
+it (`--orient-same-end-cut`). By default the long-adapter tail and the exact comparison of such
+pairs move only the quantification score, not the orientation or the mapping score
+(`--orient-quant`; see [Mapping and quantification scores](/spearfish/concepts/scores/)). All
+four are off in the `-fast` presets.
 LCP parsing is not strand-symmetric, so a read's two orientations draw different seeds; both are
 compared whenever the other orientation's best chain scores within 35% of the chosen one's
 (`--orient-margin-rel`).

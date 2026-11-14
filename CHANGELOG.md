@@ -39,8 +39,13 @@
   than 80 read bases now counts too, up to 120, where it starts at the hit transcript's 3′ end:
   cDNA reads that kept their primer and sequencing adapter after the tail have that much. On
   spike-in isoforms antisense to a longer one, many more reads go to the short isoform.
-  Mapping costs slightly more. `--no-orient-same-exact --orient-tail-after=80` turns the change
-  off.
+  By default (`--orient-quant`) the longer tail limit and the exact comparison act through the
+  quantification score only: the orientation, the hits and their mapping scores are as in
+  0.2.1, and each hit's `qscore` moves by what the two would have moved its score. So the
+  mapping output, best sets included, is unchanged, and a quantifier that reads `qscore`
+  weighs the read by the new evidence; `--no-orient-quant` applies them to the mapping score.
+  With them on, a `qscore` is written even with `--end-fit 0`. Mapping costs slightly more.
+  `--no-orient-same-exact --orient-tail-after=80` turns the change off.
 
 ## 0.2.1 (2026-11-12)
 

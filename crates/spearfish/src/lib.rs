@@ -210,9 +210,15 @@ impl MapOptions {
         SCORE_DENOM
     }
 
-    /// Whether quantification scores may differ from the scores: the end fit is on.
+    /// Whether quantification scores may differ from the scores: the end fit is on, or the
+    /// orientation rules that go to the quantification score alone
+    /// ([`map::TieBreak::orient_quant`]) are.
     pub fn quant_scores(&self) -> bool {
-        self.params.tiebreak.as_ref().is_some_and(|tb| tb.end_fit > 0.0)
+        self.params.tiebreak.as_ref().is_some_and(|tb| {
+            tb.end_fit > 0.0
+                || (tb.orient_quant
+                    && (tb.orient_same_exact || tb.orient_tail_after > map::TAIL_AFTER as u32))
+        })
     }
 
     /// A preset's options.
@@ -274,6 +280,7 @@ impl MapOptions {
             tb.orient_same = false;
             tb.orient_same_exact = false;
             tb.orient_same_end_cut = false;
+            tb.orient_quant = false;
             tb.orient_tail_after = map::TAIL_AFTER as u32;
             tb.orient_exact = 0.0;
             tb.raw_mid = false;

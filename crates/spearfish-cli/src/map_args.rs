@@ -467,6 +467,23 @@ pub struct MapArgs {
         help_heading = "Tie-break"
     )]
     pub no_orient_same_end_cut: bool,
+    /// --orient-same-exact and --orient-tail-after move only the quantification scores; the
+    /// mapping scores and the orientation are decided as without them [default: on].
+    #[arg(
+        long,
+        overrides_with = "no_orient_quant",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub orient_quant: bool,
+    /// --orient-same-exact and --orient-tail-after move the mapping scores and the orientation.
+    #[arg(
+        long,
+        overrides_with = "orient_quant",
+        hide_short_help = true,
+        help_heading = "Tie-break"
+    )]
+    pub no_orient_quant: bool,
     /// With raw read ends, also align the stretches between shared anchors in raw bases
     /// [default: on except hifi].
     #[arg(
@@ -720,6 +737,7 @@ impl MapArgs {
             .maybe_orient_exact(self.orient_exact)
             .maybe_orient_same_exact(onoff!(self.orient_same_exact / no_orient_same_exact))
             .maybe_orient_same_end_cut(onoff!(self.orient_same_end_cut / no_orient_same_end_cut))
+            .maybe_orient_quant(onoff!(self.orient_quant / no_orient_quant))
             .maybe_raw_mid(onoff!(self.raw_mid / no_raw_mid))
             .maybe_tail_templated(onoff!(self.tail_templated / no_tail_templated))
             .maybe_end_bonus_cut(onoff!(self.end_bonus_cut / no_end_bonus_cut))
@@ -934,6 +952,7 @@ mod tests {
             "--orient-exact=0",
             "--no-orient-same-exact",
             "--no-orient-same-end-cut",
+            "--no-orient-quant",
             "--no-raw-mid",
             "--no-tail-templated",
             "--no-end-bonus-cut",

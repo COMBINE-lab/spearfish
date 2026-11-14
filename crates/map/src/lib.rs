@@ -138,6 +138,13 @@ pub struct TieBreak {
     /// no evidence for it.
     #[serde(default)]
     pub orient_same_end_cut: bool,
+    /// Apply `orient_same_exact` and `orient_tail_after` to the read orientation through the
+    /// quantification score only. The mapping score, the orientation, the reported hits and
+    /// their ranks are then decided as without the two; each hit's quantification score is
+    /// moved by what the two would have moved its mapping score. A quantifier weighs the read
+    /// by that evidence, while every mapping decision stays as it was.
+    #[serde(default)]
+    pub orient_quant: bool,
     /// Near-tied orientations whose clipped alignments leave a lead of at most this many
     /// points are compared again by exact local alignment: every diagonal within
     /// [`ORIENT_EXACT_BAND`] (and a twentieth of the read) of each chain's, so the chain only
@@ -244,6 +251,7 @@ impl Default for TieBreak {
             orient_same: true,
             orient_same_exact: true,
             orient_same_end_cut: true,
+            orient_quant: true,
             orient_exact: 150.0,
             raw_mid: true,
             mid_inset: 8,
@@ -506,9 +514,10 @@ pub struct ReadResult {
     /// With HPC, the read's homopolymer runs, forward orientation: parsed query positions to
     /// raw ones (`to_raw`; its `seq` is not kept).
     pub hpc: Option<lcp_core::hpc::Hpc>,
-    /// End-fit adjustment of each hit's quantification score ([`TieBreak::end_fit`]), in the
-    /// order of `hits`; empty if no hit is adjusted. A hit's quantification score is its
-    /// mapping score plus this.
+    /// Adjustment of each hit's quantification score, in the order of `hits`: the end fit
+    /// ([`TieBreak::end_fit`]) and the orientation evidence kept out of the mapping score
+    /// ([`TieBreak::orient_quant`]); empty if no hit is adjusted. A hit's quantification
+    /// score is its mapping score plus this.
     pub end_fit: Vec<f32>,
 }
 
@@ -654,6 +663,19 @@ fn rank_orientations(st: &mut Strand, other: &mut Strand, reverse: &mut bool, le
     for h in &mut other.hits {
         h.score += shift;
         h.reverse = !*reverse;
+    }
+}
+
+/// The best scores `rank_orientations` leaves the two orientations, in the order given, from
+/// their best scores `tops` before it.
+fn ranked_tops(tops: (f32, f32), lead: f32, level: Option<f32>) -> (f32, f32) {
+    let up = |s: f32| level.map_or(s, |l| s.max(l));
+    if lead < 0.0 {
+        let b = up(tops.1);
+        (b - lead.abs(), b)
+    } else {
+        let a = up(tops.0);
+        (a, a - lead.abs())
     }
 }
 
@@ -965,7 +987,7 @@ impl<C: Chainer> Mapper<C> {
     /// adapters carries the RT primer and the sequencing adapter after its tail, more than
     /// `TAIL_AFTER`; an A-run that far from the read's end that the transcript goes on past is
     /// the transcript's own sequence.
-    fn orient_tailed(&self, tb: &TieBreak, s: &Strand) -> bool {
+    fn orient_tailed(&self, tb: &TieBreak, s: &Strand, after: u32) -> bool {
         // Without HPC the parsed read is the raw read.
         let (codes, raw) = match &s.raw {
             Some(r) => (&r.codes[..], Some(r)),
@@ -977,7 +999,7 @@ impl<C: Chainer> Mapper<C> {
         if tail_start_within(&codes[w0..], a, tb.tail_run, TAIL_AFTER).is_some() {
             return true;
         }
-        let after = tb.orient_tail_after as usize;
+        let after = after as usize;
         let (Some(h), true) = (s.hits.first(), after > TAIL_AFTER) else {
             return false;
         };
@@ -2432,6 +2454,10 @@ impl<C: Chainer> Mapper<C> {
             };
         }
         let mut both = false;
+        // With `TieBreak::orient_quant`: the orientation (`reverse`) that came first, and what
+        // the orientation rules it leaves out of the mapping score add to the quantification
+        // scores of that orientation's hits and of the other's.
+        let mut orient_q = None;
         if let Some(tb) = &self.p.tiebreak {
             let margin = |s: f32| tb.margin_abs.max(tb.orient_margin_rel * s.abs());
             both = matches!((st.hits.first(), other.hits.first()),
@@ -2482,41 +2508,66 @@ impl<C: Chainer> Mapper<C> {
                     }
                 };
                 // This orientation's lead over the other, in score points: alignment, then the
-                // poly(A) tail where one orientation shows it and the other doesn't.
-                let mut lead = unit * (cb - ca) as f32;
-                if tb.orient_tail > 0 {
-                    let tailed = |s: &Strand| self.orient_tailed(tb, s);
-                    lead += tb.orient_tail as f32
-                        * (f32::from(u8::from(tailed(&st))) - f32::from(u8::from(tailed(&other))));
-                }
+                // poly(A) tail where one orientation shows it and the other doesn't. `lead`
+                // takes a tail limit (`TieBreak::orient_tail_after`, or `TAIL_AFTER` as
+                // before it) and whether a mirrored pair is compared (`orient_same_exact`).
+                let aligned = unit * (cb - ca) as f32;
+                let tail = |after: u32| {
+                    if tb.orient_tail == 0 {
+                        return 0.0;
+                    }
+                    let tailed = |s: &Strand| f32::from(u8::from(self.orient_tailed(tb, s, after)));
+                    tb.orient_tail as f32 * (tailed(&st) - tailed(&other))
+                };
                 // One sequence on opposite strands: exact local alignments of the whole read
                 // tell the pair apart by what lies beyond it (`TieBreak::orient_same_exact`).
-                if mirror
-                    && tb.orient_same_exact
-                    && let Some(x) = self.mirror_exact(tb, plen, (&st, qa), (&other, qb))
-                {
-                    lead += tb.lambda * x as f32;
-                }
+                let same_x = (mirror && tb.orient_same_exact)
+                    .then(|| self.mirror_exact(tb, plen, (&st, qa), (&other, qb)))
+                    .flatten();
                 // A close call is decided by exact local alignments instead of the clipped
-                // ones (`TieBreak::orient_exact`); the tail term stands.
-                if let Some(sc) = &tb.affine
-                    && !mirror
-                    && tb.orient_clipped
-                    && tb.orient_exact > 0.0
-                    && lead.abs() <= tb.orient_exact
-                {
-                    let w = ORIENT_EXACT_BAND + plen / 20;
-                    let tail = lead - unit * (cb - ca) as f32;
-                    let both = (tb.end_bonus, tb.end_bonus);
-                    let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w, both);
-                    let xb = self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w, both);
-                    lead = unit * (xa - xb) as f32 + tail;
-                }
+                // ones (`TieBreak::orient_exact`); the tail term stands. Aligned once, for
+                // either lead that asks.
+                let mut exact = None;
+                let mut lead = |after: u32, same: bool| {
+                    let t = tail(after);
+                    let mut lead = aligned + t;
+                    if same && let Some(x) = same_x {
+                        lead += tb.lambda * x as f32;
+                    }
+                    if let Some(sc) = &tb.affine
+                        && !mirror
+                        && tb.orient_clipped
+                        && tb.orient_exact > 0.0
+                        && lead.abs() <= tb.orient_exact
+                    {
+                        let x = *exact.get_or_insert_with(|| {
+                            let w = ORIENT_EXACT_BAND + plen / 20;
+                            let both = (tb.end_bonus, tb.end_bonus);
+                            let xa = self.local_exact(tb, sc, qa, st.raw.as_ref(), &st.hits[0], w, both);
+                            let xb =
+                                self.local_exact(tb, sc, qb, other.raw.as_ref(), &other.hits[0], w, both);
+                            xa - xb
+                        });
+                        lead = unit * x as f32 + t;
+                    }
+                    lead
+                };
+                let full = lead(tb.orient_tail_after, true);
                 // One sequence scores the same whichever orientation's chain found it: the pair
                 // stands at the better chain's score, not at the one seed luck left lower.
-                let level =
-                    (mirror && tb.orient_same_exact).then(|| st.hits[0].score.max(other.hits[0].score));
-                rank_orientations(&mut st, &mut other, &mut reverse, lead, level);
+                let tops = (st.hits[0].score, other.hits[0].score);
+                let level = (mirror && tb.orient_same_exact).then(|| tops.0.max(tops.1));
+                if tb.orient_quant {
+                    // The mapping decision as without the two rules; the quantification
+                    // score takes the difference they make to each orientation's scores.
+                    let plain = lead(TAIL_AFTER as u32, false);
+                    let (a, b) = ranked_tops(tops, full, level);
+                    let (a0, b0) = ranked_tops(tops, plain, None);
+                    orient_q = Some((reverse, a - a0, b - b0));
+                    rank_orientations(&mut st, &mut other, &mut reverse, plain, None);
+                } else {
+                    rank_orientations(&mut st, &mut other, &mut reverse, full, level);
+                }
             }
         }
         for h in &mut st.hits {
@@ -2572,12 +2623,21 @@ impl<C: Chainer> Mapper<C> {
         }
         // The quantification score's end fit: after everything that decides the hits and
         // their scores, which it leaves as they are.
-        let end_fit = match &self.p.tiebreak {
+        let mut end_fit = match &self.p.tiebreak {
             Some(tb) if tb.end_fit > 0.0 && hits.len() >= 2 => {
                 self.end_fit(tb, &hits, reverse, (&st, &other), &mut seen)
             }
             _ => Vec::new(),
         };
+        if let Some((first, a, b)) = orient_q
+            && (a != 0.0 || b != 0.0)
+            && !hits.is_empty()
+        {
+            end_fit.resize(hits.len(), 0.0);
+            for (q, h) in end_fit.iter_mut().zip(&hits) {
+                *q += if h.reverse == first { a } else { b };
+            }
+        }
         ReadResult {
             len: raw.len() as u32,
             plen,
@@ -3647,11 +3707,12 @@ mod segmented_tests {
         let goes_on = [&body[..], &random_seq(300, 17)].concat();
         let m = mapper(&[&ends_at_tail, &goes_on], false);
         let tailed = |tx: u32, orient_tail_after: u32, read: &[u8]| {
-            let tb = TieBreak {
+            let tb = TieBreak::default();
+            m.orient_tailed(
+                &tb,
+                &strand(read, vec![hit(tx, 50., &[(0, 0, 400)])]),
                 orient_tail_after,
-                ..Default::default()
-            };
-            m.orient_tailed(&tb, &strand(read, vec![hit(tx, 50., &[(0, 0, 400)])]))
+            )
         };
         // The A-run starts at the hit transcript's 3' end: a tail, with up to 120 bases after.
         assert!(tailed(0, 120, &read));
@@ -3692,6 +3753,38 @@ mod segmented_tests {
         assert!(!reverse);
         assert_eq!(st, [(0, 50.), (0, 48.)]);
         assert_eq!(other, [(1, 47.), (1, 42.)]);
+    }
+
+    #[test]
+    fn the_quantification_score_takes_the_orientation_scores_the_rules_would_give() {
+        // `ranked_tops` gives each orientation the best score `rank_orientations` leaves it
+        // (in the order given), so the quantification score can carry what the orientation
+        // rules would move without moving the mapping scores.
+        for lead in [-31.0, -6.0, 0.0, 3.0, 30.0] {
+            for level in [None, Some(40.), Some(50.), Some(60.)] {
+                let mut st = strand(b"ACGT", vec![hit(0, 50., &[(0, 0, 10)])]);
+                let mut other = strand(b"ACGT", vec![hit(1, 40., &[(0, 0, 10)])]);
+                let mut reverse = false;
+                rank_orientations(&mut st, &mut other, &mut reverse, lead, level);
+                // `st` and `other` swap with the order; tx 0 is the first given.
+                let top = |tx: u32| [&st, &other].iter().find(|s| s.hits[0].tx == tx).unwrap().hits[0].score;
+                assert_eq!(
+                    ranked_tops((50., 40.), lead, level),
+                    (top(0), top(1)),
+                    "{lead} {level:?}"
+                );
+            }
+        }
+        // A mirrored pair the rules part by 16 points (own bases), against a tie: the leading
+        // orientation's quantification scores stay, the other's fall by the lead.
+        let (a, b) = ranked_tops((50., 46.), 16.0, Some(50.));
+        let (a0, b0) = ranked_tops((50., 46.), 0.0, None);
+        assert_eq!((a - a0, b - b0), (0.0, -16.0));
+        // The rules reverse the order (a tail after a long adapter, 30 points, against the
+        // other orientation's 6-point alignment lead).
+        let (a, b) = ranked_tops((50., 48.), -24.0, None);
+        let (a0, b0) = ranked_tops((50., 48.), 6.0, None);
+        assert_eq!((a - a0, b - b0), (-26.0, 4.0));
     }
 
     #[test]

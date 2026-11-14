@@ -390,7 +390,9 @@ def test_end_fit_settings(index, reads):
     with pytest.raises(ValueError):
         spearfish.Mapper(index, "ont", end_fit_tol=-1)
     # Off, the quantification score is the score.
-    off = spearfish.Mapper(index, "ont", end_fit=0)
+    assert "orient_quant" in spearfish.SETTINGS
+    assert tb("ont")["orient_quant"] is True and tb("ont-fast")["orient_quant"] is False
+    off = spearfish.Mapper(index, "ont", end_fit=0, orient_quant=False)
     seqs = [r[1] for r in reads]
     for r in off.map_batch(seqs):
         assert all(h.quant_score == h.score for h in r.hits)
@@ -479,8 +481,9 @@ def test_tsv_and_paf(mapper, reads, index, tmp_path):
     assert batch.to_tsv(header=True).decode() == mapper.tsv_header + tsv
     assert mapper.tsv_header == spearfish.TSV_HEADER.replace("\n", "\tqscore\n")
     assert spearfish.TSV_HEADER.startswith("read\tread_len\t") and spearfish.TSV_HEADER.endswith("\n")
-    # With the end fit off the TSV is as before.
-    off = spearfish.Mapper(index, mapper.preset, end_fit=0)
+    # With quantification scores off (the end fit and the orientation evidence) the TSV is as
+    # before.
+    off = spearfish.Mapper(index, mapper.preset, end_fit=0, orient_quant=False)
     assert off.tsv_header == spearfish.TSV_HEADER
     ob = off.map_batch(seqs, names=names)
     assert ob.to_tsv(header=True).decode().startswith(spearfish.TSV_HEADER)

@@ -25,11 +25,13 @@ The mapping score alone decides everything about the mapping itself:
 
 ## The quantification score (`qscore`)
 
-The quantification score is the mapping score plus an **end-fit adjustment**. It is the score a
+The quantification score is the mapping score plus an **end-fit adjustment** and, between a
+read's two orientations, the **orientation evidence** described below. It is the score a
 quantifier should weigh hits by: oarfish turns the difference between a hit's score and the
 read's best into a weight, `exp(-delta / D)`, and it uses the quantification score for that.
 
-For most hits the two scores are equal. They differ only when all of the following hold:
+For most hits the two scores are equal. The end fit changes them only when all of the
+following hold:
 
 1. **No poly(A) tail.** The read has no detectable poly(A) tail in either orientation (for
    example, because the reads were poly(A)-trimmed, or the tail was lost). When there is a tail,
@@ -104,6 +106,23 @@ transcript's 3' end, but end inside the other.
 The mapping score's choice of orientation does not change, and no hits are added: only the
 quantification scores differ.
 
+## Orientation evidence beyond the shared sequence
+
+Two rules weigh evidence about a read's orientation that the mapping score did not use before
+0.3.0 (see [Mapping](/spearfish/guide/mapping/)):
+
+- a poly(A) tail followed by up to 120 read bases counts where it starts at the hit transcript's
+  3' end (`--orient-tail-after`), as on cDNA reads that kept their primer and sequencing adapter;
+- best hits that are one sequence on opposite strands are compared by exact local alignments of
+  the whole read (`--orient-same-exact`), so bases one transcript has of its own count.
+
+By default (`--orient-quant`) both act on the quantification score only. The orientation, the
+hits, their ranks and their mapping scores are decided as without them. Each hit's
+quantification score then moves by what the two rules would have moved its mapping score. So
+the read weighs toward the orientation they favour in quantification, while the mapping
+output, the best set included, stays as without them. `--no-orient-quant` applies them to the
+mapping score instead, so they decide the orientation too.
+
 ## Choice of the tolerance
 
 `--end-fit-tol` is the measurement error of where a read ends on a transcript, in parsed
@@ -127,13 +146,14 @@ ends differ by more than a few bases are told apart.
 | `end_fit` | `--end-fit SCORE` | 5 points (0: off) | 0 (off) |
 | `end_fit_tol` | `--end-fit-tol BASES` | 4 | (unused) |
 | `end_fit_chain` | `--end-fit-chain` / `--no-end-fit-chain` | off, on (off with `--extend-ends`), off | (unused) |
+| `orient_quant` | `--orient-quant` / `--no-orient-quant` | on | off |
 
 In Python the settings are keyword arguments of `spearfish.Mapper` (and `Index.mapper`,
 `resolve_settings`), as for every other setting:
 
 ```python
 spearfish.Mapper(index, "drna", end_fit_chain=False)   # measure by alignment
-spearfish.Mapper(index, "ont", end_fit=0)              # quant_score == score
+spearfish.Mapper(index, "ont", end_fit=0, orient_quant=False)  # quant_score == score
 ```
 
 `Hit.quant_score` is the quantification score, also a column of `hit_columns()` and
@@ -141,8 +161,9 @@ spearfish.Mapper(index, "ont", end_fit=0)              # quant_score == score
 fit is on.
 
 The `-fast` presets reproduce spearfish 0.1.0's mapping, so the end fit is off there and
-their output is unchanged. With `--end-fit 0` (or `--tiebreak false`) the quantification score
-equals the mapping score, and the output formats are as before (no `qscore` column or tag).
+their output is unchanged. With `--end-fit 0 --no-orient-quant` (or `--tiebreak false`) the
+quantification score equals the mapping score, and the output formats are as before (no
+`qscore` column or tag).
 
 Points are on the mapping score's scale: with the default score scale, 2 points weigh a factor
 `e` in oarfish, so the default 5 points tilt a read's weight by about `e^2.5`, roughly 12 to 1,

@@ -271,6 +271,10 @@ pub struct MapSettings {
     /// both transcripts have sequence up to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orient_same_end_cut: Option<bool>,
+    /// `orient_same_exact` and `orient_tail_after` move only the quantification scores; the
+    /// mapping scores and the orientation are decided as without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orient_quant: Option<bool>,
     /// With `raw_ends`, also align the stretches between shared anchors in raw bases.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_mid: Option<bool>,
@@ -441,6 +445,7 @@ impl MapSettings {
         "orient_exact",
         "orient_same_exact",
         "orient_same_end_cut",
+        "orient_quant",
         "raw_mid",
         "tail_templated",
         "end_bonus_cut",
@@ -501,6 +506,7 @@ impl MapSettings {
             orient_exact,
             orient_same_exact,
             orient_same_end_cut,
+            orient_quant,
             raw_mid,
             tail_templated,
             end_bonus_cut,
@@ -676,6 +682,7 @@ impl MapSettings {
             set!(self.orient_exact => tb.orient_exact);
             set!(self.orient_same_exact => tb.orient_same_exact);
             set!(self.orient_same_end_cut => tb.orient_same_end_cut);
+            set!(self.orient_quant => tb.orient_quant);
             set!(self.raw_mid => tb.raw_mid);
             set!(self.tail_templated => tb.tail_templated);
             set!(self.end_bonus_cut => tb.end_bonus_cut);
@@ -850,7 +857,9 @@ mod tests {
         let tb = o.params.tiebreak.as_ref().unwrap();
         assert_eq!((tb.end_fit, tb.end_fit_tol), (2.5, 6));
         assert!(o.quant_scores());
-        assert!(!drna().end_fit(0.0).resolve().unwrap().quant_scores());
+        assert!(drna().end_fit(0.0).resolve().unwrap().quant_scores());
+        let off = drna().end_fit(0.0).orient_quant(false).resolve().unwrap();
+        assert!(!off.quant_scores());
         assert!(drna().end_fit(-1.0).resolve().is_err());
     }
 
@@ -966,8 +975,24 @@ mod tests {
             let tb = MapOptions::preset(p).params.tiebreak.unwrap();
             let on = !p.fast();
             assert_eq!((tb.orient_same_exact, tb.orient_same_end_cut), (on, on));
+            assert_eq!(tb.orient_quant, on);
             assert_eq!(tb.orient_tail_after, if on { 120 } else { 80 });
+            assert_eq!(MapOptions::preset(p).quant_scores(), on);
         }
+        // Through the mapping score instead, and with nothing to route, no quantification
+        // score of their own.
+        let o = MapSettings::builder(Preset::Ont)
+            .orient_quant(false)
+            .resolve()
+            .unwrap();
+        assert!(!o.params.tiebreak.unwrap().orient_quant);
+        let o = MapSettings::builder(Preset::Ont)
+            .end_fit(0.0)
+            .orient_same_exact(false)
+            .orient_tail_after(80)
+            .resolve()
+            .unwrap();
+        assert!(o.params.tiebreak.as_ref().unwrap().orient_quant && !o.quant_scores());
         let o = MapSettings::builder(Preset::Ont)
             .orient_same_end_cut(false)
             .orient_tail_after(80)

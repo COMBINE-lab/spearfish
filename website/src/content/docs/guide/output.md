@@ -22,7 +22,7 @@ they finish, not input order. An unmapped read gets one line with transcript `*`
 | `anchored` | Read bases covered by those seeds (homopolymer-compressed). |
 | `max_disc` | Largest gap discrepancy between consecutive anchors in the chain. |
 | `flags` | Comma-separated flags, or `-`. |
-| `qscore` | Quantification score: `score` plus the end-fit adjustment for reads without a poly(A) tail. Written only when the end fit is on (every preset except the `-fast` ones); `0` on an unmapped read's line. `rank` and the best set follow `score`. See [Mapping and quantification scores](/spearfish/concepts/scores/). |
+| `qscore` | Quantification score: `score` plus the end-fit adjustment for reads without a poly(A) tail and the orientation evidence of `--orient-quant`. Written only when either is on (every preset except the `-fast` ones); `0` on an unmapped read's line. `rank` and the best set follow `score`. See [Mapping and quantification scores](/spearfish/concepts/scores/). |
 
 ## Flags
 
@@ -77,7 +77,7 @@ Unmapped reads are left out.
 
 Tags: `tp:A:P` on the best hit and `tp:A:S` on the others, `AS:i` the score rounded, `sc:f`
 the score, `cm:i` the anchors in the chain, `rk:i` the rank, and `fl:Z` the TSV flags when there
-are any. When the end fit is on, `qs:f` is the quantification score; `AS:i` and `sc:f` stay
+are any. When quantification scores are on, `qs:f` is the quantification score; `AS:i` and `sc:f` stay
 the mapping score.
 
 ## RAD output
@@ -138,6 +138,7 @@ alignment scores oarfish uses 3.
 
 For quantification, use the quantification score (`qscore`) where it is reported: it equals the
 mapping score except for reads without a poly(A) tail whose candidates end at distinguishable
-places, where it tilts the read toward the candidates whose annotated 3' end it reaches.
+places, where it tilts the read toward the candidates whose annotated 3' end it reaches, and
+for reads whose two orientations the orientation evidence of `--orient-quant` separates.
 oarfish does this both in process and from RAD files. See
 [Mapping and quantification scores](/spearfish/concepts/scores/).
