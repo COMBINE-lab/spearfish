@@ -17,8 +17,8 @@
 //!   with the quantification score as the tag `qs:f` under the same condition.
 //! - **RAD** (feature `rad`; `rad_writer`, `rad_record`): `bulk_long_read` records (see
 //!   the `long-read-rad` crate), one per mapped read, which oarfish quantifies directly. The
-//!   file's tags carry the preset, the score scale, the index identifier, and whether spans
-//!   were extended to the read ends; with quantification scores, each alignment also carries
+//!   file's tags carry the preset, the score scale, the index identifier and how its genes
+//!   were labelled ([`rad_index_info`]), and whether spans were extended to the read ends; with quantification scores, each alignment also carries
 //!   the optional `qscore` tag, which readers that do not know it skip.
 //!
 //! The text writers append to a byte buffer, so a caller can format a batch of reads on each
@@ -265,8 +265,23 @@ pub fn rad_meta(
     })
 }
 
-/// Start a RAD file at `path` for reads mapped by `mapper` (see [`rad_meta`]), over every
-/// transcript of its index. Push records through [`long_read_rad::RadWriter::sink`]s and
+/// The RAD file tags that describe the gene labels of `mapper`'s index: where they came from
+/// (the manifest's `genes_from`; empty for an index without a manifest), the numbers of genes
+/// and transcripts, and whether the index has gene groups ([`crate::Index::has_gene_groups`]).
+#[cfg(feature = "rad")]
+pub fn rad_index_info(mapper: &crate::Mapper) -> long_read_rad::IndexInfo {
+    let idx = mapper.index();
+    let genes_from = idx.manifest().map(|m| m.input.genes_from).unwrap_or_default();
+    long_read_rad::IndexInfo::new(
+        genes_from,
+        idx.n_genes() as u64,
+        idx.n_transcripts() as u64,
+        idx.has_gene_groups(),
+    )
+}
+
+/// Start a RAD file at `path` for reads mapped by `mapper` (see [`rad_meta`] and
+/// [`rad_index_info`]), over every transcript of its index. Push records through [`long_read_rad::RadWriter::sink`]s and
 /// [`finish`](long_read_rad::RadWriter::finish) it with the read counts.
 #[cfg(feature = "rad")]
 pub fn rad_writer(
@@ -280,7 +295,8 @@ pub fn rad_writer(
     let refs: Vec<(&str, u32)> = (0..idx.n_transcripts() as u32)
         .map(|t| (idx.tx_name(t), idx.tx_len(t)))
         .collect();
-    long_read_rad::RadWriter::create(path, &refs, &rad_meta(mapper, settings, command_line)?, codec)
+    let meta = rad_meta(mapper, settings, command_line)?;
+    long_read_rad::RadWriter::create_with_index(path, &refs, &meta, &rad_index_info(mapper), codec)
 }
 
 /// Fill `rec` with the read `r`; false (and `rec` left empty) if it is unmapped, since RAD

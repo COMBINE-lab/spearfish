@@ -319,6 +319,14 @@ fn output_formats() {
         let meta = output::rad_meta(&mapper, None, "test").unwrap();
         assert_eq!((meta.preset.as_str(), meta.index_id), ("ont", index.id()));
         assert!(meta.quant_scores);
+        let info = output::rad_index_info(&mapper);
+        assert_eq!(info.num_transcripts, index.n_transcripts() as u64);
+        assert_eq!(info.num_genes, index.n_genes() as u64);
+        assert_eq!(info.gene_groups, index.has_gene_groups());
+        assert_eq!(
+            info.genes_from,
+            index.manifest().map(|m| m.input.genes_from).unwrap_or_default()
+        );
     }
 }
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+- **RAD files record how the index's genes were labelled.** `spearfish map --rad` writes four
+  new file tags: `index_genes_from` (the index manifest's `genes_from`: `fasta`, `t2g`,
+  `inferred` or `none`; empty for an index without a manifest), `index_num_genes`,
+  `index_num_transcripts`, and `index_gene_groups` (1 if the genes group the transcripts, 0 if
+  every transcript is its own gene). A quantifier reading the file can then warn about an index
+  without gene groups, as `spearfish map` does. The tags are optional: files written before
+  0.3.1 lack them, and readers that do not know them skip them. In `long-read-rad`, the new
+  `IndexInfo`, `RadWriter::create_with_index`, `read_index_info` and
+  `IndexInfo::from_file_tags` write and read them; `Meta`, `Header` and `RadWriter::create` are
+  unchanged. In the library, `output::rad_index_info` builds them for a mapper's index, and
+  `output::rad_writer` (and so the Python `RadWriter`) writes them.
+
+- The run record's `index` gains `genes` and `gene_groups`, next to `transcripts`.
+
 ## 0.3.0 (2026-11-14)
 
 - **A second score per hit, the quantification score (`qscore`), with an end fit for reads
