@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.3.1 (2026-11-14)
 
 - **RAD files record how the index's genes were labelled.** `spearfish map --rad` writes four
   new file tags: `index_genes_from` (the index manifest's `genes_from`: `fasta`, `t2g`,
