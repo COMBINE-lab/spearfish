@@ -448,7 +448,30 @@ struct RunRecord<'a> {
     parameters: &'a MapOptions,
     score_denom: f32,
     finished_unix: u64,
+    /// Warnings about the inputs that change the results (also on stderr, even under `-q`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<RunWarning>,
     stats: RunStats,
+}
+
+/// A warning recorded in the run record: a stable code to test for, and the message shown.
+#[derive(Serialize, Debug)]
+struct RunWarning {
+    code: &'static str,
+    message: String,
+}
+
+/// The warnings a mapping run gives about its index: one, `no_gene_groups`, when every
+/// transcript is its own gene (see [`Index::has_gene_groups`]).
+fn index_warnings(path: &Path, idx: &Index, info: &IndexInfo) -> Vec<RunWarning> {
+    let genes_from = info.manifest.as_ref().map(|m| m.input.genes_from.as_str());
+    if spearfish::has_gene_groups(genes_from, idx.n_transcripts(), idx.n_genes()) {
+        return Vec::new();
+    }
+    vec![RunWarning {
+        code: "no_gene_groups",
+        message: crate::index_cmd::no_gene_groups_warning(genes_from.unwrap_or("none"), Some(path)),
+    }]
 }
 
 /// One mapping run.
@@ -541,6 +564,10 @@ pub fn execute(args: Job) -> Result<Counts> {
     let index_info = IndexInfo::of(&index_path, &idx);
     if index_info.manifest.is_none() {
         log::debug!("the index has no manifest (built before manifests were recorded)");
+    }
+    let warnings = index_warnings(&index_path, &idx, &index_info);
+    for w in &warnings {
+        crate::logging::warn_always(format_args!("{}", w.message));
     }
 
     let tsv = match &tsv_path {
@@ -656,6 +683,7 @@ pub fn execute(args: Job) -> Result<Counts> {
             parameters: &opts,
             score_denom: spearfish::SCORE_DENOM,
             finished_unix: runinfo::unix_now(),
+            warnings,
             stats: RunStats {
                 counts: c,
                 mean_read_length: c.bases as f64 / c.reads.max(1) as f64,

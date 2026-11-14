@@ -1,5 +1,7 @@
 //! A minimal stderr logger for the `log` facade: `-q` shows errors only, the default adds
 //! warnings and progress summaries (info), `-v` debug and `-vv` trace messages.
+//! [`warn_always`] writes the few warnings about the inputs that change results, which `-q`
+//! does not hide.
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;
@@ -26,17 +28,29 @@ impl Log for Stderr {
             Level::Debug => ("debug", "2"),
             Level::Trace => ("trace", "2"),
         };
-        if self.color {
-            eprintln!("\x1b[{code}m{tag}\x1b[0m: {}", r.args());
-        } else {
-            eprintln!("{tag}: {}", r.args());
-        }
+        emit(self.color, tag, code, r.args());
     }
 
     fn flush(&self) {}
 }
 
+fn emit(color: bool, tag: &str, code: &str, msg: &std::fmt::Arguments) {
+    if color {
+        eprintln!("\x1b[{code}m{tag}\x1b[0m: {msg}");
+    } else {
+        eprintln!("{tag}: {msg}");
+    }
+}
+
 static LOGGER: OnceLock<Stderr> = OnceLock::new();
+
+/// A warning shown at every level, `-q` included: for a problem with the inputs that changes
+/// the results and is fixed by rebuilding or rerunning (not for advice or ignored options,
+/// which go through `log::warn!`).
+pub fn warn_always(msg: std::fmt::Arguments) {
+    let color = LOGGER.get().is_some_and(|l| l.color);
+    emit(color, "warning", "33", &msg);
+}
 
 /// Install the logger at the level `-q`/`-v` select.
 pub fn init(quiet: bool, verbose: u8) {

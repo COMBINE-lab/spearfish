@@ -171,5 +171,6 @@ two options, the last one given counts.
 
 ## Messages
 
-Progress and a summary go to standard error. `-q` shows errors only, `-v` adds detail. On a
-terminal, a progress line shows the reads mapped so far.
+Progress and a summary go to standard error. `-q` shows errors only, plus the warning for an
+index without gene groups ([Gene membership](/spearfish/guide/indexing/#gene-membership));
+`-v` adds detail. On a terminal, a progress line shows the reads mapped so far.
