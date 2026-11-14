@@ -111,6 +111,12 @@ pub struct IndexInfo {
     pub index_id: String,
     pub spec: String,
     pub transcripts: usize,
+    /// Genes, and whether they group the transcripts (false when every transcript is its own
+    /// gene; see `spearfish::Index::has_gene_groups`). Where the gene labels came from is the
+    /// manifest's `input.genes_from`. The same as the RAD file tags `index_num_genes` and
+    /// `index_gene_groups`.
+    pub genes: usize,
+    pub gene_groups: bool,
     /// The index's manifest (absent for indexes written before manifests were recorded).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<spearfish::provenance::IndexManifest>,
@@ -123,6 +129,8 @@ impl IndexInfo {
             index_id: idx.id(),
             spec: idx.raw().meta("spec").unwrap_or("").to_string(),
             transcripts: idx.n_transcripts(),
+            genes: idx.n_genes(),
+            gene_groups: idx.has_gene_groups(),
             manifest: idx.manifest(),
         }
     }

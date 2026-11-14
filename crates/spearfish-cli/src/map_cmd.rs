@@ -463,11 +463,11 @@ struct RunWarning {
 
 /// The warnings a mapping run gives about its index: one, `no_gene_groups`, when every
 /// transcript is its own gene (see [`Index::has_gene_groups`]).
-fn index_warnings(path: &Path, idx: &Index, info: &IndexInfo) -> Vec<RunWarning> {
-    let genes_from = info.manifest.as_ref().map(|m| m.input.genes_from.as_str());
-    if spearfish::has_gene_groups(genes_from, idx.n_transcripts(), idx.n_genes()) {
+fn index_warnings(path: &Path, info: &IndexInfo) -> Vec<RunWarning> {
+    if info.gene_groups {
         return Vec::new();
     }
+    let genes_from = info.manifest.as_ref().map(|m| m.input.genes_from.as_str());
     vec![RunWarning {
         code: "no_gene_groups",
         message: crate::index_cmd::no_gene_groups_warning(genes_from.unwrap_or("none"), Some(path)),
@@ -565,7 +565,7 @@ pub fn execute(args: Job) -> Result<Counts> {
     if index_info.manifest.is_none() {
         log::debug!("the index has no manifest (built before manifests were recorded)");
     }
-    let warnings = index_warnings(&index_path, &idx, &index_info);
+    let warnings = index_warnings(&index_path, &index_info);
     for w in &warnings {
         crate::logging::warn_always(format_args!("{}", w.message));
     }
