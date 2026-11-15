@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.2 (unreleased)
+## 0.3.2 (2026-11-14)
 
 - **`spearfish em` reads 15-column TSVs correctly.** Since 0.3.0, `spearfish map` writes a 15th
   TSV column, `qscore`, when quantification scores are on (every preset except the `-fast`
