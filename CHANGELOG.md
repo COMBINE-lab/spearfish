@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2 (unreleased)
+
+- **`spearfish em` reads 15-column TSVs correctly.** Since 0.3.0, `spearfish map` writes a 15th
+  TSV column, `qscore`, when quantification scores are on (every preset except the `-fast`
+  ones), but `em` still took the last column as the flags and the `score` column as the
+  weight. It therefore never saw `low_score` or `low_coverage` in such files, and used those
+  hits. `em` now finds its columns by the header's names (`read`, `transcript`, `score`,
+  `flags` and, if present, `qscore`), and reads a file without a header, or with one that does
+  not name them, by the 14-column positions as before. Hits are weighed by `qscore` when the
+  file has it and by `score` otherwise, as quantifiers should weigh them; the new
+  `--score-column score|qscore|auto` (default `auto`) chooses. Output on 14-column files is
+  unchanged, except that a file without a header no longer loses its first line.
+
 ## 0.3.1 (2026-11-14)
 
 - **RAD files record how the index's genes were labelled.** `spearfish map --rad` writes four

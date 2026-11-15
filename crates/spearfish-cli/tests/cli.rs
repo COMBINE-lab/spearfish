@@ -727,6 +727,221 @@ fn em_skips_low_coverage_reads_with_other_flags() {
     assert_eq!(counts["TOYT0000004"], 0.0);
 }
 
+/// Run `em` on the toy transcripts and the mapping TSV `tsv` (written to `name`), with `extra`
+/// arguments: the exit status, stderr, and the output file's text.
+fn run_em(name: &str, tsv: &str, extra: &[&str]) -> (bool, String, String) {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("em_columns");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (map, out) = (
+        dir.join(format!("{name}.tsv")),
+        dir.join(format!("{name}.quant.tsv")),
+    );
+    std::fs::write(&map, tsv).unwrap();
+    let _ = std::fs::remove_file(&out);
+    let o = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .args([
+            "em".as_ref(),
+            toy().as_os_str(),
+            map.as_os_str(),
+            "-o".as_ref(),
+            out.as_os_str(),
+        ])
+        .args(extra)
+        .output()
+        .unwrap();
+    (
+        o.status.success(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+        std::fs::read_to_string(&out).unwrap_or_default(),
+    )
+}
+
+/// `em`'s output as transcript → estimated reads.
+fn em_counts(quant: &str) -> std::collections::HashMap<String, f64> {
+    quant
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0].to_string(), f[2].parse().unwrap())
+        })
+        .collect()
+}
+
+const EM_HEAD_14: &str = "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\n";
+const EM_HEAD_15: &str = "read\tread_len\tstrand\trank\ttranscript\tscore\tqstart\tqend\ttstart\ttend\tanchors\tanchored\tmax_disc\tflags\tqscore\n";
+
+/// A TSV line (14 columns, or 15 with `qscore`).
+fn em_line(read: &str, tx: &str, score: &str, flags: &str, qscore: Option<&str>) -> String {
+    let mut l = format!("{read}\t1000\t+\t0\t{tx}\t{score}\t0\t1000\t0\t1000\t10\t500\t0\t{flags}");
+    if let Some(q) = qscore {
+        l.push('\t');
+        l.push_str(q);
+    }
+    l.push('\n');
+    l
+}
+
+/// `em` finds the flags in a 14-column (0.2.x) and a 15-column (`qscore`) TSV alike: hits
+/// flagged `low_score` are never used, and `low_coverage` ones only with
+/// `--keep-low-coverage`. (0.3.0 and 0.3.1 read the last column as the flags, `qscore` in a
+/// 15-column file, and so used them all.)
+#[test]
+fn em_reads_flags_in_14_and_15_column_tsvs() {
+    let reads = [
+        ("r1", "TOYT0000001", "-"),
+        ("r2", "TOYT0000002", "low_coverage"),
+        ("r3", "TOYT0000003", "rescued,low_coverage"),
+        ("r4", "TOYT0000004", "low_score"),
+        ("r5", "TOYT0000005", "anchor_span"),
+    ];
+    let tsv = |q: bool| -> String {
+        let head = if q { EM_HEAD_15 } else { EM_HEAD_14 };
+        let mut t = head.to_string();
+        for (r, tx, fl) in reads {
+            t.push_str(&em_line(r, tx, "100.00", fl, q.then_some("100.00")));
+        }
+        // An unmapped read's line.
+        t.push_str(&em_line("r6", "*", "0", "unmapped", q.then_some("0")));
+        t
+    };
+    for q in [false, true] {
+        let name = if q { "flags15" } else { "flags14" };
+        let (ok, log, quant) = run_em(name, &tsv(q), &[]);
+        assert!(ok, "{log}");
+        assert!(
+            log.contains("2 reads used (1 unmapped, 3 low-coverage or low-score skipped"),
+            "{log}"
+        );
+        let c = em_counts(&quant);
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6].map(|i| c[&format!("TOYT000000{i}")]),
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "{name}"
+        );
+        let (ok, log, quant) = run_em(name, &tsv(q), &["--keep-low-coverage"]);
+        assert!(ok, "{log}");
+        let c = em_counts(&quant);
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6].map(|i| c[&format!("TOYT000000{i}")]),
+            [1.0, 1.0, 1.0, 0.0, 1.0, 0.0],
+            "{name} --keep-low-coverage"
+        );
+    }
+}
+
+/// `em` weighs hits by `qscore` when the TSV has it (`--score-column auto`), by `score` with
+/// `--score-column score`, and refuses `--score-column qscore` without the column. Columns are
+/// found by name, in any order.
+#[test]
+fn em_weighs_hits_by_qscore() {
+    // By score, TOYT0000001 is best and TOYT0000002 within `--min-frac`; by qscore (the end fit
+    // moved TOYT0000002 up), TOYT0000002 is best by 5 points.
+    let tsv = [
+        EM_HEAD_15.to_string(),
+        em_line("r1", "TOYT0000001", "100.00", "-", Some("100.00")),
+        em_line("r1", "TOYT0000002", "98.00", "-", Some("105.00")),
+    ]
+    .concat();
+    let (ok, log, quant) = run_em("qscore_auto", &tsv, &[]);
+    assert!(ok && log.contains("weights from `qscore`"), "{log}");
+    let c = em_counts(&quant);
+    assert!(c["TOYT0000002"] > 0.99 && c["TOYT0000001"] < 0.01, "{quant}");
+    let (ok, log, quant) = run_em("qscore_score", &tsv, &["--score-column", "score"]);
+    assert!(ok && log.contains("weights from `score`"), "{log}");
+    let c = em_counts(&quant);
+    assert!(c["TOYT0000001"] > 0.99 && c["TOYT0000002"] < 0.01, "{quant}");
+
+    // r1's two hits tie by score and are 2 points apart by qscore; r2 and r3 make the two
+    // transcripts otherwise equally abundant. By score r1 splits 0.5 / 0.5; by qscore it is
+    // exp(2 / 2) times as likely on TOYT0000002, which gets e / (1 + e) of it, about 0.73.
+    let rows = [
+        ("r1", "TOYT0000001", "100.00", "100.00"),
+        ("r1", "TOYT0000002", "100.00", "102.00"),
+        ("r2", "TOYT0000001", "90.00", "90.00"),
+        ("r3", "TOYT0000002", "90.00", "90.00"),
+    ];
+    let tie: String = std::iter::once(EM_HEAD_15.to_string())
+        .chain(rows.iter().map(|&(r, t, s, q)| em_line(r, t, s, "-", Some(q))))
+        .collect();
+    let s = em_counts(&run_em("tie_score", &tie, &["--score-column", "score"]).2);
+    assert_eq!((s["TOYT0000001"], s["TOYT0000002"]), (1.5, 1.5));
+    let (ok, log, quant) = run_em("tie_qscore", &tie, &["--score-column", "qscore"]);
+    assert!(ok, "{log}");
+    let q = em_counts(&quant);
+    assert!(q["TOYT0000002"] > 1.6 && q["TOYT0000001"] < 1.4, "{q:?}");
+    assert_eq!(em_counts(&run_em("tie_auto", &tie, &[]).2), q);
+    // The same columns in another order, with no others: found by name.
+    let moved: String = std::iter::once("qscore\tread\tflags\ttranscript\tscore\n".to_string())
+        .chain(
+            rows.iter()
+                .map(|&(r, t, s, q)| format!("{q}\t{r}\t-\t{t}\t{s}\n")),
+        )
+        .collect();
+    let (ok, log, quant) = run_em("tie_reordered", &moved, &[]);
+    assert!(ok, "{log}");
+    assert_eq!(em_counts(&quant), q);
+
+    // No `qscore` column: auto weighs by score; asking for qscore is an error.
+    let tsv14 = [
+        EM_HEAD_14.to_string(),
+        em_line("r1", "TOYT0000001", "100.00", "-", None),
+    ]
+    .concat();
+    let (ok, log, _) = run_em("noq_auto", &tsv14, &[]);
+    assert!(ok && log.contains("weights from `score`"), "{log}");
+    let (ok, log, _) = run_em("noq_qscore", &tsv14, &["--score-column", "qscore"]);
+    assert!(!ok && log.contains("no `qscore` column"), "{log}");
+}
+
+/// A 14-column TSV gives exactly 0.3.1's output (checked against the 0.3.1 binary), with a
+/// header and without one. Without a header the first line is a read's; with a header `em`
+/// does not know, the 14-column layout is read and a warning logged.
+#[test]
+fn em_on_14_columns_matches_0_3_1() {
+    let rows = [
+        ("r1", "TOYT0000001", "100.00", "-"),
+        ("r1", "TOYT0000002", "99.00", "-"),
+        ("r1", "TOYT0000003", "96.50", "-"),
+        ("r2", "TOYT0000002", "80.00", "-"),
+        ("r2", "TOYT0000001", "79.00", "-"),
+        ("r3", "TOYT0000004", "120.00", "anchor_span"),
+        ("r3", "TOYT0000005", "117.50", "anchor_span"),
+        ("r4", "TOYT0000003", "60.00", "rescued"),
+        ("r5", "TOYT0000006", "50.00", "low_coverage"),
+        ("r5", "TOYT0000005", "49.00", "low_coverage"),
+        ("r6", "NOT_A_TX", "70.00", "-"),
+        ("r7", "*", "0", "unmapped"),
+        ("r8", "TOYT0000001", "90.00", "-"),
+        ("r8", "TOYT0000006", "90.00", "-"),
+        ("r9", "TOYT0000004", "30.00", "low_score"),
+    ];
+    let body: String = rows
+        .iter()
+        .map(|&(r, t, s, f)| em_line(r, t, s, f, None))
+        .collect();
+    // `spearfish em` 0.3.1 on the same file.
+    let v031 = "transcript\tlength\treads\nTOYT0000001\t1270\t2.9411\nTOYT0000002\t1150\t0.0000\nTOYT0000003\t1100\t1.0589\nTOYT0000004\t1064\t1.0000\nTOYT0000005\t1050\t0.0000\nTOYT0000006\t1050\t0.0000\n";
+    let v031_keep = "transcript\tlength\treads\nTOYT0000001\t1270\t2.5923\nTOYT0000002\t1150\t0.0000\nTOYT0000003\t1100\t1.0667\nTOYT0000004\t1064\t1.0000\nTOYT0000005\t1050\t0.0000\nTOYT0000006\t1050\t1.3409\n";
+    for (name, tsv) in [
+        ("golden14", format!("{EM_HEAD_14}{body}")),
+        ("golden14_noheader", body.clone()),
+        ("golden14_otherheader", format!("a\tb\tc\n{body}")),
+    ] {
+        let (ok, log, quant) = run_em(name, &tsv, &[]);
+        assert!(ok, "{log}");
+        assert_eq!(quant, v031, "{name}");
+        assert_eq!(
+            log.contains("header names no"),
+            name == "golden14_otherheader",
+            "{log}"
+        );
+        let (ok, log, quant) = run_em(name, &tsv, &["--keep-low-coverage"]);
+        assert!(ok, "{log}");
+        assert_eq!(quant, v031_keep, "{name} --keep-low-coverage");
+    }
+}
+
 /// The toy transcripts with Ensembl-style headers (`>TOYT0000001 cdna gene:TOYG0000001`): the
 /// ID ends at the first whitespace.
 fn described_toy(path: &std::path::Path) {
