@@ -15,4 +15,13 @@ seeds.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 anyhow.workspace = true
+# DEFLATE for BAM output: zflate by default; the features below swap in another engine.
+zflate = "1.0.0"
+libdeflater = { version = "1.19", optional = true }
+flate2 = { workspace = true, optional = true }
 index.workspace = true
+
+[features]
+# BAM output's DEFLATE engine (default: zflate).
+libdeflate = ["dep:libdeflater"]
+zlib-rs = ["dep:flate2"]
