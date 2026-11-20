@@ -8,6 +8,7 @@
 
 use seeds::BaseSeeder;
 
+use crate::gap::{self, CLIP, Hop, ReadView, View};
 use crate::index::{GenomeIndex, L2_SPEC, L3_SPEC, code};
 
 #[derive(Clone, Debug)]
@@ -87,6 +88,7 @@ pub struct Scratch {
     e1: Vec<u16>,
     e2: Vec<u16>,
     etmp: Vec<u16>,
+    gap: crate::gap::Bufs,
     /// Level-2 cores of the read, per orientation, in read order.
     l2: [Vec<L2Seed>; 2],
     /// Marks the level-2 label ids wanted by the rescue under way (indexed by id).
@@ -144,14 +146,16 @@ pub struct Mapper<'a> {
     seeder2: BaseSeeder,
 }
 
-const INF: u16 = u16::MAX / 4;
+pub(crate) const INF: u16 = u16::MAX / 4;
 
 /// Alignment costs, relative to a match: a mismatch, opening a gap, each gap base. With
 /// affine gaps one long insertion in a read is cheaper than the scattered matches a junction
 /// placed after it would collect, which unit costs get wrong.
-const MISMATCH: u16 = 6;
-const GAP_OPEN: u16 = 6;
-const GAP_EXT: u16 = 2;
+pub(crate) const MISMATCH: u16 = 6;
+pub(crate) const GAP_OPEN: u16 = 4;
+pub(crate) const GAP_EXT: u16 = 2;
+/// Each read base in a gap also forfeits the match it would have scored.
+pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
 /// Splice-site costs per site: GT..AG is free, GC..AG and AT..AC cost `SEMI`, others `NONCANON`.
 const SEMI: u16 = 4;
 const NONCANON: u16 = 9;
@@ -160,8 +164,11 @@ const COST_PER_BASE_X8: u32 = 3;
 
 /// Banded affine-gap costs of every prefix of `a` against prefixes of `b`.
 /// `e[i * w + k]` is the cost of `a[..i]` against `b[..j]` with `j = i + k - band`,
-/// `w = 2 * band + 1`. `tmp` holds the gap states.
-fn band_prefix(
+/// `w = 2 * band + 1`. `tmp` holds the gap states. With `drop > 0` the rows stop once the best
+/// score of a row (two per base of `a`, minus its cost) falls `drop` below the best seen;
+/// returns the number of rows of `a` computed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn band_prefix(
     a: impl Fn(usize) -> u8,
     m: usize,
     b: impl Fn(usize) -> u8,
@@ -169,15 +176,18 @@ fn band_prefix(
     band: usize,
     e: &mut Vec<u16>,
     tmp: &mut Vec<u16>,
-) {
+    drop: i32,
+) -> usize {
     let w = 2 * band + 1;
     e.clear();
     e.resize((m + 1) * w, INF);
     // gap states of the row above (a gap that consumes `a`), per k
     tmp.clear();
     tmp.resize(w, INF);
+    let mut best = 0i32;
     for i in 0..=m {
         let mut left = INF; // a gap that consumes `b`, ending at the cell to the left
+        let mut row = INF;
         for k in 0..w {
             let j = (i + k) as isize - band as isize;
             if j < 0 || j as usize > n {
@@ -187,7 +197,7 @@ fn band_prefix(
             let j = j as usize;
             // cell above is (i-1, j): k + 1 in the previous row
             let up = if i > 0 && k + 1 < w {
-                (tmp[k + 1] + GAP_EXT).min(e[(i - 1) * w + k + 1] + GAP_OPEN + GAP_EXT)
+                (tmp[k + 1] + INS_EXT).min(e[(i - 1) * w + k + 1] + GAP_OPEN + INS_EXT)
             } else {
                 INF
             };
@@ -208,15 +218,24 @@ fn band_prefix(
             };
             e[i * w + k] = v.min(INF);
             tmp[k] = up.min(INF);
+            row = row.min(v);
+        }
+        if drop > 0 {
+            let s = 2 * i as i32 - row as i32;
+            best = best.max(s);
+            if s + drop < best {
+                return i;
+            }
         }
     }
+    m
 }
 
 /// Cost of a donor at `p` (first intron base) and of an acceptor ending at `p` (first exon
 /// base after the intron), for a transcript on the forward or reverse strand. On the reverse
 /// strand the intron's left end is the reverse complement of the acceptor.
 #[inline]
-fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+pub(crate) fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     if p + 2 > ix.total_len() {
         return NONCANON;
     }
@@ -228,7 +247,7 @@ fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
 }
 
 #[inline]
-fn acceptor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+pub(crate) fn acceptor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     if p < 2 {
         return NONCANON;
     }
@@ -248,6 +267,62 @@ struct Placed {
     donor: u32,
     acceptor: u32,
     cost: u16,
+}
+
+struct EndSolved {
+    cost: u32,
+    /// Junctions in the direction of travel (away from the chain).
+    hops: Vec<Hop>,
+    /// Where the alignment stops (read boundary, genome boundary).
+    end: (u32, u32),
+    /// The transcript strand, when it was chosen at this end.
+    minus: Option<bool>,
+}
+
+/// Candidate exon windows (genome start, end) from a colinear run of rescued anchors: anchors
+/// that the genome does not separate form one exon. A window reaches past its anchors by the
+/// read bases they leave uncovered on that side (the exon's edge can lie anywhere in them), but
+/// not past the midpoint to the next group. Windows stay inside `(t_lo, t_hi)`.
+fn windows_of(path: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Vec<(u32, u32)> {
+    // groups as (first anchor, last anchor)
+    let mut groups: Vec<(Anchor, Anchor)> = Vec::new();
+    let mut i = 0;
+    while i < path.len() {
+        let mut j = i;
+        while j + 1 < path.len() {
+            let d = (path[j + 1].t - path[j].t) as i64 - (path[j + 1].q - path[j].q) as i64;
+            if d.abs() >= 30 {
+                break;
+            }
+            j += 1;
+        }
+        groups.push((path[i], path[j]));
+        i = j + 1;
+    }
+    let end = |a: Anchor| a.t + a.tl as u32;
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (k, &(f, l)) in groups.iter().enumerate() {
+        let lead = f.q.saturating_sub(q_lo).min(150) + 12;
+        let trail = q_hi.saturating_sub(l.q + l.ql as u32).min(150) + 12;
+        // midpoints, computed without overflowing 32 bits
+        let mid = |a: u32, b: u32| a + b.saturating_sub(a) / 2;
+        let lo = if k > 0 {
+            mid(end(groups[k - 1].1), f.t) + 1
+        } else {
+            t_lo + 20
+        };
+        let hi = if k + 1 < groups.len() {
+            mid(end(l), groups[k + 1].0.t)
+        } else {
+            t_hi.saturating_sub(20)
+        };
+        let s = f.t.saturating_sub(lead).max(lo);
+        let e = (end(l) + trail).min(hi);
+        if e > s + 4 && e - s <= 2000 {
+            out.push((s, e));
+        }
+    }
+    out
 }
 
 impl<'a> Mapper<'a> {
@@ -276,6 +351,7 @@ impl<'a> Mapper<'a> {
         sc.codes[0] = fw;
 
         let mut out: Vec<SplicedHit> = Vec::new();
+        let mut cands: Vec<(f32, bool, Vec<Anchor>)> = Vec::new();
         for o in 0..2 {
             let ascii: Vec<u8> = sc.codes[o].iter().map(|&c| b"ACGT"[c as usize]).collect();
             let h = self.seeder.parsed(&ascii).expect("HPC is on");
@@ -334,10 +410,21 @@ impl<'a> Mapper<'a> {
                 if w < 0.25 * best {
                     break;
                 }
-                if let Some(hit) = self.chain_locus(o == 1, s, e, n as u32, sc) {
-                    out.push(hit);
+                if let Some((score, chain)) = self.chain_locus(s, e, sc) {
+                    cands.push((score, o == 1, chain));
                 }
             }
+        }
+        // Only chains close to the best are worth building.
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let top = cands.first().map_or(0.0, |c| c.0);
+        for (score, reverse, chain) in cands.into_iter().take(4) {
+            if score < 0.5 * top {
+                break;
+            }
+            let read = std::mem::take(&mut sc.codes[reverse as usize]);
+            out.push(self.build(reverse, &chain, &read, n as u32, score, sc));
+            sc.codes[reverse as usize] = read;
         }
         out.sort_by_key(|h| std::cmp::Reverse(h.score));
         if let Some(h) = out.first_mut() {
@@ -346,15 +433,8 @@ impl<'a> Mapper<'a> {
         out
     }
 
-    /// Chain the hits `sc.hits[s..e]` (sorted by genome position) and build the hit.
-    fn chain_locus(
-        &self,
-        reverse: bool,
-        s: usize,
-        e: usize,
-        qlen: u32,
-        sc: &mut Scratch,
-    ) -> Option<SplicedHit> {
+    /// Chain the hits `sc.hits[s..e]` (sorted by genome position): the best chain and its score.
+    fn chain_locus(&self, s: usize, e: usize, sc: &mut Scratch) -> Option<(f32, Vec<Anchor>)> {
         const H: usize = 40;
         let hits = &sc.hits[s..e];
         let m = hits.len();
@@ -393,140 +473,129 @@ impl<'a> Mapper<'a> {
         if best < 40.0 && sc.chain.len() < 2 {
             return None;
         }
-        let mut chain: Vec<Anchor> = sc.chain.iter().map(|&i| hits[i as usize]).collect();
-        let read = std::mem::take(&mut sc.codes[reverse as usize]);
-        let hit = self.build(reverse, &mut chain, &read, qlen, best, sc);
-        sc.codes[reverse as usize] = read;
-        Some(hit)
+        Some((best, sc.chain.iter().map(|&i| hits[i as usize]).collect()))
     }
 
-    /// Blocks from a chain: junctions placed, read ends extended.
+    /// Blocks from a chain: junctions placed, exons without an anchor recovered, read ends solved.
     fn build(
         &self,
         reverse: bool,
-        chain: &mut Vec<Anchor>,
+        chain: &[Anchor],
         read: &[u8],
         qlen: u32,
         score: f32,
         sc: &mut Scratch,
     ) -> SplicedHit {
-        let ix = self.index;
-        // Exons without a level-3 anchor: where a junction leaves read bases unexplained, look
-        // for level-2 cores of those bases inside that intron and splice the found anchors in.
-        let mut i = 0;
-        let mut budget = 64u32;
-        while i + 1 < chain.len() {
-            let (a, b) = (chain[i], chain[i + 1]);
-            i += 1;
-            let d = (b.t - a.t) as i64 - (b.q - a.q) as i64;
-            if d < self.opt.min_intron as i64 {
-                continue;
-            }
-            sc.stats.junctions += 1;
-            let (q0, t0, q1, t1) = self.fixed(a, b);
-            let old = self.place(read, q0, t0, q1, t1, sc);
-            let old = old[0].cost.min(old[1].cost);
-            let m = q1.saturating_sub(q0);
-            if old < INF && (old as u32) < 24 + m * COST_PER_BASE_X8 / 8 {
-                continue;
-            }
-            sc.stats.rescues_tried += 1;
-            sc.stats.unplaced += (old >= INF) as u64;
-            let sub = self.rescue(reverse, Some(a), Some(b), qlen, sc);
-            sc.stats.empty += sub.is_empty() as u64;
-            if sub.is_empty() {
-                continue;
-            }
-            // Keep the found anchors only if the junctions they imply cost less.
-            let mut new = 0u32;
-            let mut prev = a;
-            for &x in sub.iter().chain(std::iter::once(&b)) {
-                let d = (x.t - prev.t) as i64 - (x.q - prev.q) as i64;
-                if d >= self.opt.min_intron as i64 {
-                    let (q0, t0, q1, t1) = self.fixed(prev, x);
-                    let p = self.place(read, q0, t0, q1, t1, sc);
-                    new += p[0].cost.min(p[1].cost) as u32;
-                }
-                prev = x;
-            }
-            if new + 12 >= old as u32 || budget == 0 {
-                sc.stats.not_cheaper += 1;
-            } else {
-                // Keep them, and look at the junctions they make in turn: more than one exon
-                // can be missing between two anchors.
-                sc.stats.rescues_kept += 1;
-                budget -= 1;
-                chain.splice(i..i, sub);
-                i -= 1;
-            }
-        }
-        // Read ends: when the bases past the last (before the first) anchor do not continue on
-        // the genome, look for further exons the same way, one known side only.
-        for _ in 0..4 {
-            let last = chain[chain.len() - 1];
-            let (q, t) = (last.q + last.ql as u32, last.t + last.tl as u32);
-            if qlen - q < 20 || qlen - q - self.extend(read, q, t, false, sc).0 < 12 {
-                break;
-            }
-            sc.stats.end_tried += 1;
-            let mut path = vec![last];
-            path.extend(self.rescue(reverse, Some(last), None, qlen, sc));
-            if path.len() < 2 || !self.junctions_ok(read, &path, sc) {
-                break;
-            }
-            sc.stats.end_kept += 1;
-            chain.extend_from_slice(&path[1..]);
-        }
-        for _ in 0..4 {
-            let first = chain[0];
-            if first.q < 20 || first.q - self.extend(read, first.q, first.t, true, sc).0 < 12 {
-                break;
-            }
-            sc.stats.end_tried += 1;
-            let mut path = self.rescue(reverse, None, Some(first), qlen, sc);
-            path.push(first);
-            if path.len() < 2 || !self.junctions_ok(read, &path, sc) {
-                break;
-            }
-            sc.stats.end_kept += 1;
-            path.pop();
-            chain.splice(0..0, path);
-        }
-        let chain: &[Anchor] = chain;
-        // Junctions between consecutive anchors, placed for both transcript strands.
-        let mut junc: Vec<[Placed; 2]> = Vec::new();
-        let mut cost = [0u32; 2];
+        let trigger = |c: u16, m: u32| c >= INF || c as u32 >= 24 + m * COST_PER_BASE_X8 / 8;
+        // Each pair of chain neighbours that the genome separates by an intron, placed directly.
+        let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
+        let mut vote = [0u32; 2];
         for w in chain.windows(2) {
             let (a, b) = (w[0], w[1]);
             let d = (b.t - a.t) as i64 - (b.q - a.q) as i64;
             if d < self.opt.min_intron as i64 {
                 continue;
             }
+            sc.stats.junctions += 1;
             let (q0, t0, q1, t1) = self.fixed(a, b);
             let p = self.place(read, q0, t0, q1, t1, sc);
-            cost[0] += p[0].cost as u32;
-            cost[1] += p[1].cost as u32;
-            junc.push(p);
+            let poor = trigger(p[0].cost.min(p[1].cost), q1.saturating_sub(q0));
+            if !poor {
+                vote[0] += p[0].cost as u32;
+                vote[1] += p[1].cost as u32;
+            }
+            pairs.push((a, b, p, poor));
         }
-        let minus = if self.opt.forward_only {
-            reverse
+        // The transcript strand, when the well-placed junctions agree on one.
+        let strands: Vec<bool> = if self.opt.forward_only {
+            vec![reverse]
+        } else if vote[0] + 8 <= vote[1] {
+            vec![false]
+        } else if vote[1] + 8 <= vote[0] {
+            vec![true]
         } else {
-            cost[1] < cost[0]
+            vec![false, true]
         };
-        let tx_strand = if junc.is_empty() || (!self.opt.forward_only && cost[0] == cost[1]) {
-            b'.'
-        } else if minus {
-            b'-'
-        } else {
-            b'+'
-        };
-        let mut edits = 0u32;
+        // Where a junction leaves read bases unexplained, look for level-2 cores of those bases
+        // inside that intron and solve the gap through the exons they point to.
+        let mut cand: Vec<Option<Vec<(u32, u32)>>> = vec![None; pairs.len()];
+        let mut best: Option<(u32, bool, Vec<Placed>)> = None;
+        for &minus in &strands {
+            let mut total = 0u32;
+            let mut juncs: Vec<Placed> = Vec::new();
+            for (k, &(a, b, p, poor)) in pairs.iter().enumerate() {
+                let direct = p[minus as usize];
+                if !poor {
+                    total += direct.cost as u32;
+                    juncs.push(direct);
+                    continue;
+                }
+                let (q0, t0, q1, t1) = self.fixed(a, b);
+                if cand[k].is_none() {
+                    sc.stats.rescues_tried += 1;
+                    let path = self.rescue(reverse, Some(a), Some(b), qlen, sc);
+                    sc.stats.empty += path.is_empty() as u64;
+                    cand[k] = Some(windows_of(&path, q0, q1, t0, t1));
+                }
+                let wins = cand[k].as_ref().unwrap();
+                let m = q1.saturating_sub(q0) as usize;
+                let mut done = false;
+                if !wins.is_empty() && q1 > q0 && t1 > t0 && m <= 600 {
+                    let vw: Vec<(u32, u32)> = wins.iter().map(|&(s, e)| (s - t0, e - s)).collect();
+                    let rv = ReadView { q: q0, rev: false };
+                    let gv = View {
+                        origin: t0,
+                        rev: false,
+                    };
+                    let half = self.opt.min_intron / 2;
+                    let s = gap::solve(
+                        self.index,
+                        read,
+                        rv,
+                        m,
+                        gv,
+                        Some(t1),
+                        &vw,
+                        minus,
+                        half,
+                        &mut sc.gap,
+                    );
+                    if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
+                        sc.stats.rescues_kept += (minus == strands[0]) as u64;
+                        total += s.cost;
+                        juncs.extend(s.hops.iter().map(|h| Placed {
+                            q: h.q,
+                            donor: h.leave,
+                            acceptor: h.enter,
+                            cost: 0,
+                        }));
+                        done = true;
+                    }
+                }
+                if !done {
+                    sc.stats.not_cheaper += (minus == strands[0]) as u64;
+                    total += direct.cost.min(2000) as u32;
+                    juncs.push(direct);
+                }
+            }
+            if best.as_ref().is_none_or(|b| total < b.0) {
+                best = Some((total, minus, juncs));
+            }
+        }
+        let (mut edits, minus, juncs) = best.unwrap();
+        let undecided = !self.opt.forward_only && juncs.is_empty();
+        let tx_strand =
+            if undecided || (strands.len() == 2 && pairs.iter().all(|p| p.2[0].cost == p.2[1].cost)) {
+                b'.'
+            } else if minus {
+                b'-'
+            } else {
+                b'+'
+            };
         let mut blocks: Vec<Block> = Vec::new();
         let first = chain[0];
         let (mut bq, mut bt) = (first.q, first.t);
-        for p in &junc {
-            let p = p[(minus && !self.opt.forward_only) as usize];
-            edits += p.cost.min(1000) as u32;
+        for p in &juncs {
             blocks.push(Block {
                 qs: bq,
                 qe: p.q,
@@ -544,18 +613,65 @@ impl<'a> Mapper<'a> {
             te: last.t + last.tl as u32,
         });
 
-        // Read ends: extend while the bases keep matching.
-        let (dq, dt, e0) = self.extend(read, blocks[0].qs, blocks[0].ts, true, sc);
-        blocks[0].qs -= dq;
-        blocks[0].ts -= dt;
+        // Read ends, from a point inside the outermost anchors.
+        let (_, _, q1, t1) = self.fixed(last, last);
+        let right = self.end(read, reverse, q1, t1, false, minus, undecided, qlen, sc);
+        let (q0, t0, _, _) = self.fixed(first, first);
+        let left = self.end(read, reverse, q0, t0, true, minus, undecided, qlen, sc);
+        edits += left.cost + right.cost;
+        // left end: hops come in travel order (away from the anchor); in genome order the
+        // furthest exon is first
+        let b0 = blocks[0];
+        let mut pre: Vec<Block> = Vec::new();
+        let (mut eq, mut et) = left.end;
+        for h in left.hops.iter().rev() {
+            // travelling backwards, `enter` is the end of the exon further left
+            pre.push(Block {
+                qs: eq,
+                qe: h.q,
+                ts: et,
+                te: h.enter,
+            });
+            eq = h.q;
+            et = h.leave;
+        }
+        blocks[0] = Block {
+            qs: eq,
+            qe: b0.qe,
+            ts: et,
+            te: b0.te,
+        };
+        blocks.splice(0..0, pre);
         let nb = blocks.len() - 1;
-        let (dq, dt, e1) = self.extend(read, blocks[nb].qe, blocks[nb].te, false, sc);
-        blocks[nb].qe += dq;
-        blocks[nb].te += dt;
-        edits += e0 + e1;
-        debug_assert!(blocks[nb].qe <= qlen);
-        blocks.retain(|b| b.te > b.ts || b.qe > b.qs);
-        let _ = ix;
+        let bl = blocks[nb];
+        let (mut sq, mut st) = (bl.qs, bl.ts);
+        blocks.pop();
+        for h in &right.hops {
+            blocks.push(Block {
+                qs: sq,
+                qe: h.q,
+                ts: st,
+                te: h.leave,
+            });
+            sq = h.q;
+            st = h.enter;
+        }
+        blocks.push(Block {
+            qs: sq,
+            qe: right.end.0,
+            ts: st,
+            te: right.end.1,
+        });
+        blocks.retain(|b| b.te > b.ts && b.qe >= b.qs);
+        let tx_strand = if tx_strand == b'.' && blocks.len() > 1 && !self.opt.forward_only {
+            if left.minus.or(right.minus).unwrap_or(minus) {
+                b'-'
+            } else {
+                b'+'
+            }
+        } else {
+            tx_strand
+        };
         SplicedHit {
             reverse,
             blocks,
@@ -565,6 +681,132 @@ impl<'a> Mapper<'a> {
             edits,
             primary: false,
         }
+    }
+
+    /// Solve a read end: the bases before read position `q` (`left`) or from it on, starting
+    /// at genome position `t`. Returns the junctions found, where the alignment stops, and the
+    /// strand used when it had to be chosen here.
+    #[allow(clippy::too_many_arguments)]
+    fn end(
+        &self,
+        read: &[u8],
+        reverse: bool,
+        q: u32,
+        t: u32,
+        left: bool,
+        minus: bool,
+        undecided: bool,
+        qlen: u32,
+        sc: &mut Scratch,
+    ) -> EndSolved {
+        let ix = self.index;
+        let (mut q, mut t) = (q, t);
+        let mut m = if left { q } else { qlen - q };
+        let mut out = EndSolved {
+            cost: 0,
+            hops: Vec::new(),
+            end: (q, t),
+            minus: None,
+        };
+        if m == 0 {
+            return out;
+        }
+        // A long end first runs along the genome until it stops matching; only what is left
+        // (with a margin, since a run can overshoot an exon edge by chance) is solved in full.
+        if m > 100 {
+            let (dq, dt, _) = self.extend(read, q, t, left, sc);
+            if m - dq < 12 {
+                out.end = if left { (q - dq, t - dt) } else { (q + dq, t + dt) };
+                return out;
+            }
+            let back = dq.min(dt).min(25);
+            let (aq, at) = (dq - back, dt - back);
+            (q, t) = if left { (q - aq, t - at) } else { (q + aq, t + at) };
+            m -= aq;
+        }
+        let m = m.min(400) as usize;
+        let rv = ReadView { q, rev: left };
+        let gv = View { origin: t, rev: left };
+        let half = self.opt.min_intron / 2;
+        let strands: &[bool] = if undecided {
+            &[false, true]
+        } else if minus {
+            &[true]
+        } else {
+            &[false]
+        };
+        let plain = gap::solve(ix, read, rv, m, gv, None, &[], strands[0], half, &mut sc.gap);
+        let reached = if left { q - plain.end.0 } else { plain.end.0 - q };
+        let mut best = (plain, None);
+        if m as u32 - reached >= 12 {
+            sc.stats.end_tried += 1;
+            // level-2 cores of the unexplained bases, within reach of the longest intron
+            let here = Anchor {
+                t,
+                q,
+                ql: 0,
+                tl: 0,
+                q_in: 0,
+                q_out: 0,
+                w: 0.0,
+            };
+            let path = if left {
+                self.rescue(reverse, None, Some(here), qlen, sc)
+            } else {
+                self.rescue(reverse, Some(here), None, qlen, sc)
+            };
+            let wins = if left {
+                windows_of(
+                    &path,
+                    q.saturating_sub(m as u32),
+                    q,
+                    t.saturating_sub(self.opt.max_intron),
+                    t,
+                )
+            } else {
+                windows_of(
+                    &path,
+                    q,
+                    q + m as u32,
+                    t,
+                    t.saturating_add(self.opt.max_intron).min(ix.total_len()),
+                )
+            };
+            if std::env::var_os("GMAP_DEBUG").is_some() {
+                eprintln!(
+                    "end path left={left} q={q} t={t} reached={reached}: {:?}",
+                    path.iter().map(|a| (a.t, a.q, a.ql)).collect::<Vec<_>>()
+                );
+            }
+            if !wins.is_empty() {
+                let vw: Vec<(u32, u32)> = if left {
+                    wins.iter().rev().map(|&(s, e)| (t - e, e - s)).collect()
+                } else {
+                    wins.iter().map(|&(s, e)| (s - t, e - s)).collect()
+                };
+                for &mi in strands {
+                    let s = gap::solve(ix, read, rv, m, gv, None, &vw, mi, half, &mut sc.gap);
+                    if std::env::var_os("GMAP_DEBUG").is_some() {
+                        eprintln!(
+                            "end left={left} q={q} t={t} m={m} minus={mi} windows={wins:?} plain={} cost={} hops={:?} end={:?}",
+                            best.0.cost, s.cost, s.hops, s.end
+                        );
+                    }
+                    if !s.hops.is_empty() && s.cost < best.0.cost {
+                        best = (s, Some(mi));
+                    }
+                }
+                sc.stats.end_kept += best.1.is_some() as u64;
+            }
+        }
+        out.cost = best
+            .0
+            .cost
+            .saturating_sub(CLIP * (m as u32 - if left { q - best.0.end.0 } else { best.0.end.0 - q }));
+        out.end = best.0.end;
+        out.hops = best.0.hops;
+        out.minus = best.1;
+        out
     }
 
     /// Score change of chaining anchor `a` after `p`: the read bases `a` adds, minus the price of
@@ -698,22 +940,6 @@ impl<'a> Mapper<'a> {
         path
     }
 
-    /// Whether every junction along `path` (anchors in order) is placed cheaply.
-    fn junctions_ok(&self, read: &[u8], path: &[Anchor], sc: &mut Scratch) -> bool {
-        for w in path.windows(2) {
-            let d = (w[1].t - w[0].t) as i64 - (w[1].q - w[0].q) as i64;
-            if d >= self.opt.min_intron as i64 {
-                let (q0, t0, q1, t1) = self.fixed(w[0], w[1]);
-                let p = self.place(read, q0, t0, q1, t1, sc);
-                let c = p[0].cost.min(p[1].cost);
-                if c >= INF || c as u32 >= 18 + q1.saturating_sub(q0) * COST_PER_BASE_X8 / 8 {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
     /// The corresponding read/genome points a junction after anchor `a` and before anchor `b`
     /// is placed between: the end of `a`'s first homopolymer run and the start of `b`'s last
     /// one. The anchors themselves lie between the two points on purpose: after homopolymer
@@ -759,7 +985,7 @@ impl<'a> Mapper<'a> {
         ix.bases(t1 - n as u32, t1, &mut sc.g2);
         let r = &read[q0 as usize..q1 as usize];
         let (g1, g2) = (&sc.g1, &sc.g2);
-        band_prefix(|i| r[i], m, |j| g1[j], n, band, &mut sc.e1, &mut sc.etmp);
+        band_prefix(|i| r[i], m, |j| g1[j], n, band, &mut sc.e1, &mut sc.etmp, 0);
         band_prefix(
             |i| r[m - 1 - i],
             m,
@@ -768,13 +994,11 @@ impl<'a> Mapper<'a> {
             band,
             &mut sc.e2,
             &mut sc.etmp,
+            0,
         );
         let mut out = [none; 2];
         for (s, o) in out.iter_mut().enumerate() {
             let minus = s == 1;
-            if minus && self.opt.forward_only {
-                break;
-            }
             let mut best = (INF, 0usize, 0usize, 0usize);
             for i in 0..=m {
                 // upstream part: read[..i] against genome[t0 .. t0 + j1]
@@ -856,6 +1080,7 @@ impl<'a> Mapper<'a> {
                 band,
                 &mut sc.e1,
                 &mut sc.etmp,
+                60,
             );
         } else {
             band_prefix(
@@ -866,6 +1091,7 @@ impl<'a> Mapper<'a> {
                 band,
                 &mut sc.e1,
                 &mut sc.etmp,
+                60,
             );
         }
         // The furthest point whose score (one per read base, minus three per edit) is best.
