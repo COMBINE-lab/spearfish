@@ -1,6 +1,6 @@
 //! Development driver for spliced genome mapping.
 //!
-//!   gmap index <genome.fa> <out.gidx>
+//!   gmap index <genome.fa> <out.gidx> [--no-hpc]
 //!   gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
 //!            [--junctions <BED12>] [--sam | --bam [--bam-level N]]   (default output: PAF)
 
@@ -32,7 +32,13 @@ fn main() -> anyhow::Result<()> {
     match a.get(1).map(String::as_str) {
         Some("index") => {
             let t = Instant::now();
-            let ix = GenomeIndex::build(Path::new(&a[2]), &BuildOptions::default())?;
+            let ix = GenomeIndex::build(
+                Path::new(&a[2]),
+                &BuildOptions {
+                    hpc: flag("--no-hpc").is_none(),
+                    ..Default::default()
+                },
+            )?;
             eprintln!("built in {:.1}s", t.elapsed().as_secs_f64());
             let n = ix.write(Path::new(&a[3]))?;
             eprintln!("wrote {n} bytes in total {:.1}s", t.elapsed().as_secs_f64());

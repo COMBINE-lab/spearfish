@@ -497,8 +497,8 @@ impl<'a> Mapper<'a> {
         Mapper {
             index,
             opt,
-            seeder: BaseSeeder::new(L3_SPEC, true).expect("valid seed spec"),
-            seeder2: BaseSeeder::new(L2_SPEC, true).expect("valid seed spec"),
+            seeder: BaseSeeder::new(L3_SPEC, index.hpc()).expect("valid seed spec"),
+            seeder2: BaseSeeder::new(L2_SPEC, index.hpc()).expect("valid seed spec"),
         }
     }
 
@@ -540,18 +540,45 @@ impl<'a> Mapper<'a> {
         let mut cands: Vec<(f32, bool, Vec<Anchor>)> = Vec::new();
         for o in 0..2 {
             let ascii: Vec<u8> = sc.codes[o].iter().map(|&c| b"ACGT"[c as usize]).collect();
-            let h = self.seeder.parsed(&ascii).expect("HPC is on");
-            let seeds = self.seeder.seed_parsed(&h.seq);
+            // Raw coordinates of a core: its span, the length of its first homopolymer run and
+            // the offset of its last one, and (with compression) the number of runs.
+            let h = self.seeder.parsed(&ascii);
+            let parsed: &[u8] = h.as_ref().map_or(&ascii, |h| &h.seq);
+            let coords = |s: u32, e: u32| -> (u32, u32, u16, u16, u16) {
+                match &h {
+                    Some(h) => {
+                        let (qs, qe) = h.to_raw(s, e);
+                        (
+                            qs,
+                            qe,
+                            h.run_len(s) as u16,
+                            (h.to_raw(e - 1, e).0 - qs) as u16,
+                            (e - s) as u16,
+                        )
+                    }
+                    None => {
+                        let (mut a, mut b) = (s + 1, e - 1);
+                        while a < e && ascii[a as usize] == ascii[s as usize] {
+                            a += 1;
+                        }
+                        while b > s && ascii[b as usize - 1] == ascii[e as usize - 1] {
+                            b -= 1;
+                        }
+                        (s, e, (a - s) as u16, (b - s) as u16, 0)
+                    }
+                }
+            };
+            let seeds = self.seeder.seed_parsed(parsed);
             sc.l2[o].clear();
-            for s in self.seeder2.seed_parsed(&h.seq) {
+            for s in self.seeder2.seed_parsed(parsed) {
                 if let Some(id) = ix.l2_id(s.label) {
-                    let (qs, qe) = h.to_raw(s.start, s.end);
+                    let (qs, qe, q_in, q_out, runs) = coords(s.start, s.end);
                     sc.l2[o].push(L2Seed {
                         q: qs,
                         ql: (qe - qs) as u16,
-                        q_in: h.run_len(s.start) as u16,
-                        q_out: (h.to_raw(s.end - 1, s.end).0 - qs) as u16,
-                        runs: (s.end - s.start) as u16,
+                        q_in,
+                        q_out,
+                        runs,
                         id,
                     });
                 }
@@ -562,7 +589,7 @@ impl<'a> Mapper<'a> {
                 if pos.is_empty() || pos.len() > cap {
                     continue;
                 }
-                let (qs, qe) = h.to_raw(s.start, s.end);
+                let (qs, qe, q_in, q_out, _) = coords(s.start, s.end);
                 let w = (qe - qs).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
                 for (&t, &tl) in pos.iter().zip(len) {
                     sc.hits.push(Anchor {
@@ -570,8 +597,8 @@ impl<'a> Mapper<'a> {
                         q: qs,
                         ql: (qe - qs).min(u16::MAX as u32) as u16,
                         tl: tl as u16,
-                        q_in: h.run_len(s.start) as u16,
-                        q_out: (h.to_raw(s.end - 1, s.end).0 - qs) as u16,
+                        q_in,
+                        q_out,
                         w,
                     });
                 }
@@ -1484,7 +1511,8 @@ impl<'a> Mapper<'a> {
             }
             for s in seeds[first as usize..hi].iter().filter(|s| s.id == id) {
                 // the genome length of the core: as many runs as in the read
-                let mut e = t;
+                // (without compression the genome core is as long as the read's)
+                let mut e = if s.runs == 0 { t + s.ql as u32 } else { t };
                 for _ in 0..s.runs {
                     let c = ix.base(e);
                     e += 1;

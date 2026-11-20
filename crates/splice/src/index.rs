@@ -32,11 +32,17 @@ pub const L2_SPEC: &str = "lcp:K=2";
 pub struct BuildOptions {
     /// Level-3 labels with more occurrences than this are not indexed.
     pub max_occ: u32,
+    /// Seed the homopolymer-compressed sequence (longer, sparser cores that survive
+    /// homopolymer-length errors) or the sequence as it is (shorter, denser cores).
+    pub hpc: bool,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
-        BuildOptions { max_occ: 1000 }
+        BuildOptions {
+            max_occ: 1000,
+            hpc: true,
+        }
     }
 }
 
@@ -62,6 +68,8 @@ struct Raw {
     l2_pos: *const [u32],
     l2_id: *const [u16],
     dir_bits: u32,
+    hpc: bool,
+    ranked: bool,
 }
 
 // SAFETY: the pointers refer to immutable data owned by `store`, which is never moved out
@@ -129,21 +137,31 @@ fn segments(seq: &[u8], offsets: &[u32]) -> Vec<(usize, usize)> {
 }
 
 /// (label, raw start, raw length) of the top-level cores of every segment.
-fn seed_all(seq: &[u8], segs: &[(usize, usize)], spec: &str) -> Vec<(u64, u32, u32)> {
-    let seeder = BaseSeeder::new(spec, true).expect("valid seed spec");
+fn seed_all(seq: &[u8], segs: &[(usize, usize)], spec: &str, hpc: bool) -> Vec<(u64, u32, u32)> {
+    let seeder = BaseSeeder::new(spec, hpc).expect("valid seed spec");
     segs.par_iter()
-        .flat_map_iter(|&(a, b)| {
-            let h = seeder.parsed(&seq[a..b]).expect("HPC is on");
-            let seeds = seeder.seed_parsed(&h.seq);
-            seeds
+        .flat_map_iter(|&(a, b)| match seeder.parsed(&seq[a..b]) {
+            Some(h) => seeder
+                .seed_parsed(&h.seq)
                 .into_iter()
                 .map(|s| {
                     let (rs, re) = h.to_raw(s.start, s.end);
                     (s.label, a as u32 + rs, re - rs)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            None => seeder
+                .seed_parsed(&seq[a..b])
+                .into_iter()
+                .map(|s| (s.label, a as u32 + s.start, s.end - s.start))
+                .collect::<Vec<_>>(),
         })
         .collect()
+}
+
+/// A label folded to 16 bits.
+#[inline]
+fn fold16(l: u64) -> u16 {
+    (l ^ (l >> 16) ^ (l >> 32) ^ (l >> 48)) as u16
 }
 
 impl GenomeIndex {
@@ -178,7 +196,7 @@ impl GenomeIndex {
         }
 
         // Level 3: sorted by (label, position); frequent labels dropped.
-        let mut l3 = seed_all(&seq, &segs, L3_SPEC);
+        let mut l3 = seed_all(&seq, &segs, L3_SPEC, opt.hpc);
         l3.par_sort_unstable();
         let mut labels: Vec<u64> = Vec::new();
         let mut occ_off: Vec<u32> = vec![0];
@@ -212,20 +230,29 @@ impl GenomeIndex {
         }
 
         // Level 2 in genome order.
-        let mut l2 = seed_all(&seq, &segs, L2_SPEC);
+        let mut l2 = seed_all(&seq, &segs, L2_SPEC, opt.hpc);
         let mut l2_labels: Vec<u64> = l2.par_iter().map(|x| x.0).collect();
         l2_labels.par_sort_unstable();
         l2_labels.dedup();
-        ensure!(
-            l2_labels.len() <= u16::MAX as usize,
-            "more than 65,535 distinct level-2 labels"
-        );
+        // Ids are ranks when the labels fit 16 bits (they do with compression: about 21,000
+        // on the human genome); otherwise a 16-bit fold of the label, whose collisions only
+        // add chance hits that the gap solver discards.
+        let ranked = l2_labels.len() <= u16::MAX as usize;
         l2.par_sort_unstable_by_key(|x| x.1);
         let l2_pos: Vec<u32> = l2.par_iter().map(|x| x.1).collect();
         let l2_id: Vec<u16> = l2
             .par_iter()
-            .map(|x| l2_labels.binary_search(&x.0).unwrap() as u16)
+            .map(|x| {
+                if ranked {
+                    l2_labels.binary_search(&x.0).unwrap() as u16
+                } else {
+                    fold16(x.0)
+                }
+            })
             .collect();
+        if !ranked {
+            l2_labels.clear();
+        }
         drop(l2);
         drop(seq);
 
@@ -234,7 +261,13 @@ impl GenomeIndex {
             name_bytes.extend_from_slice(n.as_bytes());
             name_bytes.push(b'\n');
         }
-        let meta = vec![dir_bits as u64, opt.max_occ as u64, dropped];
+        let meta = vec![
+            dir_bits as u64,
+            opt.max_occ as u64,
+            dropped,
+            opt.hpc as u64,
+            ranked as u64,
+        ];
         let mut w = Writer::default();
         w.add_owned("g_meta", meta);
         w.add_owned("g_names", name_bytes);
@@ -297,6 +330,8 @@ impl GenomeIndex {
             l2_pos: store.get("g2_pos")?,
             l2_id: store.get("g2_id")?,
             dir_bits: meta[0] as u32,
+            hpc: meta.get(3).is_none_or(|&x| x != 0),
+            ranked: meta.get(4).is_none_or(|&x| x != 0),
         };
         Ok(GenomeIndex {
             store,
@@ -401,9 +436,17 @@ impl GenomeIndex {
         }
     }
 
-    /// The id of a level-2 label, if the genome has it.
+    /// Whether seeds are cores of the homopolymer-compressed sequence.
+    pub fn hpc(&self) -> bool {
+        self.n.hpc
+    }
+
+    /// The id of a level-2 label, if the genome can have it.
     #[inline]
     pub fn l2_id(&self, label: u64) -> Option<u16> {
+        if !self.n.ranked {
+            return Some(fold16(label));
+        }
         // SAFETY: see `Raw`.
         unsafe { &*self.n.l2_labels }
             .binary_search(&label)
