@@ -33,7 +33,9 @@ pub struct BuildOptions {
     /// Level-3 labels with more occurrences than this are not indexed.
     pub max_occ: u32,
     /// Seed the homopolymer-compressed sequence (longer, sparser cores that survive
-    /// homopolymer-length errors) or the sequence as it is (shorter, denser cores).
+    /// homopolymer-length errors) or the sequence as it is (shorter, denser cores; the default:
+    /// on simulated and real reads it finds more loci and exons in less time, for a larger
+    /// index).
     pub hpc: bool,
 }
 
@@ -41,7 +43,7 @@ impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
             max_occ: 1000,
-            hpc: true,
+            hpc: false,
         }
     }
 }

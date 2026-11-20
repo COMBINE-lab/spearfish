@@ -1,6 +1,6 @@
 //! Development driver for spliced genome mapping.
 //!
-//!   gmap index <genome.fa> <out.gidx> [--no-hpc]
+//!   gmap index <genome.fa> <out.gidx> [--hpc]
 //!   gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
 //!            [--junctions <BED12>] [--sam | --bam [--bam-level N]]   (default output: PAF)
 
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
             let ix = GenomeIndex::build(
                 Path::new(&a[2]),
                 &BuildOptions {
-                    hpc: flag("--no-hpc").is_none(),
+                    hpc: flag("--hpc").is_some(),
                     ..Default::default()
                 },
             )?;
