@@ -6,18 +6,32 @@
 macro_rules! avx2_variant {
     ($(#[$meta:meta])* $vis:vis fn $name:ident = $body:ident, $avx:ident ($($a:ident : $t:ty),* $(,)?) -> $r:ty) => {
         #[cfg(target_arch = "x86_64")]
-        #[target_feature(enable = "avx2")]
         #[allow(clippy::too_many_arguments)]
-        unsafe fn $avx($($a: $t),*) -> $r {
-            $body($($a),*)
+        mod $avx {
+            #[allow(unused_imports)]
+            use super::*;
+            #[target_feature(enable = "avx2")]
+            pub(super) unsafe fn avx2($($a: $t),*) -> $r {
+                $body($($a),*)
+            }
+            #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
+            pub(super) unsafe fn avx512($($a: $t),*) -> $r {
+                $body($($a),*)
+            }
         }
         $(#[$meta])*
         #[inline]
         $vis fn $name($($a: $t),*) -> $r {
             #[cfg(target_arch = "x86_64")]
-            if std::is_x86_feature_detected!("avx2") {
-                // SAFETY: AVX2 was just detected.
-                return unsafe { $avx($($a),*) };
+            {
+                if std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512vl") && std::is_x86_feature_detected!("avx512dq") {
+                    // SAFETY: the features were just detected.
+                    return unsafe { $avx::avx512($($a),*) };
+                }
+                if std::is_x86_feature_detected!("avx2") {
+                    // SAFETY: AVX2 was just detected.
+                    return unsafe { $avx::avx2($($a),*) };
+                }
             }
             $body($($a),*)
         }

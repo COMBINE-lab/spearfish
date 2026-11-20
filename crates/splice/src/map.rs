@@ -1047,7 +1047,7 @@ impl<'a> Mapper<'a> {
                 .collect();
         }
         let top = cands.first().map_or(0.0, |c| c.0);
-        for (score, reverse, chain) in cands.into_iter().take(4) {
+        for (score, reverse, chain) in cands.into_iter().take(8) {
             if score < 0.7 * top {
                 break;
             }
@@ -2431,4 +2431,134 @@ pub fn sam_line(ix: &GenomeIndex, name: &str, read: &[u8], h: &SplicedHit, mapq:
         let _ = write!(out, "\tXS:A:{}", h.tx_strand as char);
     }
     out.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefix table as first written, a cell at a time: what the row kernels must reproduce.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn reference(
+        a: impl Fn(usize) -> u8,
+        m: usize,
+        b: impl Fn(usize) -> u8,
+        n: usize,
+        band: usize,
+        e: &mut Vec<u16>,
+        tmp: &mut Vec<u16>,
+        drop: i32,
+    ) -> usize {
+        let w = 2 * band + 1;
+        e.clear();
+        e.resize((m + 1) * w, INF);
+        // gap states of the row above (a gap that consumes `a`), per k
+        tmp.clear();
+        tmp.resize(w, INF);
+        // the bases of `b` once each, not once per cell, and only as far as the rows get
+        let mut bb: Vec<u8> = Vec::with_capacity(n.min(m + band));
+        let (open_ins, open_del) = (GAP_OPEN + INS_EXT, GAP_OPEN + GAP_EXT);
+        let mut best = 0i32;
+        for i in 0..=m {
+            // the row's cells: j = i + k - band within 0..=n
+            let k_lo = band.saturating_sub(i);
+            if i > n + band {
+                // past the end of `b`: nothing reachable in this or any later row
+                if drop > 0 {
+                    return i;
+                }
+                tmp.fill(INF);
+                continue;
+            }
+            let k_hi = (n + band - i).min(w - 1);
+            while bb.len() < (i + band).min(n) {
+                bb.push(b(bb.len()));
+            }
+            let ai = if i > 0 { a(i - 1) } else { 0 };
+            let (above, here) = e.split_at_mut(i * w);
+            let above = if i > 0 { &above[(i - 1) * w..] } else { &above[..0] };
+            let here = &mut here[..w];
+            let mut left = INF; // a gap that consumes `b`, ending at the cell to the left
+            let mut row = INF;
+            for k in k_lo..=k_hi {
+                let j = i + k - band;
+                // cell above is (i-1, j): k + 1 in the previous row
+                let up = if i > 0 && k + 1 < w {
+                    (tmp[k + 1] + INS_EXT).min(above[k + 1] + open_ins)
+                } else {
+                    INF
+                };
+                left = if j > 0 && k > k_lo {
+                    (left + GAP_EXT).min(here[k - 1] + open_del)
+                } else {
+                    INF
+                };
+                let v = if i == 0 && j == 0 {
+                    0
+                } else {
+                    let diag = if i > 0 && j > 0 {
+                        above[k] + if ai != bb[j - 1] { MISMATCH } else { 0 }
+                    } else {
+                        INF
+                    };
+                    diag.min(up).min(left)
+                };
+                here[k] = v.min(INF);
+                tmp[k] = up.min(INF);
+                left = left.min(INF);
+                row = row.min(v);
+            }
+            tmp[..k_lo].fill(INF);
+            tmp[k_hi + 1..].fill(INF);
+            if drop > 0 {
+                let s = 2 * i as i32 - row as i32;
+                best = best.max(s);
+                if s + drop < best {
+                    return i;
+                }
+            }
+        }
+        m
+    }
+
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn prefix_table_matches_reference() {
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..400 {
+            let m = (rng(&mut st) % 90) as usize;
+            let band = 1 + (rng(&mut st) % 12) as usize;
+            // related sequences, so that paths with gaps and mismatches are both taken
+            let a: Vec<u8> = (0..m).map(|_| (rng(&mut st) % 4) as u8).collect();
+            let mut b: Vec<u8> = Vec::new();
+            for &x in &a {
+                match rng(&mut st) % 12 {
+                    0 => {}
+                    1 => b.extend([x, (rng(&mut st) % 4) as u8]),
+                    2 => b.push((rng(&mut st) % 4) as u8),
+                    _ => b.push(x),
+                }
+            }
+            b.truncate((rng(&mut st) % 130) as usize);
+            let n = b.len();
+            let drop = if round % 3 == 0 { 20 } else { 0 };
+            let (mut e1, mut t1, mut e2, mut t2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let r1 = band_prefix(|i| a[i], m, |j| b[j], n, band, &mut e1, &mut t1, drop);
+            let r2 = reference(|i| a[i], m, |j| b[j], n, band, &mut e2, &mut t2, drop);
+            assert_eq!(r1, r2, "rows, round {round}");
+            let w = 2 * band + 1;
+            let rows = if drop > 0 { (r1 + 1).min(m + 1) } else { m + 1 };
+            assert_eq!(
+                e1[..rows * w],
+                e2[..rows * w],
+                "cells, round {round} m {m} n {n} band {band}"
+            );
+        }
+    }
 }
