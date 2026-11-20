@@ -131,6 +131,8 @@ pub struct Stats {
     /// Hits scored by aligning their blocks.
     pub scored: u64,
     pub retried: u64,
+    /// Hits whose blocks had to be made consistent (a defect upstream when not zero).
+    pub tidied: u64,
 }
 
 impl Stats {
@@ -147,6 +149,7 @@ impl Stats {
         self.end_kept += o.end_kept;
         self.scored += o.scored;
         self.retried += o.retried;
+        self.tidied += o.tidied;
     }
 }
 
@@ -278,6 +281,48 @@ struct Placed {
     donor: u32,
     acceptor: u32,
     cost: u16,
+}
+
+/// Make blocks consistent for output: in genome order without overlap, each starting on the
+/// read where the previous one ends. Returns whether anything had to change.
+fn tidy(blocks: &mut Vec<Block>, qlen: u32) -> bool {
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut changed = false;
+    for &b in blocks.iter() {
+        let mut b = b;
+        if b.te <= b.ts {
+            changed = true;
+            if let Some(p) = out.last_mut() {
+                p.qe = p.qe.max(b.qe.min(qlen));
+            }
+            continue;
+        }
+        if let Some(p) = out.last_mut() {
+            if b.ts < p.te {
+                // overlap on the genome: one block
+                changed = true;
+                p.te = p.te.max(b.te);
+                p.qe = p.qe.max(b.qe.min(qlen));
+                continue;
+            }
+            if b.qs != p.qe {
+                changed = true;
+                b.qs = p.qe;
+            }
+        }
+        if b.qe < b.qs {
+            changed = true;
+            b.qe = b.qs;
+        }
+        if b.qe > qlen {
+            changed = true;
+            b.qe = qlen;
+            b.qs = b.qs.min(qlen);
+        }
+        out.push(b);
+    }
+    *blocks = out;
+    changed
 }
 
 struct EndSolved {
@@ -745,7 +790,8 @@ impl<'a> Mapper<'a> {
             ts: st,
             te: right.end.1,
         });
-        blocks.retain(|b| b.te > b.ts && b.qe >= b.qs);
+        let fixed = tidy(&mut blocks, qlen);
+        sc.stats.tidied += fixed as u64;
         let tx_strand = if tx_strand == b'.' && blocks.len() > 1 && !self.opt.forward_only {
             if left.minus.or(right.minus).unwrap_or(minus) {
                 b'-'
@@ -1245,4 +1291,66 @@ pub fn paf_line(ix: &GenomeIndex, name: &str, qlen: u32, h: &SplicedHit, mapq: u
         h.anchors,
         h.tx_strand as char,
     );
+}
+
+/// SAM header for the index's sequences.
+pub fn sam_header(ix: &GenomeIndex, out: &mut String) {
+    use std::fmt::Write;
+    out.push_str("@HD\tVN:1.6\tSO:unsorted\tGO:query\n");
+    for (i, n) in ix.names().iter().enumerate() {
+        let _ = writeln!(out, "@SQ\tSN:{n}\tLN:{}", ix.offsets()[i + 1] - ix.offsets()[i]);
+    }
+    out.push_str("@PG\tID:spearfish\tPN:spearfish\n");
+}
+
+/// SAM record of a hit, with a block-level CIGAR (`M` per block, `I`/`D` for a length
+/// difference inside it, `N` for introns, `S` for unaligned read ends). `read` is the read as
+/// sequenced; secondary records carry no sequence.
+pub fn sam_line(ix: &GenomeIndex, name: &str, read: &[u8], h: &SplicedHit, mapq: u8, out: &mut String) {
+    use std::fmt::Write;
+    let qlen = read.len() as u32;
+    let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
+    let (rid, ts) = ix.locate(first.ts);
+    let flag = if h.reverse { 16 } else { 0 } | if h.primary { 0 } else { 256 };
+    let _ = write!(out, "{name}\t{flag}\t{}\t{}\t{mapq}\t", ix.names()[rid], ts + 1);
+    if first.qs > 0 {
+        let _ = write!(out, "{}S", first.qs);
+    }
+    for (i, b) in h.blocks.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(out, "{}N", b.ts - h.blocks[i - 1].te);
+        }
+        let (lq, lt) = (b.qe - b.qs, b.te - b.ts);
+        let mm = lq.min(lt);
+        if mm > 0 {
+            let _ = write!(out, "{mm}M");
+        }
+        if lq > lt {
+            let _ = write!(out, "{}I", lq - lt);
+        } else if lt > lq {
+            let _ = write!(out, "{}D", lt - lq);
+        }
+    }
+    if last.qe < qlen {
+        let _ = write!(out, "{}S", qlen - last.qe);
+    }
+    out.push_str("\t*\t0\t0\t");
+    if !h.primary {
+        out.push('*');
+    } else if h.reverse {
+        out.extend(read.iter().rev().map(|&b| match b.to_ascii_uppercase() {
+            b'A' => 'T',
+            b'C' => 'G',
+            b'G' => 'C',
+            b'T' | b'U' => 'A',
+            _ => 'N',
+        }));
+    } else {
+        out.extend(read.iter().map(|&b| b.to_ascii_uppercase() as char));
+    }
+    let _ = write!(out, "\t*\tAS:i:{}\tcm:i:{}", h.score, h.anchors);
+    if h.tx_strand != b'.' {
+        let _ = write!(out, "\tXS:A:{}", h.tx_strand as char);
+    }
+    out.push('\n');
 }

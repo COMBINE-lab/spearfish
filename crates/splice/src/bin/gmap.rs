@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use spearfish_splice::index::{BuildOptions, GenomeIndex};
-use spearfish_splice::map::{MapOptions, Mapper, Scratch, Stats, paf_line};
+use spearfish_splice::map::{MapOptions, Mapper, Scratch, Stats, paf_line, sam_header, sam_line};
 
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().collect();
@@ -42,8 +42,14 @@ fn main() -> anyhow::Result<()> {
                 opt.cap = c.parse()?;
             }
             let secondary = flag("--secondary").is_some();
+            let sam = flag("--sam").is_some();
             let mapper = Mapper::new(&ix, opt);
             let mut out = BufWriter::with_capacity(1 << 22, std::io::stdout().lock());
+            if sam {
+                let mut h = String::new();
+                sam_header(&ix, &mut h);
+                out.write_all(h.as_bytes())?;
+            }
             let mut rd = BufReader::with_capacity(1 << 22, File::open(&a[3])?);
             let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
             let mut line = String::new();
@@ -84,7 +90,11 @@ fn main() -> anyhow::Result<()> {
                             _ => 60,
                         };
                         for h in hits.iter().take(if secondary { 5 } else { 1 }) {
-                            paf_line(&ix, name, seq.len() as u32, h, mapq, &mut s);
+                            if sam {
+                                sam_line(&ix, name, seq, h, mapq, &mut s);
+                            } else {
+                                paf_line(&ix, name, seq.len() as u32, h, mapq, &mut s);
+                            }
                         }
                         (s, !hits.is_empty(), sc.stats)
                     })
