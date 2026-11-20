@@ -391,6 +391,8 @@ struct Window {
     e: u32,
     f: Anchor,
     l: Anchor,
+    /// Seed hits behind the window (0 for a window that did not come from seeds).
+    hits: u32,
 }
 
 impl Window {
@@ -478,7 +480,13 @@ fn windows_of(
         let (ws, we) = wish(g);
         let (s, e) = (ws.max(t_lo + 20), we.min(t_hi.saturating_sub(20)));
         if e > s + 4 && e - s <= 2000 {
-            out.push(Window { s, e, f: g.0, l: g.1 });
+            out.push(Window {
+                s,
+                e,
+                f: g.0,
+                l: g.1,
+                hits: g.2,
+            });
         }
     }
     out
@@ -728,27 +736,49 @@ impl<'a> Mapper<'a> {
                 let m = q1.saturating_sub(q0) as usize;
                 let mut done = false;
                 if (!wins.is_empty() || self.index.junctions.is_some()) && q1 > q0 && t1 > t0 && m <= 600 {
-                    let mut vw: Vec<SolverWindow> = wins.iter().map(|w| w.forward(q0, t0)).collect();
-                    vw.extend(self.known_exons(t0, t1, m));
-                    vw.sort_by_key(|w| w.0);
                     let rv = ReadView { q: q0, rev: false };
                     let gv = View {
                         origin: t0,
                         rev: false,
                     };
                     let half = self.opt.min_intron / 2;
-                    let s = gap::solve(
-                        self.index,
-                        read,
-                        rv,
-                        m,
-                        gv,
-                        Some(t1),
-                        &vw,
-                        minus,
-                        half,
-                        &mut sc.gap,
-                    );
+                    let known = self.known_exons(t0, t1, m);
+                    // Candidates backed by two or more hits first; the lone hits (mostly
+                    // strays) only if those explain nothing.
+                    let strong = wins.iter().filter(|w| w.hits >= 2).count();
+                    let mut s = Solved {
+                        cost: u32::MAX,
+                        ..Default::default()
+                    };
+                    for min_hits in [2u32, 0] {
+                        if (min_hits == 2 && strong == 0 && known.is_empty())
+                            || (min_hits == 0 && strong == wins.len() && s.cost != u32::MAX)
+                        {
+                            continue;
+                        }
+                        let mut vw: Vec<SolverWindow> = wins
+                            .iter()
+                            .filter(|w| w.hits >= min_hits)
+                            .map(|w| w.forward(q0, t0))
+                            .collect();
+                        vw.extend(known.iter().copied());
+                        vw.sort_by_key(|w| w.0);
+                        s = gap::solve(
+                            self.index,
+                            read,
+                            rv,
+                            m,
+                            gv,
+                            Some(t1),
+                            &vw,
+                            minus,
+                            half,
+                            &mut sc.gap,
+                        );
+                        if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
+                            break;
+                        }
+                    }
                     if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
                         sc.stats.rescues_kept += (minus == strands[0]) as u64;
                         total += s.cost;
@@ -1242,6 +1272,7 @@ impl<'a> Mapper<'a> {
                         e: (e + 3).min(hi),
                         f: at,
                         l: at,
+                        hits: 0,
                     };
                     found.push((best * 64 / len.max(1), w));
                 }
