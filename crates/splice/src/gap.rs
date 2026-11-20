@@ -65,7 +65,7 @@ impl View {
     }
     /// Cost of an intron ending at boundary `p` in the direction of travel.
     #[inline]
-    fn enter(&self, ix: &GenomeIndex, p: u32, minus: bool) -> u32 {
+    pub fn enter(&self, ix: &GenomeIndex, p: u32, minus: bool) -> u32 {
         let x = self.real(p);
         (if self.rev {
             donor_pen(ix, x, minus)
@@ -84,7 +84,7 @@ pub(crate) struct ReadView {
 
 impl ReadView {
     #[inline]
-    fn base(&self, read: &[u8], i: usize) -> u8 {
+    pub fn base(&self, read: &[u8], i: usize) -> u8 {
         if self.rev {
             read[self.q as usize - 1 - i]
         } else {

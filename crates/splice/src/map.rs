@@ -929,7 +929,7 @@ impl<'a> Mapper<'a> {
         let plain = gap::solve(ix, read, rv, m, gv, None, &[], strands[0], half, &mut sc.gap);
         let reached = if left { q - plain.end.0 } else { plain.end.0 - q };
         let mut best = (plain, None);
-        if m as u32 - reached >= 12 {
+        if m as u32 - reached >= 10 {
             sc.stats.end_tried += 1;
             // level-2 cores of the unexplained bases, within reach of the longest intron
             let here = Anchor {
@@ -969,18 +969,26 @@ impl<'a> Mapper<'a> {
                     path.iter().map(|a| (a.t, a.q, a.ql)).collect::<Vec<_>>()
                 );
             }
-            if !wins.is_empty() {
-                let vw: Vec<(u32, u32, i64)> = if left {
-                    wins.iter().rev().map(|w| w.backward(q, t)).collect()
-                } else {
-                    wins.iter().map(|w| w.forward(q, t)).collect()
-                };
+            let vw: Vec<(u32, u32, i64)> = if left {
+                wins.iter().rev().map(|w| w.backward(q, t)).collect()
+            } else {
+                wins.iter().map(|w| w.forward(q, t)).collect()
+            };
+            let p_end = best.0.end.1.abs_diff(t);
+            {
                 for &mi in strands {
-                    let s = gap::solve(ix, read, rv, m, gv, None, &vw, mi, half, &mut sc.gap);
+                    // exons that start at a splice site and match the unexplained bases
+                    let mut all = vw.clone();
+                    all.extend(self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, sc));
+                    if all.is_empty() {
+                        continue;
+                    }
+                    all.sort_by_key(|w| w.0);
+                    let s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
                     if std::env::var_os("GMAP_DEBUG").is_some() {
                         eprintln!(
                             "end left={left} q={q} t={t} m={m} minus={mi} windows={} plain={} cost={} hops={:?} end={:?}",
-                            wins.len(),
+                            all.len(),
                             best.0.cost,
                             s.cost,
                             s.hops,
@@ -1167,6 +1175,70 @@ impl<'a> Mapper<'a> {
         }
         out.sort_by_key(|w| w.s);
         out
+    }
+
+    /// Candidate exons past a read end, found without any seed: places where an intron can end
+    /// (in the direction of travel) and the genome then matches the read bases that the plain
+    /// extension left unexplained. Returned as the gap solver's windows.
+    #[allow(clippy::too_many_arguments)]
+    fn site_windows_end(
+        &self,
+        read: &[u8],
+        rv: ReadView,
+        m: usize,
+        reached: usize,
+        gv: View,
+        p_end: u32,
+        minus: bool,
+        sc: &mut Scratch,
+    ) -> Vec<(u32, u32, i64)> {
+        const MARGIN: usize = 4;
+        let ix = self.index;
+        let start = reached.saturating_sub(MARGIN);
+        let k = m - start;
+        if k < 10 + MARGIN {
+            return Vec::new();
+        }
+        // a short tail is only looked for close by: further off, chance matches win
+        let reach = if k < 16 + MARGIN {
+            20_000
+        } else {
+            self.opt.max_intron
+        };
+        let hi = (p_end + reach).min(gv.room(ix).saturating_sub(k as u32 + 8));
+        let probe: Vec<u8> = (0..k.min(28 + 2 * MARGIN))
+            .map(|i| rv.base(read, start + i))
+            .collect();
+        let mut found: Vec<(usize, u32, (u32, u32, i64))> = Vec::new();
+        let mut p = p_end + 20;
+        while p < hi {
+            if gv.enter(ix, p, minus) == 0 {
+                // the exon can start a few read bases into the probe
+                for o in 0..=(2 * MARGIN).min(probe.len().saturating_sub(10)) {
+                    let len = (probe.len() - o).min(20);
+                    let allowed = len / 8;
+                    let mut d = 0;
+                    for i in 0..len {
+                        d += (probe[o + i] != gv.base(ix, p + i as u32)) as usize;
+                        if d > allowed {
+                            break;
+                        }
+                    }
+                    if d <= allowed {
+                        let vs = p.saturating_sub(3);
+                        let vl = (k as u32 + 12).min(300);
+                        found.push((d, p, (vs, vl, (start + o) as i64 - (p - vs) as i64)));
+                        break;
+                    }
+                }
+            }
+            p += 1;
+        }
+        sc.stats.site_bases += (hi.saturating_sub(p_end)) as u64;
+        // best match first, then nearest; a few at most
+        found.sort_by_key(|f| (f.0, f.1));
+        found.truncate(3);
+        found.into_iter().map(|f| f.2).collect()
     }
 
     /// Score change of chaining anchor `a` after `p`: the read bases `a` adds, minus the price of
