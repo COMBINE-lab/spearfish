@@ -599,7 +599,10 @@ impl<'a> Mapper<'a> {
         // A read that level 3 anchors weakly (no hit, three anchors or fewer, or under 60% of
         // the read covered) is seeded again with pairs of level-2 cores as well.
         let weak = hits.first().is_none_or(|h| h.anchors <= 3) || 10 * covered(&hits) < 6 * read.len() as u32;
-        if weak && self.index.has_pairs() {
+        // (a long read with next to none of its level-3 cores in the genome is not from this
+        // genome: the second pass would be its most expensive step, for nothing)
+        let hopeless = sc.found_best < 2 && read.len() >= 600;
+        if weak && !hopeless && self.index.has_pairs() {
             sc.stats.retried += 1;
             // More repetitive seeds are allowed here, but only for a read that has a few of its
             // level-3 cores in the genome: one with next to none is not from this genome, and
@@ -735,7 +738,9 @@ impl<'a> Mapper<'a> {
             let best = if found[0] >= found[1] { 0 } else { 1 };
             sc.found_best = found[best];
             sc.l3_best = sc.l3[best].len();
-            let noisy = 3 * found[best] < sc.l3[best].len();
+            let noisy = 3 * found[best] < sc.l3[best].len()
+                && found[best] >= 3
+                && 25 * found[best] >= sc.l3[best].len();
             let beaten = found[1 - o] >= 5 && 4 * found[o] <= found[1 - o];
             if (pairs || (self.opt.pairs && noisy && !beaten)) && ix.has_pairs() {
                 for w in sc.l2[o].windows(2) {
@@ -781,7 +786,16 @@ impl<'a> Mapper<'a> {
             let best = loci[0].0;
             // (a read whose best locus is one or two seeds deep cannot rank its loci by
             // weight: all of them are looked at, and screened below)
-            let limit = if best < 80.0 { 48 } else { self.opt.max_loci };
+            // (only for a read with a few of its level-3 cores in the genome; one with next to
+            // none is not from this genome)
+            let of_genome = sc.found_best >= 3 && 25 * sc.found_best >= sc.l3_best.max(1);
+            let limit = if best >= 80.0 {
+                self.opt.max_loci
+            } else if of_genome {
+                400
+            } else {
+                48
+            };
             for &(w, s, e) in loci.iter().take(limit) {
                 if w < 0.25 * best {
                     break;
@@ -796,15 +810,20 @@ impl<'a> Mapper<'a> {
         // When even the best chain is one or two anchors, chance hits score like the true one.
         // Each candidate is then screened by whether the read goes on matching next to its
         // anchors (two word comparisons a side), and the best few of those are built.
+        let mut screened_ok = false;
         if cands.first().is_some_and(|c| c.2.len() <= 2) && cands.len() > 1 {
+            screened_ok = true;
             let mut screened: Vec<(u32, f32, bool, Vec<Anchor>)> = Vec::new();
             for (score, reverse, chain) in cands.drain(..) {
                 let read = &sc.codes[reverse as usize];
                 let (f, l) = (chain[0], chain[chain.len() - 1]);
                 let (lq, lt) = (l.q + l.ql as u32, l.t + l.tl as u32);
-                let m =
-                    self.diagonal_matches(read, f.q, f.t, true) + self.diagonal_matches(read, lq, lt, false);
-                if m >= 30 || (m >= 14 && (f.q < 24 || read.len() as u32 - lq < 24)) {
+                let ml = self.diagonal_matches(read, f.q, f.t, true);
+                let mr = self.diagonal_matches(read, lq, lt, false);
+                let m = ml + mr;
+                // (chance gives 6-10 a side; a true anchor of a read with 10% errors about 14-20;
+                // an anchor at a read end has one side only)
+                if m >= 24 || ml.max(mr) >= 14 {
                     screened.push((m, score, reverse, chain));
                 }
             }
@@ -813,10 +832,28 @@ impl<'a> Mapper<'a> {
                     .partial_cmp(&(a.0, a.1))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            cands = screened
+            screened.truncate(16);
+            // Among those, the ones the read really continues from: each is extended a little
+            // way to both sides (the extension stops as soon as the score drops), and the
+            // candidates are ranked by how far that got. A chance hit gets a few bases.
+            let mut reached: Vec<(u32, bool, Vec<Anchor>)> = Vec::new();
+            for (_, _, reverse, chain) in screened {
+                let read = std::mem::take(&mut sc.codes[reverse as usize]);
+                let (f, l) = (chain[0], chain[chain.len() - 1]);
+                let far = self.extend(&read, f.q, f.t, true, sc).0
+                    + self
+                        .extend(&read, l.q + l.ql as u32, l.t + l.tl as u32, false, sc)
+                        .0;
+                sc.codes[reverse as usize] = read;
+                if far >= 30 {
+                    reached.push((far, reverse, chain));
+                }
+            }
+            reached.sort_by_key(|r| std::cmp::Reverse(r.0));
+            cands = reached
                 .into_iter()
                 .take(4)
-                .map(|(m, _, r, c)| (m as f32, r, c))
+                .map(|(far, r, c)| (far as f32, r, c))
                 .collect();
         }
         let top = cands.first().map_or(0.0, |c| c.0);
@@ -826,7 +863,7 @@ impl<'a> Mapper<'a> {
             }
             let read = std::mem::take(&mut sc.codes[reverse as usize]);
             sc.gap.reset(); // another chain, possibly the other orientation of the read
-            out.push(self.build(reverse, &chain, &read, n as u32, score, sc));
+            out.push(self.build(reverse, &chain, &read, n as u32, score, screened_ok, sc));
             sc.codes[reverse as usize] = read;
         }
         // Rival hits, and a lone hit resting on few anchors, are scored by aligning their blocks;
@@ -837,20 +874,6 @@ impl<'a> Mapper<'a> {
                 h.score = self.align_score(&read, h, sc);
                 sc.codes[h.reverse as usize] = read;
                 sc.stats.scored += 1;
-            }
-            if std::env::var_os("GMAP_DEBUG_DROP").is_some() {
-                eprintln!(
-                    "scored n={} {:?}",
-                    n,
-                    out.iter()
-                        .map(|h| (
-                            h.score,
-                            h.anchors,
-                            h.blocks.len(),
-                            h.blocks.iter().map(|b| b.qe - b.qs).sum::<u32>()
-                        ))
-                        .collect::<Vec<_>>()
-                );
             }
             out.retain(|h| h.score >= self.opt.min_score);
             // A spliced read also aligns, unspliced, to a processed pseudogene of its gene, and
@@ -917,6 +940,7 @@ impl<'a> Mapper<'a> {
     }
 
     /// Blocks from a chain: junctions placed, exons without an anchor recovered, read ends solved.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &self,
         reverse: bool,
@@ -924,13 +948,16 @@ impl<'a> Mapper<'a> {
         read: &[u8],
         qlen: u32,
         score: f32,
+        screened: bool,
         sc: &mut Scratch,
     ) -> SplicedHit {
         // A chain is solid enough to look for more exons from when it has three anchors or more
         // and they cover a fortieth of the read (50 bases at least): a few chance hits strung
         // together across huge skips are not worth the solver.
         let anchored: u32 = chain.iter().map(|a| a.ql as u32).sum();
-        let solid = chain.len() >= 3 && anchored >= (qlen / 40).max(50);
+        // (a thin chain that passed the screen of thin candidates is trusted the same way: the
+        // read was seen to go on matching next to its anchors)
+        let solid = screened || (chain.len() >= 3 && anchored >= (qlen / 40).max(50));
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
         // the prefix tables of the junctions that may go to the solver, to not compute them twice
@@ -1472,12 +1499,14 @@ impl<'a> Mapper<'a> {
                     continue;
                 }
             }
-            if m.abs_diff(n) > 64 {
+            if m.abs_diff(n) > 64.max(m / 8) {
                 // lengths too far apart to align in a band: the block scores as unaligned
                 score -= 20;
                 continue;
             }
-            let band = (8 + m / 20).min(24) + m.abs_diff(n);
+            // (a long block of a noisy read drifts: its two ends can agree in length while the
+            // middle is tens of bases off the diagonal)
+            let band = (8 + m / 16).min(48) + m.abs_diff(n);
             let w = 2 * band + 1;
             let (q, t) = (b.qs as usize, b.ts);
             band_prefix(
