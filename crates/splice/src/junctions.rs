@@ -13,6 +13,9 @@ use anyhow::{Context, Result};
 
 use crate::index::GenomeIndex;
 
+/// One transcript while reading: sequence offset, reverse strand, exons.
+type Model = (u32, bool, Vec<(u32, u32)>);
+
 #[derive(Default)]
 pub struct Junctions {
     /// Sorted first-intron-base positions, per transcript strand (0 forward, 1 reverse).
@@ -39,7 +42,7 @@ impl Junctions {
             .collect();
         let gtf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gtf"));
         // transcripts as (sequence offset, reverse strand, exons)
-        let mut models: Vec<(u32, bool, Vec<(u32, u32)>)> = Vec::new();
+        let mut models: Vec<Model> = Vec::new();
         let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for line in BufReader::new(f).lines() {
             let line = line?;
