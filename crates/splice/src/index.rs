@@ -334,6 +334,42 @@ impl GenomeIndex {
         out.extend((start..end).map(|p| self.base(p)));
     }
 
+    /// Calls `f(s)` for every position `s` in `[start, end)` where the genome reads base code
+    /// `b0` at `s` and `b1` at `s + 1`, in increasing order. This is how splice-site
+    /// candidates are found: 32 positions are tested per machine word of the packed sequence.
+    pub fn pair_scan(&self, start: u32, end: u32, b0: u8, b1: u8, mut f: impl FnMut(u32)) {
+        // SAFETY: see `Raw`.
+        let w = unsafe { &*self.n.seq };
+        let end = end.min(self.total_len().saturating_sub(1));
+        if start >= end {
+            return;
+        }
+        const LOW: u64 = 0x5555_5555_5555_5555;
+        // bit 2i set where base i of the word equals `b`
+        let eq = |x: u64, b: u8| {
+            let d = x ^ (LOW * b as u64);
+            !(d | (d >> 1)) & LOW
+        };
+        let (first, last) = ((start >> 5) as usize, ((end - 1) >> 5) as usize);
+        for wi in first..=last {
+            let x = w[wi];
+            // base i + 1 of this word, with the next word's first base as base 32
+            let next = (x >> 2) | (w.get(wi + 1).copied().unwrap_or(0) << 62);
+            let mut hits = eq(x, b0) & eq(next, b1);
+            let base = (wi as u32) << 5;
+            if wi == first {
+                hits &= !0u64 << (2 * (start - base));
+            }
+            if wi == last && end - base < 32 {
+                hits &= (1u64 << (2 * (end - base))) - 1;
+            }
+            while hits != 0 {
+                f(base + hits.trailing_zeros() / 2);
+                hits &= hits - 1;
+            }
+        }
+    }
+
     /// Occurrences (raw start, raw length) of a level-3 label.
     #[inline]
     pub fn occurrences(&self, label: u64) -> (&[u32], &[u8]) {

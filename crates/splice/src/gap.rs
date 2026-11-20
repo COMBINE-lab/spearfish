@@ -121,6 +121,23 @@ pub(crate) struct Bufs {
     tmp: Vec<u16>,
     c: Vec<u32>,
     o: Vec<(u16, u16)>,
+    /// What `e1` (and `e2`) currently hold: the tables depend only on where the read and the
+    /// genome start, the direction, the length and the far point, not on the strand or the
+    /// windows, so repeated solves of one gap reuse them.
+    key1: Option<(u32, bool, usize, u32, Option<u32>)>,
+    key2: Option<(u32, bool, usize, u32, Option<u32>)>,
+    /// Work counters: solves, prefix-table cells filled, window cells filled.
+    pub calls: u64,
+    pub prefix_cells: u64,
+    pub window_cells: u64,
+}
+
+impl Bufs {
+    /// Forget the cached tables (the read changed).
+    pub fn reset(&mut self) {
+        self.key1 = None;
+        self.key2 = None;
+    }
 }
 
 /// Solve `m` read bases from `rv` against the genome from `gv`.
@@ -149,20 +166,27 @@ pub(crate) fn solve(
         None => gv.room(ix) as usize,
     };
     let n = (m + band).min(limit);
-    band_prefix(
-        |i| rv.base(read, i),
-        m,
-        |j| gv.base(ix, j as u32),
-        n,
-        band,
-        &mut b.e1,
-        &mut b.tmp,
-        0,
-    );
+    let key = Some((rv.q, rv.rev, m, gv.origin, far));
+    b.calls += 1;
+    if b.key1 != key {
+        b.prefix_cells += ((m + 1) * w) as u64;
+        band_prefix(
+            |i| rv.base(read, i),
+            m,
+            |j| gv.base(ix, j as u32),
+            n,
+            band,
+            &mut b.e1,
+            &mut b.tmp,
+            0,
+        );
+        b.key1 = key;
+    }
     // Level 0: the upstream exon alone. cur[i] = cost of read[..i] and of leaving at p[i].
     let mut cur = vec![BIG; m + 1];
     let mut curp = vec![0u32; m + 1];
     let mut best_end = (BIG, 0usize, 0usize, 0u32, None::<(u32, u32)>); // cost, level, i, end p, entry
+    let leave0: Vec<u32> = (0..=n).map(|j| gv.leave(ix, j as u32, minus)).collect();
     for i in 0..=m {
         let mut end = (INF as u32, 0u32);
         for k in 0..w {
@@ -174,7 +198,7 @@ pub(crate) fn solve(
             if e >= INF as u32 {
                 continue;
             }
-            let c = e + gv.leave(ix, j as u32, minus);
+            let c = e + leave0[j as usize];
             if c < cur[i] {
                 cur[i] = c;
                 curp[i] = j as u32;
@@ -198,11 +222,12 @@ pub(crate) fn solve(
         let vl = vl as usize;
         // Only cells near the diagonal the window's seed hits lie on: window position j goes
         // with read position i0 + j, give or take `wb`.
-        let wb = 16 + vl as i64 / 16;
+        let wb = 14 + vl as i64 / 24;
         let ww = (2 * wb + 1) as usize;
         let i_lo = (i0 - wb).clamp(0, m as i64) as usize;
         let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
         let rows = i_hi - i_lo + 1;
+        b.window_cells += (rows * ww) as u64;
         b.c.clear();
         b.c.resize(rows * ww, BIG);
         b.o.clear();
@@ -316,16 +341,19 @@ pub(crate) fn solve(
             q: rv.q + m as u32,
             rev: true,
         };
-        band_prefix(
-            |x| rr.base(read, x),
-            m,
-            |j| fv.base(ix, j as u32),
-            n,
-            band,
-            &mut b.e2,
-            &mut b.tmp,
-            0,
-        );
+        if b.key2 != key {
+            band_prefix(
+                |x| rr.base(read, x),
+                m,
+                |j| fv.base(ix, j as u32),
+                n,
+                band,
+                &mut b.e2,
+                &mut b.tmp,
+                0,
+            );
+            b.key2 = key;
+        }
         let mut best = (BIG, 0usize, 0u32);
         for (x, &c0) in cur.iter().enumerate() {
             if c0 >= BIG {

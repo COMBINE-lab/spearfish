@@ -8,7 +8,7 @@
 
 use seeds::BaseSeeder;
 
-use crate::gap::{self, CLIP, Hop, ReadView, View};
+use crate::gap::{self, CLIP, Hop, ReadView, Solved, View};
 use crate::index::{GenomeIndex, L2_SPEC, L3_SPEC, code};
 
 #[derive(Clone, Debug)]
@@ -139,6 +139,10 @@ pub struct Stats {
     pub site_tried: u64,
     pub site_kept: u64,
     pub site_bases: u64,
+    /// Gap solver work: solves, prefix-table cells, window cells; and cells of other tables.
+    pub solves: u64,
+    pub prefix_cells: u64,
+    pub window_cells: u64,
 }
 
 impl Stats {
@@ -159,6 +163,9 @@ impl Stats {
         self.site_tried += o.site_tried;
         self.site_kept += o.site_kept;
         self.site_bases += o.site_bases;
+        self.solves += o.solves;
+        self.prefix_cells += o.prefix_cells;
+        self.window_cells += o.window_cells;
     }
 }
 
@@ -381,11 +388,17 @@ impl Window {
 
 /// Candidate exon windows from level-2 hits in genome order. Hits that
 /// continue one another on the same diagonal form one group; the groups with the most hits are
-/// kept (at most `MAX_WINDOWS`), since a chance hit is usually alone. A window reaches past its
+/// kept (at most `max_windows`), since a chance hit is usually alone. A window reaches past its
 /// hits by the read bases they leave uncovered on that side (the exon's edge can lie anywhere
 /// in them), but not past the midpoint to the next group, and stays inside `(t_lo, t_hi)`.
-fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Vec<Window> {
-    const MAX_WINDOWS: usize = 8;
+fn windows_of(
+    hits: &[Anchor],
+    q_lo: u32,
+    q_hi: u32,
+    t_lo: u32,
+    t_hi: u32,
+    max_windows: usize,
+) -> Vec<Window> {
     // groups as (first hit, last hit, hits)
     let mut groups: Vec<(Anchor, Anchor, u32)> = Vec::new();
     for &h in hits {
@@ -425,7 +438,7 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
             continue;
         }
         kept.push(g);
-        if kept.len() == MAX_WINDOWS {
+        if kept.len() == max_windows {
             break;
         }
     }
@@ -453,6 +466,14 @@ impl<'a> Mapper<'a> {
 
     /// Hits of `read` (ASCII bases), best first. Empty when the read does not map.
     pub fn map(&self, read: &[u8], sc: &mut Scratch) -> Vec<SplicedHit> {
+        let hits = self.map_inner(read, sc);
+        sc.stats.solves += std::mem::take(&mut sc.gap.calls);
+        sc.stats.prefix_cells += std::mem::take(&mut sc.gap.prefix_cells);
+        sc.stats.window_cells += std::mem::take(&mut sc.gap.window_cells);
+        hits
+    }
+
+    fn map_inner(&self, read: &[u8], sc: &mut Scratch) -> Vec<SplicedHit> {
         let hits = self.map_with(read, self.opt.cap, sc);
         if !hits.is_empty() || self.opt.cap >= self.opt.cap_retry {
             return hits;
@@ -464,6 +485,7 @@ impl<'a> Mapper<'a> {
 
     fn map_with(&self, read: &[u8], cap: usize, sc: &mut Scratch) -> Vec<SplicedHit> {
         let ix = self.index;
+        sc.gap.reset();
         let n = read.len();
         if n < 30 {
             return Vec::new();
@@ -549,6 +571,7 @@ impl<'a> Mapper<'a> {
                 break;
             }
             let read = std::mem::take(&mut sc.codes[reverse as usize]);
+            sc.gap.reset(); // another chain, possibly the other orientation of the read
             out.push(self.build(reverse, &chain, &read, n as u32, score, sc));
             sc.codes[reverse as usize] = read;
         }
@@ -669,7 +692,7 @@ impl<'a> Mapper<'a> {
                     sc.stats.rescues_tried += 1;
                     let path = self.rescue(reverse, Some(a), Some(b), qlen, sc);
                     sc.stats.empty += path.is_empty() as u64;
-                    cand[k] = Some(windows_of(&path, q0, q1, t0, t1));
+                    cand[k] = Some(windows_of(&path, q0, q1, t0, t1, 8));
                 }
                 let wins = cand[k].as_ref().unwrap();
                 let m = q1.saturating_sub(q0) as usize;
@@ -875,8 +898,10 @@ impl<'a> Mapper<'a> {
     }
 
     /// Solve a read end: the bases before read position `q` (`left`) or from it on, starting
-    /// at genome position `t`. Returns the junctions found, where the alignment stops, and the
-    /// strand used when it had to be chosen here.
+    /// at genome position `t`. Works in rounds until the read is used up or nothing more fits:
+    /// run along the genome while it matches, then solve what follows (up to 400 bases) with
+    /// the candidate exons found for it. Returns the junctions found, where the alignment
+    /// stops, and the strand used when it had to be chosen here.
     #[allow(clippy::too_many_arguments)]
     fn end(
         &self,
@@ -892,99 +917,108 @@ impl<'a> Mapper<'a> {
     ) -> EndSolved {
         let ix = self.index;
         let (mut q, mut t) = (q, t);
-        let mut m = if left { q } else { qlen - q };
         let mut out = EndSolved {
             cost: 0,
             hops: Vec::new(),
             end: (q, t),
             minus: None,
         };
-        if m == 0 {
-            return out;
-        }
-        // A long end first runs along the genome until it stops matching; only what is left
-        // (with a margin, since a run can overshoot an exon edge by chance) is solved in full.
-        if m > 100 {
-            let (dq, dt, _) = self.extend(read, q, t, left, sc);
-            if m - dq < 12 {
-                out.end = if left { (q - dq, t - dt) } else { (q + dq, t + dt) };
-                return out;
-            }
-            let back = dq.min(dt).min(25);
-            let (aq, at) = (dq - back, dt - back);
-            (q, t) = if left { (q - aq, t - at) } else { (q + aq, t + at) };
-            m -= aq;
-        }
-        let m = m.min(400) as usize;
-        let rv = ReadView { q, rev: left };
-        let gv = View { origin: t, rev: left };
         let half = self.opt.min_intron / 2;
-        let strands: &[bool] = if undecided {
-            &[false, true]
-        } else if minus {
-            &[true]
-        } else {
-            &[false]
-        };
-        let plain = gap::solve(ix, read, rv, m, gv, None, &[], strands[0], half, &mut sc.gap);
-        let reached = if left { q - plain.end.0 } else { plain.end.0 - q };
-        let mut best = (plain, None);
-        if m as u32 - reached >= 10 {
-            sc.stats.end_tried += 1;
-            // level-2 cores of the unexplained bases, within reach of the longest intron
-            let here = Anchor {
-                t,
-                q,
-                ql: 0,
-                tl: 0,
-                q_in: 0,
-                q_out: 0,
-                w: 0.0,
-            };
-            let path = if left {
-                self.rescue(reverse, None, Some(here), qlen, sc)
-            } else {
-                self.rescue(reverse, Some(here), None, qlen, sc)
-            };
-            let wins = if left {
-                windows_of(
-                    &path,
-                    q.saturating_sub(m as u32),
-                    q,
-                    t.saturating_sub(self.opt.max_intron),
-                    t,
-                )
-            } else {
-                windows_of(
-                    &path,
-                    q,
-                    q + m as u32,
-                    t,
-                    t.saturating_add(self.opt.max_intron).min(ix.total_len()),
-                )
-            };
-            if std::env::var_os("GMAP_DEBUG").is_some() {
-                eprintln!(
-                    "end path left={left} q={q} t={t} reached={reached}: {:?}",
-                    path.iter().map(|a| (a.t, a.q, a.ql)).collect::<Vec<_>>()
-                );
+        let mut strands: Vec<bool> = if undecided { vec![false, true] } else { vec![minus] };
+        for _round in 0..8 {
+            let mut m = if left { q } else { qlen - q };
+            if m == 0 {
+                break;
             }
-            let vw: Vec<(u32, u32, i64)> = if left {
-                wins.iter().rev().map(|w| w.backward(q, t)).collect()
-            } else {
-                wins.iter().map(|w| w.forward(q, t)).collect()
-            };
-            let p_end = best.0.end.1.abs_diff(t);
-            {
-                for &mi in strands {
-                    // exons that start at a splice site and match the unexplained bases
+            // A long stretch first runs along the genome until it stops matching; only what is
+            // left (with a margin, since a run can overshoot an exon edge by chance) is solved.
+            if m > 100 {
+                let (dq, dt, _) = self.extend(read, q, t, left, sc);
+                if m - dq < 10 {
+                    out.end = if left { (q - dq, t - dt) } else { (q + dq, t + dt) };
+                    break;
+                }
+                let back = dq.min(dt).min(25);
+                let (aq, at) = (dq - back, dt - back);
+                (q, t) = if left { (q - aq, t - at) } else { (q + aq, t + at) };
+                m -= aq;
+            }
+            let whole = m <= 400;
+            let m = m.min(400) as usize;
+            let rv = ReadView { q, rev: left };
+            let gv = View { origin: t, rev: left };
+            let plain = gap::solve(ix, read, rv, m, gv, None, &[], strands[0], half, &mut sc.gap);
+            let reached = plain.end.0.abs_diff(q);
+            let mut best = (plain, None);
+            if m as u32 - reached >= 10 {
+                sc.stats.end_tried += 1;
+                // level-2 cores of the unexplained bases, within reach of the longest intron
+                let here = Anchor {
+                    t,
+                    q,
+                    ql: 0,
+                    tl: 0,
+                    q_in: 0,
+                    q_out: 0,
+                    w: 0.0,
+                };
+                let hits = if left {
+                    self.rescue(reverse, None, Some(here), qlen, sc)
+                } else {
+                    self.rescue(reverse, Some(here), None, qlen, sc)
+                };
+                // windows start at the unexplained bases, not at the start of this round
+                let slack = reached.saturating_sub(12);
+                let wins = if left {
+                    windows_of(
+                        &hits,
+                        q.saturating_sub(m as u32),
+                        q - slack,
+                        t.saturating_sub(self.opt.max_intron),
+                        t,
+                        4,
+                    )
+                } else {
+                    let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
+                    windows_of(&hits, q + slack, q + m as u32, t, hi, 4)
+                };
+                let vw: Vec<(u32, u32, i64)> = if left {
+                    wins.iter().rev().map(|w| w.backward(q, t)).collect()
+                } else {
+                    wins.iter().map(|w| w.forward(q, t)).collect()
+                };
+                let p_end = best.0.end.1.abs_diff(t);
+                for &mi in &strands {
+                    // plus exons that start at a splice site and match the unexplained bases
+                    // Most introns are short: look nearby first, further only if that gives
+                    // nothing better than the plain extension.
+                    let mut s = Solved {
+                        cost: u32::MAX,
+                        ..Default::default()
+                    };
                     let mut all = vw.clone();
-                    all.extend(self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, sc));
-                    if all.is_empty() {
+                    let mut tried: Vec<(u32, u32, i64)> = Vec::new();
+                    for near in [true, false] {
+                        let sites =
+                            self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, near, sc);
+                        if !near && sites == tried {
+                            break; // looking further found nothing new
+                        }
+                        all.truncate(vw.len());
+                        all.extend(sites.iter().copied());
+                        tried = sites;
+                        if all.is_empty() {
+                            continue;
+                        }
+                        all.sort_by_key(|w| w.0);
+                        s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
+                        if !s.hops.is_empty() && s.cost < best.0.cost {
+                            break;
+                        }
+                    }
+                    if s.cost == u32::MAX {
                         continue;
                     }
-                    all.sort_by_key(|w| w.0);
-                    let s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
                     if std::env::var_os("GMAP_DEBUG").is_some() {
                         eprintln!(
                             "end left={left} q={q} t={t} m={m} minus={mi} windows={} plain={} cost={} hops={:?} end={:?}",
@@ -1001,14 +1035,22 @@ impl<'a> Mapper<'a> {
                 }
                 sc.stats.end_kept += best.1.is_some() as u64;
             }
+            let (s, chosen) = best;
+            let got = s.end.0.abs_diff(q);
+            out.cost += s.cost.saturating_sub(CLIP * (m as u32 - got));
+            out.end = s.end;
+            let hopped = !s.hops.is_empty();
+            out.hops.extend(s.hops);
+            if let Some(mi) = chosen {
+                out.minus = out.minus.or(Some(mi));
+                strands = vec![mi];
+            }
+            // Go on only if this round used all it was given and more of the read remains.
+            if whole || (m as u32 - got >= 10 && !hopped) || got < 30 {
+                break;
+            }
+            (q, t) = s.end;
         }
-        out.cost = best
-            .0
-            .cost
-            .saturating_sub(CLIP * (m as u32 - if left { q - best.0.end.0 } else { best.0.end.0 - q }));
-        out.end = best.0.end;
-        out.hops = best.0.hops;
-        out.minus = best.1;
         out
     }
 
@@ -1121,9 +1163,15 @@ impl<'a> Mapper<'a> {
         }
         let mut found: Vec<(usize, Window)> = Vec::new();
         let mut scanned = 0u64;
-        for p in lo..hi {
-            scanned += 1;
-            if acceptor_pen(ix, p, minus) != 0 {
+        scanned += (hi - lo) as u64;
+        // acceptors: AG before the exon on the forward strand, AC on the reverse
+        let (a0, a1) = if minus { (0, 1) } else { (0, 2) };
+        let mut starts: Vec<u32> = Vec::new();
+        ix.pair_scan(lo.saturating_sub(2), hi.saturating_sub(2), a0, a1, |s| {
+            starts.push(s + 2)
+        });
+        for p in starts {
+            if p < lo {
                 continue;
             }
             for len in len_lo..=len_hi {
@@ -1190,6 +1238,7 @@ impl<'a> Mapper<'a> {
         gv: View,
         p_end: u32,
         minus: bool,
+        near: bool,
         sc: &mut Scratch,
     ) -> Vec<(u32, u32, i64)> {
         const MARGIN: usize = 4;
@@ -1200,7 +1249,7 @@ impl<'a> Mapper<'a> {
             return Vec::new();
         }
         // a short tail is only looked for close by: further off, chance matches win
-        let reach = if k < 16 + MARGIN {
+        let reach = if k < 16 + MARGIN || near {
             20_000
         } else {
             self.opt.max_intron
@@ -1210,29 +1259,46 @@ impl<'a> Mapper<'a> {
             .map(|i| rv.base(read, start + i))
             .collect();
         let mut found: Vec<(usize, u32, (u32, u32, i64))> = Vec::new();
-        let mut p = p_end + 20;
-        while p < hi {
-            if gv.enter(ix, p, minus) == 0 {
-                // the exon can start a few read bases into the probe
-                for o in 0..=(2 * MARGIN).min(probe.len().saturating_sub(10)) {
-                    let len = (probe.len() - o).min(20);
-                    let allowed = len / 8;
-                    let mut d = 0;
-                    for i in 0..len {
-                        d += (probe[o + i] != gv.base(ix, p + i as u32)) as usize;
-                        if d > allowed {
-                            break;
-                        }
-                    }
-                    if d <= allowed {
-                        let vs = p.saturating_sub(3);
-                        let vl = (k as u32 + 12).min(300);
-                        found.push((d, p, (vs, vl, (start + o) as i64 - (p - vs) as i64)));
+        // Where an intron can end in the direction of travel: travelling forwards, after an
+        // acceptor (AG, or AC for a reverse-strand transcript); backwards, before a donor (GT,
+        // or CT).
+        let from = p_end + 20;
+        let mut cands: Vec<u32> = Vec::new();
+        if from < hi {
+            if gv.rev {
+                let (b0, b1) = if minus { (1, 3) } else { (2, 3) };
+                let (a, b) = (gv.real(hi), gv.real(from));
+                ix.pair_scan(a + 1, b + 1, b0, b1, |s| cands.push(gv.origin - s));
+            } else {
+                let (b0, b1) = if minus { (0, 1) } else { (0, 2) };
+                let (a, b) = (gv.real(from), gv.real(hi));
+                ix.pair_scan(a.saturating_sub(2), b.saturating_sub(2), b0, b1, |s| {
+                    cands.push(s + 2 - gv.origin)
+                });
+            }
+        }
+        for p in cands {
+            if p < from || p >= hi || gv.enter(ix, p, minus) != 0 {
+                continue;
+            }
+            // the exon can start a few read bases into the probe
+            for o in 0..=(2 * MARGIN).min(probe.len().saturating_sub(10)) {
+                let len = (probe.len() - o).min(20);
+                let allowed = len / 8;
+                let mut d = 0;
+                for i in 0..len {
+                    d += (probe[o + i] != gv.base(ix, p + i as u32)) as usize;
+                    if d > allowed {
                         break;
                     }
                 }
+                if d <= allowed {
+                    let vs = p.saturating_sub(3);
+                    let vl = (k as u32 + 12).min(300);
+                    found.push((d, p, (vs, vl, (start + o) as i64 - (p - vs) as i64)));
+                    break;
+                }
             }
-            p += 1;
         }
         sc.stats.site_bases += (hi.saturating_sub(p_end)) as u64;
         // best match first, then nearest; a few at most
