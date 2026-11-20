@@ -15,13 +15,14 @@ seeds.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 anyhow.workspace = true
-# DEFLATE for BAM output: zflate by default; the features below swap in another engine.
-zflate = "1.0.0"
+# DEFLATE for BAM output: zlib-rs (through flate2) by default; the features below swap in a
+# faster engine. zflate needs Rust 1.91, above the workspace's minimum, so it is opt-in.
+flate2.workspace = true
+zflate = { version = "1.0.0", optional = true }
 libdeflater = { version = "1.19", optional = true }
-flate2 = { workspace = true, optional = true }
 index.workspace = true
 
 [features]
-# BAM output's DEFLATE engine (default: zflate).
+# BAM output's DEFLATE engine (default: zlib-rs).
+zflate = ["dep:zflate"]
 libdeflate = ["dep:libdeflater"]
-zlib-rs = ["dep:flate2"]

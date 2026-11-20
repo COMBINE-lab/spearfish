@@ -2,8 +2,9 @@
 //!
 //! A BGZF file is a series of independent gzip members, so worker threads can each turn their
 //! records into complete blocks and the writer only has to append bytes in order. The DEFLATE
-//! engine is chosen at build time: `zflate` (the default; a Rust port of libdeflate),
-//! `libdeflate` (the C library) or `zlib-rs` (through flate2). The record encoder does not
+//! engine is chosen at build time: `zlib-rs` through flate2 (the default), or with a build
+//! feature `zflate` (a Rust port of libdeflate; fastest, needs Rust 1.91) or `libdeflate` (the C
+//! library). The record encoder does not
 //! depend on the engine, so their outputs decompress to the same bytes.
 
 use crate::index::GenomeIndex;
@@ -18,16 +19,16 @@ pub struct Level(pub u8);
 
 /// The name of the DEFLATE engine this build uses.
 pub fn engine() -> &'static str {
-    if cfg!(feature = "libdeflate") {
-        "libdeflate"
-    } else if cfg!(feature = "zlib-rs") {
-        "zlib-rs"
-    } else {
+    if cfg!(feature = "zflate") {
         "zflate"
+    } else if cfg!(feature = "libdeflate") {
+        "libdeflate"
+    } else {
+        "zlib-rs"
     }
 }
 
-#[cfg(not(any(feature = "libdeflate", feature = "zlib-rs")))]
+#[cfg(feature = "zflate")]
 fn deflate(src: &[u8], level: Level, dst: &mut [u8]) -> (usize, u32) {
     thread_local! {
         static C: std::cell::RefCell<Option<(u8, zflate::Compressor)>> = const { std::cell::RefCell::new(None) };
@@ -50,7 +51,7 @@ fn deflate(src: &[u8], level: Level, dst: &mut [u8]) -> (usize, u32) {
     })
 }
 
-#[cfg(feature = "libdeflate")]
+#[cfg(all(feature = "libdeflate", not(feature = "zflate")))]
 fn deflate(src: &[u8], level: Level, dst: &mut [u8]) -> (usize, u32) {
     let l = libdeflater::CompressionLvl::new(level.0 as i32).expect("level 0 to 12");
     let n = libdeflater::Compressor::new(l)
@@ -59,7 +60,7 @@ fn deflate(src: &[u8], level: Level, dst: &mut [u8]) -> (usize, u32) {
     (n, libdeflater::crc32(src))
 }
 
-#[cfg(all(feature = "zlib-rs", not(feature = "libdeflate")))]
+#[cfg(not(any(feature = "zflate", feature = "libdeflate")))]
 fn deflate(src: &[u8], level: Level, dst: &mut [u8]) -> (usize, u32) {
     let mut c = flate2::Compress::new(flate2::Compression::new(level.0.min(9) as u32), false);
     c.compress(src, dst, flate2::FlushCompress::Finish)
