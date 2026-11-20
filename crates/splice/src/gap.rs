@@ -173,7 +173,39 @@ pub(crate) struct Bufs {
     pub window_cells: u64,
 }
 
+/// A copy of the prefix tables of one gap, to solve it again later without recomputing them.
+#[derive(Clone, Default)]
+pub(crate) struct Tables {
+    key: Key,
+    e1: Vec<u16>,
+    e2: Vec<u16>,
+}
+
 impl Bufs {
+    /// The tables of the gap solved last (both must be present: a gap between two anchors).
+    pub fn stash(&self) -> Tables {
+        debug_assert!(self.key1 == self.key2);
+        Tables {
+            key: self.key1,
+            e1: self.e1.clone(),
+            e2: self.e2.clone(),
+        }
+    }
+
+    /// Put stashed tables back, unless they are the current ones.
+    pub fn restore(&mut self, t: &Tables) {
+        if t.key.is_some() && self.key1 != t.key {
+            self.e1.clear();
+            self.e1.extend_from_slice(&t.e1);
+            self.e2.clear();
+            self.e2.extend_from_slice(&t.e2);
+            self.key1 = t.key;
+            self.key2 = t.key;
+            self.l0_key = None;
+            self.r_key = None;
+        }
+    }
+
     /// Forget the cached tables (the read changed).
     pub fn reset(&mut self) {
         self.key1 = None;

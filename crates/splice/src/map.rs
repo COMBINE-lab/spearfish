@@ -100,7 +100,6 @@ pub struct Scratch {
     back: Vec<u32>,
     chain: Vec<u32>,
     g1: Vec<u8>,
-    g2: Vec<u8>,
     e1: Vec<u16>,
     e2: Vec<u16>,
     etmp: Vec<u16>,
@@ -931,6 +930,8 @@ impl<'a> Mapper<'a> {
         let solid = chain.len() >= 3 && anchored >= (qlen / 40).max(50);
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
+        // the prefix tables of the junctions that may go to the solver, to not compute them twice
+        let mut tables: Vec<Option<gap::Tables>> = Vec::new();
         for w in chain.windows(2) {
             let (a, b) = (w[0], w[1]);
             let d = (b.t - a.t) as i64 - (b.q - a.q) as i64;
@@ -940,6 +941,9 @@ impl<'a> Mapper<'a> {
             sc.stats.junctions += 1;
             let (q0, t0, q1, t1) = self.fixed(a, b);
             let p = self.place(read, q0, t0, q1, t1, sc);
+            let c = p[0].cost.min(p[1].cost);
+            let doubtful = c < INF && c as u32 >= 18 + q1.saturating_sub(q0) * self.opt.trigger_x64 / 64;
+            tables.push((solid && doubtful).then(|| sc.gap.stash()));
             pairs.push((a, b, p, false));
         }
         // Two levels of doubt about a junction. One that costs more than a clean read's would
@@ -997,6 +1001,9 @@ impl<'a> Mapper<'a> {
                     continue;
                 }
                 let (q0, t0, q1, t1) = self.fixed(a, b);
+                if let Some(t) = &tables[k] {
+                    sc.gap.restore(t);
+                }
                 let hard = {
                     let c = p[0].cost.min(p[1].cost);
                     c >= INF || c as u32 >= 18 + q1.saturating_sub(q0) * rate / 64
@@ -1853,9 +1860,9 @@ impl<'a> Mapper<'a> {
 
     /// The best split of read `[q0, q1)` into a part that continues the genome from `t0` and a
     /// part that ends at `t1`, for a transcript on the forward strand (`[0]`) and on the reverse
-    /// strand (`[1]`): the edit tables are shared, only the splice-site penalties differ.
+    /// strand (`[1]`): the gap solver without candidate exons. The prefix tables are shared by
+    /// the two strands and stay in `sc.gap` for whoever solves this gap next.
     fn place(&self, read: &[u8], q0: u32, t0: u32, q1: u32, t1: u32, sc: &mut Scratch) -> [Placed; 2] {
-        let ix = self.index;
         let none = Placed {
             q: q0,
             donor: t0,
@@ -1869,75 +1876,32 @@ impl<'a> Mapper<'a> {
             return [none; 2];
         }
         let m = (q1 - q0) as usize;
-        let band = 4 + m / 10;
-        let w = 2 * band + 1;
-        let span = (t1 - t0) as usize;
-        let n = (m + band).min(span);
-        ix.bases(t0, t0 + n as u32, &mut sc.g1);
-        ix.bases(t1 - n as u32, t1, &mut sc.g2);
-        let r = &read[q0 as usize..q1 as usize];
-        let (g1, g2) = (&sc.g1, &sc.g2);
-        band_prefix(|i| r[i], m, |j| g1[j], n, band, &mut sc.e1, &mut sc.etmp, 0);
-        band_prefix(
-            |i| r[m - 1 - i],
-            m,
-            |j| g2[n - 1 - j],
-            n,
-            band,
-            &mut sc.e2,
-            &mut sc.etmp,
-            0,
-        );
+        let rv = ReadView { q: q0, rev: false };
+        let gv = View {
+            origin: t0,
+            rev: false,
+        };
+        let half = self.opt.min_intron / 2;
         let mut out = [none; 2];
         for (s, o) in out.iter_mut().enumerate() {
-            let minus = s == 1;
-            let dpen: Vec<u16> = (0..=n).map(|j| donor_pen(ix, t0 + j as u32, minus)).collect();
-            let apen: Vec<u16> = (0..=n).map(|j| acceptor_pen(ix, t1 - j as u32, minus)).collect();
-            let mut best = (INF, 0usize, 0usize, 0usize);
-            for i in 0..=m {
-                // upstream part: read[..i] against genome[t0 .. t0 + j1]
-                let mut l = (INF, 0usize);
-                for k in 0..w {
-                    let j = (i + k) as isize - band as isize;
-                    if j < 0 || j as usize > n {
-                        continue;
-                    }
-                    let c = sc.e1[i * w + k] + dpen[j as usize];
-                    if c < l.0 {
-                        l = (c, j as usize);
-                    }
-                }
-                let mut rr = (INF, 0usize);
-                for k in 0..w {
-                    let j = (m - i + k) as isize - band as isize;
-                    if j < 0 || j as usize > n {
-                        continue;
-                    }
-                    let c = sc.e2[(m - i) * w + k] + apen[j as usize];
-                    if c < rr.0 {
-                        rr = (c, j as usize);
-                    }
-                }
-                let c = l.0 + rr.0;
-                if c < best.0 && l.1 + rr.1 + (self.opt.min_intron as usize / 2) <= span {
-                    best = (c, i, l.1, rr.1);
-                }
-            }
-            if std::env::var_os("GMAP_DEBUG").is_some() {
-                let t = |v: &[u8]| v.iter().map(|&c| b"ACGT"[c as usize] as char).collect::<String>();
-                eprintln!(
-                    "place minus={minus} q0={q0} q1={q1} t0={t0} t1={t1} m={m} n={n} band={band} best={best:?}\n  read={}\n  g1  ={}\n  g2  ={}",
-                    t(r),
-                    t(&sc.g1),
-                    t(&sc.g2)
-                );
-            }
-            if best.0 < INF {
+            let solved = gap::solve(
+                self.index,
+                read,
+                rv,
+                m,
+                gv,
+                Some(t1),
+                &[],
+                s == 1,
+                half,
+                &mut sc.gap,
+            );
+            if let (true, Some(h)) = (solved.cost < INF as u32, solved.hops.first()) {
                 *o = Placed {
-                    q: q0 + best.1 as u32,
-                    donor: t0 + best.2 as u32,
-                    acceptor: t1 - best.3 as u32,
-                    cost: best.0,
+                    q: h.q,
+                    donor: h.leave,
+                    acceptor: h.enter,
+                    cost: solved.cost as u16,
                     origin: b'd',
                 };
             }
