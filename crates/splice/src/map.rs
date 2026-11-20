@@ -157,6 +157,8 @@ pub struct Stats {
     pub site_tried: u64,
     pub site_kept: u64,
     pub site_bases: u64,
+    /// Junctions placed without a table (an exact match from both sides, canonical sites).
+    pub fast_placed: u64,
     /// Gap solver work: solves, prefix-table cells, window cells; and cells of other tables.
     pub solves: u64,
     pub prefix_cells: u64,
@@ -182,6 +184,7 @@ impl Stats {
         self.site_tried += o.site_tried;
         self.site_kept += o.site_kept;
         self.site_bases += o.site_bases;
+        self.fast_placed += o.fast_placed;
         self.solves += o.solves;
         self.prefix_cells += o.prefix_cells;
         self.window_cells += o.window_cells;
@@ -1890,12 +1893,55 @@ impl<'a> Mapper<'a> {
             return [none; 2];
         }
         let m = (q1 - q0) as usize;
+        let half = self.opt.min_intron / 2;
+        // Most junctions of a clean read need no table: the read bases match the genome exactly
+        // from the left up to some point and from the right back to some point, and where the
+        // two stretches overlap there is a split at canonical sites. That split costs nothing,
+        // so no alignment can beat it.
+        {
+            let ix = self.index;
+            let (r, span) = (&read[q0 as usize..q1 as usize], (t1 - t0) as usize);
+            let mut l = 0;
+            while l < m && l < span && r[l] == ix.base(t0 + l as u32) {
+                l += 1;
+            }
+            let mut rr = 0;
+            while rr < m && rr < span && r[m - 1 - rr] == ix.base(t1 - 1 - rr as u32) {
+                rr += 1;
+            }
+            if l + rr >= m && m + (half as usize) <= span {
+                let mut fast = [none; 2];
+                let mut free = false;
+                for (s, o) in fast.iter_mut().enumerate() {
+                    let mut best = (u16::MAX, 0usize);
+                    for i in (m - rr)..=l {
+                        let c = donor_pen(ix, t0 + i as u32, s == 1)
+                            + acceptor_pen(ix, t1 - (m - i) as u32, s == 1);
+                        if c < best.0 {
+                            best = (c, i);
+                        }
+                    }
+                    free |= best.0 == 0;
+                    *o = Placed {
+                        q: q0 + best.1 as u32,
+                        donor: t0 + best.1 as u32,
+                        acceptor: t1 - (m - best.1) as u32,
+                        cost: best.0,
+                        origin: b'd',
+                    };
+                }
+                if free {
+                    sc.gap.reset(); // the tables in there are not this junction's
+                    sc.stats.fast_placed += 1;
+                    return fast;
+                }
+            }
+        }
         let rv = ReadView { q: q0, rev: false };
         let gv = View {
             origin: t0,
             rev: false,
         };
-        let half = self.opt.min_intron / 2;
         let mut out = [none; 2];
         for (s, o) in out.iter_mut().enumerate() {
             let solved = gap::solve(
