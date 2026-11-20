@@ -69,6 +69,12 @@ struct Raw {
     l2_labels: *const [u64],
     l2_pos: *const [u32],
     l2_id: *const [u16],
+    p_labels: *const [u64],
+    p_dir: *const [u32],
+    p_occ_off: *const [u32],
+    p_pos: *const [u32],
+    p_len: *const [u8],
+    p_bits: u32,
     dir_bits: u32,
     hpc: bool,
     ranked: bool,
@@ -158,6 +164,18 @@ fn seed_all(seq: &[u8], segs: &[(usize, usize)], spec: &str, hpc: bool) -> Vec<(
                 .collect::<Vec<_>>(),
         })
         .collect()
+}
+
+/// The label of two consecutive level-2 cores taken as one seed.
+#[inline]
+pub fn pair_label(a: u64, b: u64) -> u64 {
+    (a.rotate_left(23) ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Whether a pair label is in the fallback table (every other one is).
+#[inline]
+pub fn keep_pair(l: u64) -> bool {
+    (l >> 40) & 1 == 0
 }
 
 /// A label folded to 16 bits.
@@ -255,6 +273,42 @@ impl GenomeIndex {
         if !ranked {
             l2_labels.clear();
         }
+        // Fallback seeds for reads that level 3 anchors weakly: pairs of consecutive level-2
+        // cores (every other pair, chosen by label), as a label table like level 3's.
+        let mut pairs: Vec<(u64, u32, u8)> = l2
+            .par_windows(2)
+            .filter_map(|w| {
+                let l = pair_label(w[0].0, w[1].0);
+                (w[1].1 - w[0].1 < 64 && keep_pair(l))
+                    .then(|| (l, w[0].1, (w[1].1 + w[1].2 - w[0].1).min(255) as u8))
+            })
+            .collect();
+        pairs.par_sort_unstable();
+        let (mut p_labels, mut p_occ_off, mut p_pos, mut p_len) =
+            (Vec::new(), vec![0u32], Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < pairs.len() {
+            let mut j = i + 1;
+            while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+                j += 1;
+            }
+            if j - i <= opt.max_occ as usize {
+                p_labels.push(pairs[i].0);
+                p_pos.extend(pairs[i..j].iter().map(|x| x.1));
+                p_len.extend(pairs[i..j].iter().map(|x| x.2));
+                p_occ_off.push(p_pos.len() as u32);
+            }
+            i = j;
+        }
+        drop(pairs);
+        let p_bits = (p_labels.len().max(2).ilog2()).clamp(1, 28);
+        let mut p_dir = vec![0u32; (1usize << p_bits) + 1];
+        for &l in &p_labels {
+            p_dir[(l >> (64 - p_bits)) as usize + 1] += 1;
+        }
+        for b in 1..p_dir.len() {
+            p_dir[b] += p_dir[b - 1];
+        }
         drop(l2);
         drop(seq);
 
@@ -269,6 +323,7 @@ impl GenomeIndex {
             dropped,
             opt.hpc as u64,
             ranked as u64,
+            p_bits as u64,
         ];
         let mut w = Writer::default();
         w.add_owned("g_meta", meta);
@@ -284,6 +339,11 @@ impl GenomeIndex {
         w.add_owned("g2_labels", l2_labels);
         w.add_owned("g2_pos", l2_pos);
         w.add_owned("g2_id", l2_id);
+        w.add_owned("gp_labels", p_labels);
+        w.add_owned("gp_dir", p_dir);
+        w.add_owned("gp_occ_off", p_occ_off);
+        w.add_owned("gp_pos", p_pos);
+        w.add_owned("gp_len", p_len);
         Self::from_store(Store::from_bytes(&w.to_bytes())?)
     }
 
@@ -293,6 +353,10 @@ impl GenomeIndex {
 
     pub fn write(&self, path: &Path) -> Result<u64> {
         let mut w = Writer::default();
+        let optional = ["gp_labels", "gp_dir", "gp_occ_off", "gp_pos", "gp_len"];
+        for name in optional.iter().copied().filter(|n| self.store.has(n)) {
+            w.add::<u8>(name, self.store.get(name)?);
+        }
         for name in [
             "g_meta",
             "g_names",
@@ -331,6 +395,32 @@ impl GenomeIndex {
             l2_labels: store.get("g2_labels")?,
             l2_pos: store.get("g2_pos")?,
             l2_id: store.get("g2_id")?,
+            p_labels: if store.has("gp_labels") {
+                store.get("gp_labels")?
+            } else {
+                &[]
+            },
+            p_dir: if store.has("gp_dir") {
+                store.get("gp_dir")?
+            } else {
+                &[]
+            },
+            p_occ_off: if store.has("gp_occ_off") {
+                store.get("gp_occ_off")?
+            } else {
+                &[]
+            },
+            p_pos: if store.has("gp_pos") {
+                store.get("gp_pos")?
+            } else {
+                &[]
+            },
+            p_len: if store.has("gp_len") {
+                store.get("gp_len")?
+            } else {
+                &[]
+            },
+            p_bits: meta.get(5).copied().unwrap_or(0) as u32,
             dir_bits: meta[0] as u32,
             hpc: meta.get(3).is_none_or(|&x| x != 0),
             ranked: meta.get(4).is_none_or(|&x| x != 0),
@@ -428,6 +518,36 @@ impl GenomeIndex {
             )
         };
         let b = (label >> (64 - self.n.dir_bits)) as usize;
+        let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
+        match labels[lo..hi].binary_search(&label) {
+            Ok(i) => {
+                let (s, e) = (off[lo + i] as usize, off[lo + i + 1] as usize);
+                (&pos[s..e], &len[s..e])
+            }
+            Err(_) => (&[], &[]),
+        }
+    }
+
+    /// Whether the index has the fallback table of level-2 pairs.
+    pub fn has_pairs(&self) -> bool {
+        // SAFETY: see `Raw`.
+        self.n.p_bits > 0 && !unsafe { &*self.n.p_labels }.is_empty()
+    }
+
+    /// Occurrences (raw start, raw length) of a level-2 pair label (see [`pair_label`]).
+    #[inline]
+    pub fn pair_occurrences(&self, label: u64) -> (&[u32], &[u8]) {
+        // SAFETY: see `Raw`.
+        let (labels, dir, off, pos, len) = unsafe {
+            (
+                &*self.n.p_labels,
+                &*self.n.p_dir,
+                &*self.n.p_occ_off,
+                &*self.n.p_pos,
+                &*self.n.p_len,
+            )
+        };
+        let b = (label >> (64 - self.n.p_bits)) as usize;
         let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
         match labels[lo..hi].binary_search(&label) {
             Ok(i) => {

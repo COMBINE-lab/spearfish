@@ -114,6 +114,7 @@ struct L2Seed {
     /// Homopolymer runs in the core.
     runs: u16,
     id: u16,
+    label: u64,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -512,16 +513,29 @@ impl<'a> Mapper<'a> {
     }
 
     fn map_inner(&self, read: &[u8], sc: &mut Scratch) -> Vec<SplicedHit> {
-        let hits = self.map_with(read, self.opt.cap, sc);
+        let covered = |h: &[SplicedHit]| {
+            h.first()
+                .map_or(0, |h| h.blocks.iter().map(|b| b.qe - b.qs).sum::<u32>())
+        };
+        let mut hits = self.map_with(read, self.opt.cap, false, sc);
+        // A read that level 3 anchors weakly (no hit, three anchors or fewer, or under 60% of
+        // the read covered) is seeded again with pairs of level-2 cores as well.
+        let weak = hits.first().is_none_or(|h| h.anchors <= 3) || 10 * covered(&hits) < 6 * read.len() as u32;
+        if weak && self.index.has_pairs() {
+            sc.stats.retried += 1;
+            let again = self.map_with(read, self.opt.cap, true, sc);
+            if covered(&again) > covered(&hits) {
+                hits = again;
+            }
+        }
         if !hits.is_empty() || self.opt.cap >= self.opt.cap_retry {
             return hits;
         }
-        // Nothing with the usual seeds: allow the repetitive ones too.
-        sc.stats.retried += 1;
-        self.map_with(read, self.opt.cap_retry, sc)
+        // Still nothing: allow the repetitive seeds too.
+        self.map_with(read, self.opt.cap_retry, true, sc)
     }
 
-    fn map_with(&self, read: &[u8], cap: usize, sc: &mut Scratch) -> Vec<SplicedHit> {
+    fn map_with(&self, read: &[u8], cap: usize, pairs: bool, sc: &mut Scratch) -> Vec<SplicedHit> {
         let ix = self.index;
         sc.gap.reset();
         let n = read.len();
@@ -580,6 +594,7 @@ impl<'a> Mapper<'a> {
                         q_out,
                         runs,
                         id,
+                        label: s.label,
                     });
                 }
             }
@@ -601,6 +616,31 @@ impl<'a> Mapper<'a> {
                         q_out,
                         w,
                     });
+                }
+            }
+            if pairs && ix.has_pairs() {
+                for w in sc.l2[o].windows(2) {
+                    let l = crate::index::pair_label(w[0].label, w[1].label);
+                    if w[1].q - w[0].q >= 64 || !crate::index::keep_pair(l) {
+                        continue;
+                    }
+                    let (pos, len) = ix.pair_occurrences(l);
+                    if pos.is_empty() || pos.len() > cap {
+                        continue;
+                    }
+                    let ql = w[1].q + w[1].ql as u32 - w[0].q;
+                    let wt = ql.min(40) as f32 / (1.0 + (pos.len() as f32).ln());
+                    for (&t, &tl) in pos.iter().zip(len) {
+                        sc.hits.push(Anchor {
+                            t,
+                            q: w[0].q,
+                            ql: ql as u16,
+                            tl: tl as u16,
+                            q_in: w[0].q_in,
+                            q_out: (w[1].q - w[0].q) as u16 + w[1].q_out,
+                            w: wt,
+                        });
+                    }
                 }
             }
             if sc.hits.is_empty() {
