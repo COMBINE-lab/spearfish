@@ -4,7 +4,7 @@
 /// runs. `$body` is an `#[inline(always)]` function; its loops are plain and the compiler
 /// vectorizes them for whichever instruction set the copy is built for.
 macro_rules! avx2_variant {
-    ($(#[$meta:meta])* fn $name:ident = $body:ident, $avx:ident ($($a:ident : $t:ty),* $(,)?) -> $r:ty) => {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident = $body:ident, $avx:ident ($($a:ident : $t:ty),* $(,)?) -> $r:ty) => {
         #[cfg(target_arch = "x86_64")]
         #[target_feature(enable = "avx2")]
         #[allow(clippy::too_many_arguments)]
@@ -13,7 +13,7 @@ macro_rules! avx2_variant {
         }
         $(#[$meta])*
         #[inline]
-        fn $name($($a: $t),*) -> $r {
+        $vis fn $name($($a: $t),*) -> $r {
             #[cfg(target_arch = "x86_64")]
             if std::is_x86_feature_detected!("avx2") {
                 // SAFETY: AVX2 was just detected.

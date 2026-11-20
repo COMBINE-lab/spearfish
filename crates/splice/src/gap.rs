@@ -327,7 +327,7 @@ fn row_end_body(row: &[u16], off0: i32) -> u32 {
     end
 }
 avx2_variant! {
-    fn row_end = row_end_body, row_end_avx2(row: &[u16], off0: i32) -> u32
+    pub(crate) fn row_end = row_end_body, row_end_avx2(row: &[u16], off0: i32) -> u32
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]

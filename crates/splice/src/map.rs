@@ -96,6 +96,12 @@ struct Anchor {
 pub struct Scratch {
     codes: [Vec<u8>; 2],
     hits: Vec<Anchor>,
+    /// Scratch of the hit sort: keys, and the hits in their new order.
+    hit_keys: Vec<u64>,
+    /// Pairs of level-2 cores as seeds, per orientation, once they were asked for.
+    pair_seeds: [Vec<L2Seed>; 2],
+    pairs_done: [bool; 2],
+    hits_sorted: Vec<Anchor>,
     f: Vec<f32>,
     back: Vec<u32>,
     chain: Vec<u32>,
@@ -130,6 +136,8 @@ struct L2Seed {
     runs: u16,
     id: u16,
     label: u64,
+    /// Where the label's occurrences are in the index (level-3 cores only).
+    occ: (u32, u32),
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -211,6 +219,71 @@ pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
 /// Splice-site costs per site: GT..AG is free, GC..AG and AT..AC cost `SEMI`, others `NONCANON`.
 const SEMI: u16 = 8;
 const NONCANON: u16 = 18;
+/// Sort hits by genome position, then read position. The keys (position and index in one
+/// word) are sorted, not the hits themselves, which are then moved once.
+fn sort_hits(hits: &mut Vec<Anchor>, keys: &mut Vec<u64>, sorted: &mut Vec<Anchor>) {
+    if hits.len() < 32 {
+        hits.sort_unstable_by_key(|a| (a.t, a.q));
+        return;
+    }
+    keys.clear();
+    keys.extend(
+        hits.iter()
+            .enumerate()
+            .map(|(i, a)| ((a.t as u64) << 32) | i as u64),
+    );
+    if keys.len() < 512 {
+        keys.sort_unstable();
+    } else {
+        // by position in three counting passes of 11, 11 and 10 bits (the index in the low
+        // half keeps its order)
+        const BITS: [u32; 3] = [11, 11, 10];
+        let n = keys.len();
+        let mut counts = [[0u32; 2048]; 3];
+        for &k in keys.iter() {
+            let t = (k >> 32) as usize;
+            counts[0][t & 2047] += 1;
+            counts[1][(t >> 11) & 2047] += 1;
+            counts[2][t >> 22] += 1;
+        }
+        keys.resize(2 * n, 0);
+        let (mut a, mut b) = keys.split_at_mut(n);
+        let mut shift = 32;
+        for (p, c) in counts.iter_mut().enumerate() {
+            let mask = (1u64 << BITS[p]) - 1;
+            let mut at = 0u32;
+            for x in c.iter_mut() {
+                let here = *x;
+                *x = at;
+                at += here;
+            }
+            for &k in a.iter() {
+                let d = ((k >> shift) & mask) as usize;
+                b[c[d] as usize] = k;
+                c[d] += 1;
+            }
+            std::mem::swap(&mut a, &mut b);
+            shift += BITS[p];
+        }
+        // (three passes: the sorted keys are in the second half)
+        keys.copy_within(n.., 0);
+        keys.truncate(n);
+    }
+    sorted.clear();
+    sorted.extend(keys.iter().map(|&k| hits[(k & 0xffff_ffff) as usize]));
+    // hits at one genome position (few): by read position
+    let mut s = 0;
+    for i in 1..=sorted.len() {
+        if i == sorted.len() || sorted[i].t != sorted[s].t {
+            if i - s > 1 {
+                sorted[s..i].sort_unstable_by_key(|a| a.q);
+            }
+            s = i;
+        }
+    }
+    std::mem::swap(hits, sorted);
+}
+
 /// Banded affine-gap costs of every prefix of `a` against prefixes of `b`.
 /// `e[i * w + k]` is the cost of `a[..i]` against `b[..j]` with `j = i + k - band`,
 /// `w = 2 * band + 1`. `tmp` holds the gap states. With `drop > 0` the rows stop once the best
@@ -738,6 +811,7 @@ impl<'a> Mapper<'a> {
                     runs,
                     id: 0,
                     label: s.label,
+                    occ: (0, 0),
                 });
             }
             sc.l2[o].clear();
@@ -752,9 +826,63 @@ impl<'a> Mapper<'a> {
                         runs,
                         id,
                         label: s.label,
+                        occ: (0, 0),
                     });
                 }
             }
+        }
+        // Every level-3 core is looked up once per read, all of them a step at a time (see
+        // `GenomeIndex::prefetch_dir`); the passes over the read share the result.
+        for o in 0..2 {
+            for s in &sc.l3[o] {
+                ix.prefetch_dir(s.label, false);
+            }
+        }
+        for o in 0..2 {
+            for s in &sc.l3[o] {
+                ix.prefetch_bucket(s.label, false);
+            }
+        }
+        for o in 0..2 {
+            for s in sc.l3[o].iter_mut() {
+                s.occ = ix.occ_range(s.label, false);
+            }
+        }
+        sc.pair_seeds[0].clear();
+        sc.pair_seeds[1].clear();
+        sc.pairs_done = [false; 2];
+    }
+
+    /// The read's pairs of level-2 cores in orientation `o` that are in the index, looked up
+    /// once per read like the level-3 cores.
+    fn pair_seeds(&self, o: usize, sc: &mut Scratch) {
+        if std::mem::replace(&mut sc.pairs_done[o], true) {
+            return;
+        }
+        let ix = self.index;
+        for w in sc.l2[o].windows(2) {
+            let l = crate::index::pair_label(w[0].label, w[1].label);
+            if w[1].q - w[0].q >= 64 || !crate::index::keep_pair(l) {
+                continue;
+            }
+            ix.prefetch_dir(l, true);
+            let ql = w[1].q + w[1].ql as u32 - w[0].q;
+            sc.pair_seeds[o].push(L2Seed {
+                q: w[0].q,
+                ql: ql as u16,
+                q_in: w[0].q_in,
+                q_out: (w[1].q - w[0].q) as u16 + w[1].q_out,
+                runs: 0,
+                id: 0,
+                label: l,
+                occ: (0, 0),
+            });
+        }
+        for s in &sc.pair_seeds[o] {
+            ix.prefetch_bucket(s.label, true);
+        }
+        for s in sc.pair_seeds[o].iter_mut() {
+            s.occ = ix.occ_range(s.label, true);
         }
     }
 
@@ -770,7 +898,7 @@ impl<'a> Mapper<'a> {
         let mut found = [0usize; 2];
         for o in 0..2 {
             for s in &sc.l3[o] {
-                let (pos, len) = ix.occurrences(s.label);
+                let (pos, len) = ix.occ(s.occ, false);
                 found[o] += !pos.is_empty() as usize;
                 if pos.is_empty() || pos.len() > cap {
                     continue;
@@ -804,25 +932,21 @@ impl<'a> Mapper<'a> {
                 && 25 * found[best] >= sc.l3[best].len();
             let beaten = found[1 - o] >= 5 && 4 * found[o] <= found[1 - o];
             if (pairs || (self.opt.pairs && noisy && !beaten)) && ix.has_pairs() {
-                for w in sc.l2[o].windows(2) {
-                    let l = crate::index::pair_label(w[0].label, w[1].label);
-                    if w[1].q - w[0].q >= 64 || !crate::index::keep_pair(l) {
-                        continue;
-                    }
-                    let (pos, len) = ix.pair_occurrences(l);
+                self.pair_seeds(o, sc);
+                for s in &sc.pair_seeds[o] {
+                    let (pos, len) = ix.occ(s.occ, true);
                     if pos.is_empty() || pos.len() > cap {
                         continue;
                     }
-                    let ql = w[1].q + w[1].ql as u32 - w[0].q;
-                    let wt = ql.min(40) as f32 / (1.0 + (pos.len() as f32).ln());
+                    let wt = (s.ql as u32).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
                     for (&t, &tl) in pos.iter().zip(len) {
                         sc.hits.push(Anchor {
                             t,
-                            q: w[0].q,
-                            ql: ql as u16,
+                            q: s.q,
+                            ql: s.ql,
                             tl: tl as u16,
-                            q_in: w[0].q_in,
-                            q_out: (w[1].q - w[0].q) as u16 + w[1].q_out,
+                            q_in: s.q_in,
+                            q_out: s.q_out,
                             w: wt,
                         });
                     }
@@ -832,7 +956,7 @@ impl<'a> Mapper<'a> {
                 continue;
             }
             sc.had_hits = true;
-            sc.hits.sort_unstable_by_key(|a| (a.t, a.q));
+            sort_hits(&mut sc.hits, &mut sc.hit_keys, &mut sc.hits_sorted);
             // Loci: runs of hits no further apart than the longest intron.
             let mut loci: Vec<(f32, usize, usize)> = Vec::new();
             let mut s = 0;
@@ -843,8 +967,7 @@ impl<'a> Mapper<'a> {
                     s = i;
                 }
             }
-            loci.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-            let best = loci[0].0;
+            let best = loci.iter().map(|l| l.0).fold(0.0, f32::max);
             // (a read whose best locus is one or two seeds deep cannot rank its loci by
             // weight: all of them are looked at, and screened below)
             // (only for a read with a few of its level-3 cores in the genome; one with next to
@@ -857,10 +980,16 @@ impl<'a> Mapper<'a> {
             } else {
                 48
             };
-            for &(w, s, e) in loci.iter().take(limit) {
-                if w < 0.25 * best {
-                    break;
-                }
+            // The heaviest `limit` loci among those within a quarter of the best, heaviest
+            // first (a read of chance hits has thousands of loci of one hit each: they are
+            // not all sorted).
+            loci.retain(|l| l.0 >= 0.25 * best);
+            if loci.len() > limit {
+                loci.select_nth_unstable_by(limit, |a, b| b.0.total_cmp(&a.0));
+                loci.truncate(limit);
+            }
+            loci.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            for &(_, s, e) in loci.iter() {
                 if let Some((score, chain)) = self.chain_locus(s, e, sc) {
                     cands.push((score, o == 1, chain));
                 }
@@ -2168,16 +2297,16 @@ impl<'a> Mapper<'a> {
         // The furthest point whose score (one per read base, minus three per edit) is best.
         let mut best = (0i32, 0usize, 0usize, 0u16);
         for i in 1..=m {
+            // the row's cells within the genome stretch; on a tie, the genome length closest
+            // to the read length
+            let k_lo = band.saturating_sub(i);
             let mut row = (INF, 0usize);
-            for k in 0..w {
-                let j = (i + k) as isize - band as isize;
-                if j < 0 || j as usize > n {
-                    continue;
-                }
-                // on a tie, the genome length closest to the read length
-                let c = sc.e1[i * w + k];
-                if c < row.0 || (c == row.0 && j.unsigned_abs().abs_diff(i) < row.1.abs_diff(i)) {
-                    row = (c, j as usize);
+            if i <= n + band {
+                let k_hi = (n + band - i).min(w - 1);
+                let best =
+                    crate::gap::row_end(&sc.e1[i * w + k_lo..=i * w + k_hi], k_lo as i32 - band as i32);
+                if best != u32::MAX {
+                    row = ((best >> 16) as u16, i + k_lo + (best & 0xff) as usize - band);
                 }
             }
             let s = 2 * i as i32 - row.0 as i32;

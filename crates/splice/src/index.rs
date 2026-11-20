@@ -527,6 +527,78 @@ impl GenomeIndex {
         }
     }
 
+    /// The tables of level-3 labels, or those of level-2 pairs.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    fn tables(&self, pairs: bool) -> (&[u64], &[u32], &[u32], &[u32], &[u8], u32) {
+        // SAFETY: see `Raw`.
+        unsafe {
+            if pairs {
+                (
+                    &*self.n.p_labels,
+                    &*self.n.p_dir,
+                    &*self.n.p_occ_off,
+                    &*self.n.p_pos,
+                    &*self.n.p_len,
+                    self.n.p_bits,
+                )
+            } else {
+                (
+                    &*self.n.labels,
+                    &*self.n.dir,
+                    &*self.n.occ_off,
+                    &*self.n.pos,
+                    &*self.n.len,
+                    self.n.dir_bits,
+                )
+            }
+        }
+    }
+
+    /// Looking a label up touches four places in memory, each known only from the one before.
+    /// A read's labels are therefore looked up together, a step at a time: this asks for a
+    /// label's directory entry, [`Self::prefetch_bucket`] for its bucket of labels, and
+    /// [`Self::occ_range`] finds its occurrence list and asks for that.
+    #[inline]
+    pub fn prefetch_dir(&self, label: u64, pairs: bool) {
+        let (_, dir, _, _, _, bits) = self.tables(pairs);
+        prefetch(dir.as_ptr().wrapping_add((label >> (64 - bits)) as usize));
+    }
+
+    /// See [`Self::prefetch_dir`].
+    #[inline]
+    pub fn prefetch_bucket(&self, label: u64, pairs: bool) {
+        let (labels, dir, off, _, _, bits) = self.tables(pairs);
+        let lo = dir[(label >> (64 - bits)) as usize] as usize;
+        prefetch(labels.as_ptr().wrapping_add(lo));
+        prefetch(off.as_ptr().wrapping_add(lo));
+    }
+
+    /// Where a label's occurrences are, for [`Self::occ`] (an empty range: none).
+    #[inline]
+    pub fn occ_range(&self, label: u64, pairs: bool) -> (u32, u32) {
+        let (labels, dir, off, pos, len, bits) = self.tables(pairs);
+        let b = (label >> (64 - bits)) as usize;
+        let (lo, hi) = (dir[b] as usize, dir[b + 1] as usize);
+        match labels[lo..hi].binary_search(&label) {
+            Ok(i) => {
+                let (s, e) = (off[lo + i], off[lo + i + 1]);
+                prefetch(pos.as_ptr().wrapping_add(s as usize));
+                prefetch(len.as_ptr().wrapping_add(s as usize));
+                (s, e)
+            }
+            Err(_) => (0, 0),
+        }
+    }
+
+    /// Occurrences (raw start, raw length) in a range from [`Self::occ_range`].
+    #[inline]
+    pub fn occ(&self, range: (u32, u32), pairs: bool) -> (&[u32], &[u8]) {
+        let (_, _, _, pos, len, _) = self.tables(pairs);
+        let (s, e) = (range.0 as usize, range.1 as usize);
+        (&pos[s..e], &len[s..e])
+    }
+
     /// Occurrences (raw start, raw length) of a level-3 label.
     #[inline]
     pub fn occurrences(&self, label: u64) -> (&[u32], &[u8]) {
@@ -612,4 +684,16 @@ impl GenomeIndex {
     pub fn sizes(&self) -> Vec<(String, usize)> {
         self.store.sizes()
     }
+}
+
+/// A cache hint for the line holding `p` (x86-64 only; never faults).
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint: it reads nothing and cannot fault, whatever the address.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
 }
