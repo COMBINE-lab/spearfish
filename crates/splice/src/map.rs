@@ -65,6 +65,8 @@ pub struct SplicedHit {
     /// Alignment cost summed over the placed junctions and read ends.
     pub edits: u32,
     pub primary: bool,
+    /// One letter per junction, in genome order, saying how it was made (for diagnosis).
+    pub origins: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -281,7 +283,13 @@ struct Placed {
     donor: u32,
     acceptor: u32,
     cost: u16,
+    /// How the junction was made: `d` placed directly, `p` placed directly although the fit
+    /// was poor, `w` by the gap solver through a candidate exon, `e` at a read end.
+    origin: u8,
 }
+
+/// Reference skips shorter than this are written as deletions, not introns.
+const MIN_INTRON_OUT: u32 = 30;
 
 /// Make blocks consistent for output: in genome order without overlap, each starting on the
 /// read where the previous one ends. Returns whether anything had to change.
@@ -298,9 +306,10 @@ fn tidy(blocks: &mut Vec<Block>, qlen: u32) -> bool {
             continue;
         }
         if let Some(p) = out.last_mut() {
-            if b.ts < p.te {
-                // overlap on the genome: one block
-                changed = true;
+            if b.ts < p.te + MIN_INTRON_OUT {
+                // overlap on the genome, or a skip too short to be an intron (a deletion in
+                // the read): one block
+                changed |= b.ts < p.te;
                 p.te = p.te.max(b.te);
                 p.qe = p.qe.max(b.qe.min(qlen));
                 continue;
@@ -392,36 +401,49 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
             groups.push((h, h, 1));
         }
     }
-    if groups.len() > MAX_WINDOWS {
-        let mut by: Vec<usize> = (0..groups.len()).collect();
-        by.sort_by_key(|&k| {
-            std::cmp::Reverse((groups[k].2, groups[k].1.q + groups[k].1.ql as u32 - groups[k].0.q))
-        });
-        by.truncate(MAX_WINDOWS);
-        by.sort_unstable();
-        groups = by.into_iter().map(|k| groups[k]).collect();
-    }
-    groups.sort_by_key(|g| g.0.t);
     let end = |a: Anchor| a.t + a.tl as u32;
+    // A group's wish: its hits widened by the read bases they leave uncovered on each side.
+    let wish = |g: &(Anchor, Anchor, u32)| {
+        let lead = g.0.q.saturating_sub(q_lo).min(150) + 12;
+        let trail = q_hi.saturating_sub(g.1.q + g.1.ql as u32).min(150) + 12;
+        (g.0.t.saturating_sub(lead), end(g.1) + trail)
+    };
+    // Strongest groups first; a group whose hits lie inside the wish of a stronger one is
+    // dropped (a stray hit inside an exon must not split that exon's window).
+    let mut by: Vec<usize> = (0..groups.len()).collect();
+    by.sort_by_key(|&k| std::cmp::Reverse((groups[k].2, end(groups[k].1) - groups[k].0.t)));
+    let mut kept: Vec<(Anchor, Anchor, u32)> = Vec::new();
+    for k in by {
+        let g = groups[k];
+        if kept.iter().any(|o| {
+            let (s, e) = wish(o);
+            g.0.t < e && s < end(g.1)
+        }) {
+            continue;
+        }
+        kept.push(g);
+        if kept.len() == MAX_WINDOWS {
+            break;
+        }
+    }
+    kept.sort_by_key(|g| g.0.t);
     // midpoints, computed without overflowing 32 bits
     let mid = |a: u32, b: u32| a + b.saturating_sub(a) / 2;
     let mut out: Vec<Window> = Vec::new();
-    for (k, &(f, l, _)) in groups.iter().enumerate() {
-        let lead = f.q.saturating_sub(q_lo).min(150) + 12;
-        let trail = q_hi.saturating_sub(l.q + l.ql as u32).min(150) + 12;
+    for (k, g) in kept.iter().enumerate() {
+        let (f, l) = (g.0, g.1);
+        let (ws, we) = wish(g);
         let lo = if k > 0 {
-            mid(end(groups[k - 1].1), f.t) + 1
+            mid(end(kept[k - 1].1), f.t) + 1
         } else {
             t_lo + 20
         };
-        let lo = lo.max(out.last().map_or(0, |w| w.e));
-        let hi = if k + 1 < groups.len() {
-            mid(end(l), groups[k + 1].0.t)
+        let hi = if k + 1 < kept.len() {
+            mid(end(l), kept[k + 1].0.t)
         } else {
             t_hi.saturating_sub(20)
         };
-        let s = f.t.saturating_sub(lead).max(lo);
-        let e = (end(l) + trail).min(hi);
+        let (s, e) = (ws.max(lo), we.min(hi));
         if e > s + 4 && e - s <= 2000 {
             out.push(Window { s, e, f, l });
         }
@@ -690,6 +712,7 @@ impl<'a> Mapper<'a> {
                             donor: h.leave,
                             acceptor: h.enter,
                             cost: 0,
+                            origin: b'w',
                         }));
                         done = true;
                     }
@@ -703,7 +726,10 @@ impl<'a> Mapper<'a> {
                 if !done {
                     sc.stats.not_cheaper += (minus == strands[0]) as u64;
                     total += direct.cost.min(2000) as u32;
-                    juncs.push(direct);
+                    juncs.push(Placed {
+                        origin: b'p',
+                        ..direct
+                    });
                 }
             }
             if best.as_ref().is_none_or(|b| total < b.0) {
@@ -723,6 +749,7 @@ impl<'a> Mapper<'a> {
         let mut blocks: Vec<Block> = Vec::new();
         let first = chain[0];
         let (mut bq, mut bt) = (first.q, first.t);
+        let mut origins: Vec<u8> = juncs.iter().map(|p| p.origin).collect();
         for p in &juncs {
             blocks.push(Block {
                 qs: bq,
@@ -769,6 +796,8 @@ impl<'a> Mapper<'a> {
             ts: et,
             te: b0.te,
         };
+        origins.splice(0..0, std::iter::repeat_n(b'e', pre.len()));
+        origins.extend(std::iter::repeat_n(b'e', right.hops.len()));
         blocks.splice(0..0, pre);
         let nb = blocks.len() - 1;
         let bl = blocks[nb];
@@ -791,6 +820,9 @@ impl<'a> Mapper<'a> {
             te: right.end.1,
         });
         let fixed = tidy(&mut blocks, qlen);
+        if fixed || origins.len() + 1 != blocks.len() {
+            origins = vec![b'?'; blocks.len().saturating_sub(1)];
+        }
         sc.stats.tidied += fixed as u64;
         let tx_strand = if tx_strand == b'.' && blocks.len() > 1 && !self.opt.forward_only {
             if left.minus.or(right.minus).unwrap_or(minus) {
@@ -809,6 +841,7 @@ impl<'a> Mapper<'a> {
             anchors: chain.len() as u32,
             edits,
             primary: false,
+            origins,
         }
     }
 
@@ -1097,6 +1130,7 @@ impl<'a> Mapper<'a> {
             donor: t0,
             acceptor: t1,
             cost: INF,
+            origin: b'd',
         };
         if q1 <= q0 || t1 <= t0 || (q1 - q0) > 600 {
             // anchors that overlap on the read, or too many read bases to explain from two
@@ -1171,6 +1205,7 @@ impl<'a> Mapper<'a> {
                     donor: t0 + best.2 as u32,
                     acceptor: t1 - best.3 as u32,
                     cost: best.0,
+                    origin: b'd',
                 };
             }
         }
@@ -1281,7 +1316,7 @@ pub fn paf_line(ix: &GenomeIndex, name: &str, qlen: u32, h: &SplicedHit, mapq: u
     }
     let _ = writeln!(
         out,
-        "{name}\t{qlen}\t{qs}\t{qe}\t{}\t{}\t{tlen}\t{ts}\t{}\t{matches}\t{}\t{mapq}\ttp:A:{}\tAS:i:{}\tcm:i:{}\tts:A:{}\tcg:Z:{cg}",
+        "{name}\t{qlen}\t{qs}\t{qe}\t{}\t{}\t{tlen}\t{ts}\t{}\t{matches}\t{}\t{mapq}\ttp:A:{}\tAS:i:{}\tcm:i:{}\tts:A:{}\tjo:Z:{}\tcg:Z:{cg}",
         if h.reverse { '-' } else { '+' },
         ix.names()[rid],
         last.te - off,
@@ -1290,6 +1325,11 @@ pub fn paf_line(ix: &GenomeIndex, name: &str, qlen: u32, h: &SplicedHit, mapq: u
         h.score,
         h.anchors,
         h.tx_strand as char,
+        if h.origins.is_empty() {
+            "-"
+        } else {
+            std::str::from_utf8(&h.origins).unwrap_or("-")
+        },
     );
 }
 

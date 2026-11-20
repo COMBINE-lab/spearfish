@@ -5,7 +5,7 @@
 //! passing through candidate exon windows, each entered after an intron and left before the
 //! next one, and finally either arriving at a far fixed point (a gap between two anchors) or
 //! stopping with the rest of the read clipped (a read end). Every read base is paid for:
-//! aligned (banded affine costs outside the windows, linear gaps inside), or clipped. Each
+//! aligned (banded affine costs), or clipped. Each
 //! window used costs `EXTRA_INTRON` on top of its splice sites, so an exon is added only when
 //! it explains more than it costs.
 //!
@@ -19,10 +19,6 @@ use crate::map::{GAP_EXT, GAP_OPEN, INF, INS_EXT, MISMATCH, acceptor_pen, band_p
 pub(crate) const EXTRA_INTRON: u32 = 20;
 /// Price of a read base left unaligned at a read end (the match it forgoes).
 pub(crate) const CLIP: u32 = 2;
-/// Linear gap prices per base inside a candidate exon: a genome base skipped, a read base
-/// left out.
-const DEL: u32 = (GAP_OPEN / 2 + GAP_EXT) as u32;
-const INS: u32 = (GAP_OPEN / 2 + INS_EXT) as u32;
 const BIG: u32 = 1 << 28;
 
 /// The genome read from `origin`, forwards or backwards. Position `p` of the view is the
@@ -219,12 +215,20 @@ pub(crate) fn solve(
         let mut next = cur.clone();
         let mut nextp = curp.clone();
         let mut v: Vec<Option<(u32, u32)>> = vec![None; m + 1];
+        // Affine gaps, as outside the windows: `up` holds, per k, the best cost of a cell that
+        // ends in read bases left out (and where that path entered the window).
+        let mut up: Vec<(u32, (u16, u16))> = vec![(BIG, (0, 0)); ww];
+        let open_del = (GAP_OPEN + GAP_EXT) as u32;
+        let open_ins = (GAP_OPEN + INS_EXT) as u32;
         for i in i_lo..=i_hi {
             let ri = if i > 0 { rv.base(read, i - 1) } else { 0 };
             let row = (i - i_lo) * ww;
+            let mut left = (BIG, (0u16, 0u16)); // ends in genome bases skipped
             for k in 0..ww {
                 let j = i as i64 - i0 + k as i64 - wb;
                 if j < 0 || j > vl as i64 {
+                    left = (BIG, (0, 0));
+                    up[k] = (BIG, (0, 0));
                     continue;
                 }
                 let j = j as usize;
@@ -235,26 +239,45 @@ pub(crate) fn solve(
                 } else {
                     (BIG, (0, 0))
                 };
-                if i > i_lo {
-                    // (i - 1, j - 1) is the same k one row up; (i - 1, j) is k + 1 there
-                    if j > 0 {
-                        let d = b.c[at - ww] + if ri != gb[j - 1] { MISMATCH as u32 } else { 0 };
-                        if d < c {
-                            c = d;
-                            o = b.o[at - ww];
-                        }
+                // (i - 1, j - 1) is the same k one row up; (i - 1, j) is k + 1 there
+                let f = if i > i_lo && k + 1 < ww {
+                    let (ext, opn) = (up[k + 1].0 + INS_EXT as u32, b.c[at - ww + 1] + open_ins);
+                    if ext <= opn {
+                        (ext, up[k + 1].1)
+                    } else {
+                        (opn, b.o[at - ww + 1])
                     }
-                    if k + 1 < ww && b.c[at - ww + 1] + INS < c {
-                        c = b.c[at - ww + 1] + INS;
-                        o = b.o[at - ww + 1];
+                } else {
+                    (BIG, (0, 0))
+                };
+                left = if k > 0 && j > 0 {
+                    let (ext, opn) = (left.0 + GAP_EXT as u32, b.c[at - 1] + open_del);
+                    if ext <= opn {
+                        (ext, left.1)
+                    } else {
+                        (opn, b.o[at - 1])
+                    }
+                } else {
+                    (BIG, (0, 0))
+                };
+                if i > i_lo && j > 0 {
+                    let d = b.c[at - ww] + if ri != gb[j - 1] { MISMATCH as u32 } else { 0 };
+                    if d < c {
+                        c = d;
+                        o = b.o[at - ww];
                     }
                 }
-                if k > 0 && j > 0 && b.c[at - 1] + DEL < c {
-                    c = b.c[at - 1] + DEL;
-                    o = b.o[at - 1];
+                if f.0 < c {
+                    c = f.0;
+                    o = f.1;
+                }
+                if left.0 < c {
+                    c = left.0;
+                    o = left.1;
                 }
                 b.c[at] = c.min(BIG);
                 b.o[at] = o;
+                up[k] = (f.0.min(BIG), f.1);
                 if c >= BIG || j as u16 <= o.1 {
                     continue; // nothing of the window used yet
                 }
