@@ -526,8 +526,8 @@ fn windows_of(
     let end = |a: Anchor| a.t + a.tl as u32;
     // A group's wish: its hits widened by the read bases they leave uncovered on each side.
     let wish = |g: &(Anchor, Anchor, u32)| {
-        let lead = g.0.q.saturating_sub(q_lo).min(400) + 12;
-        let trail = q_hi.saturating_sub(g.1.q + g.1.ql as u32).min(400) + 12;
+        let lead = g.0.q.saturating_sub(q_lo).min(150) + 12;
+        let trail = q_hi.saturating_sub(g.1.q + g.1.ql as u32).min(150) + 12;
         (g.0.t.saturating_sub(lead), end(g.1) + trail)
     };
     // Strongest groups first; a group whose hits overlap a stronger group's hits is dropped.
@@ -1035,9 +1035,9 @@ impl<'a> Mapper<'a> {
                     // Then, if junctions were given, the known exons inside this intron on their
                     // own, believed only when every junction of the solution is a known one.
                     let mut found = false;
-                    // what a junction of this length costs on a clean read: an answer above it
+                    // what a junction of this length usually costs on this read: an answer above it
                     // still leaves something unexplained
-                    let fine = 18 + m as u32 * self.opt.trigger_x64 / 64;
+                    let fine = 18 + m as u32 * self.opt.trigger_x64.max(usual) / 64;
                     for (min_hits, from_known) in [(2u32, false), (0, false), (0, true)] {
                         // the lone hits are tried when the junction is clearly bad, and also when
                         // the well-supported candidates gave an answer that is still a poor fit
