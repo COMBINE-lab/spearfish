@@ -635,7 +635,15 @@ impl<'a> Mapper<'a> {
                 }
                 let w = (s.ql as u32).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
                 for (&t, &tl) in pos.iter().zip(len) {
-                    sc.hits.push(Anchor { t, q: s.q, ql: s.ql, tl: tl as u16, q_in: s.q_in, q_out: s.q_out, w });
+                    sc.hits.push(Anchor {
+                        t,
+                        q: s.q,
+                        ql: s.ql,
+                        tl: tl as u16,
+                        q_in: s.q_in,
+                        q_out: s.q_out,
+                        w,
+                    });
                 }
             }
             if pairs && ix.has_pairs() {
@@ -693,7 +701,7 @@ impl<'a> Mapper<'a> {
         cands.sort_by(|a, b| b.0.total_cmp(&a.0));
         let top = cands.first().map_or(0.0, |c| c.0);
         for (score, reverse, chain) in cands.into_iter().take(4) {
-            if score < 0.5 * top {
+            if score < 0.7 * top {
                 break;
             }
             let read = std::mem::take(&mut sc.codes[reverse as usize]);
@@ -1257,7 +1265,12 @@ impl<'a> Mapper<'a> {
             if m == 0 {
                 continue;
             }
-            let band = 8 + m / 20 + m.abs_diff(n);
+            if m.abs_diff(n) > 64 {
+                // lengths too far apart to align in a band: the block scores as unaligned
+                score -= 20;
+                continue;
+            }
+            let band = (8 + m / 20).min(24) + m.abs_diff(n);
             let w = 2 * band + 1;
             let (q, t) = (b.qs as usize, b.ts);
             band_prefix(

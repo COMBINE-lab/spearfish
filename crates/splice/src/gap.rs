@@ -173,7 +173,7 @@ pub(crate) fn solve(
     min_gap: u32,
     b: &mut Bufs,
 ) -> Solved {
-    let band = 4 + m / 10;
+    let band = (4 + m / 10).min(24);
     let w = 2 * band + 1;
     let limit = match far {
         Some(t1) => (t1 - gv.origin) as usize,
