@@ -214,7 +214,7 @@ const NONCANON: u16 = 18;
 /// `w = 2 * band + 1`. `tmp` holds the gap states. With `drop > 0` the rows stop once the best
 /// score of a row (two per base of `a`, minus its cost) falls `drop` below the best seen;
 /// returns the number of rows of `a` computed.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) fn band_prefix(
     a: impl Fn(usize) -> u8,
     m: usize,
@@ -231,25 +231,41 @@ pub(crate) fn band_prefix(
     // gap states of the row above (a gap that consumes `a`), per k
     tmp.clear();
     tmp.resize(w, INF);
+    // the bases of `b` once each, not once per cell, and only as far as the rows get
+    let mut bb: Vec<u8> = Vec::with_capacity(n.min(m + band));
+    let (open_ins, open_del) = (GAP_OPEN + INS_EXT, GAP_OPEN + GAP_EXT);
     let mut best = 0i32;
     for i in 0..=m {
+        // the row's cells: j = i + k - band within 0..=n
+        let k_lo = band.saturating_sub(i);
+        if i > n + band {
+            // past the end of `b`: nothing reachable in this or any later row
+            if drop > 0 {
+                return i;
+            }
+            tmp.fill(INF);
+            continue;
+        }
+        let k_hi = (n + band - i).min(w - 1);
+        while bb.len() < (i + band).min(n) {
+            bb.push(b(bb.len()));
+        }
+        let ai = if i > 0 { a(i - 1) } else { 0 };
+        let (above, here) = e.split_at_mut(i * w);
+        let above = if i > 0 { &above[(i - 1) * w..] } else { &above[..0] };
+        let here = &mut here[..w];
         let mut left = INF; // a gap that consumes `b`, ending at the cell to the left
         let mut row = INF;
-        for k in 0..w {
-            let j = (i + k) as isize - band as isize;
-            if j < 0 || j as usize > n {
-                left = INF;
-                continue;
-            }
-            let j = j as usize;
+        for k in k_lo..=k_hi {
+            let j = i + k - band;
             // cell above is (i-1, j): k + 1 in the previous row
             let up = if i > 0 && k + 1 < w {
-                (tmp[k + 1] + INS_EXT).min(e[(i - 1) * w + k + 1] + GAP_OPEN + INS_EXT)
+                (tmp[k + 1] + INS_EXT).min(above[k + 1] + open_ins)
             } else {
                 INF
             };
-            left = if j > 0 && k > 0 {
-                (left + GAP_EXT).min(e[i * w + k - 1] + GAP_OPEN + GAP_EXT)
+            left = if j > 0 && k > k_lo {
+                (left + GAP_EXT).min(here[k - 1] + open_del)
             } else {
                 INF
             };
@@ -257,16 +273,19 @@ pub(crate) fn band_prefix(
                 0
             } else {
                 let diag = if i > 0 && j > 0 {
-                    e[(i - 1) * w + k] + if a(i - 1) != b(j - 1) { MISMATCH } else { 0 }
+                    above[k] + if ai != bb[j - 1] { MISMATCH } else { 0 }
                 } else {
                     INF
                 };
                 diag.min(up).min(left)
             };
-            e[i * w + k] = v.min(INF);
+            here[k] = v.min(INF);
             tmp[k] = up.min(INF);
+            left = left.min(INF);
             row = row.min(v);
         }
+        tmp[..k_lo].fill(INF);
+        tmp[k_hi + 1..].fill(INF);
         if drop > 0 {
             let s = 2 * i as i32 - row as i32;
             best = best.max(s);

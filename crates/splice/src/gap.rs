@@ -144,6 +144,10 @@ pub(crate) struct Solved {
     pub end: (u32, u32),
 }
 
+/// What a pair of prefix tables was computed for: where the read and the genome start, the
+/// direction, the length and the far point (`None` before any).
+type Key = Option<(u32, bool, usize, u32, Option<u32>)>;
+
 #[derive(Default)]
 pub(crate) struct Bufs {
     e1: Vec<u16>,
@@ -152,14 +156,14 @@ pub(crate) struct Bufs {
     /// What `e1` (and `e2`) currently hold: the tables depend only on where the read and the
     /// genome start, the direction, the length and the far point, not on the strand or the
     /// windows, so repeated solves of one gap reuse them.
-    key1: Option<(u32, bool, usize, u32, Option<u32>)>,
-    key2: Option<(u32, bool, usize, u32, Option<u32>)>,
+    key1: Key,
+    key2: Key,
     /// Level 0 and the far side, cached per tables and strand.
-    l0_key: Option<(Option<(u32, bool, usize, u32, Option<u32>)>, bool)>,
+    l0_key: Option<(Key, bool)>,
     l0_cur: Vec<u32>,
     l0_p: Vec<u32>,
     l0_end: (u32, usize, u32),
-    r_key: Option<(Option<(u32, bool, usize, u32, Option<u32>)>, bool)>,
+    r_key: Option<(Key, bool)>,
     r_cost: Vec<u32>,
     r_j: Vec<u32>,
     r_leave: Vec<u32>,
@@ -186,7 +190,7 @@ impl Bufs {
 /// bases are clipped. `windows` are candidate exons as (view position, length, read offset
 /// that goes with the window's start, half-width of the band around that diagonal or 0 for the
 /// usual one), in travel order; they may overlap. `minus` is the transcript strand.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) fn solve(
     ix: &GenomeIndex,
     read: &[u8],
