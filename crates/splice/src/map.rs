@@ -1451,6 +1451,27 @@ impl<'a> Mapper<'a> {
             if m == 0 {
                 continue;
             }
+            if m == n {
+                // equal lengths: when the block matches with a few mismatches and no shift, that
+                // is its alignment, and no table is needed
+                let (q, t) = (b.qs as usize, b.ts);
+                let allowed = 2 + m / 64;
+                let mut mm = 0;
+                for i in 0..m {
+                    mm += (read[q + i] != ix.base(t + i as u32)) as usize;
+                    if mm > allowed {
+                        break;
+                    }
+                }
+                if mm <= allowed {
+                    score += 2 * m as i32 - (mm as u16 * MISMATCH) as i32;
+                    if k > 0 && h.tx_strand != b'.' {
+                        score -= donor_pen(ix, h.blocks[k - 1].te, minus) as i32
+                            + acceptor_pen(ix, b.ts, minus) as i32;
+                    }
+                    continue;
+                }
+            }
             if m.abs_diff(n) > 64 {
                 // lengths too far apart to align in a band: the block scores as unaligned
                 score -= 20;
