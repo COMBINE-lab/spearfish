@@ -468,6 +468,21 @@ impl GenomeIndex {
         out.extend((start..end).map(|p| self.base(p)));
     }
 
+    /// The 32 bases from `p` on, packed two bits each with the first base lowest (bases past
+    /// the end of the genome read as A).
+    #[inline]
+    pub fn word(&self, p: u32) -> u64 {
+        // SAFETY: see `Raw`.
+        let w = unsafe { &*self.n.seq };
+        let (i, sh) = ((p >> 5) as usize, (p & 31) * 2);
+        let lo = w.get(i).copied().unwrap_or(0) >> sh;
+        if sh == 0 {
+            lo
+        } else {
+            lo | (w.get(i + 1).copied().unwrap_or(0) << (64 - sh))
+        }
+    }
+
     /// Calls `f(s)` for every position `s` in `[start, end)` where the genome reads base code
     /// `b0` at `s` and `b1` at `s + 1`, in increasing order. This is how splice-site
     /// candidates are found: 32 positions are tested per machine word of the packed sequence.

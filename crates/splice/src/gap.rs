@@ -49,6 +49,23 @@ impl View {
             self.origin + p
         }
     }
+    /// The 32 bases from view position `p` on, in the direction of travel, packed two bits
+    /// each with the first base lowest; `None` too close to the genome's start to read them.
+    #[inline]
+    pub fn word(&self, ix: &GenomeIndex, p: u32) -> Option<u64> {
+        if !self.rev {
+            return Some(ix.word(self.origin + p));
+        }
+        let x = self.origin - p; // the bases x-1, x-2, ... in that order
+        if x < 32 {
+            return None;
+        }
+        // reverse the order of the 32 two-bit groups
+        let mut w = ix.word(x - 32).swap_bytes();
+        w = ((w >> 4) & 0x0f0f_0f0f_0f0f_0f0f) | ((w & 0x0f0f_0f0f_0f0f_0f0f) << 4);
+        w = ((w >> 2) & 0x3333_3333_3333_3333) | ((w & 0x3333_3333_3333_3333) << 2);
+        Some(w)
+    }
     pub fn room(&self, ix: &GenomeIndex) -> u32 {
         if self.rev {
             self.origin

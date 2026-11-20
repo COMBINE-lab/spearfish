@@ -839,7 +839,8 @@ impl<'a> Mapper<'a> {
             sc.stats.junctions += 1;
             let (q0, t0, q1, t1) = self.fixed(a, b);
             let p = self.place(read, q0, t0, q1, t1, sc);
-            let poor = trigger(p[0].cost.min(p[1].cost), q1.saturating_sub(q0));
+            // (a chain of one or two anchors is too thin to spend the solver on)
+            let poor = chain.len() >= 3 && trigger(p[0].cost.min(p[1].cost), q1.saturating_sub(q0));
             if !poor {
                 vote[0] += p[0].cost as u32;
                 vote[1] += p[1].cost as u32;
@@ -1227,24 +1228,11 @@ impl<'a> Mapper<'a> {
                     let mut all = vw.clone();
                     all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
                     let base = all.len();
-                    let mut tried: Vec<SolverWindow> = Vec::new();
-                    for near in [true, false] {
-                        let sites =
-                            self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, near, sc);
-                        if !near && sites == tried {
-                            break; // looking further found nothing new
-                        }
-                        all.truncate(base);
-                        all.extend(sites.iter().copied());
-                        tried = sites;
-                        if all.is_empty() {
-                            continue;
-                        }
+                    all.extend(self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, true, sc));
+                    let _ = base;
+                    if !all.is_empty() {
                         all.sort_by_key(|w| w.0);
                         s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
-                        if !s.hops.is_empty() && s.cost + self.hop_margin(&s, mi) <= plain_cost {
-                            break;
-                        }
                     }
                     if s.cost == u32::MAX {
                         continue;
@@ -1577,25 +1565,30 @@ impl<'a> Mapper<'a> {
                 });
             }
         }
+        // The probe at each offset the exon can start at in it, as packed words, so that a
+        // candidate is compared by XOR and a bit count.
+        const LOW: u64 = 0x5555_5555_5555_5555;
+        let offsets = (2 * MARGIN).min(probe.len().saturating_sub(10));
+        let packed: Vec<(u64, u64, u32)> = (0..=offsets)
+            .map(|o| {
+                let len = (probe.len() - o).min(20);
+                let w = (0..len).fold(0u64, |w, i| w | (probe[o + i] as u64) << (2 * i));
+                (w, (1u64 << (2 * len)) - 1, (len / 8) as u32)
+            })
+            .collect();
         for p in cands {
             if p < from || p >= hi || gv.enter_motif(ix, p, minus) > 5 {
                 continue;
             }
+            let Some(g) = gv.word(ix, p) else { continue };
             // the exon can start a few read bases into the probe
-            for o in 0..=(2 * MARGIN).min(probe.len().saturating_sub(10)) {
-                let len = (probe.len() - o).min(20);
-                let allowed = len / 8;
-                let mut d = 0;
-                for i in 0..len {
-                    d += (probe[o + i] != gv.base(ix, p + i as u32)) as usize;
-                    if d > allowed {
-                        break;
-                    }
-                }
+            for (o, &(w, mask, allowed)) in packed.iter().enumerate() {
+                let x = (g ^ w) & mask;
+                let d = ((x | (x >> 1)) & LOW).count_ones();
                 if d <= allowed {
                     let vs = p.saturating_sub(3);
                     let vl = (k as u32 + 12).min(300);
-                    found.push((d, p, (vs, vl, (start + o) as i64 - (p - vs) as i64, 0)));
+                    found.push((d as usize, p, (vs, vl, (start + o) as i64 - (p - vs) as i64, 0)));
                     break;
                 }
             }
@@ -1819,6 +1812,38 @@ impl<'a> Mapper<'a> {
         let m = if left { q as usize } else { read.len() - q as usize };
         if m == 0 {
             return (0, 0, 0);
+        }
+        // A quick look before any table: if the next 24 read bases match the genome on none of
+        // the five nearest diagonals better than chance allows, there is nothing to extend
+        // into (junk past a stray anchor, or the bases after an exon's edge).
+        if m >= 24 {
+            const LOW: u64 = 0x5555_5555_5555_5555;
+            let rw = (0..24).fold(0u64, |w, i| {
+                let b = if left {
+                    read[q as usize - 1 - i]
+                } else {
+                    read[q as usize + i]
+                };
+                w | (b as u64 & 3) << (2 * i)
+            });
+            let gv = View { origin: t, rev: left };
+            let room = gv.room(ix);
+            let mut best = 0u32;
+            for shift in 0..5u32 {
+                // read offset 0 against genome offsets 0..=2, and read offsets 1..=2 against 0
+                let (gs, rs) = if shift < 3 { (shift, 0) } else { (0, shift - 2) };
+                if gs + 32 >= room {
+                    continue;
+                }
+                if let Some(g) = gv.word(ix, gs) {
+                    let n = 24 - rs;
+                    let x = (g ^ (rw >> (2 * rs))) & ((1u64 << (2 * n)) - 1);
+                    best = best.max(n - ((x | (x >> 1)) & LOW).count_ones());
+                }
+            }
+            if best < 12 {
+                return (0, 0, 0);
+            }
         }
         let band = (8 + m / 20).min(32);
         let w = 2 * band + 1;
