@@ -112,6 +112,29 @@ pub struct Stats {
     pub rescues_tried: u64,
     pub rescues_kept: u64,
     pub window_bases: u64,
+    /// Rescues between anchors: nothing found; found but not cheaper; cheaper but a junction
+    /// along the new path is poor; not tried because the junction was too costly to place at all.
+    pub empty: u64,
+    pub not_cheaper: u64,
+    pub poor_junction: u64,
+    pub unplaced: u64,
+    pub end_tried: u64,
+    pub end_kept: u64,
+}
+
+impl Stats {
+    pub fn add(&mut self, o: &Stats) {
+        self.junctions += o.junctions;
+        self.rescues_tried += o.rescues_tried;
+        self.rescues_kept += o.rescues_kept;
+        self.window_bases += o.window_bases;
+        self.empty += o.empty;
+        self.not_cheaper += o.not_cheaper;
+        self.poor_junction += o.poor_junction;
+        self.unplaced += o.unplaced;
+        self.end_tried += o.end_tried;
+        self.end_kept += o.end_kept;
+    }
 }
 
 pub struct Mapper<'a> {
@@ -391,6 +414,7 @@ impl<'a> Mapper<'a> {
         // Exons without a level-3 anchor: where a junction leaves read bases unexplained, look
         // for level-2 cores of those bases inside that intron and splice the found anchors in.
         let mut i = 0;
+        let mut budget = 64u32;
         while i + 1 < chain.len() {
             let (a, b) = (chain[i], chain[i + 1]);
             i += 1;
@@ -407,7 +431,9 @@ impl<'a> Mapper<'a> {
                 continue;
             }
             sc.stats.rescues_tried += 1;
+            sc.stats.unplaced += (old >= INF) as u64;
             let sub = self.rescue(reverse, Some(a), Some(b), qlen, sc);
+            sc.stats.empty += sub.is_empty() as u64;
             if sub.is_empty() {
                 continue;
             }
@@ -423,14 +449,15 @@ impl<'a> Mapper<'a> {
                 }
                 prev = x;
             }
-            let mut path = vec![a];
-            path.extend_from_slice(&sub);
-            path.push(b);
-            if new + 12 < old as u32 && self.junctions_ok(read, &path, sc) {
+            if new + 12 >= old as u32 || budget == 0 {
+                sc.stats.not_cheaper += 1;
+            } else {
+                // Keep them, and look at the junctions they make in turn: more than one exon
+                // can be missing between two anchors.
                 sc.stats.rescues_kept += 1;
-                let n = sub.len();
+                budget -= 1;
                 chain.splice(i..i, sub);
-                i += n;
+                i -= 1;
             }
         }
         // Read ends: when the bases past the last (before the first) anchor do not continue on
@@ -441,13 +468,13 @@ impl<'a> Mapper<'a> {
             if qlen - q < 20 || qlen - q - self.extend(read, q, t, false, sc).0 < 12 {
                 break;
             }
-            sc.stats.rescues_tried += 1;
+            sc.stats.end_tried += 1;
             let mut path = vec![last];
             path.extend(self.rescue(reverse, Some(last), None, qlen, sc));
             if path.len() < 2 || !self.junctions_ok(read, &path, sc) {
                 break;
             }
-            sc.stats.rescues_kept += 1;
+            sc.stats.end_kept += 1;
             chain.extend_from_slice(&path[1..]);
         }
         for _ in 0..4 {
@@ -455,13 +482,13 @@ impl<'a> Mapper<'a> {
             if first.q < 20 || first.q - self.extend(read, first.q, first.t, true, sc).0 < 12 {
                 break;
             }
-            sc.stats.rescues_tried += 1;
+            sc.stats.end_tried += 1;
             let mut path = self.rescue(reverse, None, Some(first), qlen, sc);
             path.push(first);
             if path.len() < 2 || !self.junctions_ok(read, &path, sc) {
                 break;
             }
-            sc.stats.rescues_kept += 1;
+            sc.stats.end_kept += 1;
             path.pop();
             chain.splice(0..0, path);
         }

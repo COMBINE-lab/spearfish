@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use spearfish_splice::index::{BuildOptions, GenomeIndex};
-use spearfish_splice::map::{MapOptions, Mapper, Scratch, paf_line};
+use spearfish_splice::map::{MapOptions, Mapper, Scratch, Stats, paf_line};
 
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().collect();
@@ -48,6 +48,7 @@ fn main() -> anyhow::Result<()> {
             let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
             let mut line = String::new();
             let (mut nreads, mut nmapped) = (0u64, 0u64);
+            let mut stats = Stats::default();
             let mut done = false;
             while !done {
                 batch.clear();
@@ -70,9 +71,10 @@ fn main() -> anyhow::Result<()> {
                     }
                     batch.push((name, seq));
                 }
-                let outs: Vec<(String, bool)> = batch
+                let outs: Vec<(String, bool, Stats)> = batch
                     .par_iter()
                     .map_init(Scratch::default, |sc, (name, seq)| {
+                        sc.stats = Stats::default();
                         let hits = mapper.map(seq, sc);
                         let mut s = String::new();
                         let mapq = match (hits.first(), hits.get(1)) {
@@ -84,12 +86,13 @@ fn main() -> anyhow::Result<()> {
                         for h in hits.iter().take(if secondary { 5 } else { 1 }) {
                             paf_line(&ix, name, seq.len() as u32, h, mapq, &mut s);
                         }
-                        (s, !hits.is_empty())
+                        (s, !hits.is_empty(), sc.stats)
                     })
                     .collect();
-                for (s, m) in &outs {
+                for (s, m, st) in &outs {
                     out.write_all(s.as_bytes())?;
                     nmapped += *m as u64;
+                    stats.add(st);
                 }
                 nreads += batch.len() as u64;
             }
@@ -98,6 +101,7 @@ fn main() -> anyhow::Result<()> {
                 "mapped {nmapped} of {nreads} reads in {:.1}s",
                 t.elapsed().as_secs_f64()
             );
+            eprintln!("{stats:?}");
         }
         _ => anyhow::bail!(
             "usage: gmap index <genome.fa> <out.gidx> | gmap map <genome.gidx> <reads> [--threads N]"
