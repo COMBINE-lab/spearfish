@@ -3,8 +3,9 @@
 //! All positions are raw (uncompressed) bases on one axis that concatenates the reference
 //! sequences in file order, so a position fits 32 bits for genomes under 4.29 Gbp.
 //!
-//! - `seq`: 2 bits per base (A=0, C=1, G=2, T=3; other symbols are stored as A and listed
-//!   in `n_runs`, and never seeded).
+//! - `seq`: 2 bits per base (A=0, C=1, G=2, T=3; other symbols are stored as a base that
+//!   depends on the position, so that they match nothing, are listed in `n_runs`, and are
+//!   never seeded).
 //! - Level-3 LCP cores of the homopolymer-compressed sequence: distinct `labels` (sorted),
 //!   and per label the raw start and raw length of each occurrence. Labels with more than
 //!   `max_occ` occurrences are left out.
@@ -197,7 +198,14 @@ impl GenomeIndex {
             let hi = (lo + 32).min(seq.len());
             let mut x = 0u64;
             for (k, &b) in seq[lo.min(hi)..hi].iter().enumerate() {
-                x |= ((code(b) & 3) as u64) << (2 * k);
+                // A symbol other than A, C, G, T must not look like any base: it is stored as
+                // a base that depends on its position, so that a run of N matches nothing
+                // (a read's poly(A) tail would otherwise match an N spacer stored as A).
+                let c = match code(b) {
+                    c @ 0..=3 => c as u64,
+                    _ => ((lo + k) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 62,
+                };
+                x |= c << (2 * k);
             }
             *out = x;
         });
