@@ -15,6 +15,8 @@ use crate::index::{GenomeIndex, L2_SPEC, L3_SPEC, code};
 pub struct MapOptions {
     /// Seeds with more occurrences than this are not used.
     pub cap: usize,
+    /// The cap for a second attempt when a read gets no hit.
+    pub cap_retry: usize,
     pub max_intron: u32,
     /// A reference skip of at least this many bases between two chained anchors is a junction.
     pub min_intron: u32,
@@ -22,16 +24,20 @@ pub struct MapOptions {
     pub max_loci: usize,
     /// Only forward-strand transcripts (direct RNA): the read is the transcript's sense strand.
     pub forward_only: bool,
+    /// Hits that were aligned and score below this are dropped.
+    pub min_score: i32,
 }
 
 impl Default for MapOptions {
     fn default() -> Self {
         MapOptions {
             cap: 64,
+            cap_retry: 1000,
             max_intron: 200_000,
             min_intron: 40,
             max_loci: 6,
             forward_only: false,
+            min_score: 60,
         }
     }
 }
@@ -122,6 +128,9 @@ pub struct Stats {
     pub unplaced: u64,
     pub end_tried: u64,
     pub end_kept: u64,
+    /// Hits scored by aligning their blocks.
+    pub scored: u64,
+    pub retried: u64,
 }
 
 impl Stats {
@@ -136,6 +145,8 @@ impl Stats {
         self.unplaced += o.unplaced;
         self.end_tried += o.end_tried;
         self.end_kept += o.end_kept;
+        self.scored += o.scored;
+        self.retried += o.retried;
     }
 }
 
@@ -157,8 +168,8 @@ pub(crate) const GAP_EXT: u16 = 2;
 /// Each read base in a gap also forfeits the match it would have scored.
 pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
 /// Splice-site costs per site: GT..AG is free, GC..AG and AT..AC cost `SEMI`, others `NONCANON`.
-const SEMI: u16 = 4;
-const NONCANON: u16 = 9;
+const SEMI: u16 = 8;
+const NONCANON: u16 = 18;
 /// Expected cost per read base of a true alignment at long-read error rates (x 8).
 const COST_PER_BASE_X8: u32 = 3;
 
@@ -337,6 +348,16 @@ impl<'a> Mapper<'a> {
 
     /// Hits of `read` (ASCII bases), best first. Empty when the read does not map.
     pub fn map(&self, read: &[u8], sc: &mut Scratch) -> Vec<SplicedHit> {
+        let hits = self.map_with(read, self.opt.cap, sc);
+        if !hits.is_empty() || self.opt.cap >= self.opt.cap_retry {
+            return hits;
+        }
+        // Nothing with the usual seeds: allow the repetitive ones too.
+        sc.stats.retried += 1;
+        self.map_with(read, self.opt.cap_retry, sc)
+    }
+
+    fn map_with(&self, read: &[u8], cap: usize, sc: &mut Scratch) -> Vec<SplicedHit> {
         let ix = self.index;
         let n = read.len();
         if n < 30 {
@@ -373,7 +394,7 @@ impl<'a> Mapper<'a> {
             sc.hits.clear();
             for s in &seeds {
                 let (pos, len) = ix.occurrences(s.label);
-                if pos.is_empty() || pos.len() > self.opt.cap {
+                if pos.is_empty() || pos.len() > cap {
                     continue;
                 }
                 let (qs, qe) = h.to_raw(s.start, s.end);
@@ -426,6 +447,17 @@ impl<'a> Mapper<'a> {
             out.push(self.build(reverse, &chain, &read, n as u32, score, sc));
             sc.codes[reverse as usize] = read;
         }
+        // Rival hits, and a lone hit resting on few anchors, are scored by aligning their blocks;
+        // a lone well-anchored hit keeps its chain score and is never aligned inside its exons.
+        if out.len() > 1 || out.first().is_some_and(|h| h.anchors <= 3) {
+            for h in out.iter_mut() {
+                let read = std::mem::take(&mut sc.codes[h.reverse as usize]);
+                h.score = self.align_score(&read, h, sc);
+                sc.codes[h.reverse as usize] = read;
+                sc.stats.scored += 1;
+            }
+            out.retain(|h| h.score >= self.opt.min_score);
+        }
         out.sort_by_key(|h| std::cmp::Reverse(h.score));
         if let Some(h) = out.first_mut() {
             h.primary = true;
@@ -470,9 +502,6 @@ impl<'a> Mapper<'a> {
             i = sc.back[i as usize];
         }
         sc.chain.reverse();
-        if best < 40.0 && sc.chain.len() < 2 {
-            return None;
-        }
         Some((best, sc.chain.iter().map(|&i| hits[i as usize]).collect()))
     }
 
@@ -807,6 +836,41 @@ impl<'a> Mapper<'a> {
         out.hops = best.0.hops;
         out.minus = best.1;
         out
+    }
+
+    /// Alignment score of a hit: per block, two per read base minus the banded affine cost of
+    /// the block against its genome interval; splice sites off the canonical pair cost as in
+    /// junction placement.
+    fn align_score(&self, read: &[u8], h: &SplicedHit, sc: &mut Scratch) -> i32 {
+        let ix = self.index;
+        let minus = h.tx_strand == b'-';
+        let mut score = 0i32;
+        for (k, b) in h.blocks.iter().enumerate() {
+            let (m, n) = ((b.qe - b.qs) as usize, (b.te - b.ts) as usize);
+            if m == 0 {
+                continue;
+            }
+            let band = 8 + m / 20 + m.abs_diff(n);
+            let w = 2 * band + 1;
+            let (q, t) = (b.qs as usize, b.ts);
+            band_prefix(
+                |i| read[q + i],
+                m,
+                |j| ix.base(t + j as u32),
+                n,
+                band,
+                &mut sc.e1,
+                &mut sc.etmp,
+                0,
+            );
+            let cost = sc.e1[m * w + (n + band - m)];
+            score += 2 * m as i32 - cost.min(2 * m as u16 + 20) as i32;
+            if k > 0 && h.tx_strand != b'.' {
+                score -=
+                    donor_pen(ix, h.blocks[k - 1].te, minus) as i32 + acceptor_pen(ix, b.ts, minus) as i32;
+            }
+        }
+        score
     }
 
     /// Score change of chaining anchor `a` after `p`: the read bases `a` adds, minus the price of
