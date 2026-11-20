@@ -24,6 +24,9 @@ pub struct MapOptions {
     pub max_loci: usize,
     /// Only forward-strand transcripts (direct RNA): the read is the transcript's sense strand.
     pub forward_only: bool,
+    /// Junction cost per read base (times 64) above which the solver looks for missed exons,
+    /// unless the read's own junctions usually cost more.
+    pub trigger_x64: u32,
     /// Hits that were aligned and score below this are dropped.
     pub min_score: i32,
 }
@@ -37,6 +40,7 @@ impl Default for MapOptions {
             min_intron: 40,
             max_loci: 6,
             forward_only: false,
+            trigger_x64: 16,
             min_score: 100,
         }
     }
@@ -826,10 +830,8 @@ impl<'a> Mapper<'a> {
         score: f32,
         sc: &mut Scratch,
     ) -> SplicedHit {
-        let trigger = |c: u16, m: u32| c >= INF || c as u32 >= 18 + m / 4;
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
-        let mut vote = [0u32; 2];
         for w in chain.windows(2) {
             let (a, b) = (w[0], w[1]);
             let d = (b.t - a.t) as i64 - (b.q - a.q) as i64;
@@ -839,13 +841,38 @@ impl<'a> Mapper<'a> {
             sc.stats.junctions += 1;
             let (q0, t0, q1, t1) = self.fixed(a, b);
             let p = self.place(read, q0, t0, q1, t1, sc);
+            pairs.push((a, b, p, false));
+        }
+        // Two levels of doubt about a junction. One that costs more than a clean read's would
+        // gets the candidates backed by two or more seed hits. Only one that costs clearly more
+        // than this read's junctions usually do (the median cost per base follows the read's
+        // error rate) also gets the lone hits and the seedless search, so that a noisy read
+        // does not send every junction through all of it.
+        let per_base = |x: &(Anchor, Anchor, [Placed; 2], bool)| {
+            let (q0, _, q1, _) = self.fixed(x.0, x.1);
+            let c = x.2[0].cost.min(x.2[1].cost);
+            (c < INF && q1 > q0).then(|| 64 * c as u32 / (q1 - q0))
+        };
+        let mut rates: Vec<u32> = pairs.iter().filter_map(per_base).collect();
+        rates.sort_unstable();
+        let usual = if rates.len() >= 3 {
+            rates[rates.len() / 2]
+        } else {
+            0
+        };
+        let rate = (self.opt.trigger_x64).max(usual * 3 / 2); // cost per base, times 64
+        let mut vote = [0u32; 2];
+        for x in pairs.iter_mut() {
+            let (q0, _, q1, _) = self.fixed(x.0, x.1);
+            let (c, m) = (x.2[0].cost.min(x.2[1].cost), q1.saturating_sub(q0));
             // (a chain of one or two anchors is too thin to spend the solver on)
-            let poor = chain.len() >= 3 && trigger(p[0].cost.min(p[1].cost), q1.saturating_sub(q0));
-            if !poor {
-                vote[0] += p[0].cost as u32;
-                vote[1] += p[1].cost as u32;
+            x.3 = chain.len() >= 3 && (c >= INF || c as u32 >= 18 + m * self.opt.trigger_x64 / 64);
+            // every placed junction votes on the strand (a noisy read's junctions are mostly
+            // doubtful, and leaving them out left the strand undecided and the work doubled)
+            if x.2[0].cost < INF && x.2[1].cost < INF {
+                vote[0] += x.2[0].cost as u32;
+                vote[1] += x.2[1].cost as u32;
             }
-            pairs.push((a, b, p, poor));
         }
         // The transcript strand, when the well-placed junctions agree on one.
         let strands: Vec<bool> = if self.opt.forward_only {
@@ -872,6 +899,10 @@ impl<'a> Mapper<'a> {
                     continue;
                 }
                 let (q0, t0, q1, t1) = self.fixed(a, b);
+                let hard = {
+                    let c = p[0].cost.min(p[1].cost);
+                    c >= INF || c as u32 >= 18 + q1.saturating_sub(q0) * rate / 64
+                };
                 if cand[k].is_none() {
                     sc.stats.rescues_tried += 1;
                     let path = self.rescue(reverse, Some(a), Some(b), qlen, sc);
@@ -903,6 +934,7 @@ impl<'a> Mapper<'a> {
                         if (from_known && known.is_empty())
                             || (!from_known && wins.is_empty())
                             || (!from_known && min_hits == 2 && strong == 0)
+                            || (!from_known && min_hits == 0 && !hard)
                             || (!from_known && min_hits == 0 && strong == wins.len() && s.cost != u32::MAX)
                         {
                             continue;
@@ -951,7 +983,7 @@ impl<'a> Mapper<'a> {
                 }
                 // No level-2 hit led to a cheaper explanation: look for an exon between a pair of
                 // splice sites that matches the unexplained bases.
-                if !done && q1 > q0 && t1 > t0 && m <= 600 {
+                if !done && hard && q1 > q0 && t1 > t0 && m <= 600 {
                     let sites = self.site_windows(read, q0, t0, q1, t1, minus, sc);
                     if !sites.is_empty() {
                         sc.stats.site_tried += (minus == strands[0]) as u64;
