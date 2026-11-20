@@ -109,6 +109,10 @@ pub struct Scratch {
     l2: [Vec<L2Seed>; 2],
     /// Level-3 cores of the read, per orientation.
     l3: [Vec<L2Seed>; 2],
+    /// Level-3 cores of the read found in the genome, and their number, in the better orientation
+    /// (from the last mapping pass).
+    found_best: usize,
+    l3_best: usize,
     /// Whether the last mapping pass had any seed hit to chain.
     had_hits: bool,
     /// Marks the level-2 label ids wanted by the rescue under way (indexed by id).
@@ -576,7 +580,15 @@ impl<'a> Mapper<'a> {
         let weak = hits.first().is_none_or(|h| h.anchors <= 3) || 10 * covered(&hits) < 6 * read.len() as u32;
         if weak && self.index.has_pairs() {
             sc.stats.retried += 1;
-            let again = self.map_with(read, self.opt.cap, true, sc);
+            // More repetitive seeds are allowed here, but only for a read that has a few of its
+            // level-3 cores in the genome: one with next to none is not from this genome, and
+            // would only cost time.
+            let cap = if 25 * sc.found_best >= sc.l3_best.max(1) && sc.found_best >= 3 {
+                self.opt.cap.max(256)
+            } else {
+                self.opt.cap
+            };
+            let again = self.map_with(read, cap, true, sc);
             if covered(&again) > covered(&hits) {
                 hits = again;
             }
@@ -700,6 +712,8 @@ impl<'a> Mapper<'a> {
             // more). They keep the stretches between anchors short. An orientation that the
             // other one clearly beats is not the one the read maps in and is spared the lookups.
             let best = if found[0] >= found[1] { 0 } else { 1 };
+            sc.found_best = found[best];
+            sc.l3_best = sc.l3[best].len();
             let noisy = 3 * found[best] < sc.l3[best].len();
             let beaten = found[1 - o] >= 5 && 4 * found[o] <= found[1 - o];
             if (pairs || (self.opt.pairs && noisy && !beaten)) && ix.has_pairs() {
@@ -744,7 +758,10 @@ impl<'a> Mapper<'a> {
             }
             loci.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
             let best = loci[0].0;
-            for &(w, s, e) in loci.iter().take(self.opt.max_loci) {
+            // (a read whose best locus is one or two seeds deep cannot rank its loci by
+            // weight: all of them are looked at, and screened below)
+            let limit = if best < 80.0 { 48 } else { self.opt.max_loci };
+            for &(w, s, e) in loci.iter().take(limit) {
                 if w < 0.25 * best {
                     break;
                 }
@@ -755,6 +772,32 @@ impl<'a> Mapper<'a> {
         }
         // Only chains close to the best are worth building.
         cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // When even the best chain is one or two anchors, chance hits score like the true one.
+        // Each candidate is then screened by whether the read goes on matching next to its
+        // anchors (two word comparisons a side), and the best few of those are built.
+        if cands.first().is_some_and(|c| c.2.len() <= 2) && cands.len() > 1 {
+            let mut screened: Vec<(u32, f32, bool, Vec<Anchor>)> = Vec::new();
+            for (score, reverse, chain) in cands.drain(..) {
+                let read = &sc.codes[reverse as usize];
+                let (f, l) = (chain[0], chain[chain.len() - 1]);
+                let (lq, lt) = (l.q + l.ql as u32, l.t + l.tl as u32);
+                let m =
+                    self.diagonal_matches(read, f.q, f.t, true) + self.diagonal_matches(read, lq, lt, false);
+                if m >= 30 || (m >= 14 && (f.q < 24 || read.len() as u32 - lq < 24)) {
+                    screened.push((m, score, reverse, chain));
+                }
+            }
+            screened.sort_by(|a, b| {
+                (b.0, b.1)
+                    .partial_cmp(&(a.0, a.1))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            cands = screened
+                .into_iter()
+                .take(4)
+                .map(|(m, _, r, c)| (m as f32, r, c))
+                .collect();
+        }
         let top = cands.first().map_or(0.0, |c| c.0);
         for (score, reverse, chain) in cands.into_iter().take(4) {
             if score < 0.7 * top {
@@ -773,6 +816,20 @@ impl<'a> Mapper<'a> {
                 h.score = self.align_score(&read, h, sc);
                 sc.codes[h.reverse as usize] = read;
                 sc.stats.scored += 1;
+            }
+            if std::env::var_os("GMAP_DEBUG_DROP").is_some() {
+                eprintln!(
+                    "scored n={} {:?}",
+                    n,
+                    out.iter()
+                        .map(|h| (
+                            h.score,
+                            h.anchors,
+                            h.blocks.len(),
+                            h.blocks.iter().map(|b| b.qe - b.qs).sum::<u32>()
+                        ))
+                        .collect::<Vec<_>>()
+                );
             }
             out.retain(|h| h.score >= self.opt.min_score);
             // A spliced read also aligns, unspliced, to a processed pseudogene of its gene, and
@@ -848,6 +905,11 @@ impl<'a> Mapper<'a> {
         score: f32,
         sc: &mut Scratch,
     ) -> SplicedHit {
+        // A chain is solid enough to look for more exons from when it has three anchors or more
+        // and they cover a fortieth of the read (50 bases at least): a few chance hits strung
+        // together across huge skips are not worth the solver.
+        let anchored: u32 = chain.iter().map(|a| a.ql as u32).sum();
+        let solid = chain.len() >= 3 && anchored >= (qlen / 40).max(50);
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
         for w in chain.windows(2) {
@@ -883,8 +945,7 @@ impl<'a> Mapper<'a> {
         for x in pairs.iter_mut() {
             let (q0, _, q1, _) = self.fixed(x.0, x.1);
             let (c, m) = (x.2[0].cost.min(x.2[1].cost), q1.saturating_sub(q0));
-            // (a chain of one or two anchors is too thin to spend the solver on)
-            x.3 = chain.len() >= 3 && (c >= INF || c as u32 >= 18 + m * self.opt.trigger_x64 / 64);
+            x.3 = solid && (c >= INF || c as u32 >= 18 + m * self.opt.trigger_x64 / 64);
             // every placed junction votes on the strand (a noisy read's junctions are mostly
             // doubtful, and leaving them out left the strand undecided and the work doubled)
             if x.2[0].cost < INF && x.2[1].cost < INF {
@@ -1091,8 +1152,7 @@ impl<'a> Mapper<'a> {
 
         // Read ends, from a point inside the outermost anchors.
         let (_, _, q1, t1) = self.fixed(last, last);
-        // A chain of one or two anchors is too thin to go looking for more exons from.
-        let rescue = chain.len() >= 3;
+        let rescue = solid;
         let right = self.end(read, reverse, q1, t1, false, minus, undecided, rescue, qlen, sc);
         let (q0, t0, _, _) = self.fixed(first, first);
         let left = self.end(read, reverse, q0, t0, true, minus, undecided, rescue, qlen, sc);
@@ -1866,6 +1926,41 @@ impl<'a> Mapper<'a> {
         out
     }
 
+    /// Of the 24 read bases next to read position `q` (before it when `left`), how many match
+    /// the genome next to `t` on the best of the five nearest diagonals. Chance gives about 6-10.
+    fn diagonal_matches(&self, read: &[u8], q: u32, t: u32, left: bool) -> u32 {
+        const LOW: u64 = 0x5555_5555_5555_5555;
+        let ix = self.index;
+        let avail = if left { q as usize } else { read.len() - q as usize };
+        if avail < 24 {
+            return 0;
+        }
+        let rw = (0..24).fold(0u64, |w, i| {
+            let b = if left {
+                read[q as usize - 1 - i]
+            } else {
+                read[q as usize + i]
+            };
+            w | (b as u64 & 3) << (2 * i)
+        });
+        let gv = View { origin: t, rev: left };
+        let room = gv.room(ix);
+        let mut best = 0u32;
+        for shift in 0..5u32 {
+            // read offset 0 against genome offsets 0..=2, and read offsets 1..=2 against 0
+            let (gs, rs) = if shift < 3 { (shift, 0) } else { (0, shift - 2) };
+            if gs + 32 >= room {
+                continue;
+            }
+            if let Some(g) = gv.word(ix, gs) {
+                let n = 24 - rs;
+                let x = (g ^ (rw >> (2 * rs))) & ((1u64 << (2 * n)) - 1);
+                best = best.max(n - ((x | (x >> 1)) & LOW).count_ones());
+            }
+        }
+        best
+    }
+
     /// Extend from read position `q` / genome position `t` towards the read's start (`left`) or
     /// end. Returns the read and genome bases added and the edits among them.
     fn extend(&self, read: &[u8], q: u32, t: u32, left: bool, sc: &mut Scratch) -> (u32, u32, u32) {
@@ -1877,34 +1972,8 @@ impl<'a> Mapper<'a> {
         // A quick look before any table: if the next 24 read bases match the genome on none of
         // the five nearest diagonals better than chance allows, there is nothing to extend
         // into (junk past a stray anchor, or the bases after an exon's edge).
-        if m >= 24 {
-            const LOW: u64 = 0x5555_5555_5555_5555;
-            let rw = (0..24).fold(0u64, |w, i| {
-                let b = if left {
-                    read[q as usize - 1 - i]
-                } else {
-                    read[q as usize + i]
-                };
-                w | (b as u64 & 3) << (2 * i)
-            });
-            let gv = View { origin: t, rev: left };
-            let room = gv.room(ix);
-            let mut best = 0u32;
-            for shift in 0..5u32 {
-                // read offset 0 against genome offsets 0..=2, and read offsets 1..=2 against 0
-                let (gs, rs) = if shift < 3 { (shift, 0) } else { (0, shift - 2) };
-                if gs + 32 >= room {
-                    continue;
-                }
-                if let Some(g) = gv.word(ix, gs) {
-                    let n = 24 - rs;
-                    let x = (g ^ (rw >> (2 * rs))) & ((1u64 << (2 * n)) - 1);
-                    best = best.max(n - ((x | (x >> 1)) & LOW).count_ones());
-                }
-            }
-            if best < 12 {
-                return (0, 0, 0);
-            }
+        if m >= 24 && self.diagonal_matches(read, q, t, left) < 12 {
+            return (0, 0, 0);
         }
         let band = (8 + m / 20).min(32);
         let w = 2 * band + 1;
