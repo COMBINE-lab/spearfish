@@ -135,6 +135,10 @@ pub struct Stats {
     pub retried: u64,
     /// Hits whose blocks had to be made consistent (a defect upstream when not zero).
     pub tidied: u64,
+    /// Splice-site searches: tried, kept, genome bases scanned.
+    pub site_tried: u64,
+    pub site_kept: u64,
+    pub site_bases: u64,
 }
 
 impl Stats {
@@ -152,6 +156,9 @@ impl Stats {
         self.scored += o.scored;
         self.retried += o.retried;
         self.tidied += o.tidied;
+        self.site_tried += o.site_tried;
+        self.site_kept += o.site_kept;
+        self.site_bases += o.site_bases;
     }
 }
 
@@ -175,9 +182,6 @@ pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
 /// Splice-site costs per site: GT..AG is free, GC..AG and AT..AC cost `SEMI`, others `NONCANON`.
 const SEMI: u16 = 8;
 const NONCANON: u16 = 18;
-/// Expected cost per read base of a true alignment at long-read error rates (x 8).
-const COST_PER_BASE_X8: u32 = 3;
-
 /// Banded affine-gap costs of every prefix of `a` against prefixes of `b`.
 /// `e[i * w + k]` is the cost of `a[..i]` against `b[..j]` with `j = i + k - band`,
 /// `w = 2 * band + 1`. `tmp` holds the gap states. With `drop > 0` the rows stop once the best
@@ -284,7 +288,8 @@ struct Placed {
     acceptor: u32,
     cost: u16,
     /// How the junction was made: `d` placed directly, `p` placed directly although the fit
-    /// was poor, `w` by the gap solver through a candidate exon, `e` at a read end.
+    /// was poor, `w` by the gap solver through an exon that level-2 cores pointed to, `s` through
+    /// one found between splice sites, `e` at a read end.
     origin: u8,
 }
 
@@ -408,17 +413,15 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
         let trail = q_hi.saturating_sub(g.1.q + g.1.ql as u32).min(150) + 12;
         (g.0.t.saturating_sub(lead), end(g.1) + trail)
     };
-    // Strongest groups first; a group whose hits lie inside the wish of a stronger one is
-    // dropped (a stray hit inside an exon must not split that exon's window).
+    // Strongest groups first; a group whose hits overlap a stronger group's hits is dropped.
+    // Windows may overlap one another: the solver takes them in genome order and uses a later
+    // one only after it has left an earlier one, so a stray hit costs time, not accuracy.
     let mut by: Vec<usize> = (0..groups.len()).collect();
     by.sort_by_key(|&k| std::cmp::Reverse((groups[k].2, end(groups[k].1) - groups[k].0.t)));
     let mut kept: Vec<(Anchor, Anchor, u32)> = Vec::new();
     for k in by {
         let g = groups[k];
-        if kept.iter().any(|o| {
-            let (s, e) = wish(o);
-            g.0.t < e && s < end(g.1)
-        }) {
+        if kept.iter().any(|o| g.0.t < end(o.1) && o.0.t < end(g.1)) {
             continue;
         }
         kept.push(g);
@@ -427,25 +430,12 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
         }
     }
     kept.sort_by_key(|g| g.0.t);
-    // midpoints, computed without overflowing 32 bits
-    let mid = |a: u32, b: u32| a + b.saturating_sub(a) / 2;
     let mut out: Vec<Window> = Vec::new();
-    for (k, g) in kept.iter().enumerate() {
-        let (f, l) = (g.0, g.1);
+    for g in &kept {
         let (ws, we) = wish(g);
-        let lo = if k > 0 {
-            mid(end(kept[k - 1].1), f.t) + 1
-        } else {
-            t_lo + 20
-        };
-        let hi = if k + 1 < kept.len() {
-            mid(end(l), kept[k + 1].0.t)
-        } else {
-            t_hi.saturating_sub(20)
-        };
-        let (s, e) = (ws.max(lo), we.min(hi));
+        let (s, e) = (ws.max(t_lo + 20), we.min(t_hi.saturating_sub(20)));
         if e > s + 4 && e - s <= 2000 {
-            out.push(Window { s, e, f, l });
+            out.push(Window { s, e, f: g.0, l: g.1 });
         }
     }
     out
@@ -630,7 +620,7 @@ impl<'a> Mapper<'a> {
         score: f32,
         sc: &mut Scratch,
     ) -> SplicedHit {
-        let trigger = |c: u16, m: u32| c >= INF || c as u32 >= 24 + m * COST_PER_BASE_X8 / 8;
+        let trigger = |c: u16, m: u32| c >= INF || c as u32 >= 18 + m / 4;
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
         let mut vote = [0u32; 2];
@@ -715,6 +705,45 @@ impl<'a> Mapper<'a> {
                             origin: b'w',
                         }));
                         done = true;
+                    }
+                }
+                // No level-2 hit led to a cheaper explanation: look for an exon between a pair of
+                // splice sites that matches the unexplained bases.
+                if !done && q1 > q0 && t1 > t0 && m <= 600 {
+                    let sites = self.site_windows(read, q0, t0, q1, t1, minus, sc);
+                    if !sites.is_empty() {
+                        sc.stats.site_tried += (minus == strands[0]) as u64;
+                        let vw: Vec<(u32, u32, i64)> = sites.iter().map(|w| w.forward(q0, t0)).collect();
+                        let rv = ReadView { q: q0, rev: false };
+                        let gv = View {
+                            origin: t0,
+                            rev: false,
+                        };
+                        let half = self.opt.min_intron / 2;
+                        let s = gap::solve(
+                            self.index,
+                            read,
+                            rv,
+                            m,
+                            gv,
+                            Some(t1),
+                            &vw,
+                            minus,
+                            half,
+                            &mut sc.gap,
+                        );
+                        if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
+                            sc.stats.site_kept += (minus == strands[0]) as u64;
+                            total += s.cost;
+                            juncs.extend(s.hops.iter().map(|h| Placed {
+                                q: h.q,
+                                donor: h.leave,
+                                acceptor: h.enter,
+                                cost: 0,
+                                origin: b's',
+                            }));
+                            done = true;
+                        }
                     }
                 }
                 if std::env::var_os("GMAP_DEBUG").is_some() {
@@ -1008,6 +1037,136 @@ impl<'a> Mapper<'a> {
             }
         }
         score
+    }
+
+    /// Candidate exons for read bases that neither side of a junction explains, found without
+    /// any seed: genome intervals inside the intron that start after an acceptor site, end
+    /// before a donor site, are about as long as the unexplained bases, and match them.
+    #[allow(clippy::too_many_arguments)]
+    fn site_windows(
+        &self,
+        read: &[u8],
+        q0: u32,
+        t0: u32,
+        q1: u32,
+        t1: u32,
+        minus: bool,
+        sc: &mut Scratch,
+    ) -> Vec<Window> {
+        let ix = self.index;
+        let m = (q1 - q0) as usize;
+        // How far the read follows the genome from either side.
+        let band = 4 + m / 10;
+        let n = (m + band).min((t1 - t0) as usize);
+        let reach = |e: &Vec<u16>, rows: usize| {
+            let w = 2 * band + 1;
+            let mut best = (0i32, 0usize);
+            for i in 1..=rows {
+                let row = e[i * w..(i + 1) * w].iter().copied().min().unwrap_or(INF);
+                let s = 2 * i as i32 - row as i32;
+                if s > best.0 {
+                    best = (s, i);
+                }
+            }
+            best.1
+        };
+        let rows = band_prefix(
+            |i| read[q0 as usize + i],
+            m,
+            |j| ix.base(t0 + j as u32),
+            n,
+            band,
+            &mut sc.e1,
+            &mut sc.etmp,
+            30,
+        );
+        let up = reach(&sc.e1, rows);
+        let rows = band_prefix(
+            |i| read[q1 as usize - 1 - i],
+            m,
+            |j| ix.base(t1 - 1 - j as u32),
+            n,
+            band,
+            &mut sc.e2,
+            &mut sc.etmp,
+            30,
+        );
+        let down = reach(&sc.e2, rows);
+        if up + down + 6 > m {
+            return Vec::new();
+        }
+        // The unexplained bases, with a margin on both sides (the read can follow an intron a
+        // few bases by chance), and the exon lengths that fit them.
+        const MARGIN: usize = 4;
+        let (up, down) = (up.saturating_sub(MARGIN), down.saturating_sub(MARGIN));
+        let k = m - up - down;
+        let mid = &read[q0 as usize + up..q1 as usize - down];
+        let (lo, hi) = (t0 + up as u32 + 20, (t1 - down as u32).saturating_sub(20));
+        if hi <= lo || k > 200 + 2 * MARGIN {
+            return Vec::new();
+        }
+        let slack = 2 + k / 10;
+        let (len_lo, len_hi) = (k.saturating_sub(2 * MARGIN + slack).max(4), k + slack);
+        // an exon under ten bases is only looked for close by: further off, chance matches win
+        if len_lo < 10 && hi - lo > 20_000 {
+            return Vec::new();
+        }
+        let mut found: Vec<(usize, Window)> = Vec::new();
+        let mut scanned = 0u64;
+        for p in lo..hi {
+            scanned += 1;
+            if acceptor_pen(ix, p, minus) != 0 {
+                continue;
+            }
+            for len in len_lo..=len_hi {
+                let e = p + len as u32;
+                if e > hi || donor_pen(ix, e, minus) != 0 {
+                    continue;
+                }
+                // the exon against the unexplained bases at every offset it can have in them
+                let allowed = len / 8;
+                let mut best = usize::MAX;
+                for o in 0..=k.saturating_sub(len) {
+                    let mut d = 0;
+                    for i in 0..len.min(k - o) {
+                        d += (mid[o + i] != ix.base(p + i as u32)) as usize;
+                        if d > allowed {
+                            break;
+                        }
+                    }
+                    best = best.min(d);
+                }
+                if best <= allowed {
+                    let at = Anchor {
+                        t: p,
+                        q: q0 + up as u32,
+                        ql: 0,
+                        tl: 0,
+                        q_in: 0,
+                        q_out: 0,
+                        w: 0.0,
+                    };
+                    let w = Window {
+                        s: p.saturating_sub(3).max(lo),
+                        e: (e + 3).min(hi),
+                        f: at,
+                        l: at,
+                    };
+                    found.push((best * 64 / len.max(1), w));
+                }
+            }
+        }
+        sc.stats.site_bases += scanned;
+        // Non-overlapping, best match first; a few at most.
+        found.sort_by_key(|f| f.0);
+        let mut out: Vec<Window> = Vec::new();
+        for (_, w) in found {
+            if out.len() < 4 && out.iter().all(|o| w.e + 20 <= o.s || o.e + 20 <= w.s) {
+                out.push(w);
+            }
+        }
+        out.sort_by_key(|w| w.s);
+        out
     }
 
     /// Score change of chaining anchor `a` after `p`: the read bases `a` adds, minus the price of

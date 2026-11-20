@@ -128,7 +128,7 @@ pub(crate) struct Bufs {
 /// `far` is the real genome position of the far fixed point (the read bases then end exactly
 /// there; `gv` and `rv` must be forward); without it the read end is free and unexplained
 /// bases are clipped. `windows` are candidate exons as (view position, length, read offset
-/// that goes with the window's start), in travel order and not overlapping. `minus` is the transcript strand.
+/// that goes with the window's start), in travel order; they may overlap. `minus` is the transcript strand.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve(
     ix: &GenomeIndex,
