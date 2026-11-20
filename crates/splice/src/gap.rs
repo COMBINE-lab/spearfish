@@ -222,6 +222,114 @@ impl Bufs {
 /// bases are clipped. `windows` are candidate exons as (view position, length, read offset
 /// that goes with the window's start, half-width of the band around that diagonal or 0 for the
 /// usual one), in travel order; they may overlap. `minus` is the transcript strand.
+const SH: u32 = 32;
+const BIGP: u64 = (BIG as u64) << SH;
+
+/// One row of a candidate exon's table. A cell is one word: its cost above, and below it where
+/// its path entered the window. `pd`, `pu` are the row above at the same and the next k, `ur`
+/// its cells that end in read bases left out (next k); `hr`, `nu` receive this row. Returns the
+/// cheapest way to leave the window in this row and the cheapest cell to end the read in, each
+/// as cost above and offset in the row below (`u64::MAX`: none).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn window_row_body(
+    pd: &[u64],
+    pu: &[u64],
+    ur: &[u64],
+    hr: &mut [u64],
+    nu: &mut [u64],
+    en: &[u32],
+    lv: &[u32],
+    g: &[u8],
+    ri: u8,
+    entry: u64,
+    j_lo: usize,
+    j_min: usize,
+) -> (u64, u64) {
+    let open_del = ((GAP_OPEN + GAP_EXT) as u64) << SH;
+    let open_ins = ((GAP_OPEN + INS_EXT) as u64) << SH;
+    let (ins_ext, del_ext) = ((INS_EXT as u64) << SH, (GAP_EXT as u64) << SH);
+    let mismatch = (MISMATCH as u64) << SH;
+    let len = hr.len();
+    let (pd, pu, ur, nu) = (&pd[..len], &pu[..len], &ur[..len], &mut nu[..len]);
+    let (en, lv, g) = (&en[..len], &lv[..len], &g[..len]);
+    // every way into a cell but along the row
+    for x in 0..len {
+        let j = j_lo + x;
+        // (selections are written as masks: these branches are not predictable)
+        let may = ((j >= j_min) as u64).wrapping_neg();
+        let e = ((entry + (((en[x] as u64) << SH) | j as u64)) & may) | (BIGP & !may);
+        // (i - 1, j) is k + 1 in the row above
+        let f = (ur[x] + ins_ext).min(pu[x] + open_ins).min(BIGP);
+        // (i - 1, j - 1) is the same k in the row above
+        let d = pd[x] + ((ri != g[x]) as u64) * mismatch;
+        nu[x] = f;
+        hr[x] = e.min(d).min(f).min(BIGP);
+    }
+    // along the row (`left` never exceeds BIGP + open_del, since a cell is at most BIGP)
+    let mut left = BIGP;
+    for c in hr.iter_mut() {
+        *c = (*c).min(left);
+        left = (left + del_ext).min(*c + open_del);
+    }
+    // something of the window is used: it can be left here, or the read can end
+    let (mut bl, mut be) = (u64::MAX, u64::MAX);
+    for x in 0..len {
+        let c = hr[x];
+        let unused = (((c < BIGP) & ((j_lo + x) as u64 > (c & 0xffff))) as u64).wrapping_sub(1);
+        let cost = c >> SH;
+        let l = (((cost + lv[x] as u64) << 16) | x as u64) | unused;
+        let t = ((cost << 16) | x as u64) | unused;
+        bl = bl.min(l);
+        be = be.min(t);
+    }
+    (bl, be)
+}
+
+avx2_variant! {
+    #[allow(clippy::too_many_arguments)]
+    fn window_row = window_row_body, window_row_avx2(
+        pd: &[u64], pu: &[u64], ur: &[u64], hr: &mut [u64], nu: &mut [u64],
+        en: &[u32], lv: &[u32], g: &[u8], ri: u8, entry: u64, j_lo: usize, j_min: usize,
+    ) -> (u64, u64)
+}
+
+/// The cheapest cell of a prefix-table row once the cost of leaving the genome there is
+/// added: cost above, offset in the row in the low 8 bits (the first of equals);
+/// `u32::MAX` when no cell is reachable.
+#[inline(always)]
+fn row_best_body(row: &[u16], lv: &[u32]) -> u32 {
+    let len = row.len();
+    let lv = &lv[..len];
+    let mut best = u32::MAX;
+    for x in 0..len {
+        let e = row[x] as u32;
+        let c = (((e + lv[x]) << 8) | x as u32) | ((e < INF as u32) as u32).wrapping_sub(1);
+        best = best.min(c);
+    }
+    best
+}
+avx2_variant! {
+    fn row_best = row_best_body, row_best_avx2(row: &[u16], lv: &[u32]) -> u32
+}
+
+/// The cheapest cell of a prefix-table row, the nearest to the diagonal of equals (`off0` is
+/// the first cell's signed distance from it): cost above, then distance, then offset.
+#[inline(always)]
+fn row_end_body(row: &[u16], off0: i32) -> u32 {
+    let mut end = u32::MAX;
+    for (x, &e) in row.iter().enumerate() {
+        let e = e as u32;
+        let off = (off0 + x as i32).unsigned_abs();
+        let c = ((e << 16) | (off << 8) | x as u32) | ((e < INF as u32) as u32).wrapping_sub(1);
+        end = end.min(c);
+    }
+    end
+}
+avx2_variant! {
+    fn row_end = row_end_body, row_end_avx2(row: &[u16], off0: i32) -> u32
+}
+
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) fn solve(
     ix: &GenomeIndex,
@@ -267,27 +375,29 @@ pub(crate) fn solve(
         b.l0_p.resize(m + 1, 0);
         b.l0_end = (BIG, 0, 0);
         let leave0: Vec<u32> = (0..=n).map(|j| gv.leave(ix, j as u32, minus)).collect();
+        // (per row: the cheapest cell with its leaving cost, the first of equals; and, for a
+        // read end, the cheapest cell, the nearest to the diagonal of equals)
+        let want_end = far.is_none();
         for i in 0..=m {
-            let mut end = (INF as u32, 0u32);
             let (j_lo, j_hi) = (i.saturating_sub(band), (i + band).min(n));
-            for j in j_lo..=j_hi {
-                let e = b.e1[i * w + j + band - i] as u32;
-                if e >= INF as u32 {
-                    continue;
-                }
-                let c = e + leave0[j];
-                if c < b.l0_cur[i] {
-                    b.l0_cur[i] = c;
-                    b.l0_p[i] = j as u32;
-                }
-                if e < end.0 || (e == end.0 && j.abs_diff(i) < (end.1 as usize).abs_diff(i)) {
-                    end = (e, j as u32);
-                }
+            if j_hi < j_lo {
+                continue;
             }
-            if end.0 < INF as u32 {
-                let c = end.0 + CLIP * (m - i) as u32;
-                if c < b.l0_end.0 {
-                    b.l0_end = (c, i, end.1);
+            let len = j_hi - j_lo + 1;
+            let row = &b.e1[i * w + j_lo + band - i..][..len];
+            let lv = &leave0[j_lo..][..len];
+            let best = row_best(row, lv);
+            if best != u32::MAX {
+                b.l0_cur[i] = best >> 8;
+                b.l0_p[i] = (j_lo + (best & 0xff) as usize) as u32;
+            }
+            if want_end {
+                let end = row_end(row, j_lo as i32 - i as i32);
+                if end != u32::MAX {
+                    let c = (end >> 16) + CLIP * (m - i) as u32;
+                    if c < b.l0_end.0 {
+                        b.l0_end = (c, i, (j_lo + (end & 0xff) as usize) as u32);
+                    }
                 }
             }
         }
@@ -317,124 +427,83 @@ pub(crate) fn solve(
             .map(|j| EXTRA_INTRON + gv.enter(ix, vs + j as u32, minus))
             .collect();
         let leave: Vec<u32> = (0..=vl).map(|j| gv.leave(ix, vs + j as u32, minus)).collect();
-        let gb: Vec<u8> = (0..vl).map(|j| gv.base(ix, vs + j as u32)).collect();
+        // (gb[j] is the genome base before window position j)
+        let gb: Vec<u8> = std::iter::once(4)
+            .chain((0..vl).map(|j| gv.base(ix, vs + j as u32)))
+            .collect();
         let mut next = cur.clone();
         let mut nextp = curp.clone();
         let mut v: Vec<Option<(u32, u32)>> = vec![None; m + 1];
-        // Affine gaps, as outside the windows. Only two rows are kept: every cell carries where
-        // its path entered the window (read position and window position, packed), so no table
-        // is walked back. `uc`/`uo` hold, per k, the best cost of a cell of the row above that
-        // ends in read bases left out.
-        let open_del = (GAP_OPEN + GAP_EXT) as u32;
-        let open_ins = (GAP_OPEN + INS_EXT) as u32;
-        let (ins_ext, del_ext, mismatch) = (INS_EXT as u32, GAP_EXT as u32, MISMATCH as u32);
-        let (mut pc, mut po) = (vec![BIG; ww], vec![0u32; ww]);
-        let (mut cc, mut co) = (vec![BIG; ww], vec![0u32; ww]);
-        let (mut uc, mut uo) = (vec![BIG; ww], vec![0u32; ww]);
+        // Affine gaps, as outside the windows. Only two rows are kept. A cell is one word: its
+        // cost above, and below it where its path entered the window (read position and window
+        // position), so the cheapest of several ways is one comparison and no table is walked
+        // back. `up` holds, per k, the best cell of the row above that ends in read bases left
+        // out. All three rows have one spare cell at the end.
+        let mut prev = vec![BIGP; ww + 1];
+        let mut here = vec![BIGP; ww + 1];
+        let mut up = vec![BIGP; ww + 1];
+        let mut up2 = vec![BIGP; ww + 1];
         for i in i_lo..=i_hi {
             let ri = if i > 0 { rv.base(read, i - 1) } else { 0 };
             // window position j = base_j + k
             let base_j = i as i64 - i0 - wb;
             let k_lo = (-base_j).max(0) as usize;
             let k_hi = (vl as i64 - base_j).min(ww as i64 - 1);
-            cc.fill(BIG);
+            here.fill(BIGP);
             if k_hi < k_lo as i64 {
-                uc.fill(BIG);
-                std::mem::swap(&mut pc, &mut cc);
-                std::mem::swap(&mut po, &mut co);
+                up.fill(BIGP);
+                std::mem::swap(&mut prev, &mut here);
                 continue;
             }
             let k_hi = k_hi as usize;
+            let j_lo = (base_j + k_lo as i64) as usize;
+            let len = k_hi - k_lo + 1;
             // entering here is allowed where the genome was left far enough before
-            let entry_ok = cur[i] < BIG;
-            let j_min = (curp[i] + min_gap).saturating_sub(vs) as usize;
-            let first_row = i == i_lo;
-            let (mut left_c, mut left_o) = (BIG, 0u32);
-            let (mut bl, mut blj, mut blo) = (next[i], usize::MAX, 0u32);
-            let (mut be, mut bej, mut beo) = (BIG, 0usize, 0u32);
-            for k in k_lo..=k_hi {
-                let j = (base_j + k as i64) as usize;
-                let (mut c, mut o) = if entry_ok && j >= j_min {
-                    (cur[i] + enter[j], ((i as u32) << 16) | j as u32)
-                } else {
-                    (BIG, 0)
-                };
-                // (i - 1, j) is k + 1 in the row above
-                let (fc, fo) = if !first_row && k + 1 < ww {
-                    let (ext, opn) = (uc[k + 1] + ins_ext, pc[k + 1] + open_ins);
-                    if ext <= opn {
-                        (ext, uo[k + 1])
-                    } else {
-                        (opn, po[k + 1])
-                    }
-                } else {
-                    (BIG, 0)
-                };
-                if k > k_lo {
-                    let (ext, opn) = (left_c + del_ext, cc[k - 1] + open_del);
-                    if ext <= opn {
-                        left_c = ext;
-                    } else {
-                        left_c = opn;
-                        left_o = co[k - 1];
-                    }
-                } else {
-                    left_c = BIG;
-                }
-                // (i - 1, j - 1) is the same k in the row above
-                if !first_row && j > 0 {
-                    let d = pc[k] + if ri != gb[j - 1] { mismatch } else { 0 };
-                    if d < c {
-                        c = d;
-                        o = po[k];
-                    }
-                }
-                if fc < c {
-                    c = fc;
-                    o = fo;
-                }
-                if left_c < c {
-                    c = left_c;
-                    o = left_o;
-                }
-                let c = c.min(BIG);
-                left_c = left_c.min(BIG);
-                cc[k] = c;
-                co[k] = o;
-                uc[k] = fc.min(BIG);
-                uo[k] = fo;
-                if c < BIG && j as u32 > (o & 0xffff) {
-                    // something of the window is used: it can be left here, or the read can end
-                    let l = c + leave[j];
-                    if l < bl {
-                        (bl, blj, blo) = (l, j, o);
-                    }
-                    if c < be {
-                        (be, bej, beo) = (c, j, o);
-                    }
-                }
+            let j_min = if cur[i] < BIG {
+                (curp[i] + min_gap).saturating_sub(vs) as usize
+            } else {
+                usize::MAX
+            };
+            let entry = ((cur[i] as u64) << SH) | ((i as u64) << 16);
+            let (bl, be) = window_row(
+                &prev[k_lo..k_lo + len],
+                &prev[k_lo + 1..k_lo + 1 + len],
+                &up[k_lo + 1..k_lo + 1 + len],
+                &mut here[k_lo..k_lo + len],
+                &mut up2[k_lo..k_lo + len],
+                &enter[j_lo..j_lo + len],
+                &leave[j_lo..j_lo + len],
+                &gb[j_lo..j_lo + len],
+                ri,
+                entry,
+                j_lo,
+                j_min,
+            );
+            up2[..k_lo].fill(BIGP);
+            up2[k_hi + 1..].fill(BIGP);
+            std::mem::swap(&mut up, &mut up2);
+            if bl != u64::MAX && ((bl >> 16) as u32) < next[i] {
+                let x = (bl & 0xffff) as usize;
+                let o = here[k_lo + x] as u32;
+                next[i] = (bl >> 16) as u32;
+                nextp[i] = vs + (j_lo + x) as u32;
+                v[i] = Some(((o >> 16) & 0xffff, vs + (o & 0xffff)));
             }
-            uc[..k_lo].fill(BIG);
-            uc[k_hi + 1..].fill(BIG);
-            if blj != usize::MAX {
-                next[i] = bl;
-                nextp[i] = vs + blj as u32;
-                v[i] = Some((blo >> 16, vs + (blo & 0xffff)));
-            }
-            if far.is_none() && be < BIG {
-                let e = be + CLIP * (m - i) as u32;
+            if far.is_none() && be != u64::MAX {
+                let x = (be & 0xffff) as usize;
+                let o = here[k_lo + x] as u32;
+                let e = (be >> 16) as u32 + CLIP * (m - i) as u32;
                 if e < best_end.0 {
                     best_end = (
                         e,
                         via.len() + 1,
                         i,
-                        vs + bej as u32,
-                        Some((beo >> 16, vs + (beo & 0xffff))),
+                        vs + (j_lo + x) as u32,
+                        Some(((o >> 16) & 0xffff, vs + (o & 0xffff))),
                     );
                 }
             }
-            std::mem::swap(&mut pc, &mut cc);
-            std::mem::swap(&mut po, &mut co);
+            std::mem::swap(&mut prev, &mut here);
         }
         cur = next;
         curp = nextp;
@@ -482,16 +551,16 @@ pub(crate) fn solve(
             b.r_leave = far_leave;
             for rest in 0..=m {
                 let (j_lo, j_hi) = (rest.saturating_sub(band), (rest + band).min(n));
-                for j in j_lo..=j_hi {
-                    let e = b.e2[rest * w + j + band - rest] as u32;
-                    if e >= INF as u32 {
-                        continue;
-                    }
-                    let c = e + b.r_leave[j];
-                    if c < b.r_cost[rest] {
-                        b.r_cost[rest] = c;
-                        b.r_j[rest] = j as u32;
-                    }
+                if j_hi < j_lo {
+                    continue;
+                }
+                let len = j_hi - j_lo + 1;
+                let row = &b.e2[rest * w + j_lo + band - rest..][..len];
+                let lv = &b.r_leave[j_lo..][..len];
+                let best = row_best(row, lv);
+                if best != u32::MAX {
+                    b.r_cost[rest] = best >> 8;
+                    b.r_j[rest] = (j_lo + (best & 0xff) as usize) as u32;
                 }
             }
             b.r_key = Some((key, minus));

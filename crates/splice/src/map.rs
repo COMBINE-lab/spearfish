@@ -216,7 +216,7 @@ const NONCANON: u16 = 18;
 /// `w = 2 * band + 1`. `tmp` holds the gap states. With `drop > 0` the rows stop once the best
 /// score of a row (two per base of `a`, minus its cost) falls `drop` below the best seen;
 /// returns the number of rows of `a` computed.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn band_prefix(
     a: impl Fn(usize) -> u8,
     m: usize,
@@ -227,15 +227,18 @@ pub(crate) fn band_prefix(
     tmp: &mut Vec<u16>,
     drop: i32,
 ) -> usize {
+    debug_assert!(band >= 1);
     let w = 2 * band + 1;
     e.clear();
     e.resize((m + 1) * w, INF);
-    // gap states of the row above (a gap that consumes `a`), per k
+    // gap states of the row above (a gap that consumes `a`), per k, and those of the row being
+    // filled; each with one spare cell
     tmp.clear();
-    tmp.resize(w, INF);
+    tmp.resize(2 * (w + 1), INF);
+    let (mut cur, mut new) = tmp.split_at_mut(w + 1);
     // the bases of `b` once each, not once per cell, and only as far as the rows get
     let mut bb: Vec<u8> = Vec::with_capacity(n.min(m + band));
-    let (open_ins, open_del) = (GAP_OPEN + INS_EXT, GAP_OPEN + GAP_EXT);
+    let open_ins = GAP_OPEN + INS_EXT;
     let mut best = 0i32;
     for i in 0..=m {
         // the row's cells: j = i + k - band within 0..=n
@@ -245,49 +248,56 @@ pub(crate) fn band_prefix(
             if drop > 0 {
                 return i;
             }
-            tmp.fill(INF);
+            cur.fill(INF);
             continue;
         }
         let k_hi = (n + band - i).min(w - 1);
         while bb.len() < (i + band).min(n) {
             bb.push(b(bb.len()));
         }
-        let ai = if i > 0 { a(i - 1) } else { 0 };
         let (above, here) = e.split_at_mut(i * w);
-        let above = if i > 0 { &above[(i - 1) * w..] } else { &above[..0] };
         let here = &mut here[..w];
-        let mut left = INF; // a gap that consumes `b`, ending at the cell to the left
-        let mut row = INF;
-        for k in k_lo..=k_hi {
-            let j = i + k - band;
-            // cell above is (i-1, j): k + 1 in the previous row
-            let up = if i > 0 && k + 1 < w {
-                (tmp[k + 1] + INS_EXT).min(above[k + 1] + open_ins)
-            } else {
-                INF
-            };
-            left = if j > 0 && k > k_lo {
-                (left + GAP_EXT).min(here[k - 1] + open_del)
-            } else {
-                INF
-            };
-            let v = if i == 0 && j == 0 {
-                0
-            } else {
-                let diag = if i > 0 && j > 0 {
-                    above[k] + if ai != bb[j - 1] { MISMATCH } else { 0 }
-                } else {
-                    INF
-                };
-                diag.min(up).min(left)
-            };
-            here[k] = v.min(INF);
-            tmp[k] = up.min(INF);
-            left = left.min(INF);
-            row = row.min(v);
+        if i == 0 {
+            here[band] = 0;
+        } else {
+            let above = &above[(i - 1) * w..];
+            let ai = a(i - 1);
+            // Every way into a cell but along the row. The cell above (i - 1, j) is k + 1 in
+            // the previous row, the diagonal one the same k. The first cell of the row when
+            // it is column 0, and the band's last cell, lack one of them.
+            let (mut lo, mut hi) = (k_lo, k_hi);
+            if i + k_lo == band {
+                let up = (cur[k_lo + 1] + INS_EXT).min(above[k_lo + 1] + open_ins).min(INF);
+                here[k_lo] = up;
+                new[k_lo] = up;
+                lo += 1;
+            }
+            if k_hi == w - 1 && hi >= lo {
+                let j = i + hi - band;
+                here[hi] = (above[hi] + if ai != bb[j - 1] { MISMATCH } else { 0 }).min(INF);
+                new[hi] = INF;
+                hi -= 1;
+            }
+            if lo <= hi {
+                prefix_cells(
+                    &above[lo..=hi],
+                    &above[lo + 1..=hi + 1],
+                    &cur[lo + 1..=hi + 1],
+                    &mut here[lo..=hi],
+                    &mut new[lo..=hi],
+                    &bb[i + lo - band - 1..],
+                    ai,
+                );
+            }
         }
-        tmp[..k_lo].fill(INF);
-        tmp[k_hi + 1..].fill(INF);
+        new[..k_lo].fill(INF);
+        new[k_hi + 1..].fill(INF);
+        if i == 0 {
+            new.fill(INF);
+        }
+        // along the row: a gap that consumes `b`
+        let row = prefix_left(&mut here[k_lo..=k_hi]);
+        std::mem::swap(&mut cur, &mut new);
         if drop > 0 {
             let s = 2 * i as i32 - row as i32;
             best = best.max(s);
@@ -297,6 +307,57 @@ pub(crate) fn band_prefix(
         }
     }
     m
+}
+
+/// The cells of one row of [`band_prefix`] that have both a cell above and a diagonal one:
+/// the cheaper of the two ways in, and the gap state for the next row.
+#[inline(always)]
+fn prefix_cells_body(
+    diag: &[u16],
+    above: &[u16],
+    gap: &[u16],
+    here: &mut [u16],
+    new: &mut [u16],
+    bb: &[u8],
+    ai: u8,
+) {
+    let len = here.len();
+    let (diag, above, gap, new, bb) = (
+        &diag[..len],
+        &above[..len],
+        &gap[..len],
+        &mut new[..len],
+        &bb[..len],
+    );
+    let open_ins = GAP_OPEN + INS_EXT;
+    for x in 0..len {
+        let up = (gap[x] + INS_EXT).min(above[x] + open_ins).min(INF);
+        let d = diag[x] + ((ai != bb[x]) as u16) * MISMATCH;
+        new[x] = up;
+        here[x] = d.min(up);
+    }
+}
+avx2_variant! {
+    fn prefix_cells = prefix_cells_body, prefix_cells_avx2(
+        diag: &[u16], above: &[u16], gap: &[u16], here: &mut [u16], new: &mut [u16], bb: &[u8], ai: u8,
+    ) -> ()
+}
+
+/// Gaps along one row of [`band_prefix`], over cells that hold every other way in; returns
+/// the row's lowest cost. (A gap is never opened from a cell that a gap reached, so the gap
+/// state follows from the cells as they were.)
+#[inline]
+fn prefix_left(here: &mut [u16]) -> u16 {
+    let open_del = GAP_OPEN + GAP_EXT;
+    let (mut left, mut row) = (INF, INF);
+    for c in here.iter_mut() {
+        let t = *c;
+        let v = t.min(left);
+        *c = v;
+        left = (left + GAP_EXT).min(t + open_del);
+        row = row.min(v);
+    }
+    row
 }
 
 /// Cost of a splice site unknown to the annotation, when one was given (on top of its motif).
