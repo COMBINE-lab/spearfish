@@ -272,13 +272,32 @@ const UNKNOWN_SITE: u16 = 5;
 /// Motif cost of an intron's left end at `p` (its first base) and of its right end at `p` (the
 /// first exon base after it), for a transcript on the forward or reverse strand. On the
 /// reverse strand the left end is the reverse complement of the acceptor.
+/// Small cost of a canonical site whose neighbouring base is not the usual one: GT is mostly
+/// followed by A or G, and AG mostly preceded by C or T (as minimap2's `--splice-flank`).
+const FLANK: u16 = 5;
+
 #[inline]
 pub(crate) fn donor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
-    if p + 2 > ix.total_len() {
+    if p + 3 > ix.total_len() || p < 1 {
         return NONCANON;
     }
     match (minus, ix.base(p), ix.base(p + 1)) {
-        (false, 2, 3) | (true, 1, 3) => 0,                    // GT; CT (= AG)
+        // GT, then A or G
+        (false, 2, 3) => {
+            if matches!(ix.base(p + 2), 0 | 2) {
+                0
+            } else {
+                FLANK
+            }
+        }
+        // CT (= AG on the other strand), then A or G (= C or T before the AG)
+        (true, 1, 3) => {
+            if matches!(ix.base(p + 2), 0 | 2) {
+                0
+            } else {
+                FLANK
+            }
+        }
         (false, 2, 1) | (false, 0, 3) | (true, 2, 3) => SEMI, // GC, AT; GT (= AC)
         _ => NONCANON,
     }
@@ -286,11 +305,26 @@ pub(crate) fn donor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
 
 #[inline]
 pub(crate) fn acceptor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
-    if p < 2 {
+    if p < 3 {
         return NONCANON;
     }
     match (minus, ix.base(p - 2), ix.base(p - 1)) {
-        (false, 0, 2) | (true, 0, 1) => 0,                   // AG; AC (= GT)
+        // C or T, then AG
+        (false, 0, 2) => {
+            if matches!(ix.base(p - 3), 1 | 3) {
+                0
+            } else {
+                FLANK
+            }
+        }
+        // C or T, then AC (= GT on the other strand, followed there by A or G)
+        (true, 0, 1) => {
+            if matches!(ix.base(p - 3), 1 | 3) {
+                0
+            } else {
+                FLANK
+            }
+        }
         (false, 0, 1) | (true, 2, 1) | (true, 0, 3) => SEMI, // AC; GC, AT (= GC, AT donors)
         _ => NONCANON,
     }
@@ -1380,7 +1414,7 @@ impl<'a> Mapper<'a> {
             }
             for len in len_lo..=len_hi {
                 let e = p + len as u32;
-                if e > hi || donor_motif(ix, e, minus) != 0 {
+                if e > hi || donor_motif(ix, e, minus) > FLANK {
                     continue;
                 }
                 // the exon against the unexplained bases at every offset it can have in them
@@ -1544,7 +1578,7 @@ impl<'a> Mapper<'a> {
             }
         }
         for p in cands {
-            if p < from || p >= hi || gv.enter_motif(ix, p, minus) != 0 {
+            if p < from || p >= hi || gv.enter_motif(ix, p, minus) > 5 {
                 continue;
             }
             // the exon can start a few read bases into the probe
