@@ -37,7 +37,7 @@ impl Default for MapOptions {
             min_intron: 40,
             max_loci: 6,
             forward_only: false,
-            min_score: 60,
+            min_score: 100,
         }
     }
 }
@@ -134,6 +134,8 @@ pub struct Stats {
     /// Hits scored by aligning their blocks.
     pub scored: u64,
     pub retried: u64,
+    /// Spliced hits ranked above an unspliced rival of slightly higher score.
+    pub spliced_preferred: u64,
     /// Hits whose blocks had to be made consistent (a defect upstream when not zero).
     pub tidied: u64,
     /// Splice-site searches: tried, kept, genome bases scanned.
@@ -160,6 +162,7 @@ impl Stats {
         self.end_kept += o.end_kept;
         self.scored += o.scored;
         self.retried += o.retried;
+        self.spliced_preferred += o.spliced_preferred;
         self.tidied += o.tidied;
         self.site_tried += o.site_tried;
         self.site_kept += o.site_kept;
@@ -690,6 +693,21 @@ impl<'a> Mapper<'a> {
                 sc.stats.scored += 1;
             }
             out.retain(|h| h.score >= self.opt.min_score);
+            // A spliced read also aligns, unspliced, to a processed pseudogene of its gene, and
+            // there it can cover a few more bases (no read ends lost at junctions). When a
+            // spliced hit is within 10% of the best unspliced one and aligns at least as well
+            // per base, it is the gene the read came from.
+            let cover = |h: &SplicedHit| h.blocks.iter().map(|b| b.qe - b.qs).sum::<u32>().max(1) as i64;
+            if let Some(u) = out.iter().filter(|h| h.blocks.len() == 1).max_by_key(|h| h.score) {
+                let (us, uc) = (u.score as i64, cover(u));
+                for h in out.iter_mut().filter(|h| h.blocks.len() > 1) {
+                    let (hs, hc) = (h.score as i64, cover(h));
+                    if hs < us && 10 * hs >= 9 * us && hs * uc >= us * hc {
+                        h.score = us as i32 + 1;
+                        sc.stats.spliced_preferred += 1;
+                    }
+                }
+            }
         }
         out.sort_by_key(|h| std::cmp::Reverse(h.score));
         if let Some(h) = out.first_mut() {
@@ -951,9 +969,11 @@ impl<'a> Mapper<'a> {
 
         // Read ends, from a point inside the outermost anchors.
         let (_, _, q1, t1) = self.fixed(last, last);
-        let right = self.end(read, reverse, q1, t1, false, minus, undecided, qlen, sc);
+        // A chain of one or two anchors is too thin to go looking for more exons from.
+        let rescue = chain.len() >= 3;
+        let right = self.end(read, reverse, q1, t1, false, minus, undecided, rescue, qlen, sc);
         let (q0, t0, _, _) = self.fixed(first, first);
-        let left = self.end(read, reverse, q0, t0, true, minus, undecided, qlen, sc);
+        let left = self.end(read, reverse, q0, t0, true, minus, undecided, rescue, qlen, sc);
         edits += left.cost + right.cost;
         // left end: hops come in travel order (away from the anchor); in genome order the
         // furthest exon is first
@@ -1041,6 +1061,7 @@ impl<'a> Mapper<'a> {
         left: bool,
         minus: bool,
         undecided: bool,
+        rescue: bool,
         qlen: u32,
         sc: &mut Scratch,
     ) -> EndSolved {
@@ -1054,6 +1075,12 @@ impl<'a> Mapper<'a> {
         };
         let half = self.opt.min_intron / 2;
         let mut strands: Vec<bool> = if undecided { vec![false, true] } else { vec![minus] };
+        if !rescue {
+            // a thin chain: only run along the genome while it matches (stops early on junk)
+            let (dq, dt, _) = self.extend(read, q, t, left, sc);
+            out.end = if left { (q - dq, t - dt) } else { (q + dq, t + dt) };
+            return out;
+        }
         for _round in 0..8 {
             let mut m = if left { q } else { qlen - q };
             if m == 0 {
@@ -1078,9 +1105,20 @@ impl<'a> Mapper<'a> {
             let gv = View { origin: t, rev: left };
             let plain = gap::solve(ix, read, rv, m, gv, None, &[], strands[0], half, &mut sc.gap);
             let reached = plain.end.0.abs_diff(q);
+            let plain_cost = plain.cost;
             let mut best = (plain, None);
             let known = self.index.junctions.is_some();
-            if m as u32 - reached >= if known { 4 } else { 10 } {
+            // What is left of the read may be a poly(A) tail (poly(T) on the other strand) or
+            // other low-complexity sequence: that is clipped, never searched for.
+            let tail = {
+                let n = (m - reached as usize).min(24);
+                let mut c = [0usize; 4];
+                for i in 0..n {
+                    c[rv.base(read, reached as usize + i) as usize & 3] += 1;
+                }
+                n > 0 && 4 * c.iter().max().unwrap() >= 3 * n
+            };
+            if rescue && !tail && m as u32 - reached >= if known { 4 } else { 10 } {
                 sc.stats.end_tried += 1;
                 // level-2 cores of the unexplained bases, within reach of the longest intron
                 let here = Anchor {
@@ -1144,7 +1182,7 @@ impl<'a> Mapper<'a> {
                         }
                         all.sort_by_key(|w| w.0);
                         s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
-                        if !s.hops.is_empty() && s.cost < best.0.cost {
+                        if !s.hops.is_empty() && s.cost + self.hop_margin(&s, mi) <= plain_cost {
                             break;
                         }
                     }
@@ -1161,7 +1199,10 @@ impl<'a> Mapper<'a> {
                             s.end
                         );
                     }
-                    if !s.hops.is_empty() && s.cost < best.0.cost {
+                    if !s.hops.is_empty()
+                        && s.cost < best.0.cost
+                        && s.cost + self.hop_margin(&s, mi) <= plain_cost
+                    {
                         best = (s, Some(mi));
                     }
                 }
@@ -1358,6 +1399,19 @@ impl<'a> Mapper<'a> {
         out
     }
 
+    /// How much cheaper than clipping a read-end solution with junctions must be to be believed:
+    /// little when every junction is a known one, otherwise enough that a short chance match
+    /// (a level-2 core is 11-13 bases) cannot pay for an exon.
+    fn hop_margin(&self, s: &Solved, minus: bool) -> u32 {
+        let known = self.index.junctions.as_ref().is_some_and(|j| {
+            s.hops.iter().all(|h| {
+                let (l, r) = (h.leave.min(h.enter), h.leave.max(h.enter));
+                j.left_site(l, minus) && j.right_site(r, minus)
+            })
+        });
+        if known { 4 } else { 12 }
+    }
+
     /// Known exons inside the intron `(t0, t1)` that the read bases of a gap of `m` bases could
     /// hold, as windows for the gap solver (searched over the whole gap, since nothing says
     /// where in the read they fall).
@@ -1431,11 +1485,10 @@ impl<'a> Mapper<'a> {
             return Vec::new();
         }
         // a short tail is only looked for close by: further off, chance matches win
-        let reach = if k < 16 + MARGIN || near {
-            20_000
-        } else {
-            self.opt.max_intron
-        };
+        // Seedless candidates are looked for nearby only: a scan of the longest intron's reach
+        // costs more than every other step and found an exon for under 2% of real read ends.
+        let _ = near;
+        let reach = 20_000u32.min(self.opt.max_intron);
         let hi = (p_end + reach).min(gv.room(ix).saturating_sub(k as u32 + 8));
         let probe: Vec<u8> = (0..k.min(28 + 2 * MARGIN))
             .map(|i| rv.base(read, start + i))
@@ -1702,7 +1755,7 @@ impl<'a> Mapper<'a> {
         if m == 0 {
             return (0, 0, 0);
         }
-        let band = 8 + m / 20;
+        let band = (8 + m / 20).min(32);
         let w = 2 * band + 1;
         let n = if left {
             (m + band).min(t as usize)
