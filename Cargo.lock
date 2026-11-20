@@ -1514,6 +1514,7 @@ dependencies = [
  "anyhow",
  "rayon",
  "rustc-hash",
+ "spearfish-index",
  "spearfish-lcp",
  "spearfish-seeds",
 ]
