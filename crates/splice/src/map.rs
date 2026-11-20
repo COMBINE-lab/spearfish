@@ -380,6 +380,10 @@ struct EndSolved {
     minus: Option<bool>,
 }
 
+/// A window as the gap solver takes it: position and length in the solver's view, the read
+/// offset that goes with the window's start, and the band's half-width (0 for the usual one).
+type SolverWindow = (u32, u32, i64, i64);
+
 /// A candidate exon: genome interval and the first and last seed hit it was built from.
 #[derive(Clone, Copy, Debug)]
 struct Window {
@@ -392,7 +396,7 @@ struct Window {
 impl Window {
     /// For the gap solver travelling forwards from read `q`, genome `t`: (position, length,
     /// read offset that goes with the window's start, 0 for the usual band).
-    fn forward(&self, q: u32, t: u32) -> (u32, u32, i64, i64) {
+    fn forward(&self, q: u32, t: u32) -> SolverWindow {
         (
             self.s - t,
             self.e - self.s,
@@ -401,7 +405,7 @@ impl Window {
         )
     }
     /// The same travelling backwards from read `q`, genome `t`.
-    fn backward(&self, q: u32, t: u32) -> (u32, u32, i64, i64) {
+    fn backward(&self, q: u32, t: u32) -> SolverWindow {
         let (lq, lt) = (self.l.q + self.l.ql as u32, self.l.t + self.l.tl as u32);
         (
             t - self.e,
@@ -724,7 +728,7 @@ impl<'a> Mapper<'a> {
                 let m = q1.saturating_sub(q0) as usize;
                 let mut done = false;
                 if (!wins.is_empty() || self.index.junctions.is_some()) && q1 > q0 && t1 > t0 && m <= 600 {
-                    let mut vw: Vec<(u32, u32, i64, i64)> = wins.iter().map(|w| w.forward(q0, t0)).collect();
+                    let mut vw: Vec<SolverWindow> = wins.iter().map(|w| w.forward(q0, t0)).collect();
                     vw.extend(self.known_exons(t0, t1, m));
                     vw.sort_by_key(|w| w.0);
                     let rv = ReadView { q: q0, rev: false };
@@ -764,7 +768,7 @@ impl<'a> Mapper<'a> {
                     let sites = self.site_windows(read, q0, t0, q1, t1, minus, sc);
                     if !sites.is_empty() {
                         sc.stats.site_tried += (minus == strands[0]) as u64;
-                        let vw: Vec<(u32, u32, i64, i64)> = sites.iter().map(|w| w.forward(q0, t0)).collect();
+                        let vw: Vec<SolverWindow> = sites.iter().map(|w| w.forward(q0, t0)).collect();
                         let rv = ReadView { q: q0, rev: false };
                         let gv = View {
                             origin: t0,
@@ -1011,7 +1015,7 @@ impl<'a> Mapper<'a> {
                     let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
                     windows_of(&hits, q + slack, q + m as u32, t, hi, 4)
                 };
-                let vw: Vec<(u32, u32, i64, i64)> = if left {
+                let vw: Vec<SolverWindow> = if left {
                     wins.iter().rev().map(|w| w.backward(q, t)).collect()
                 } else {
                     wins.iter().map(|w| w.forward(q, t)).collect()
@@ -1028,7 +1032,7 @@ impl<'a> Mapper<'a> {
                     let mut all = vw.clone();
                     all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
                     let base = all.len();
-                    let mut tried: Vec<(u32, u32, i64, i64)> = Vec::new();
+                    let mut tried: Vec<SolverWindow> = Vec::new();
                     for near in [true, false] {
                         let sites =
                             self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, near, sc);
@@ -1259,14 +1263,14 @@ impl<'a> Mapper<'a> {
     /// Known exons inside the intron `(t0, t1)` that the read bases of a gap of `m` bases could
     /// hold, as windows for the gap solver (searched over the whole gap, since nothing says
     /// where in the read they fall).
-    fn known_exons(&self, t0: u32, t1: u32, m: usize) -> Vec<(u32, u32, i64, i64)> {
+    fn known_exons(&self, t0: u32, t1: u32, m: usize) -> Vec<SolverWindow> {
         let Some(j) = &self.index.junctions else {
             return Vec::new();
         };
         if t1 < t0 + 60 {
             return Vec::new();
         }
-        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
+        let mut out: Vec<SolverWindow> = Vec::new();
         for &(s, e) in j.exons_in(t0 + 20, t1 - 20) {
             if e + 20 <= t1 && (e - s) as usize <= m + 20 && out.len() < 12 {
                 out.push((s - t0, e - s, 0, m as i64 + (e - s) as i64));
@@ -1277,13 +1281,13 @@ impl<'a> Mapper<'a> {
 
     /// Windows past a read end that known junctions lead to: introns that start within a few
     /// bases of where the plain extension stopped (`p_end`, in the view's coordinates).
-    fn known_hops(&self, gv: View, p_end: u32, reached: usize, k: usize) -> Vec<(u32, u32, i64, i64)> {
+    fn known_hops(&self, gv: View, p_end: u32, reached: usize, k: usize) -> Vec<SolverWindow> {
         let Some(j) = &self.index.junctions else {
             return Vec::new();
         };
         let x = gv.real(p_end);
         let vl = (k as u32 + 12).min(300);
-        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
+        let mut out: Vec<SolverWindow> = Vec::new();
         if gv.rev {
             // travelling backwards: introns whose right end is near x; the next exon ends at
             // their left end
@@ -1320,7 +1324,7 @@ impl<'a> Mapper<'a> {
         minus: bool,
         near: bool,
         sc: &mut Scratch,
-    ) -> Vec<(u32, u32, i64, i64)> {
+    ) -> Vec<SolverWindow> {
         const MARGIN: usize = 4;
         let ix = self.index;
         let start = reached.saturating_sub(MARGIN);
@@ -1338,7 +1342,7 @@ impl<'a> Mapper<'a> {
         let probe: Vec<u8> = (0..k.min(28 + 2 * MARGIN))
             .map(|i| rv.base(read, start + i))
             .collect();
-        let mut found: Vec<(usize, u32, (u32, u32, i64, i64))> = Vec::new();
+        let mut found: Vec<(usize, u32, SolverWindow)> = Vec::new();
         // Where an intron can end in the direction of travel: travelling forwards, after an
         // acceptor (AG, or AC for a reverse-strand transcript); backwards, before a donor (GT,
         // or CT).
