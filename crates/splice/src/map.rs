@@ -99,6 +99,10 @@ pub struct Scratch {
     gap: crate::gap::Bufs,
     /// Level-2 cores of the read, per orientation, in read order.
     l2: [Vec<L2Seed>; 2],
+    /// Level-3 cores of the read, per orientation.
+    l3: [Vec<L2Seed>; 2],
+    /// Whether the last mapping pass had any seed hit to chain.
+    had_hits: bool,
     /// Marks the level-2 label ids wanted by the rescue under way (indexed by id).
     want: Vec<u32>,
     /// Counters for reports.
@@ -520,6 +524,10 @@ impl<'a> Mapper<'a> {
             h.first()
                 .map_or(0, |h| h.blocks.iter().map(|b| b.qe - b.qs).sum::<u32>())
         };
+        if read.len() < 30 {
+            return Vec::new();
+        }
+        self.seed(read, sc);
         let mut hits = self.map_with(read, self.opt.cap, false, sc);
         // A read that level 3 anchors weakly (no hit, three anchors or fewer, or under 60% of
         // the read covered) is seeded again with pairs of level-2 cores as well.
@@ -531,20 +539,17 @@ impl<'a> Mapper<'a> {
                 hits = again;
             }
         }
-        if !hits.is_empty() || self.opt.cap >= self.opt.cap_retry {
+        // Still nothing, and nothing even to chain: allow the repetitive seeds too. (A read whose
+        // chains all failed does not get better from more repeats.)
+        if !hits.is_empty() || sc.had_hits || self.opt.cap >= self.opt.cap_retry {
             return hits;
         }
-        // Still nothing: allow the repetitive seeds too.
         self.map_with(read, self.opt.cap_retry, true, sc)
     }
 
-    fn map_with(&self, read: &[u8], cap: usize, pairs: bool, sc: &mut Scratch) -> Vec<SplicedHit> {
+    /// Seed the read once, in both orientations: level-3 and level-2 cores with raw coordinates.
+    fn seed(&self, read: &[u8], sc: &mut Scratch) {
         let ix = self.index;
-        sc.gap.reset();
-        let n = read.len();
-        if n < 30 {
-            return Vec::new();
-        }
         // Both orientations as codes; other symbols read as A.
         sc.codes[0].clear();
         sc.codes[0].extend(read.iter().map(|&b| code(b) & 3));
@@ -553,8 +558,6 @@ impl<'a> Mapper<'a> {
         sc.codes[1].extend(fw.iter().rev().map(|&c| 3 - c));
         sc.codes[0] = fw;
 
-        let mut out: Vec<SplicedHit> = Vec::new();
-        let mut cands: Vec<(f32, bool, Vec<Anchor>)> = Vec::new();
         for o in 0..2 {
             let ascii: Vec<u8> = sc.codes[o].iter().map(|&c| b"ACGT"[c as usize]).collect();
             // Raw coordinates of a core: its span, the length of its first homopolymer run and
@@ -585,7 +588,19 @@ impl<'a> Mapper<'a> {
                     }
                 }
             };
-            let seeds = self.seeder.seed_parsed(parsed);
+            sc.l3[o].clear();
+            for s in self.seeder.seed_parsed(parsed) {
+                let (qs, qe, q_in, q_out, runs) = coords(s.start, s.end);
+                sc.l3[o].push(L2Seed {
+                    q: qs,
+                    ql: (qe - qs).min(u16::MAX as u32) as u16,
+                    q_in,
+                    q_out,
+                    runs,
+                    id: 0,
+                    label: s.label,
+                });
+            }
             sc.l2[o].clear();
             for s in self.seeder2.seed_parsed(parsed) {
                 if let Some(id) = ix.l2_id(s.label) {
@@ -601,24 +616,26 @@ impl<'a> Mapper<'a> {
                     });
                 }
             }
+        }
+    }
+
+    fn map_with(&self, read: &[u8], cap: usize, pairs: bool, sc: &mut Scratch) -> Vec<SplicedHit> {
+        let ix = self.index;
+        sc.gap.reset();
+        let n = read.len();
+        let mut out: Vec<SplicedHit> = Vec::new();
+        let mut cands: Vec<(f32, bool, Vec<Anchor>)> = Vec::new();
+        sc.had_hits = false;
+        for o in 0..2 {
             sc.hits.clear();
-            for s in &seeds {
+            for s in &sc.l3[o] {
                 let (pos, len) = ix.occurrences(s.label);
                 if pos.is_empty() || pos.len() > cap {
                     continue;
                 }
-                let (qs, qe, q_in, q_out, _) = coords(s.start, s.end);
-                let w = (qe - qs).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
+                let w = (s.ql as u32).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
                 for (&t, &tl) in pos.iter().zip(len) {
-                    sc.hits.push(Anchor {
-                        t,
-                        q: qs,
-                        ql: (qe - qs).min(u16::MAX as u32) as u16,
-                        tl: tl as u16,
-                        q_in,
-                        q_out,
-                        w,
-                    });
+                    sc.hits.push(Anchor { t, q: s.q, ql: s.ql, tl: tl as u16, q_in: s.q_in, q_out: s.q_out, w });
                 }
             }
             if pairs && ix.has_pairs() {
@@ -649,6 +666,7 @@ impl<'a> Mapper<'a> {
             if sc.hits.is_empty() {
                 continue;
             }
+            sc.had_hits = true;
             sc.hits.sort_unstable_by_key(|a| (a.t, a.q));
             // Loci: runs of hits no further apart than the longest intron.
             let mut loci: Vec<(f32, usize, usize)> = Vec::new();
