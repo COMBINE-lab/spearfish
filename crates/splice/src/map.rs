@@ -526,8 +526,8 @@ fn windows_of(
     let end = |a: Anchor| a.t + a.tl as u32;
     // A group's wish: its hits widened by the read bases they leave uncovered on each side.
     let wish = |g: &(Anchor, Anchor, u32)| {
-        let lead = g.0.q.saturating_sub(q_lo).min(150) + 12;
-        let trail = q_hi.saturating_sub(g.1.q + g.1.ql as u32).min(150) + 12;
+        let lead = g.0.q.saturating_sub(q_lo).min(400) + 12;
+        let trail = q_hi.saturating_sub(g.1.q + g.1.ql as u32).min(400) + 12;
         (g.0.t.saturating_sub(lead), end(g.1) + trail)
     };
     // Strongest groups first; a group whose hits overlap a stronger group's hits is dropped.
@@ -1035,12 +1035,18 @@ impl<'a> Mapper<'a> {
                     // Then, if junctions were given, the known exons inside this intron on their
                     // own, believed only when every junction of the solution is a known one.
                     let mut found = false;
+                    // what a junction of this length costs on a clean read: an answer above it
+                    // still leaves something unexplained
+                    let fine = 18 + m as u32 * self.opt.trigger_x64 / 64;
                     for (min_hits, from_known) in [(2u32, false), (0, false), (0, true)] {
-                        if (from_known && known.is_empty())
+                        // the lone hits are tried when the junction is clearly bad, and also when
+                        // the well-supported candidates gave an answer that is still a poor fit
+                        // (a second exon may be missing in the same gap)
+                        let lone_too = hard || (found && s.cost >= fine);
+                        if (from_known && (known.is_empty() || found))
                             || (!from_known && wins.is_empty())
                             || (!from_known && min_hits == 2 && strong == 0)
-                            || (!from_known && min_hits == 0 && !hard)
-                            || (!from_known && min_hits == 0 && strong == wins.len() && s.cost != u32::MAX)
+                            || (!from_known && min_hits == 0 && (!lone_too || strong == wins.len()))
                         {
                             continue;
                         }
@@ -1053,7 +1059,7 @@ impl<'a> Mapper<'a> {
                                 .collect()
                         };
                         vw.sort_by_key(|w| w.0);
-                        s = gap::solve(
+                        let t = gap::solve(
                             self.index,
                             read,
                             rv,
@@ -1065,12 +1071,20 @@ impl<'a> Mapper<'a> {
                             half,
                             &mut sc.gap,
                         );
-                        if s.hops.len() > 1
-                            && s.cost < (direct.cost as u32).min(1 << 20)
-                            && (!from_known || self.hop_margin(&s, minus) <= 4)
+                        let limit = if found {
+                            s.cost
+                        } else {
+                            (direct.cost as u32).min(1 << 20)
+                        };
+                        if t.hops.len() > 1
+                            && t.cost < limit
+                            && (!from_known || self.hop_margin(&t, minus) <= 4)
                         {
                             found = true;
-                            break;
+                            s = t;
+                            if s.cost < fine {
+                                break;
+                            }
                         }
                     }
                     if found {
