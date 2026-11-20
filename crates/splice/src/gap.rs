@@ -131,8 +131,8 @@ pub(crate) struct Bufs {
 ///
 /// `far` is the real genome position of the far fixed point (the read bases then end exactly
 /// there; `gv` and `rv` must be forward); without it the read end is free and unexplained
-/// bases are clipped. `windows` are candidate exons as (view position, length), in travel
-/// order and not overlapping. `minus` is the transcript strand.
+/// bases are clipped. `windows` are candidate exons as (view position, length, read offset
+/// that goes with the window's start), in travel order and not overlapping. `minus` is the transcript strand.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve(
     ix: &GenomeIndex,
@@ -141,7 +141,7 @@ pub(crate) fn solve(
     m: usize,
     gv: View,
     far: Option<u32>,
-    windows: &[(u32, u32)],
+    windows: &[(u32, u32, i64)],
     minus: bool,
     min_gap: u32,
     b: &mut Bufs,
@@ -198,43 +198,58 @@ pub(crate) fn solve(
     // have left the genome there, through this window or not.
     let mut lev_p: Vec<Vec<u32>> = vec![curp.clone()];
     let mut via: Vec<Vec<Option<(u32, u32)>>> = Vec::new();
-    for &(vs, vl) in windows {
+    for &(vs, vl, i0) in windows {
         let vl = vl as usize;
-        let cols = vl + 1;
+        // Only cells near the diagonal the window's seed hits lie on: window position j goes
+        // with read position i0 + j, give or take `wb`.
+        let wb = 16 + vl as i64 / 16;
+        let ww = (2 * wb + 1) as usize;
+        let i_lo = (i0 - wb).clamp(0, m as i64) as usize;
+        let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
+        let rows = i_hi - i_lo + 1;
         b.c.clear();
-        b.c.resize((m + 1) * cols, BIG);
+        b.c.resize(rows * ww, BIG);
         b.o.clear();
-        b.o.resize((m + 1) * cols, (0, 0));
-        let enter: Vec<u32> = (0..cols)
+        b.o.resize(rows * ww, (0, 0));
+        let enter: Vec<u32> = (0..=vl)
             .map(|j| EXTRA_INTRON + gv.enter(ix, vs + j as u32, minus))
             .collect();
-        let leave: Vec<u32> = (0..cols).map(|j| gv.leave(ix, vs + j as u32, minus)).collect();
+        let leave: Vec<u32> = (0..=vl).map(|j| gv.leave(ix, vs + j as u32, minus)).collect();
         let gb: Vec<u8> = (0..vl).map(|j| gv.base(ix, vs + j as u32)).collect();
         let mut next = cur.clone();
         let mut nextp = curp.clone();
         let mut v: Vec<Option<(u32, u32)>> = vec![None; m + 1];
-        for i in 0..=m {
+        for i in i_lo..=i_hi {
             let ri = if i > 0 { rv.base(read, i - 1) } else { 0 };
-            for j in 0..cols {
-                let at = i * cols + j;
+            let row = (i - i_lo) * ww;
+            for k in 0..ww {
+                let j = i as i64 - i0 + k as i64 - wb;
+                if j < 0 || j > vl as i64 {
+                    continue;
+                }
+                let j = j as usize;
+                let at = row + k;
                 // enter here, if the genome was left far enough before this point
                 let (mut c, mut o) = if cur[i] < BIG && vs + j as u32 >= curp[i] + min_gap {
                     (cur[i] + enter[j], (i as u16, j as u16))
                 } else {
                     (BIG, (0, 0))
                 };
-                if i > 0 && j > 0 {
-                    let d = b.c[at - cols - 1] + if ri != gb[j - 1] { MISMATCH as u32 } else { 0 };
-                    if d < c {
-                        c = d;
-                        o = b.o[at - cols - 1];
+                if i > i_lo {
+                    // (i - 1, j - 1) is the same k one row up; (i - 1, j) is k + 1 there
+                    if j > 0 {
+                        let d = b.c[at - ww] + if ri != gb[j - 1] { MISMATCH as u32 } else { 0 };
+                        if d < c {
+                            c = d;
+                            o = b.o[at - ww];
+                        }
+                    }
+                    if k + 1 < ww && b.c[at - ww + 1] + INS < c {
+                        c = b.c[at - ww + 1] + INS;
+                        o = b.o[at - ww + 1];
                     }
                 }
-                if i > 0 && b.c[at - cols] + INS < c {
-                    c = b.c[at - cols] + INS;
-                    o = b.o[at - cols];
-                }
-                if j > 0 && b.c[at - 1] + DEL < c {
+                if k > 0 && j > 0 && b.c[at - 1] + DEL < c {
                     c = b.c[at - 1] + DEL;
                     o = b.o[at - 1];
                 }

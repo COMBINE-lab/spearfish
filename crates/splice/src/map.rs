@@ -290,12 +290,42 @@ struct EndSolved {
     minus: Option<bool>,
 }
 
-/// Candidate exon windows (genome start, end) from level-2 hits in genome order. Hits that
+/// A candidate exon: genome interval and the first and last seed hit it was built from.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    s: u32,
+    e: u32,
+    f: Anchor,
+    l: Anchor,
+}
+
+impl Window {
+    /// For the gap solver travelling forwards from read `q`, genome `t`: (position, length,
+    /// read offset that goes with the window's start).
+    fn forward(&self, q: u32, t: u32) -> (u32, u32, i64) {
+        (
+            self.s - t,
+            self.e - self.s,
+            (self.f.q as i64 - q as i64) - (self.f.t - self.s) as i64,
+        )
+    }
+    /// The same travelling backwards from read `q`, genome `t`.
+    fn backward(&self, q: u32, t: u32) -> (u32, u32, i64) {
+        let (lq, lt) = (self.l.q + self.l.ql as u32, self.l.t + self.l.tl as u32);
+        (
+            t - self.e,
+            self.e - self.s,
+            (q as i64 - lq as i64) - (self.e - lt) as i64,
+        )
+    }
+}
+
+/// Candidate exon windows from level-2 hits in genome order. Hits that
 /// continue one another on the same diagonal form one group; the groups with the most hits are
 /// kept (at most `MAX_WINDOWS`), since a chance hit is usually alone. A window reaches past its
 /// hits by the read bases they leave uncovered on that side (the exon's edge can lie anywhere
 /// in them), but not past the midpoint to the next group, and stays inside `(t_lo, t_hi)`.
-fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Vec<(u32, u32)> {
+fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Vec<Window> {
     const MAX_WINDOWS: usize = 8;
     // groups as (first hit, last hit, hits)
     let mut groups: Vec<(Anchor, Anchor, u32)> = Vec::new();
@@ -330,7 +360,7 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
     let end = |a: Anchor| a.t + a.tl as u32;
     // midpoints, computed without overflowing 32 bits
     let mid = |a: u32, b: u32| a + b.saturating_sub(a) / 2;
-    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut out: Vec<Window> = Vec::new();
     for (k, &(f, l, _)) in groups.iter().enumerate() {
         let lead = f.q.saturating_sub(q_lo).min(150) + 12;
         let trail = q_hi.saturating_sub(l.q + l.ql as u32).min(150) + 12;
@@ -339,7 +369,7 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
         } else {
             t_lo + 20
         };
-        let lo = lo.max(out.last().map_or(0, |w| w.1));
+        let lo = lo.max(out.last().map_or(0, |w| w.e));
         let hi = if k + 1 < groups.len() {
             mid(end(l), groups[k + 1].0.t)
         } else {
@@ -348,7 +378,7 @@ fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Ve
         let s = f.t.saturating_sub(lead).max(lo);
         let e = (end(l) + trail).min(hi);
         if e > s + 4 && e - s <= 2000 {
-            out.push((s, e));
+            out.push(Window { s, e, f, l });
         }
     }
     out
@@ -565,7 +595,7 @@ impl<'a> Mapper<'a> {
         };
         // Where a junction leaves read bases unexplained, look for level-2 cores of those bases
         // inside that intron and solve the gap through the exons they point to.
-        let mut cand: Vec<Option<Vec<(u32, u32)>>> = vec![None; pairs.len()];
+        let mut cand: Vec<Option<Vec<Window>>> = vec![None; pairs.len()];
         let mut best: Option<(u32, bool, Vec<Placed>)> = None;
         for &minus in &strands {
             let mut total = 0u32;
@@ -588,7 +618,7 @@ impl<'a> Mapper<'a> {
                 let m = q1.saturating_sub(q0) as usize;
                 let mut done = false;
                 if !wins.is_empty() && q1 > q0 && t1 > t0 && m <= 600 {
-                    let vw: Vec<(u32, u32)> = wins.iter().map(|&(s, e)| (s - t0, e - s)).collect();
+                    let vw: Vec<(u32, u32, i64)> = wins.iter().map(|w| w.forward(q0, t0)).collect();
                     let rv = ReadView { q: q0, rev: false };
                     let gv = View {
                         origin: t0,
@@ -832,17 +862,21 @@ impl<'a> Mapper<'a> {
                 );
             }
             if !wins.is_empty() {
-                let vw: Vec<(u32, u32)> = if left {
-                    wins.iter().rev().map(|&(s, e)| (t - e, e - s)).collect()
+                let vw: Vec<(u32, u32, i64)> = if left {
+                    wins.iter().rev().map(|w| w.backward(q, t)).collect()
                 } else {
-                    wins.iter().map(|&(s, e)| (s - t, e - s)).collect()
+                    wins.iter().map(|w| w.forward(q, t)).collect()
                 };
                 for &mi in strands {
                     let s = gap::solve(ix, read, rv, m, gv, None, &vw, mi, half, &mut sc.gap);
                     if std::env::var_os("GMAP_DEBUG").is_some() {
                         eprintln!(
-                            "end left={left} q={q} t={t} m={m} minus={mi} windows={wins:?} plain={} cost={} hops={:?} end={:?}",
-                            best.0.cost, s.cost, s.hops, s.end
+                            "end left={left} q={q} t={t} m={m} minus={mi} windows={} plain={} cost={} hops={:?} end={:?}",
+                            wins.len(),
+                            best.0.cost,
+                            s.cost,
+                            s.hops,
+                            s.end
                         );
                     }
                     if !s.hops.is_empty() && s.cost < best.0.cost {
