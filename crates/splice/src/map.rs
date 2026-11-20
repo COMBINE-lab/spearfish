@@ -290,38 +290,56 @@ struct EndSolved {
     minus: Option<bool>,
 }
 
-/// Candidate exon windows (genome start, end) from a colinear run of rescued anchors: anchors
-/// that the genome does not separate form one exon. A window reaches past its anchors by the
-/// read bases they leave uncovered on that side (the exon's edge can lie anywhere in them), but
-/// not past the midpoint to the next group. Windows stay inside `(t_lo, t_hi)`.
-fn windows_of(path: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Vec<(u32, u32)> {
-    // groups as (first anchor, last anchor)
-    let mut groups: Vec<(Anchor, Anchor)> = Vec::new();
-    let mut i = 0;
-    while i < path.len() {
-        let mut j = i;
-        while j + 1 < path.len() {
-            let d = (path[j + 1].t - path[j].t) as i64 - (path[j + 1].q - path[j].q) as i64;
-            if d.abs() >= 30 {
-                break;
+/// Candidate exon windows (genome start, end) from level-2 hits in genome order. Hits that
+/// continue one another on the same diagonal form one group; the groups with the most hits are
+/// kept (at most `MAX_WINDOWS`), since a chance hit is usually alone. A window reaches past its
+/// hits by the read bases they leave uncovered on that side (the exon's edge can lie anywhere
+/// in them), but not past the midpoint to the next group, and stays inside `(t_lo, t_hi)`.
+fn windows_of(hits: &[Anchor], q_lo: u32, q_hi: u32, t_lo: u32, t_hi: u32) -> Vec<(u32, u32)> {
+    const MAX_WINDOWS: usize = 8;
+    // groups as (first hit, last hit, hits)
+    let mut groups: Vec<(Anchor, Anchor, u32)> = Vec::new();
+    for &h in hits {
+        let mut joined = false;
+        for g in groups.iter_mut().rev().take(4) {
+            let l = g.1;
+            if h.q > l.q && h.t > l.t && h.t - l.t < 2000 {
+                let d = (h.t - l.t) as i64 - (h.q - l.q) as i64;
+                if d.abs() < 30 {
+                    g.1 = h;
+                    g.2 += 1;
+                    joined = true;
+                    break;
+                }
             }
-            j += 1;
         }
-        groups.push((path[i], path[j]));
-        i = j + 1;
+        if !joined {
+            groups.push((h, h, 1));
+        }
     }
+    if groups.len() > MAX_WINDOWS {
+        let mut by: Vec<usize> = (0..groups.len()).collect();
+        by.sort_by_key(|&k| {
+            std::cmp::Reverse((groups[k].2, groups[k].1.q + groups[k].1.ql as u32 - groups[k].0.q))
+        });
+        by.truncate(MAX_WINDOWS);
+        by.sort_unstable();
+        groups = by.into_iter().map(|k| groups[k]).collect();
+    }
+    groups.sort_by_key(|g| g.0.t);
     let end = |a: Anchor| a.t + a.tl as u32;
+    // midpoints, computed without overflowing 32 bits
+    let mid = |a: u32, b: u32| a + b.saturating_sub(a) / 2;
     let mut out: Vec<(u32, u32)> = Vec::new();
-    for (k, &(f, l)) in groups.iter().enumerate() {
+    for (k, &(f, l, _)) in groups.iter().enumerate() {
         let lead = f.q.saturating_sub(q_lo).min(150) + 12;
         let trail = q_hi.saturating_sub(l.q + l.ql as u32).min(150) + 12;
-        // midpoints, computed without overflowing 32 bits
-        let mid = |a: u32, b: u32| a + b.saturating_sub(a) / 2;
         let lo = if k > 0 {
             mid(end(groups[k - 1].1), f.t) + 1
         } else {
             t_lo + 20
         };
+        let lo = lo.max(out.last().map_or(0, |w| w.1));
         let hi = if k + 1 < groups.len() {
             mid(end(l), groups[k + 1].0.t)
         } else {
@@ -600,6 +618,12 @@ impl<'a> Mapper<'a> {
                         }));
                         done = true;
                     }
+                }
+                if std::env::var_os("GMAP_DEBUG").is_some() {
+                    eprintln!(
+                        "gap q0={q0} q1={q1} t0={t0} t1={t1} minus={minus} direct={} windows={wins:?} done={done}",
+                        direct.cost
+                    );
                 }
                 if !done {
                     sc.stats.not_cheaper += (minus == strands[0]) as u64;
@@ -890,8 +914,8 @@ impl<'a> Mapper<'a> {
 
     /// Level-2 anchors for read bases the chain leaves unexplained, searched only where they can
     /// lie: between chain neighbours `a` and `b`, or, when one of them is missing, within the
-    /// longest intron's reach past the chain's first or last anchor. Returns the best colinear
-    /// run, or nothing.
+    /// longest intron's reach past the chain's first or last anchor. Returns every hit, in genome
+    /// order.
     fn rescue(
         &self,
         reverse: bool,
@@ -960,48 +984,7 @@ impl<'a> Mapper<'a> {
         for s in &seeds[lo..hi] {
             sc.want[s.id as usize] = u32::MAX;
         }
-        if hits.is_empty() {
-            return hits;
-        }
-        // Best path a -> hits... -> b (hits are in genome order).
-        let n = hits.len();
-        let mut f = vec![0f32; n];
-        let mut back = vec![u32::MAX; n];
-        let (mut best, mut best_i) = (
-            match (a, b) {
-                (Some(a), Some(b)) => self.step(a, b),
-                _ => 0.0,
-            },
-            u32::MAX,
-        );
-        for j in 0..n {
-            let h = hits[j];
-            f[j] = a.map_or(h.ql as f32, |a| self.step(a, h));
-            for i in j.saturating_sub(40)..j {
-                let p = hits[i];
-                if p.q + p.ql as u32 > h.q || p.t + p.tl as u32 > h.t {
-                    continue;
-                }
-                let v = f[i] + self.step(p, h);
-                if v > f[j] {
-                    f[j] = v;
-                    back[j] = i as u32;
-                }
-            }
-            let v = f[j] + b.map_or(0.0, |b| self.step(h, b));
-            if v > best {
-                best = v;
-                best_i = j as u32;
-            }
-        }
-        let mut path = Vec::new();
-        let mut i = best_i;
-        while i != u32::MAX {
-            path.push(hits[i as usize]);
-            i = back[i as usize];
-        }
-        path.reverse();
-        path
+        hits
     }
 
     /// The corresponding read/genome points a junction after anchor `a` and before anchor `b`
