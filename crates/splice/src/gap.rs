@@ -149,13 +149,20 @@ pub(crate) struct Bufs {
     e1: Vec<u16>,
     e2: Vec<u16>,
     tmp: Vec<u16>,
-    c: Vec<u32>,
-    o: Vec<(u16, u16)>,
     /// What `e1` (and `e2`) currently hold: the tables depend only on where the read and the
     /// genome start, the direction, the length and the far point, not on the strand or the
     /// windows, so repeated solves of one gap reuse them.
     key1: Option<(u32, bool, usize, u32, Option<u32>)>,
     key2: Option<(u32, bool, usize, u32, Option<u32>)>,
+    /// Level 0 and the far side, cached per tables and strand.
+    l0_key: Option<(Option<(u32, bool, usize, u32, Option<u32>)>, bool)>,
+    l0_cur: Vec<u32>,
+    l0_p: Vec<u32>,
+    l0_end: (u32, usize, u32),
+    r_key: Option<(Option<(u32, bool, usize, u32, Option<u32>)>, bool)>,
+    r_cost: Vec<u32>,
+    r_j: Vec<u32>,
+    r_leave: Vec<u32>,
     /// Work counters: solves, prefix-table cells filled, window cells filled.
     pub calls: u64,
     pub prefix_cells: u64,
@@ -167,6 +174,8 @@ impl Bufs {
     pub fn reset(&mut self) {
         self.key1 = None;
         self.key2 = None;
+        self.l0_key = None;
+        self.r_key = None;
     }
 }
 
@@ -214,36 +223,45 @@ pub(crate) fn solve(
         b.key1 = key;
     }
     // Level 0: the upstream exon alone. cur[i] = cost of read[..i] and of leaving at p[i].
-    let mut cur = vec![BIG; m + 1];
-    let mut curp = vec![0u32; m + 1];
+    // It depends on the tables and the strand only, so repeated solves of one gap reuse it.
+    if b.l0_key != Some((key, minus)) {
+        b.l0_cur.clear();
+        b.l0_cur.resize(m + 1, BIG);
+        b.l0_p.clear();
+        b.l0_p.resize(m + 1, 0);
+        b.l0_end = (BIG, 0, 0);
+        let leave0: Vec<u32> = (0..=n).map(|j| gv.leave(ix, j as u32, minus)).collect();
+        for i in 0..=m {
+            let mut end = (INF as u32, 0u32);
+            let (j_lo, j_hi) = (i.saturating_sub(band), (i + band).min(n));
+            for j in j_lo..=j_hi {
+                let e = b.e1[i * w + j + band - i] as u32;
+                if e >= INF as u32 {
+                    continue;
+                }
+                let c = e + leave0[j];
+                if c < b.l0_cur[i] {
+                    b.l0_cur[i] = c;
+                    b.l0_p[i] = j as u32;
+                }
+                if e < end.0 || (e == end.0 && j.abs_diff(i) < (end.1 as usize).abs_diff(i)) {
+                    end = (e, j as u32);
+                }
+            }
+            if end.0 < INF as u32 {
+                let c = end.0 + CLIP * (m - i) as u32;
+                if c < b.l0_end.0 {
+                    b.l0_end = (c, i, end.1);
+                }
+            }
+        }
+        b.l0_key = Some((key, minus));
+    }
+    let mut cur = b.l0_cur.clone();
+    let mut curp = b.l0_p.clone();
     let mut best_end = (BIG, 0usize, 0usize, 0u32, None::<(u32, u32)>); // cost, level, i, end p, entry
-    let leave0: Vec<u32> = (0..=n).map(|j| gv.leave(ix, j as u32, minus)).collect();
-    for i in 0..=m {
-        let mut end = (INF as u32, 0u32);
-        for k in 0..w {
-            let j = (i + k) as isize - band as isize;
-            if j < 0 || j as usize > n {
-                continue;
-            }
-            let e = b.e1[i * w + k] as u32;
-            if e >= INF as u32 {
-                continue;
-            }
-            let c = e + leave0[j as usize];
-            if c < cur[i] {
-                cur[i] = c;
-                curp[i] = j as u32;
-            }
-            if e < end.0 || (e == end.0 && (j as usize).abs_diff(i) < (end.1 as usize).abs_diff(i)) {
-                end = (e, j as u32);
-            }
-        }
-        if far.is_none() && end.0 < INF as u32 {
-            let c = end.0 + CLIP * (m - i) as u32;
-            if c < best_end.0 {
-                best_end = (c, 0, i, end.1, None);
-            }
-        }
+    if far.is_none() && b.l0_end.0 < BIG {
+        best_end = (b.l0_end.0, 0, b.l0_end.1, b.l0_end.2, None);
     }
     // Candidate exons, one level each. A level keeps, per read position, the cheapest way to
     // have left the genome there, through this window or not.
@@ -259,10 +277,6 @@ pub(crate) fn solve(
         let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
         let rows = i_hi - i_lo + 1;
         b.window_cells += (rows * ww) as u64;
-        b.c.clear();
-        b.c.resize(rows * ww, BIG);
-        b.o.clear();
-        b.o.resize(rows * ww, (0, 0));
         let enter: Vec<u32> = (0..=vl)
             .map(|j| EXTRA_INTRON + gv.enter(ix, vs + j as u32, minus))
             .collect();
@@ -271,85 +285,120 @@ pub(crate) fn solve(
         let mut next = cur.clone();
         let mut nextp = curp.clone();
         let mut v: Vec<Option<(u32, u32)>> = vec![None; m + 1];
-        // Affine gaps, as outside the windows: `up` holds, per k, the best cost of a cell that
-        // ends in read bases left out (and where that path entered the window).
-        let mut up: Vec<(u32, (u16, u16))> = vec![(BIG, (0, 0)); ww];
+        // Affine gaps, as outside the windows. Only two rows are kept: every cell carries where
+        // its path entered the window (read position and window position, packed), so no table
+        // is walked back. `uc`/`uo` hold, per k, the best cost of a cell of the row above that
+        // ends in read bases left out.
         let open_del = (GAP_OPEN + GAP_EXT) as u32;
         let open_ins = (GAP_OPEN + INS_EXT) as u32;
+        let (ins_ext, del_ext, mismatch) = (INS_EXT as u32, GAP_EXT as u32, MISMATCH as u32);
+        let (mut pc, mut po) = (vec![BIG; ww], vec![0u32; ww]);
+        let (mut cc, mut co) = (vec![BIG; ww], vec![0u32; ww]);
+        let (mut uc, mut uo) = (vec![BIG; ww], vec![0u32; ww]);
         for i in i_lo..=i_hi {
             let ri = if i > 0 { rv.base(read, i - 1) } else { 0 };
-            let row = (i - i_lo) * ww;
-            let mut left = (BIG, (0u16, 0u16)); // ends in genome bases skipped
-            for k in 0..ww {
-                let j = i as i64 - i0 + k as i64 - wb;
-                if j < 0 || j > vl as i64 {
-                    left = (BIG, (0, 0));
-                    up[k] = (BIG, (0, 0));
-                    continue;
+            // window position j = base_j + k
+            let base_j = i as i64 - i0 - wb;
+            let k_lo = (-base_j).max(0) as usize;
+            let k_hi = (vl as i64 - base_j).min(ww as i64 - 1);
+            cc.fill(BIG);
+            if k_hi < k_lo as i64 {
+                uc.fill(BIG);
+                std::mem::swap(&mut pc, &mut cc);
+                std::mem::swap(&mut po, &mut co);
+                continue;
+            }
+            let k_hi = k_hi as usize;
+            // entering here is allowed where the genome was left far enough before
+            let entry_ok = cur[i] < BIG;
+            let j_min = (curp[i] + min_gap).saturating_sub(vs) as usize;
+            let first_row = i == i_lo;
+            let (mut left_c, mut left_o) = (BIG, 0u32);
+            let (mut bl, mut blj, mut blo) = (next[i], usize::MAX, 0u32);
+            let (mut be, mut bej, mut beo) = (BIG, 0usize, 0u32);
+            for k in k_lo..=k_hi {
+                let j = (base_j + k as i64) as usize;
+                let (mut c, mut o) = if entry_ok && j >= j_min {
+                    (cur[i] + enter[j], ((i as u32) << 16) | j as u32)
+                } else {
+                    (BIG, 0)
+                };
+                // (i - 1, j) is k + 1 in the row above
+                let (fc, fo) = if !first_row && k + 1 < ww {
+                    let (ext, opn) = (uc[k + 1] + ins_ext, pc[k + 1] + open_ins);
+                    if ext <= opn {
+                        (ext, uo[k + 1])
+                    } else {
+                        (opn, po[k + 1])
+                    }
+                } else {
+                    (BIG, 0)
+                };
+                if k > k_lo {
+                    let (ext, opn) = (left_c + del_ext, cc[k - 1] + open_del);
+                    if ext <= opn {
+                        left_c = ext;
+                    } else {
+                        left_c = opn;
+                        left_o = co[k - 1];
+                    }
+                } else {
+                    left_c = BIG;
                 }
-                let j = j as usize;
-                let at = row + k;
-                // enter here, if the genome was left far enough before this point
-                let (mut c, mut o) = if cur[i] < BIG && vs + j as u32 >= curp[i] + min_gap {
-                    (cur[i] + enter[j], (i as u16, j as u16))
-                } else {
-                    (BIG, (0, 0))
-                };
-                // (i - 1, j - 1) is the same k one row up; (i - 1, j) is k + 1 there
-                let f = if i > i_lo && k + 1 < ww {
-                    let (ext, opn) = (up[k + 1].0 + INS_EXT as u32, b.c[at - ww + 1] + open_ins);
-                    if ext <= opn {
-                        (ext, up[k + 1].1)
-                    } else {
-                        (opn, b.o[at - ww + 1])
-                    }
-                } else {
-                    (BIG, (0, 0))
-                };
-                left = if k > 0 && j > 0 {
-                    let (ext, opn) = (left.0 + GAP_EXT as u32, b.c[at - 1] + open_del);
-                    if ext <= opn {
-                        (ext, left.1)
-                    } else {
-                        (opn, b.o[at - 1])
-                    }
-                } else {
-                    (BIG, (0, 0))
-                };
-                if i > i_lo && j > 0 {
-                    let d = b.c[at - ww] + if ri != gb[j - 1] { MISMATCH as u32 } else { 0 };
+                // (i - 1, j - 1) is the same k in the row above
+                if !first_row && j > 0 {
+                    let d = pc[k] + if ri != gb[j - 1] { mismatch } else { 0 };
                     if d < c {
                         c = d;
-                        o = b.o[at - ww];
+                        o = po[k];
                     }
                 }
-                if f.0 < c {
-                    c = f.0;
-                    o = f.1;
+                if fc < c {
+                    c = fc;
+                    o = fo;
                 }
-                if left.0 < c {
-                    c = left.0;
-                    o = left.1;
+                if left_c < c {
+                    c = left_c;
+                    o = left_o;
                 }
-                b.c[at] = c.min(BIG);
-                b.o[at] = o;
-                up[k] = (f.0.min(BIG), f.1);
-                if c >= BIG || j as u16 <= o.1 {
-                    continue; // nothing of the window used yet
-                }
-                let entry = Some((o.0 as u32, vs + o.1 as u32));
-                if c + leave[j] < next[i] {
-                    next[i] = c + leave[j];
-                    nextp[i] = vs + j as u32;
-                    v[i] = entry;
-                }
-                if far.is_none() {
-                    let e = c + CLIP * (m - i) as u32;
-                    if e < best_end.0 {
-                        best_end = (e, via.len() + 1, i, vs + j as u32, entry);
+                let c = c.min(BIG);
+                left_c = left_c.min(BIG);
+                cc[k] = c;
+                co[k] = o;
+                uc[k] = fc.min(BIG);
+                uo[k] = fo;
+                if c < BIG && j as u32 > (o & 0xffff) {
+                    // something of the window is used: it can be left here, or the read can end
+                    let l = c + leave[j];
+                    if l < bl {
+                        (bl, blj, blo) = (l, j, o);
+                    }
+                    if c < be {
+                        (be, bej, beo) = (c, j, o);
                     }
                 }
             }
+            uc[..k_lo].fill(BIG);
+            uc[k_hi + 1..].fill(BIG);
+            if blj != usize::MAX {
+                next[i] = bl;
+                nextp[i] = vs + blj as u32;
+                v[i] = Some((blo >> 16, vs + (blo & 0xffff)));
+            }
+            if far.is_none() && be < BIG {
+                let e = be + CLIP * (m - i) as u32;
+                if e < best_end.0 {
+                    best_end = (
+                        e,
+                        via.len() + 1,
+                        i,
+                        vs + bej as u32,
+                        Some((beo >> 16, vs + (beo & 0xffff))),
+                    );
+                }
+            }
+            std::mem::swap(&mut pc, &mut cc);
+            std::mem::swap(&mut po, &mut co);
         }
         cur = next;
         curp = nextp;
@@ -385,23 +434,50 @@ pub(crate) fn solve(
             );
             b.key2 = key;
         }
+        // The far side per number of read bases it takes: its cheapest arrival, cached like
+        // level 0. The pairing with level 0 then costs one addition per read position; only
+        // when that arrival would overlap the place the genome was left is the row searched.
+        if b.r_key != Some((key, minus)) {
+            let far_leave: Vec<u32> = (0..=n).map(|j| fv.leave(ix, j as u32, minus)).collect();
+            b.r_cost.clear();
+            b.r_cost.resize(m + 1, BIG);
+            b.r_j.clear();
+            b.r_j.resize(m + 1, 0);
+            b.r_leave = far_leave;
+            for rest in 0..=m {
+                let (j_lo, j_hi) = (rest.saturating_sub(band), (rest + band).min(n));
+                for j in j_lo..=j_hi {
+                    let e = b.e2[rest * w + j + band - rest] as u32;
+                    if e >= INF as u32 {
+                        continue;
+                    }
+                    let c = e + b.r_leave[j];
+                    if c < b.r_cost[rest] {
+                        b.r_cost[rest] = c;
+                        b.r_j[rest] = j as u32;
+                    }
+                }
+            }
+            b.r_key = Some((key, minus));
+        }
         let mut best = (BIG, 0usize, 0u32);
-        let far_leave: Vec<u32> = (0..=n).map(|j| fv.leave(ix, j as u32, minus)).collect();
         for (x, &c0) in cur.iter().enumerate() {
-            if c0 >= BIG {
+            let rest = m - x;
+            if c0 >= BIG || b.r_cost[rest] >= BIG || c0 + b.r_cost[rest] >= best.0 {
                 continue;
             }
-            let rest = m - x;
-            for k in 0..w {
-                let j = (rest + k) as isize - band as isize;
-                if j < 0 || j as usize > n {
-                    continue;
-                }
-                let e = b.e2[rest * w + k] as u32;
+            let enter = t1 - b.r_j[rest];
+            if gv.real(curp[x]) + min_gap <= enter {
+                best = (c0 + b.r_cost[rest], x, enter);
+                continue;
+            }
+            let (j_lo, j_hi) = (rest.saturating_sub(band), (rest + band).min(n));
+            for j in j_lo..=j_hi {
+                let e = b.e2[rest * w + j + band - rest] as u32;
                 if e >= INF as u32 {
                     continue;
                 }
-                let c = c0 + e + far_leave[j as usize];
+                let c = c0 + e + b.r_leave[j];
                 let enter = t1 - j as u32;
                 if c < best.0 && gv.real(curp[x]) + min_gap <= enter {
                     best = (c, x, enter);
