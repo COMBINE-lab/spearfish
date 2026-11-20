@@ -13,7 +13,10 @@
 //! is solved by the same code as its right end.
 
 use crate::index::GenomeIndex;
-use crate::map::{GAP_EXT, GAP_OPEN, INF, INS_EXT, MISMATCH, acceptor_pen, band_prefix, donor_pen};
+use crate::map::{
+    GAP_EXT, GAP_OPEN, INF, INS_EXT, MISMATCH, acceptor_motif, acceptor_pen, band_prefix, donor_motif,
+    donor_pen,
+};
 
 /// Price of each exon added between two fixed points (besides its splice sites).
 pub(crate) const EXTRA_INTRON: u32 = 20;
@@ -64,6 +67,16 @@ impl View {
         }) as u32
     }
     /// Cost of an intron ending at boundary `p` in the direction of travel.
+    /// The motif part of [`Self::enter`] alone.
+    #[inline]
+    pub fn enter_motif(&self, ix: &GenomeIndex, p: u32, minus: bool) -> u32 {
+        let x = self.real(p);
+        (if self.rev {
+            donor_motif(ix, x, minus)
+        } else {
+            acceptor_motif(ix, x, minus)
+        }) as u32
+    }
     #[inline]
     pub fn enter(&self, ix: &GenomeIndex, p: u32, minus: bool) -> u32 {
         let x = self.real(p);
@@ -145,7 +158,8 @@ impl Bufs {
 /// `far` is the real genome position of the far fixed point (the read bases then end exactly
 /// there; `gv` and `rv` must be forward); without it the read end is free and unexplained
 /// bases are clipped. `windows` are candidate exons as (view position, length, read offset
-/// that goes with the window's start), in travel order; they may overlap. `minus` is the transcript strand.
+/// that goes with the window's start, half-width of the band around that diagonal or 0 for the
+/// usual one), in travel order; they may overlap. `minus` is the transcript strand.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve(
     ix: &GenomeIndex,
@@ -154,7 +168,7 @@ pub(crate) fn solve(
     m: usize,
     gv: View,
     far: Option<u32>,
-    windows: &[(u32, u32, i64)],
+    windows: &[(u32, u32, i64, i64)],
     minus: bool,
     min_gap: u32,
     b: &mut Bufs,
@@ -218,11 +232,11 @@ pub(crate) fn solve(
     // have left the genome there, through this window or not.
     let mut lev_p: Vec<Vec<u32>> = vec![curp.clone()];
     let mut via: Vec<Vec<Option<(u32, u32)>>> = Vec::new();
-    for &(vs, vl, i0) in windows {
+    for &(vs, vl, i0, band) in windows {
         let vl = vl as usize;
         // Only cells near the diagonal the window's seed hits lie on: window position j goes
         // with read position i0 + j, give or take `wb`.
-        let wb = 14 + vl as i64 / 24;
+        let wb = if band > 0 { band } else { 14 + vl as i64 / 24 };
         let ww = (2 * wb + 1) as usize;
         let i_lo = (i0 - wb).clamp(0, m as i64) as usize;
         let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
@@ -355,6 +369,7 @@ pub(crate) fn solve(
             b.key2 = key;
         }
         let mut best = (BIG, 0usize, 0u32);
+        let far_leave: Vec<u32> = (0..=n).map(|j| fv.leave(ix, j as u32, minus)).collect();
         for (x, &c0) in cur.iter().enumerate() {
             if c0 >= BIG {
                 continue;
@@ -369,7 +384,7 @@ pub(crate) fn solve(
                 if e >= INF as u32 {
                     continue;
                 }
-                let c = c0 + e + fv.leave(ix, j as u32, minus);
+                let c = c0 + e + far_leave[j as usize];
                 let enter = t1 - j as u32;
                 if c < best.0 && gv.real(curp[x]) + min_gap <= enter {
                     best = (c, x, enter);

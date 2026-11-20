@@ -45,6 +45,8 @@ pub struct GenomeIndex {
     store: Store,
     names: Vec<String>,
     n: Raw,
+    /// Known junctions, when the user gave some for this run (not stored in the index).
+    pub junctions: Option<crate::junctions::Junctions>,
 }
 
 /// Pointers into the container's sections (the `Store` owns the bytes and outlives them).
@@ -296,7 +298,12 @@ impl GenomeIndex {
             l2_id: store.get("g2_id")?,
             dir_bits: meta[0] as u32,
         };
-        Ok(GenomeIndex { store, names, n })
+        Ok(GenomeIndex {
+            store,
+            names,
+            n,
+            junctions: None,
+        })
     }
 
     pub fn names(&self) -> &[String] {

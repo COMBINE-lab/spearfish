@@ -33,7 +33,12 @@ fn main() -> anyhow::Result<()> {
         }
         Some("map") => {
             let t = Instant::now();
-            let ix = GenomeIndex::open(Path::new(&a[2]))?;
+            let mut ix = GenomeIndex::open(Path::new(&a[2]))?;
+            if let Some(bed) = val("--junctions") {
+                let j = spearfish_splice::junctions::Junctions::from_bed12(Path::new(&bed), &ix)?;
+                eprintln!("{} known junctions", j.len());
+                ix.junctions = Some(j);
+            }
             let mut opt = MapOptions {
                 forward_only: flag("--forward").is_some(),
                 ..Default::default()

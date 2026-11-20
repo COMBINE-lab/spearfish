@@ -2,4 +2,5 @@
 
 mod gap;
 pub mod index;
+pub mod junctions;
 pub mod map;

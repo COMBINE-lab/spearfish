@@ -258,11 +258,14 @@ pub(crate) fn band_prefix(
     m
 }
 
-/// Cost of a donor at `p` (first intron base) and of an acceptor ending at `p` (first exon
-/// base after the intron), for a transcript on the forward or reverse strand. On the reverse
-/// strand the intron's left end is the reverse complement of the acceptor.
+/// Cost of a splice site unknown to the annotation, when one was given (on top of its motif).
+const UNKNOWN_SITE: u16 = 5;
+
+/// Motif cost of an intron's left end at `p` (its first base) and of its right end at `p` (the
+/// first exon base after it), for a transcript on the forward or reverse strand. On the
+/// reverse strand the left end is the reverse complement of the acceptor.
 #[inline]
-pub(crate) fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+pub(crate) fn donor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     if p + 2 > ix.total_len() {
         return NONCANON;
     }
@@ -274,7 +277,7 @@ pub(crate) fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
 }
 
 #[inline]
-pub(crate) fn acceptor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+pub(crate) fn acceptor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     if p < 2 {
         return NONCANON;
     }
@@ -282,6 +285,27 @@ pub(crate) fn acceptor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
         (false, 0, 2) | (true, 0, 1) => 0,                   // AG; AC (= GT)
         (false, 0, 1) | (true, 2, 1) | (true, 0, 3) => SEMI, // AC; GC, AT (= GC, AT donors)
         _ => NONCANON,
+    }
+}
+
+/// Cost of an intron's left end at `p`: nothing for a known site; otherwise the motif cost,
+/// and a little more when junctions were given and this is not one of them.
+#[inline]
+pub(crate) fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+    match &ix.junctions {
+        Some(j) if j.left_site(p, minus) => 0,
+        Some(_) => donor_motif(ix, p, minus) + UNKNOWN_SITE,
+        None => donor_motif(ix, p, minus),
+    }
+}
+
+/// Cost of an intron's right end at `p`, as [`donor_pen`].
+#[inline]
+pub(crate) fn acceptor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+    match &ix.junctions {
+        Some(j) if j.right_site(p, minus) => 0,
+        Some(_) => acceptor_motif(ix, p, minus) + UNKNOWN_SITE,
+        None => acceptor_motif(ix, p, minus),
     }
 }
 
@@ -367,21 +391,23 @@ struct Window {
 
 impl Window {
     /// For the gap solver travelling forwards from read `q`, genome `t`: (position, length,
-    /// read offset that goes with the window's start).
-    fn forward(&self, q: u32, t: u32) -> (u32, u32, i64) {
+    /// read offset that goes with the window's start, 0 for the usual band).
+    fn forward(&self, q: u32, t: u32) -> (u32, u32, i64, i64) {
         (
             self.s - t,
             self.e - self.s,
             (self.f.q as i64 - q as i64) - (self.f.t - self.s) as i64,
+            0,
         )
     }
     /// The same travelling backwards from read `q`, genome `t`.
-    fn backward(&self, q: u32, t: u32) -> (u32, u32, i64) {
+    fn backward(&self, q: u32, t: u32) -> (u32, u32, i64, i64) {
         let (lq, lt) = (self.l.q + self.l.ql as u32, self.l.t + self.l.tl as u32);
         (
             t - self.e,
             self.e - self.s,
             (q as i64 - lq as i64) - (self.e - lt) as i64,
+            0,
         )
     }
 }
@@ -697,8 +723,10 @@ impl<'a> Mapper<'a> {
                 let wins = cand[k].as_ref().unwrap();
                 let m = q1.saturating_sub(q0) as usize;
                 let mut done = false;
-                if !wins.is_empty() && q1 > q0 && t1 > t0 && m <= 600 {
-                    let vw: Vec<(u32, u32, i64)> = wins.iter().map(|w| w.forward(q0, t0)).collect();
+                if (!wins.is_empty() || self.index.junctions.is_some()) && q1 > q0 && t1 > t0 && m <= 600 {
+                    let mut vw: Vec<(u32, u32, i64, i64)> = wins.iter().map(|w| w.forward(q0, t0)).collect();
+                    vw.extend(self.known_exons(t0, t1, m));
+                    vw.sort_by_key(|w| w.0);
                     let rv = ReadView { q: q0, rev: false };
                     let gv = View {
                         origin: t0,
@@ -736,7 +764,7 @@ impl<'a> Mapper<'a> {
                     let sites = self.site_windows(read, q0, t0, q1, t1, minus, sc);
                     if !sites.is_empty() {
                         sc.stats.site_tried += (minus == strands[0]) as u64;
-                        let vw: Vec<(u32, u32, i64)> = sites.iter().map(|w| w.forward(q0, t0)).collect();
+                        let vw: Vec<(u32, u32, i64, i64)> = sites.iter().map(|w| w.forward(q0, t0)).collect();
                         let rv = ReadView { q: q0, rev: false };
                         let gv = View {
                             origin: t0,
@@ -950,7 +978,8 @@ impl<'a> Mapper<'a> {
             let plain = gap::solve(ix, read, rv, m, gv, None, &[], strands[0], half, &mut sc.gap);
             let reached = plain.end.0.abs_diff(q);
             let mut best = (plain, None);
-            if m as u32 - reached >= 10 {
+            let known = self.index.junctions.is_some();
+            if m as u32 - reached >= if known { 4 } else { 10 } {
                 sc.stats.end_tried += 1;
                 // level-2 cores of the unexplained bases, within reach of the longest intron
                 let here = Anchor {
@@ -982,7 +1011,7 @@ impl<'a> Mapper<'a> {
                     let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
                     windows_of(&hits, q + slack, q + m as u32, t, hi, 4)
                 };
-                let vw: Vec<(u32, u32, i64)> = if left {
+                let vw: Vec<(u32, u32, i64, i64)> = if left {
                     wins.iter().rev().map(|w| w.backward(q, t)).collect()
                 } else {
                     wins.iter().map(|w| w.forward(q, t)).collect()
@@ -997,14 +1026,16 @@ impl<'a> Mapper<'a> {
                         ..Default::default()
                     };
                     let mut all = vw.clone();
-                    let mut tried: Vec<(u32, u32, i64)> = Vec::new();
+                    all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
+                    let base = all.len();
+                    let mut tried: Vec<(u32, u32, i64, i64)> = Vec::new();
                     for near in [true, false] {
                         let sites =
                             self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, near, sc);
                         if !near && sites == tried {
                             break; // looking further found nothing new
                         }
-                        all.truncate(vw.len());
+                        all.truncate(base);
                         all.extend(sites.iter().copied());
                         tried = sites;
                         if all.is_empty() {
@@ -1176,7 +1207,7 @@ impl<'a> Mapper<'a> {
             }
             for len in len_lo..=len_hi {
                 let e = p + len as u32;
-                if e > hi || donor_pen(ix, e, minus) != 0 {
+                if e > hi || donor_motif(ix, e, minus) != 0 {
                     continue;
                 }
                 // the exon against the unexplained bases at every offset it can have in them
@@ -1225,6 +1256,55 @@ impl<'a> Mapper<'a> {
         out
     }
 
+    /// Known exons inside the intron `(t0, t1)` that the read bases of a gap of `m` bases could
+    /// hold, as windows for the gap solver (searched over the whole gap, since nothing says
+    /// where in the read they fall).
+    fn known_exons(&self, t0: u32, t1: u32, m: usize) -> Vec<(u32, u32, i64, i64)> {
+        let Some(j) = &self.index.junctions else {
+            return Vec::new();
+        };
+        if t1 < t0 + 60 {
+            return Vec::new();
+        }
+        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
+        for &(s, e) in j.exons_in(t0 + 20, t1 - 20) {
+            if e + 20 <= t1 && (e - s) as usize <= m + 20 && out.len() < 12 {
+                out.push((s - t0, e - s, 0, m as i64 + (e - s) as i64));
+            }
+        }
+        out
+    }
+
+    /// Windows past a read end that known junctions lead to: introns that start within a few
+    /// bases of where the plain extension stopped (`p_end`, in the view's coordinates).
+    fn known_hops(&self, gv: View, p_end: u32, reached: usize, k: usize) -> Vec<(u32, u32, i64, i64)> {
+        let Some(j) = &self.index.junctions else {
+            return Vec::new();
+        };
+        let x = gv.real(p_end);
+        let vl = (k as u32 + 12).min(300);
+        let mut out: Vec<(u32, u32, i64, i64)> = Vec::new();
+        if gv.rev {
+            // travelling backwards: introns whose right end is near x; the next exon ends at
+            // their left end
+            for &(right, left) in j.from_right(x.saturating_sub(12), x + 30) {
+                let over = right as i64 - x as i64; // > 0: the extension ran past the site
+                if left >= vl {
+                    out.push((gv.origin - left, vl, reached as i64 - over, 24));
+                }
+            }
+        } else {
+            for &(left, right) in j.from_left(x.saturating_sub(30), x + 12) {
+                let over = x as i64 - left as i64;
+                if right >= gv.origin {
+                    out.push((right - gv.origin, vl, reached as i64 - over, 24));
+                }
+            }
+        }
+        out.truncate(8);
+        out
+    }
+
     /// Candidate exons past a read end, found without any seed: places where an intron can end
     /// (in the direction of travel) and the genome then matches the read bases that the plain
     /// extension left unexplained. Returned as the gap solver's windows.
@@ -1240,7 +1320,7 @@ impl<'a> Mapper<'a> {
         minus: bool,
         near: bool,
         sc: &mut Scratch,
-    ) -> Vec<(u32, u32, i64)> {
+    ) -> Vec<(u32, u32, i64, i64)> {
         const MARGIN: usize = 4;
         let ix = self.index;
         let start = reached.saturating_sub(MARGIN);
@@ -1258,7 +1338,7 @@ impl<'a> Mapper<'a> {
         let probe: Vec<u8> = (0..k.min(28 + 2 * MARGIN))
             .map(|i| rv.base(read, start + i))
             .collect();
-        let mut found: Vec<(usize, u32, (u32, u32, i64))> = Vec::new();
+        let mut found: Vec<(usize, u32, (u32, u32, i64, i64))> = Vec::new();
         // Where an intron can end in the direction of travel: travelling forwards, after an
         // acceptor (AG, or AC for a reverse-strand transcript); backwards, before a donor (GT,
         // or CT).
@@ -1278,7 +1358,7 @@ impl<'a> Mapper<'a> {
             }
         }
         for p in cands {
-            if p < from || p >= hi || gv.enter(ix, p, minus) != 0 {
+            if p < from || p >= hi || gv.enter_motif(ix, p, minus) != 0 {
                 continue;
             }
             // the exon can start a few read bases into the probe
@@ -1295,7 +1375,7 @@ impl<'a> Mapper<'a> {
                 if d <= allowed {
                     let vs = p.saturating_sub(3);
                     let vl = (k as u32 + 12).min(300);
-                    found.push((d, p, (vs, vl, (start + o) as i64 - (p - vs) as i64)));
+                    found.push((d, p, (vs, vl, (start + o) as i64 - (p - vs) as i64, 0)));
                     break;
                 }
             }
@@ -1457,6 +1537,8 @@ impl<'a> Mapper<'a> {
         let mut out = [none; 2];
         for (s, o) in out.iter_mut().enumerate() {
             let minus = s == 1;
+            let dpen: Vec<u16> = (0..=n).map(|j| donor_pen(ix, t0 + j as u32, minus)).collect();
+            let apen: Vec<u16> = (0..=n).map(|j| acceptor_pen(ix, t1 - j as u32, minus)).collect();
             let mut best = (INF, 0usize, 0usize, 0usize);
             for i in 0..=m {
                 // upstream part: read[..i] against genome[t0 .. t0 + j1]
@@ -1466,7 +1548,7 @@ impl<'a> Mapper<'a> {
                     if j < 0 || j as usize > n {
                         continue;
                     }
-                    let c = sc.e1[i * w + k] + donor_pen(ix, t0 + j as u32, minus);
+                    let c = sc.e1[i * w + k] + dpen[j as usize];
                     if c < l.0 {
                         l = (c, j as usize);
                     }
@@ -1477,7 +1559,7 @@ impl<'a> Mapper<'a> {
                     if j < 0 || j as usize > n {
                         continue;
                     }
-                    let c = sc.e2[(m - i) * w + k] + acceptor_pen(ix, t1 - j as u32, minus);
+                    let c = sc.e2[(m - i) * w + k] + apen[j as usize];
                     if c < rr.0 {
                         rr = (c, j as usize);
                     }
