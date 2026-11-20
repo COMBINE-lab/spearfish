@@ -1,6 +1,6 @@
 //! Known splice junctions and exons (optional input).
 //!
-//! Read from a BED12 file of transcript models (as `paftools.js gff2bed` writes). Positions
+//! Read from a BED12 file of transcript models (as `paftools.js gff2bed` writes) or a GTF. Positions
 //! are on the index's concatenated axis. A known splice site costs nothing where an unknown
 //! one pays for its motif and a little more for being unknown; known exons and the
 //! donor-to-acceptor links are extra candidates where read bases are left unexplained.
@@ -27,7 +27,9 @@ pub struct Junctions {
 }
 
 impl Junctions {
-    pub fn from_bed12(path: &Path, ix: &GenomeIndex) -> Result<Junctions> {
+    /// Read transcript models from a BED12 file, or from a GTF (by its `.gtf` extension: `exon`
+    /// records grouped by `transcript_id`).
+    pub fn from_file(path: &Path, ix: &GenomeIndex) -> Result<Junctions> {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let offset: std::collections::HashMap<&str, u32> = ix
             .names()
@@ -35,37 +37,64 @@ impl Junctions {
             .enumerate()
             .map(|(i, n)| (n.as_str(), ix.offsets()[i]))
             .collect();
-        let mut j = Junctions::default();
+        let gtf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gtf"));
+        // transcripts as (sequence offset, reverse strand, exons)
+        let mut models: Vec<(u32, bool, Vec<(u32, u32)>)> = Vec::new();
+        let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for line in BufReader::new(f).lines() {
             let line = line?;
             let p: Vec<&str> = line.split('\t').collect();
-            if p.len() < 12 {
-                continue;
+            if gtf {
+                if p.len() < 9 || p[2] != "exon" {
+                    continue;
+                }
+                let Some(&off) = offset.get(p[0]) else { continue };
+                let Some(id) = p[8]
+                    .split("transcript_id \"")
+                    .nth(1)
+                    .and_then(|x| x.split('"').next())
+                else {
+                    continue;
+                };
+                let (s, e): (u32, u32) = (p[3].parse()?, p[4].parse()?);
+                let k = *by_id.entry(id.to_string()).or_insert_with(|| {
+                    models.push((off, p[6] == "-", Vec::new()));
+                    models.len() - 1
+                });
+                models[k].2.push((off + s - 1, off + e));
+            } else {
+                if p.len() < 12 {
+                    continue;
+                }
+                let Some(&off) = offset.get(p[0]) else { continue };
+                let start: u32 = p[1].parse()?;
+                let sizes = p[10]
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<u32>().unwrap_or(0));
+                let starts = p[11]
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<u32>().unwrap_or(0));
+                let exons = sizes
+                    .zip(starts)
+                    .map(|(z, b)| (off + start + b, off + start + b + z))
+                    .collect();
+                models.push((off, p[5] == "-", exons));
             }
-            let Some(&off) = offset.get(p[0]) else { continue };
-            let start: u32 = p[1].parse()?;
-            let minus = (p[5] == "-") as usize;
-            let sizes: Vec<u32> = p[10]
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.parse().unwrap_or(0))
-                .collect();
-            let starts: Vec<u32> = p[11]
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.parse().unwrap_or(0))
-                .collect();
-            for k in 0..sizes.len().min(starts.len()) {
-                let (s, e) = (off + start + starts[k], off + start + starts[k] + sizes[k]);
+        }
+        let mut j = Junctions::default();
+        for (_, minus, mut exons) in models {
+            exons.sort_unstable();
+            for (k, &(s, e)) in exons.iter().enumerate() {
                 j.exons.push((s, e));
-                if k > 0 {
-                    let left = off + start + starts[k - 1] + sizes[k - 1];
+                if k > 0 && s > exons[k - 1].1 {
+                    let left = exons[k - 1].1;
                     j.by_left.push((left, s));
-                    // on the genome the intron's left end is the donor of a forward-strand
-                    // transcript and the acceptor side of a reverse-strand one; the cost
-                    // functions take genome sides, so both are stored by side
-                    j.donors[minus].push(left);
-                    j.acceptors[minus].push(s);
+                    // the cost functions take genome sides (left end, right end of the intron),
+                    // whichever of them is the donor on the transcript's strand
+                    j.donors[minus as usize].push(left);
+                    j.acceptors[minus as usize].push(s);
                 }
             }
         }

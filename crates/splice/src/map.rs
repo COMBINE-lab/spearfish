@@ -896,18 +896,25 @@ impl<'a> Mapper<'a> {
                         cost: u32::MAX,
                         ..Default::default()
                     };
-                    for min_hits in [2u32, 0] {
-                        if (min_hits == 2 && strong == 0 && known.is_empty())
-                            || (min_hits == 0 && strong == wins.len() && s.cost != u32::MAX)
+                    // Then, if junctions were given, the known exons inside this intron on their
+                    // own, believed only when every junction of the solution is a known one.
+                    let mut found = false;
+                    for (min_hits, from_known) in [(2u32, false), (0, false), (0, true)] {
+                        if (from_known && known.is_empty())
+                            || (!from_known && wins.is_empty())
+                            || (!from_known && min_hits == 2 && strong == 0)
+                            || (!from_known && min_hits == 0 && strong == wins.len() && s.cost != u32::MAX)
                         {
                             continue;
                         }
-                        let mut vw: Vec<SolverWindow> = wins
-                            .iter()
-                            .filter(|w| w.hits >= min_hits)
-                            .map(|w| w.forward(q0, t0))
-                            .collect();
-                        vw.extend(known.iter().copied());
+                        let mut vw: Vec<SolverWindow> = if from_known {
+                            known.clone()
+                        } else {
+                            wins.iter()
+                                .filter(|w| w.hits >= min_hits)
+                                .map(|w| w.forward(q0, t0))
+                                .collect()
+                        };
                         vw.sort_by_key(|w| w.0);
                         s = gap::solve(
                             self.index,
@@ -921,11 +928,15 @@ impl<'a> Mapper<'a> {
                             half,
                             &mut sc.gap,
                         );
-                        if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
+                        if s.hops.len() > 1
+                            && s.cost < (direct.cost as u32).min(1 << 20)
+                            && (!from_known || self.hop_margin(&s, minus) <= 4)
+                        {
+                            found = true;
                             break;
                         }
                     }
-                    if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
+                    if found {
                         sc.stats.rescues_kept += (minus == strands[0]) as u64;
                         total += s.cost;
                         juncs.extend(s.hops.iter().map(|h| Placed {

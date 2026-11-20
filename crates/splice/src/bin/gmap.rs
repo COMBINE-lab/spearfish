@@ -2,7 +2,7 @@
 //!
 //!   gmap index <genome.fa> <out.gidx> [--hpc]
 //!   gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
-//!            [--junctions <BED12>] [--sam | --bam [--bam-level N]]   (default output: PAF)
+//!            [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]]   (default output: PAF)
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -50,8 +50,12 @@ fn main() -> anyhow::Result<()> {
             let t = Instant::now();
             let mut ix = GenomeIndex::open(Path::new(&a[2]))?;
             if let Some(bed) = val("--junctions") {
-                let j = spearfish_splice::junctions::Junctions::from_bed12(Path::new(&bed), &ix)?;
+                let j = spearfish_splice::junctions::Junctions::from_file(Path::new(&bed), &ix)?;
                 eprintln!("{} known junctions", j.len());
+                anyhow::ensure!(
+                    !j.is_empty(),
+                    "no junction in {bed} lies on a sequence of this index"
+                );
                 ix.junctions = Some(j);
             }
             let mut opt = MapOptions {
