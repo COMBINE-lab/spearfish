@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
             }
             let mut opt = MapOptions {
                 forward_only: flag("--forward").is_some(),
+                pairs: flag("--no-pairs").is_none(),
                 ..Default::default()
             };
             if let Some(c) = val("--cap") {

@@ -24,6 +24,9 @@ pub struct MapOptions {
     pub max_loci: usize,
     /// Only forward-strand transcripts (direct RNA): the read is the transcript's sense strand.
     pub forward_only: bool,
+    /// Seed noisy reads with pairs of level-2 cores as well as level-3 cores from the start
+    /// (otherwise only reads that level 3 anchors weakly get them, in a second pass).
+    pub pairs: bool,
     /// Junction cost per read base (times 64) above which the solver looks for missed exons,
     /// unless the read's own junctions usually cost more.
     pub trigger_x64: u32,
@@ -40,6 +43,7 @@ impl Default for MapOptions {
             min_intron: 40,
             max_loci: 6,
             forward_only: false,
+            pairs: true,
             trigger_x64: 16,
             min_score: 100,
         }
@@ -664,16 +668,19 @@ impl<'a> Mapper<'a> {
         let mut out: Vec<SplicedHit> = Vec::new();
         let mut cands: Vec<(f32, bool, Vec<Anchor>)> = Vec::new();
         sc.had_hits = false;
+        // Level-3 hits of both orientations first: which one the read maps in shows in them.
+        let mut l3_hits: [Vec<Anchor>; 2] = [Vec::new(), Vec::new()];
+        let mut found = [0usize; 2];
         for o in 0..2 {
-            sc.hits.clear();
             for s in &sc.l3[o] {
                 let (pos, len) = ix.occurrences(s.label);
+                found[o] += !pos.is_empty() as usize;
                 if pos.is_empty() || pos.len() > cap {
                     continue;
                 }
                 let w = (s.ql as u32).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
                 for (&t, &tl) in pos.iter().zip(len) {
-                    sc.hits.push(Anchor {
+                    l3_hits[o].push(Anchor {
                         t,
                         q: s.q,
                         ql: s.ql,
@@ -684,7 +691,18 @@ impl<'a> Mapper<'a> {
                     });
                 }
             }
-            if pairs && ix.has_pairs() {
+        }
+        for o in 0..2 {
+            sc.hits.clear();
+            sc.hits.append(&mut l3_hits[o]);
+            // Pairs of level-2 cores as seeds too, for a noisy read: one with under a quarter of
+            // its level-3 cores in the genome in its better orientation (about 7% error or
+            // more). They keep the stretches between anchors short. An orientation that the
+            // other one clearly beats is not the one the read maps in and is spared the lookups.
+            let best = if found[0] >= found[1] { 0 } else { 1 };
+            let noisy = 3 * found[best] < sc.l3[best].len();
+            let beaten = found[1 - o] >= 5 && 4 * found[o] <= found[1 - o];
+            if (pairs || (self.opt.pairs && noisy && !beaten)) && ix.has_pairs() {
                 for w in sc.l2[o].windows(2) {
                     let l = crate::index::pair_label(w[0].label, w[1].label);
                     if w[1].q - w[0].q >= 64 || !crate::index::keep_pair(l) {
