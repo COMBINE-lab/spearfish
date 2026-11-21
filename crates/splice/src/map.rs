@@ -694,6 +694,10 @@ struct Placed {
 
 /// Reference skips shorter than this are written as deletions, not introns.
 const MIN_INTRON_OUT: u32 = 30;
+/// Skips shorter than this are reported as deletions in the end: among real reads' skips of
+/// 30 to 59 bases next to none is a known intron (they are bases the read lacks). Until a hit
+/// is chosen they stay junctions, priced as such.
+const MIN_INTRON_REPORTED: u32 = 60;
 
 /// Make blocks consistent for output: in genome order without overlap, each starting on the
 /// read where the previous one ends. Returns whether anything had to change.
@@ -1244,6 +1248,21 @@ impl<'a> Mapper<'a> {
         out.sort_by_key(|h| std::cmp::Reverse(h.score));
         if let Some(h) = out.first_mut() {
             h.primary = true;
+        }
+        for h in out.iter_mut() {
+            let mut k = 1;
+            while k < h.blocks.len() {
+                if h.blocks[k].ts < h.blocks[k - 1].te + MIN_INTRON_REPORTED {
+                    let b = h.blocks.remove(k);
+                    h.blocks[k - 1].te = b.te;
+                    h.blocks[k - 1].qe = b.qe;
+                    if k - 1 < h.origins.len() {
+                        h.origins.remove(k - 1);
+                    }
+                } else {
+                    k += 1;
+                }
+            }
         }
         out
     }
