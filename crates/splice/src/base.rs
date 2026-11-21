@@ -41,8 +41,9 @@ pub enum Mode {
     #[default]
     Edits,
     /// Affine gaps: the fewest-edits alignment first, then every stretch of it with an indel
-    /// aligned again with affine gap costs (16 bases kept on each side of an indel; the long
-    /// runs without one stay as they are).
+    /// aligned again with affine gap costs (8 bases kept on each side of an indel; the long
+    /// runs without one stay as they are). A stretch with a long indel also gets the second,
+    /// cheaper cost for long gaps.
     Affine,
 }
 
@@ -59,8 +60,13 @@ const MAT: [i8; 25] = {
 };
 
 /// A run of this many aligned bases without an indel is where the edit alignment is cut into
-/// segments (in the middle of the run).
-const CUT: u32 = 16;
+/// segments (in the middle of the run); of a longer run, this many bases at each end go to
+/// the segments beside it.
+const CUT: u32 = 8;
+/// How far from the corners' diagonals the affine alignment of a segment may stray.
+const BAND: usize = 8;
+/// A segment with an indel of this many bases or more is aligned with the second gap cost too.
+const LONG_GAP: u32 = 10;
 
 /// Working memory of the block aligner.
 #[derive(Default)]
@@ -72,10 +78,13 @@ pub struct Aligner {
     tmp: Vec<u32>,
     seg: Vec<u32>,
     ksw: ksw2rs::Aligner,
+    small: Small,
     /// Wavefronts, one after the other: that of `s` edits holds diagonals `-s..=s` from `s * s`.
     waves: Vec<i32>,
     genome: Vec<u8>,
     codes: Vec<u8>,
+    /// Seed matches taken as they are in the block at hand: read offset, genome offset, length.
+    fixed: Vec<(usize, usize, usize)>,
 }
 
 fn push(ops: &mut Vec<u32>, len: u32, op: u32) {
@@ -349,6 +358,155 @@ fn affine(ksw: &mut ksw2rs::Aligner, a: &[u8], g: &[u8], w: i32, ops: &mut Vec<u
     true
 }
 
+/// Working memory of [`window`].
+#[derive(Default)]
+struct Small {
+    /// Per cell, where its best score came from (see `window`).
+    back: Vec<u8>,
+    /// Two rows of scores: the best, and the best ending in each kind of gap.
+    rows: [Vec<[i32; 5]>; 2],
+    rev: Vec<u32>,
+}
+
+/// Gap costs: a gap of `l` bases costs the lesser of `Q + E * l` and `Q2 + E2 * l` (the second
+/// makes a long gap cheap, as minimap2's long-read presets do), or the first alone.
+const Q: i32 = 4;
+const E: i32 = 2;
+const Q2: i32 = 24;
+const E2: i32 = 1;
+/// Windows of more cells than this go to the general kernel.
+const SMALL_CELLS: usize = 1 << 16;
+
+/// Align all of `a` to all of `g` with affine gaps, diagonals within `w` of the two corners':
+/// appends the operations. A plain table, a cell at a time: slower than the vector kernel,
+/// and used for the few segments that want the second gap cost (`two`), which that kernel
+/// lacks. False (nothing appended) when the window is too large for it.
+fn window(sm: &mut Small, a: &[u8], g: &[u8], w: usize, two: bool, ops: &mut Vec<u32>) -> bool {
+    let (m, n) = (a.len(), g.len());
+    if m == 0 || n == 0 {
+        push(ops, m as u32, I);
+        push(ops, n as u32, D);
+        return true;
+    }
+    // diagonal k = j - i, from `klo` on; column c of row i is j = i + klo + c
+    let klo = (n as i64 - m as i64).min(0) - w as i64;
+    let width = m.abs_diff(n) + 2 * w + 1;
+    if (m + 1) * width > SMALL_CELLS {
+        return false;
+    }
+    const NEG: i32 = i32::MIN / 4;
+    let (q2, e2) = if two { (Q2, E2) } else { (Q, E) };
+    sm.back.clear();
+    sm.back.resize((m + 1) * width, 0);
+    for r in sm.rows.iter_mut() {
+        r.clear();
+        r.resize(width + 2, [NEG; 5]);
+    }
+    // A cell holds: best, and best ending in a gap of the genome side (first and second cost)
+    // and of the read side. Its byte: the state the best came from (0 diagonal, 1 to 4 the
+    // gaps), and one bit per gap state saying it extends a gap rather than opens one.
+    for i in 0..=m {
+        let (prev, cur) = {
+            let (x, y) = sm.rows.split_at_mut(1);
+            if i % 2 == 0 {
+                (&y[0], &mut x[0])
+            } else {
+                (&x[0], &mut y[0])
+            }
+        };
+        // (rows are stored one cell in, so that c - 1 and c + 1 exist)
+        cur[0] = [NEG; 5];
+        cur[width + 1] = [NEG; 5];
+        let ai = if i > 0 { a[i - 1] } else { 0 };
+        for c in 0..width {
+            let j = i as i64 + klo + c as i64;
+            if j < 0 || j > n as i64 {
+                cur[c + 1] = [NEG; 5];
+                continue;
+            }
+            let j = j as usize;
+            let mut cell = [NEG; 5];
+            let mut b = 0u8;
+            if i == 0 && j == 0 {
+                cell[0] = 0;
+            } else {
+                // a genome base with no read base: from the cell to the left (c - 1)
+                if j > 0 {
+                    let l = cur[c];
+                    let (o, x) = (l[0] - Q - E, l[1] - E);
+                    cell[1] = o.max(x);
+                    b |= ((x > o) as u8) << 3;
+                    let (o, x) = (l[0] - q2 - e2, l[2] - e2);
+                    cell[2] = o.max(x);
+                    b |= ((x > o) as u8) << 4;
+                }
+                // a read base with no genome base: from the cell above (c + 1 in the row before)
+                if i > 0 {
+                    let u = prev[c + 2];
+                    let (o, x) = (u[0] - Q - E, u[3] - E);
+                    cell[3] = o.max(x);
+                    b |= ((x > o) as u8) << 5;
+                    let (o, x) = (u[0] - q2 - e2, u[4] - e2);
+                    cell[4] = o.max(x);
+                    b |= ((x > o) as u8) << 6;
+                }
+                let mut best = (NEG, 0u8);
+                if i > 0 && j > 0 {
+                    let gj = g[j - 1];
+                    let sc = if ai > 3 || gj > 3 {
+                        -1
+                    } else if ai == gj {
+                        2
+                    } else {
+                        -4
+                    };
+                    best = (prev[c + 1][0] + sc, 0);
+                }
+                for (k, &v) in cell.iter().enumerate().skip(1) {
+                    if v > best.0 {
+                        best = (v, k as u8);
+                    }
+                }
+                cell[0] = best.0;
+                b |= best.1;
+            }
+            cur[c + 1] = cell;
+            sm.back[i * width + c] = b;
+        }
+    }
+    // Walk back from the far corner.
+    sm.rev.clear();
+    let (mut i, mut j, mut state) = (m, n, 0u8);
+    while i > 0 || j > 0 {
+        let c = (j as i64 - i as i64 - klo) as usize;
+        let b = sm.back[i * width + c];
+        if state == 0 {
+            state = b & 7;
+            if state == 0 {
+                push(&mut sm.rev, 1, M);
+                i -= 1;
+                j -= 1;
+            }
+            continue;
+        }
+        let extends = b >> (2 + state) & 1 == 1;
+        if state <= 2 {
+            push(&mut sm.rev, 1, D);
+            j -= 1;
+        } else {
+            push(&mut sm.rev, 1, I);
+            i -= 1;
+        }
+        if !extends {
+            state = 0;
+        }
+    }
+    for &o in sm.rev.iter().rev() {
+        push(ops, o >> 4, o & 15);
+    }
+    true
+}
+
 /// The edits of an alignment of `a` to `g`.
 fn count(a: &[u8], g: &[u8], ops: &[u32]) -> u32 {
     let (mut i, mut j, mut e) = (0usize, 0usize, 0u32);
@@ -432,12 +590,57 @@ impl Aligner {
             let a = &self.codes[b.qs as usize..b.qe as usize];
             self.bases += m as u64;
             let waves = &mut self.waves;
-            let mut first_pass = |ops: &mut Vec<u32>| {
-                if plain && clean {
-                    block(m, n, &ext_bases(a, &self.genome), waves, ops)
-                } else {
-                    block(m, n, &ext_codes(a, &self.genome), waves, ops)
+            // The chain's seed matches inside the block, where they do match base for base and
+            // follow one another on both sequences, are taken as they are; only what lies
+            // between them is aligned.
+            let genome = &self.genome;
+            let fixed = &mut self.fixed;
+            fixed.clear();
+            let (mut qn, mut tn) = (b.qs, b.ts);
+            for &(q, t, len) in &h.seeds {
+                let len = len as u32;
+                if q >= qn
+                    && t >= tn
+                    && q + len <= b.qe
+                    && t + len <= b.te
+                    && len >= 12
+                    && (0..len as usize).all(|x| {
+                        a[(q - b.qs) as usize + x] == genome[(t - b.ts) as usize + x]
+                            && a[(q - b.qs) as usize + x] < 4
+                    })
+                {
+                    fixed.push(((q - b.qs) as usize, (t - b.ts) as usize, len as usize));
+                    (qn, tn) = (q + len, t + len);
                 }
+            }
+            let mut first_pass = |ops: &mut Vec<u32>| {
+                let mut edits = 0;
+                let (mut i0, mut j0) = (0usize, 0usize);
+                for x in 0..=fixed.len() {
+                    let (i1, j1, len) = if x < fixed.len() { fixed[x] } else { (m, n, 0) };
+                    if plain && clean {
+                        let ext = ext_bases(a, genome);
+                        edits += block(
+                            i1 - i0,
+                            j1 - j0,
+                            &|i, j, max| ext(i0 + i, j0 + j, max),
+                            waves,
+                            ops,
+                        );
+                    } else {
+                        let ext = ext_codes(a, genome);
+                        edits += block(
+                            i1 - i0,
+                            j1 - j0,
+                            &|i, j, max| ext(i0 + i, j0 + j, max),
+                            waves,
+                            ops,
+                        );
+                    }
+                    push(ops, len as u32, M);
+                    (i0, j0) = (i1 + len, j1 + len);
+                }
+                edits
             };
             if self.mode != Mode::Edits {
                 let start = ops.len();
@@ -472,16 +675,20 @@ impl Aligner {
                         }
                     }
                     if cut {
-                        let mut runs = 0u32;
+                        let (mut runs, mut longest) = (0u32, 0u32);
                         for &o in &self.seg {
                             if o & 15 != M {
                                 runs += 1;
+                                longest = longest.max(o >> 4);
                             }
                         }
                         let wanted = runs > 0;
                         let (sa, sg) = (&a[i0..i], &self.genome[j0..j]);
-                        let w = sa.len().abs_diff(sg.len()) as i32 + 16;
-                        if wanted && affine(&mut self.ksw, sa, sg, w, ops) {
+                        let w = (sa.len().abs_diff(sg.len()) + BAND) as i32;
+                        if wanted
+                            && ((longest >= LONG_GAP && window(&mut self.small, sa, sg, BAND, true, ops))
+                                || affine(&mut self.ksw, sa, sg, w, ops))
+                        {
                             self.again += sa.len() as u64;
                         } else {
                             for &o in &self.seg {
@@ -539,6 +746,75 @@ mod tests {
             }
         }
         row[b.len()]
+    }
+
+    /// Affine score of an alignment at the first gap cost.
+    fn score(a: &[u8], b: &[u8], ops: &[u32]) -> i32 {
+        let (mut i, mut j, mut sc) = (0usize, 0usize, 0i32);
+        for &op in ops {
+            let len = (op >> 4) as usize;
+            match op & 15 {
+                M => {
+                    sc += (0..len)
+                        .map(|t| if a[i + t] == b[j + t] { 2 } else { -4 })
+                        .sum::<i32>();
+                    i += len;
+                    j += len;
+                }
+                I => {
+                    sc -= Q + E * len as i32;
+                    i += len;
+                }
+                _ => {
+                    sc -= Q + E * len as i32;
+                    j += len;
+                }
+            }
+        }
+        assert_eq!((i, j), (a.len(), b.len()));
+        sc
+    }
+
+    /// The table kernel and the vector kernel give alignments of the same score at one gap
+    /// cost, no worse than the fewest-edits alignment's.
+    #[test]
+    fn kernels_agree() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut sm, mut ksw, mut waves) = (Small::default(), ksw2rs::Aligner::new(), Vec::new());
+        for _ in 0..300 {
+            let n = 1 + (rnd() % 80) as usize;
+            let b: Vec<u8> = (0..n).map(|_| (rnd() % 4) as u8).collect();
+            let mut a = Vec::new();
+            for &c in &b {
+                match rnd() % 100 {
+                    r if r < 4 => {}
+                    r if r < 8 => a.extend([c, (rnd() % 4) as u8]),
+                    r if r < 12 => a.push((c + 1) % 4),
+                    _ => a.push(c),
+                }
+            }
+            if a.is_empty() {
+                continue;
+            }
+            let (mut o1, mut o2, mut o3) = (Vec::new(), Vec::new(), Vec::new());
+            assert!(window(&mut sm, &a, &b, 12, false, &mut o1));
+            assert!(affine(
+                &mut ksw,
+                &a,
+                &b,
+                (a.len().abs_diff(b.len()) + 12) as i32,
+                &mut o2
+            ));
+            block(a.len(), b.len(), &ext_codes(&a, &b), &mut waves, &mut o3);
+            assert_eq!(score(&a, &b, &o1), score(&a, &b, &o2));
+            assert!(score(&a, &b, &o1) >= score(&a, &b, &o3));
+        }
     }
 
     /// The operations consume both sequences exactly, and their edits are the fewest possible.

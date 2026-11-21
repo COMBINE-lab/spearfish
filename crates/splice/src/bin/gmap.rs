@@ -84,6 +84,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 Format::Paf
             };
+            opt.keep_seeds = base_level;
             let mapper = Mapper::new(&ix, opt);
             let mut out = BufWriter::with_capacity(1 << 22, std::io::stdout().lock());
             match format {

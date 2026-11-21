@@ -32,6 +32,9 @@ pub struct MapOptions {
     pub trigger_x64: u32,
     /// Hits that were aligned and score below this are dropped.
     pub min_score: i32,
+    /// Keep each hit's chained seed matches (for the base-level alignment, which then only has
+    /// to align between them).
+    pub keep_seeds: bool,
 }
 
 impl Default for MapOptions {
@@ -46,6 +49,7 @@ impl Default for MapOptions {
             pairs: true,
             trigger_x64: 16,
             min_score: 100,
+            keep_seeds: false,
         }
     }
 }
@@ -75,6 +79,10 @@ pub struct SplicedHit {
     pub primary: bool,
     /// One letter per junction, in genome order, saying how it was made (for diagnosis).
     pub origins: Vec<u8>,
+    /// The chained seed matches as (read position, genome position, length), in chain order;
+    /// empty unless [`MapOptions::keep_seeds`]. They are where the chain was built from, not
+    /// part of the result: a block need not hold them, nor they match base for base.
+    pub seeds: Vec<(u32, u32, u16)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2124,6 +2132,11 @@ impl<'a> Mapper<'a> {
             edits,
             primary: false,
             origins,
+            seeds: if self.opt.keep_seeds {
+                chain.iter().map(|a| (a.q, a.t, a.ql.min(a.tl))).collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
