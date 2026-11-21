@@ -523,6 +523,12 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
     }
 }
 
+/// By how much a read-end solution with an unknown junction must beat clipping: for usual
+/// sites and a short intron, usual sites and a long one, other sites and a short intron,
+/// other sites and a long one. `END_NEAR` divides short from long.
+const END_MARGIN: [u32; 4] = [2, 16, 16, 32];
+const END_NEAR: u32 = 20_000;
+
 /// Cost of a splice site unknown to the annotation, when one was given (on top of its motif).
 const UNKNOWN_SITE: u16 = 5;
 
@@ -2134,7 +2140,27 @@ impl<'a> Mapper<'a> {
                 j.left_site(l, minus) && j.right_site(r, minus)
             })
         });
-        if known { 4 } else { 8 }
+        if known {
+            return 4;
+        }
+        // An unknown junction at a read end is believed on little when both its sites are the
+        // usual ones and the intron is short, and only on much more otherwise: among real
+        // reads' end junctions, those are the ones that turn out to be annotated.
+        let ix = self.index;
+        s.hops
+            .iter()
+            .map(|h| {
+                let (l, r) = (h.leave.min(h.enter), h.leave.max(h.enter));
+                let plain = donor_motif(ix, l, minus) + acceptor_motif(ix, r, minus) == 0;
+                match (plain, r - l < END_NEAR) {
+                    (true, true) => END_MARGIN[0],
+                    (true, false) => END_MARGIN[1],
+                    (false, true) => END_MARGIN[2],
+                    (false, false) => END_MARGIN[3],
+                }
+            })
+            .max()
+            .unwrap_or(END_MARGIN[0])
     }
 
     /// Known exons inside the intron `(t0, t1)` that the read bases of a gap of `m` bases could
