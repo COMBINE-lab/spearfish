@@ -225,7 +225,7 @@ pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
 /// other `NONCANON`. The two ends of an AT..AC intron cost `ATAC` each: sites are priced one
 /// at a time, so a cheap AT or AC would also make GT..AC and AT..AG cheap, which are not
 /// introns, and AT..AC itself is rare.
-const SEMI: u16 = 8;
+const SEMI: u16 = 11;
 const NONCANON: u16 = 26;
 const ATAC: u16 = 14;
 /// Sort hits by genome position, then read position. The keys (position and index in one
