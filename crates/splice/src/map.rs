@@ -216,9 +216,13 @@ pub(crate) const GAP_OPEN: u16 = 4;
 pub(crate) const GAP_EXT: u16 = 2;
 /// Each read base in a gap also forfeits the match it would have scored.
 pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
-/// Splice-site costs per site: GT..AG is free, GC..AG and AT..AC cost `SEMI`, others `NONCANON`.
+/// Splice-site costs per site: GT and AG are free, a GC left end costs `SEMI` (GC..AG), any
+/// other `NONCANON`. The two ends of an AT..AC intron cost `ATAC` each: sites are priced one
+/// at a time, so a cheap AT or AC would also make GT..AC and AT..AG cheap, which are not
+/// introns, and AT..AC itself is rare.
 const SEMI: u16 = 8;
 const NONCANON: u16 = 18;
+const ATAC: u16 = 14;
 /// Sort hits by genome position, then read position. The keys (position and index in one
 /// word) are sorted, not the hits themselves, which are then moved once.
 fn sort_hits(hits: &mut Vec<Anchor>, keys: &mut Vec<u64>, sorted: &mut Vec<Anchor>) {
@@ -540,7 +544,8 @@ const fn donor_code(minus: bool, b0: u8, b1: u8, b2: u8) -> u16 {
                 FLANK
             }
         }
-        (false, 2, 1) | (false, 0, 3) | (true, 2, 3) => SEMI, // GC, AT; GT (= AC)
+        (false, 2, 1) => SEMI,                // GC
+        (false, 0, 3) | (true, 2, 3) => ATAC, // AT; GT (= AC)
         _ => NONCANON,
     }
 }
@@ -557,7 +562,8 @@ const fn acceptor_code(minus: bool, b3: u8, b2: u8, b1: u8) -> u16 {
                 FLANK
             }
         }
-        (false, 0, 1) | (true, 2, 1) | (true, 0, 3) => SEMI, // AC; GC, AT (= GC, AT donors)
+        (true, 2, 1) => SEMI,                 // GC (= a GC donor)
+        (false, 0, 1) | (true, 0, 3) => ATAC, // AC; AT (= an AT donor)
         _ => NONCANON,
     }
 }

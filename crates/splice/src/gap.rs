@@ -601,7 +601,7 @@ pub(crate) fn solve(
     min_gap: u32,
     b: &mut Bufs,
 ) -> Solved {
-    let band = (4 + m / 10).min(24);
+    let band = (16 + m / 8).min(40);
     let w = 2 * band + 1;
     let limit = match far {
         Some(t1) => (t1 - gv.origin) as usize,
@@ -745,7 +745,7 @@ pub(crate) fn solve(
         let vl = vl as usize;
         // Only cells near the diagonal the window's seed hits lie on: window position j goes
         // with read position i0 + j, give or take `wb`.
-        let wb = if band > 0 { band } else { 14 + vl as i64 / 24 };
+        let wb = if band > 0 { band } else { 20 + vl as i64 / 16 };
         let ww = (2 * wb + 1) as usize;
         let i_lo = (i0 - wb).clamp(0, m as i64) as usize;
         let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
