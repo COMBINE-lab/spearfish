@@ -122,6 +122,11 @@ pub struct Scratch {
     had_hits: bool,
     /// Marks the level-2 label ids wanted by the rescue under way (indexed by id).
     want: Vec<u32>,
+    /// Short-word search of a gap: per word, the last read offset with it (plus one); per
+    /// read offset, the one before with the same word (plus one); the matches found.
+    kfirst: Vec<u16>,
+    knext: Vec<u16>,
+    khits: Vec<(u32, u16)>,
     /// Counters for reports.
     pub stats: Stats,
 }
@@ -522,6 +527,11 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
         (_mm_extract_epi16::<0>(_mm_minpos_epu16(l)) as u16).min(INF)
     }
 }
+
+/// Short-word search of a gap: the longest intron searched, and the read bases the matches on
+/// one diagonal must cover.
+const WORD_SPAN: u32 = 100_000;
+const WORD_COVER: u32 = 14;
 
 /// By how much a read-end solution with an unknown junction must beat clipping: for usual
 /// sites and a short intron, usual sites and a long one, other sites and a short intron,
@@ -1558,9 +1568,13 @@ impl<'a> Mapper<'a> {
                 // splice sites that matches the unexplained bases.
                 if !done && hard && q1 > q0 && t1 > t0 && m <= 600 {
                     let sites = self.site_windows(read, q0, t0, q1, t1, minus, sc);
-                    if !sites.is_empty() {
+                    let words = self.word_windows(read, q0, t0, q1, t1, sc);
+                    if !sites.is_empty() || !words.is_empty() {
                         sc.stats.site_tried += (minus == strands[0]) as u64;
-                        let vw: Vec<SolverWindow> = sites.iter().map(|w| w.forward(q0, t0)).collect();
+                        let mut vw: Vec<SolverWindow> = sites.iter().map(|w| w.forward(q0, t0)).collect();
+                        let by_words = !words.is_empty();
+                        vw.extend(words);
+                        vw.sort_by_key(|w| w.0);
                         let rv = ReadView { q: q0, rev: false };
                         let gv = View {
                             origin: t0,
@@ -1587,7 +1601,7 @@ impl<'a> Mapper<'a> {
                                 donor: h.leave,
                                 acceptor: h.enter,
                                 cost: 0,
-                                origin: b's',
+                                origin: if by_words { b'k' } else { b's' },
                             }));
                             done = true;
                         }
@@ -1991,6 +2005,130 @@ impl<'a> Mapper<'a> {
             }
         }
         score
+    }
+
+    /// Candidate exons for the read bases `[q0, q1)` inside the intron `(t0, t1)`, found by
+    /// short words: every 8-base word of those read bases is looked for along the intron, and
+    /// matches that agree on a diagonal and together cover `WORD_COVER` read bases or more make
+    /// a candidate. Read bases with many errors keep too few level-2 cores for the usual search,
+    /// but still share short words with their exon; by chance, a diagonal collects one match
+    /// at most. For junctions that nothing else explained, and introns up to `WORD_SPAN`.
+    fn word_windows(
+        &self,
+        read: &[u8],
+        q0: u32,
+        t0: u32,
+        q1: u32,
+        t1: u32,
+        sc: &mut Scratch,
+    ) -> Vec<SolverWindow> {
+        const K: usize = 8;
+        const TOP: u32 = 2 * (K as u32 - 1);
+        let ix = self.index;
+        let m = (q1 - q0) as usize;
+        let (lo, hi) = (t0 + 20, t1.saturating_sub(20));
+        if !(24..=600).contains(&m) || hi <= lo + 2 * K as u32 || hi - lo > WORD_SPAN {
+            return Vec::new();
+        }
+        if sc.kfirst.is_empty() {
+            sc.kfirst.resize(1 << (2 * K), 0);
+        }
+        sc.knext.clear();
+        sc.knext.resize(m, 0);
+        // (words of one base or of two alternating are left out)
+        let dull = |c: u32| (c ^ (c >> 2)) & 0x3fff == 0 || (c ^ (c >> 4)) & 0x0fff == 0;
+        let (mut code, mut run) = (0u32, 0usize);
+        for i in 0..m {
+            let b = read[q0 as usize + i] as u32;
+            run = if b > 3 { 0 } else { run + 1 };
+            code = (code >> 2) | ((b & 3) << TOP);
+            if run >= K && !dull(code) {
+                let at = i + 1 - K;
+                sc.knext[at] = sc.kfirst[code as usize];
+                sc.kfirst[code as usize] = at as u16 + 1;
+            }
+        }
+        // matches as (genome position of read offset 0, plus m to stay positive; read offset)
+        sc.khits.clear();
+        let (mut g, mut n, mut p) = (0u32, 0usize, lo);
+        'scan: while p < hi {
+            let w = ix.word(p);
+            let cnt = (hi - p).min(32);
+            for j in 0..cnt {
+                g = (g >> 2) | ((((w >> (2 * j)) & 3) as u32) << TOP);
+                n += 1;
+                if n < K {
+                    continue;
+                }
+                let mut x = sc.kfirst[g as usize];
+                while x != 0 {
+                    let at = x as u32 - 1;
+                    sc.khits.push((p + j + 1 - K as u32 + m as u32 - at, at as u16));
+                    x = sc.knext[at as usize];
+                }
+                if sc.khits.len() > 8192 {
+                    break 'scan;
+                }
+            }
+            p += cnt;
+        }
+        // (the table is cleared by walking the read's words again)
+        let (mut code, mut run) = (0u32, 0usize);
+        for i in 0..m {
+            let b = read[q0 as usize + i] as u32;
+            run = if b > 3 { 0 } else { run + 1 };
+            code = (code >> 2) | ((b & 3) << TOP);
+            if run >= K {
+                sc.kfirst[code as usize] = 0;
+            }
+        }
+        if sc.khits.len() > 8192 || sc.khits.len() < 2 {
+            return Vec::new();
+        }
+        sc.khits.sort_unstable();
+        // groups of matches on diagonals no more than 3 apart from one to the next
+        let mut found: Vec<(u32, SolverWindow)> = Vec::new();
+        let mut offs: Vec<u16> = Vec::new();
+        let hits = &sc.khits;
+        let mut a = 0;
+        for b in 1..=hits.len() {
+            if b < hits.len() && hits[b].0 - hits[b - 1].0 <= 3 {
+                continue;
+            }
+            if b - a >= 2 {
+                offs.clear();
+                offs.extend(hits[a..b].iter().map(|h| h.1));
+                offs.sort_unstable();
+                let (mut cover, mut end) = (0u32, 0u32);
+                for &o in &offs {
+                    let (s, e) = (o as u32, o as u32 + K as u32);
+                    cover += e - s.max(end).min(e);
+                    end = end.max(e);
+                }
+                if cover >= WORD_COVER {
+                    // where read offset 0 falls on the group's middle diagonal, and the window:
+                    // the matched bases, and on either side the read bases still unexplained
+                    // (150 at most), as for windows from level-2 hits
+                    let zero = hits[(a + b) / 2].0 as i64 - m as i64;
+                    let (first, last) = (offs[0] as i64, offs[offs.len() - 1] as i64 + K as i64);
+                    let gs = (zero + first - first.min(150) - 8).max(lo as i64);
+                    let ge = (zero + last + (m as i64 - last).min(150) + 8).min(hi as i64);
+                    if ge > gs + K as i64 {
+                        found.push((cover, ((gs - t0 as i64) as u32, (ge - gs) as u32, gs - zero, 0)));
+                    }
+                }
+            }
+            a = b;
+        }
+        // the best covered first; a few, apart from one another
+        found.sort_by_key(|f| std::cmp::Reverse(f.0));
+        let mut out: Vec<SolverWindow> = Vec::new();
+        for (_, w) in found {
+            if out.len() < 4 && out.iter().all(|o| w.0 + w.1 <= o.0 || o.0 + o.1 <= w.0) {
+                out.push(w);
+            }
+        }
+        out
     }
 
     /// Candidate exons for read bases that neither side of a junction explains, found without
