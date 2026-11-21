@@ -715,6 +715,12 @@ const WORD_SPAN: u32 = 100_000;
 const WORD_COVER: u32 = 14;
 /// Approximate search of a gap: the edits allowed in a piece of 32 and of 48 read bases.
 const SCAN_EDITS: [u32; 2] = [11, 17];
+/// The same at a read end, where what remains of the read may not belong to the transcript.
+const SCAN_EDITS_END: [u32; 2] = [11, 17];
+/// How far from a read end's last aligned base the approximate search looks.
+const SCAN_END_SPAN: u32 = 6_000;
+/// By how much a read-end solution through an exon found that way must beat clipping.
+const SCAN_END_MARGIN: u32 = 20;
 
 /// By how much a read-end solution with an unknown junction must beat clipping: for usual
 /// sites and a short intron, usual sites and a long one, other sites and a short intron,
@@ -2103,38 +2109,57 @@ impl<'a> Mapper<'a> {
                 };
                 // windows start at the unexplained bases, not at the start of this round
                 let slack = reached.saturating_sub(12);
-                let wins = if left {
-                    windows_of(
-                        &hits,
-                        q.saturating_sub(m as u32),
-                        q - slack,
-                        t.saturating_sub(self.opt.max_intron),
-                        t,
-                        4,
-                    )
-                } else {
-                    let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
-                    windows_of(&hits, q + slack, q + m as u32, t, hi, 4)
+                let windows = |hits: &[Anchor]| {
+                    if left {
+                        windows_of(
+                            hits,
+                            q.saturating_sub(m as u32),
+                            q - slack,
+                            t.saturating_sub(self.opt.max_intron),
+                            t,
+                            4,
+                        )
+                    } else {
+                        let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
+                        windows_of(hits, q + slack, q + m as u32, t, hi, 4)
+                    }
                 };
+                // Most introns are short, and within the longest intron's reach a noisy read
+                // has chance groups of hits with more hits than its next exon has: the best
+                // candidates nearby are kept as well as the best overall.
+                let near: Vec<Anchor> = hits
+                    .iter()
+                    .copied()
+                    .filter(|h| h.t.abs_diff(t) <= END_NEAR)
+                    .collect();
+                let mut wins = windows(&hits);
+                if near.len() < hits.len() {
+                    for w in windows(&near) {
+                        if wins.iter().all(|o| w.e <= o.s || o.e <= w.s) {
+                            wins.push(w);
+                        }
+                    }
+                    wins.sort_by_key(|w| w.s);
+                }
                 let vw: Vec<SolverWindow> = if left {
                     wins.iter().rev().map(|w| w.backward(q, t)).collect()
                 } else {
                     wins.iter().map(|w| w.forward(q, t)).collect()
                 };
                 let p_end = best.0.end.1.abs_diff(t);
+                let scanned = self.scan_windows_end(read, rv, m, reached as usize, gv, p_end);
                 for &mi in &strands {
-                    // plus exons that start at a splice site and match the unexplained bases
-                    // Most introns are short: look nearby first, further only if that gives
-                    // nothing better than the plain extension.
                     let mut s = Solved {
                         cost: u32::MAX,
                         ..Default::default()
                     };
+                    // the candidates from seed hits, plus known exons, exons that start at a
+                    // splice site and match the unexplained bases, and those of the
+                    // approximate search
                     let mut all = vw.clone();
                     all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
-                    let base = all.len();
                     all.extend(self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, true, sc));
-                    let _ = base;
+                    all.extend(scanned.iter().copied());
                     if !all.is_empty() {
                         all.sort_by_key(|w| w.0);
                         s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
@@ -2144,18 +2169,25 @@ impl<'a> Mapper<'a> {
                     }
                     if std::env::var_os("GMAP_DEBUG").is_some() {
                         eprintln!(
-                            "end left={left} q={q} t={t} m={m} minus={mi} windows={} plain={} cost={} hops={:?} end={:?}",
-                            all.len(),
+                            "end left={left} q={q} t={t} m={m} minus={mi} reached={reached} hits={} windows={:?} plain={} cost={} hops={:?} end={:?}",
+                            hits.len(),
+                            all,
                             best.0.cost,
                             s.cost,
                             s.hops,
                             s.end
                         );
                     }
-                    if !s.hops.is_empty()
-                        && s.cost < best.0.cost
-                        && s.cost + self.hop_margin(&s, mi) <= plain_cost
-                    {
+                    // (an exon found by the approximate search alone has no seed behind it)
+                    let by_scan = s.hops.iter().any(|h| {
+                        let p = h.enter.abs_diff(t);
+                        scanned.iter().any(|w| w.0 <= p && p <= w.0 + w.1)
+                            && !vw.iter().any(|w| w.0 <= p && p <= w.0 + w.1)
+                    });
+                    let margin = self
+                        .hop_margin(&s, mi)
+                        .max(if by_scan { SCAN_END_MARGIN } else { 0 });
+                    if !s.hops.is_empty() && s.cost < best.0.cost && s.cost + margin <= plain_cost {
                         best = (s, Some(mi));
                     }
                 }
@@ -2371,7 +2403,7 @@ impl<'a> Mapper<'a> {
     /// approximate matching: pieces of those read bases (32 and 48 long, overlapping) are
     /// looked for along the intron with Myers' bit-vector method, which gives, at every genome
     /// position, the fewest edits between a piece and any stretch of the genome ending there.
-    /// A piece that matches within about a quarter of its length makes a candidate. This finds
+    /// A piece that matches within about a third of its length makes a candidate. This finds
     /// exons whose read bases are too noisy to share even a short word with the genome. For
     /// junctions that nothing else explained, and introns up to `WORD_SPAN`.
     #[allow(clippy::too_many_arguments)]
@@ -2769,6 +2801,75 @@ impl<'a> Mapper<'a> {
         found.sort_by_key(|f| (f.0, f.1));
         found.truncate(3);
         found.into_iter().map(|f| f.2).collect()
+    }
+
+    /// Candidate exons for the bases of a read end that the genome next to it does not explain
+    /// (from `reached` bases into the `m` of the view `rv`), found by approximate matching as in
+    /// [`Self::scan_windows`]: the first of those bases, in pieces, are looked for within
+    /// `END_NEAR` of the view's origin, past `p_end`.
+    fn scan_windows_end(
+        &self,
+        read: &[u8],
+        rv: ReadView,
+        m: usize,
+        reached: usize,
+        gv: View,
+        p_end: u32,
+    ) -> Vec<SolverWindow> {
+        let ix = self.index;
+        let start = reached.saturating_sub(8);
+        let from = p_end + 20;
+        let hi = (p_end + SCAN_END_SPAN.min(self.opt.max_intron)).min(gv.room(ix).saturating_sub(64));
+        if m < start + 32 || hi <= from + 64 {
+            return Vec::new();
+        }
+        // pieces as (offset in the view, length, edits allowed)
+        let mut pieces: Vec<(usize, usize, u32)> = Vec::new();
+        for (len, allowed, n) in [(32usize, SCAN_EDITS_END[0], 3), (48, SCAN_EDITS_END[1], 2)] {
+            for k in 0..n {
+                if start + 16 * k + len <= m {
+                    pieces.push((start + 16 * k, len, allowed));
+                }
+            }
+        }
+        // (a piece is matched in genome order: backwards in the view when it runs backwards)
+        let mut peq = [[0u64; 4]; SCAN_PIECES];
+        for (k, &(o, len, _)) in pieces.iter().enumerate() {
+            for i in 0..len {
+                let b = rv.base(read, if rv.rev { o + len - 1 - i } else { o + i });
+                if b < 4 {
+                    peq[k][b as usize] |= 1 << i;
+                }
+            }
+        }
+        let (lo_real, hi_real) = if gv.rev {
+            (gv.origin - hi, gv.origin - from)
+        } else {
+            (gv.origin + from, gv.origin + hi)
+        };
+        let mut found: Vec<(u32, usize, u32)> = Vec::new();
+        scan(&|p| ix.word(p), lo_real, hi_real, &pieces, &peq, &mut found);
+        found.sort_unstable();
+        let mut out: Vec<SolverWindow> = Vec::new();
+        for (_, k, end) in found {
+            let (o, len, _) = pieces[k];
+            // where the piece starts in the view, and the window: from a few bases before
+            // it, for the read bases that remain
+            let ps = if gv.rev {
+                gv.origin - end
+            } else {
+                (end - gv.origin).saturating_sub(len as u32)
+            };
+            let vs = ps.saturating_sub(16).max(from);
+            let vl = ((m - o) as u32 + 28)
+                .min(300)
+                .min(gv.room(ix).saturating_sub(vs + 8));
+            if ps >= vs && vl >= 16 && out.len() < 3 && out.iter().all(|w| vs + vl <= w.0 || w.0 + w.1 <= vs)
+            {
+                out.push((vs, vl, o as i64 - (ps - vs) as i64, 0));
+            }
+        }
+        out
     }
 
     /// Score change of chaining anchor `a` after `p`: the read bases `a` adds, minus the price of
