@@ -134,6 +134,23 @@ impl Junctions {
         self.acceptors[minus as usize].binary_search(&p).is_ok()
     }
 
+    /// The known intron left ends (`right`: right ends) in `[lo, hi]` for a transcript strand.
+    pub fn sites_in(&self, lo: u32, hi: u32, minus: bool, right: bool) -> &[u32] {
+        let v = if right {
+            &self.acceptors[minus as usize]
+        } else {
+            &self.donors[minus as usize]
+        };
+        let a = v.partition_point(|&x| x < lo);
+        let b = a + v[a..].partition_point(|&x| x <= hi);
+        &v[a..b]
+    }
+
+    /// Whether `[left, right)` is a known intron.
+    pub fn intron(&self, left: u32, right: u32) -> bool {
+        self.by_left.binary_search(&(left, right)).is_ok()
+    }
+
     /// Known exons that lie inside `[lo, hi)`.
     pub fn exons_in(&self, lo: u32, hi: u32) -> &[(u32, u32)] {
         let a = self.exons.partition_point(|e| e.0 < lo);

@@ -251,6 +251,8 @@ pub(crate) struct Bufs {
     /// junction in it is a known one): an exon then costs nothing on top of its sites, so
     /// that a known exon of three bases beats writing them as an insertion.
     pub known_only: bool,
+    /// What an exon costs on top of its sites while `known_only` is set.
+    pub known_extra: u32,
     pub calls: u64,
     pub prefix_cells: u64,
     pub window_cells: u64,
@@ -758,7 +760,7 @@ pub(crate) fn solve(
         // such a cell or the window can be entered in it; the rows before the first place
         // it can be entered and after the last, once nothing is left, are not filled.
         let ub = if far.is_some() { bound } else { best_end.0 };
-        let extra = if b.known_only { 0 } else { EXTRA_INTRON };
+        let extra = if b.known_only { b.known_extra } else { EXTRA_INTRON };
         let enters = |c: u32, ub: u32| c < BIG && (ub >= BIG || c + extra <= ub);
         let first = (i_lo..=i_hi).find(|&i| enters(cur[i], ub));
         let Some(first) = first else {

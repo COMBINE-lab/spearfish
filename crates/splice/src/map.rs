@@ -836,7 +836,7 @@ pub(crate) fn acceptor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
 
 /// [`donor_pen`] and [`acceptor_pen`] at each of `lo..=hi`, from the bases read once:
 /// `bases` receives those of `[lo - 3, hi + 3)`. Returns false, with nothing filled, when
-/// junctions were given or the range is too near an end of the genome for that (the caller
+/// the range is too near an end of the genome for that (the caller
 /// then asks site by site).
 pub(crate) fn site_pens(
     ix: &GenomeIndex,
@@ -847,7 +847,7 @@ pub(crate) fn site_pens(
     donors: &mut Vec<u32>,
     acceptors: &mut Vec<u32>,
 ) -> bool {
-    if ix.junctions.is_some() || lo < 3 || hi as u64 + 3 > ix.total_len() as u64 {
+    if lo < 3 || hi as u64 + 3 > ix.total_len() as u64 {
         return false;
     }
     ix.bases(lo - 3, hi + 3, bases);
@@ -863,6 +863,19 @@ pub(crate) fn site_pens(
         let d = (bases[k + 3] | (bases[k + 4] << 2) | (bases[k + 5] << 4)) as usize;
         donors.push(dt[d] as u32);
         c = (c >> 2) | ((bases[k + 3] as usize) << 4);
+    }
+    // With known junctions: a known site costs nothing, any other its motif and the price of
+    // an unknown site (as `donor_pen` and `acceptor_pen`).
+    if let Some(j) = &ix.junctions {
+        let unknown = UNKNOWN.get().0 as u32;
+        donors.iter_mut().for_each(|c| *c += unknown);
+        acceptors.iter_mut().for_each(|c| *c += unknown);
+        for &p in j.sites_in(lo, hi, minus, false) {
+            donors[(p - lo) as usize] = 0;
+        }
+        for &p in j.sites_in(lo, hi, minus, true) {
+            acceptors[(p - lo) as usize] = 0;
+        }
     }
     true
 }
@@ -904,6 +917,13 @@ struct Placed {
 }
 
 /// Known exons shorter than this are tried inside any junction that did not fit exactly.
+/// Read ends of up to this many unaligned bases are aligned to the genome next to the hit.
+const END_CLOSE: u32 = 16;
+/// Price of a known intron at a read end (besides its sites, which cost nothing).
+const KNOWN_END: u32 = 8;
+/// The most unexplained read bases at an end for which the known introns are tried on their own
+/// (more than that is another exon or more, and the seeds find those).
+const KNOWN_END_SPAN: u32 = 60;
 const MICRO_EXON: u32 = 20;
 
 /// Reference skips shorter than this are written as deletions, not introns.
@@ -1830,6 +1850,18 @@ impl<'a> Mapper<'a> {
                                 .map(|w| w.forward(q0, t0))
                                 .collect()
                         };
+                        // (known exons inside the intron are candidates in every round: where
+                        // the seed hits point to one of two missing exons, the other is often
+                        // a known one)
+                        if !from_known {
+                            // (but not one that a seed window already covers)
+                            let seeded = vw.len();
+                            for k in &known {
+                                if !vw[..seeded].iter().any(|w| w.0 <= k.0 && k.0 + k.1 <= w.0 + w.1) {
+                                    vw.push(*k);
+                                }
+                            }
+                        }
                         vw.sort_by_key(|w| w.0);
                         sc.gap.known_only = from_known;
                         let t = gap::solve(
@@ -2113,6 +2145,24 @@ impl<'a> Mapper<'a> {
                 blocks.drain(..a);
                 origins = vec![b'?'; blocks.len() - 1];
             }
+            // A few read bases left over at an end are aligned too when they fit the genome
+            // next to the hit: where a read ends then shows in where its hit ends.
+            let nb = blocks.len() - 1;
+            if let Some(d) = self.close(read, blocks[0].qs, blocks[0].ts - lo, true, blocks[0].ts, sc) {
+                blocks[0].qs = 0;
+                blocks[0].ts -= d;
+            }
+            if let Some(d) = self.close(
+                read,
+                qlen - blocks[nb].qe,
+                hi - blocks[nb].te,
+                false,
+                blocks[nb].te,
+                sc,
+            ) {
+                blocks[nb].qe = qlen;
+                blocks[nb].te += d;
+            }
         }
         let tx_strand = if tx_strand == b'.' && blocks.len() > 1 && !self.opt.forward_only {
             if left.minus.or(right.minus).unwrap_or(minus) {
@@ -2138,6 +2188,47 @@ impl<'a> Mapper<'a> {
                 Vec::new()
             },
         }
+    }
+
+    /// The `c` read bases left over at a read end (`left`: before the hit), against the genome
+    /// next to the hit at `t` with `room` bases to the end of the sequence: the number of genome
+    /// bases they align to with the fewest edits (on a tie, the number closest to `c`), if those
+    /// edits are few enough to be sequencing errors. A low-complexity end (a tail) stays clipped.
+    fn close(&self, read: &[u8], c: u32, room: u32, left: bool, t: u32, sc: &mut Scratch) -> Option<u32> {
+        if c == 0 || c > END_CLOSE || room == 0 {
+            return None;
+        }
+        let (c, n) = (c as usize, (c + 3).min(room) as usize);
+        let rb = |i: usize| if left { read[c - 1 - i] } else { read[read.len() - c + i] } & 3;
+        if c >= 6 {
+            let mut count = [0usize; 4];
+            (0..c).for_each(|i| count[rb(i) as usize] += 1);
+            if 4 * count.iter().max().unwrap() >= 3 * c {
+                return None;
+            }
+        }
+        if left {
+            self.index.bases(t - n as u32, t, &mut sc.g1);
+        } else {
+            self.index.bases(t, t + n as u32, &mut sc.g1);
+        }
+        let g = &sc.g1;
+        let gb = |j: usize| if left { g[n - 1 - j] } else { g[j] };
+        let mut row = [0u8; END_CLOSE as usize + 4];
+        (0..=n).for_each(|j| row[j] = j as u8);
+        for i in 0..c {
+            let mut diag = row[0];
+            row[0] = i as u8 + 1;
+            for j in 0..n {
+                let v = (diag + (rb(i) != gb(j)) as u8)
+                    .min(row[j] + 1)
+                    .min(row[j + 1] + 1);
+                diag = row[j + 1];
+                row[j + 1] = v;
+            }
+        }
+        let (e, _, j) = (0..=n).map(|j| (row[j], j.abs_diff(c), j)).min().unwrap();
+        (3 * e as usize <= c + 2).then_some(j as u32)
     }
 
     /// Solve a read end: the bases before read position `q` (`left`) or from it on, starting
@@ -2212,7 +2303,34 @@ impl<'a> Mapper<'a> {
                 }
                 n > 0 && 4 * c.iter().max().unwrap() >= 3 * n
             };
-            if rescue && !tail && m as u32 - reached >= if known { 4 } else { 10 } {
+            // With known junctions, first the known introns that start where the alignment
+            // stops: a read end that goes on in the exon after one of them is believed on a
+            // few bases, and then nothing else is searched.
+            let mut settled = false;
+            if rescue && !tail && known && m as u32 - reached >= 4 && m as u32 - reached <= KNOWN_END_SPAN {
+                let p_end = best.0.end.1.abs_diff(t);
+                let mut kh = self.known_hops(gv, p_end, reached as usize, m - reached as usize);
+                kh.sort_by_key(|w| w.0);
+                if !kh.is_empty() {
+                    let j = self.index.junctions.as_ref().unwrap();
+                    for &mi in &strands {
+                        sc.gap.known_only = true;
+                        sc.gap.known_extra = KNOWN_END;
+                        let s = gap::solve(ix, read, rv, m, gv, None, &kh, mi, half, &mut sc.gap);
+                        sc.gap.known_only = false;
+                        sc.gap.known_extra = 0;
+                        let all_known = !s.hops.is_empty()
+                            && s.hops
+                                .iter()
+                                .all(|h| j.intron(h.leave.min(h.enter), h.leave.max(h.enter)));
+                        if all_known && s.cost < best.0.cost && s.cost <= plain_cost {
+                            settled = m as u32 - s.end.0.abs_diff(q) < 4;
+                            best = (s, Some(mi));
+                        }
+                    }
+                }
+            }
+            if rescue && !tail && !settled && m as u32 - reached >= 10 {
                 sc.stats.end_tried += 1;
                 // level-2 cores of the unexplained bases, within reach of the longest intron
                 let here = Anchor {
@@ -2326,7 +2444,9 @@ impl<'a> Mapper<'a> {
                 strands = vec![mi];
             }
             // Go on only if this round used all it was given and more of the read remains.
-            if whole || (m as u32 - got >= 10 && !hopped) || got < 30 {
+            // (after a junction, what is still left of the read may lie in a further exon)
+            let more = hopped && got > 0 && m as u32 - got >= if known { 4 } else { 10 };
+            if !more && (whole || (m as u32 - got >= 10 && !hopped) || got < 30) {
                 break;
             }
             (q, t) = s.end;
@@ -2803,7 +2923,10 @@ impl<'a> Mapper<'a> {
         let mut out: Vec<SolverWindow> = Vec::new();
         for &(s, e) in j.exons_in(t0 + 20, t1 - 20) {
             if e + 20 <= t1 && (e - s) as usize <= m + 20 && out.len() < 12 {
-                out.push((s - t0, e - s, 0, m as i64 + (e - s) as i64));
+                // (the exon lies somewhere in the m read bases: its first base goes with a read
+                // position from 0 to m less its length, give or take a few for indels)
+                let (l, m) = ((e - s) as i64, m as i64);
+                out.push((s - t0, e - s, (m - l) / 2, (m - l).abs() / 2 + 8 + l / 8));
             }
         }
         out
