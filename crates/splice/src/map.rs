@@ -528,6 +528,183 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
     }
 }
 
+/// The most pieces of a gap's read bases looked for in one approximate search.
+const SCAN_PIECES: usize = 16;
+
+/// Approximate search of the genome `[lo, hi)` (`word(p)` gives the 32 bases from `p` on) for pieces of a read (Myers' bit-vector
+/// method): `pieces` gives each piece's length and the edits allowed (second and third
+/// field), `peq[k][c]` the positions of piece `k` that hold base `c`. For every run of genome
+/// positions where a piece ends within its allowed edits, the run's best position is added
+/// to `found` as (edits per 64 bases, piece, position after the match).
+fn scan(
+    word: &impl Fn(u32) -> u64,
+    lo: u32,
+    hi: u32,
+    pieces: &[(usize, usize, u32)],
+    peq: &[[u64; 4]; SCAN_PIECES],
+    found: &mut Vec<(u32, usize, u32)>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") {
+        for g in (0..pieces.len()).step_by(8) {
+            // SAFETY: the feature was just detected.
+            unsafe { scan_avx512(word, lo, hi, pieces, peq, g, found) };
+        }
+        return;
+    }
+    scan_plain(word, lo, hi, pieces, peq, found)
+}
+
+fn scan_plain(
+    word: &impl Fn(u32) -> u64,
+    lo: u32,
+    hi: u32,
+    pieces: &[(usize, usize, u32)],
+    peq: &[[u64; 4]; SCAN_PIECES],
+    found: &mut Vec<(u32, usize, u32)>,
+) {
+    let n = pieces.len();
+    let mut top = [0u64; SCAN_PIECES];
+    let (mut pv, mut mv) = ([0u64; SCAN_PIECES], [0u64; SCAN_PIECES]);
+    let mut score = [0u32; SCAN_PIECES];
+    // the best end of the run of matching positions each piece is in: (edits, position)
+    let mut run = [(u32::MAX, 0u32); SCAN_PIECES];
+    for (k, &(_, len, _)) in pieces.iter().enumerate() {
+        top[k] = 1 << (len - 1);
+        pv[k] = if len == 64 { !0 } else { (1u64 << len) - 1 };
+        score[k] = len as u32;
+    }
+    let mut p = lo;
+    while p < hi {
+        let w = word(p);
+        let cnt = (hi - p).min(32);
+        for j in 0..cnt {
+            let c = ((w >> (2 * j)) & 3) as usize;
+            for k in 0..n {
+                let eq = peq[k][c];
+                let xv = eq | mv[k];
+                let xh = (((eq & pv[k]).wrapping_add(pv[k])) ^ pv[k]) | eq;
+                let mut ph = mv[k] | !(xh | pv[k]);
+                let mut mh = pv[k] & xh;
+                score[k] += (ph & top[k] != 0) as u32;
+                score[k] -= (mh & top[k] != 0) as u32;
+                ph <<= 1;
+                mh <<= 1;
+                pv[k] = mh | !(xv | ph);
+                mv[k] = ph & xv;
+                if score[k] <= pieces[k].2 {
+                    if score[k] < run[k].0 {
+                        run[k] = (score[k], p + j + 1);
+                    }
+                } else if run[k].0 != u32::MAX {
+                    found.push((run[k].0 * 64 / pieces[k].1 as u32, k, run[k].1));
+                    run[k].0 = u32::MAX;
+                }
+            }
+        }
+        p += cnt;
+    }
+    for k in 0..n {
+        if run[k].0 != u32::MAX {
+            found.push((run[k].0 * 64 / pieces[k].1 as u32, k, run[k].1));
+        }
+    }
+}
+
+/// [`scan_plain`] for the pieces `g..g + 8`, one piece per 64-bit lane, with the same results.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn scan_avx512(
+    word: &impl Fn(u32) -> u64,
+    lo: u32,
+    hi: u32,
+    pieces: &[(usize, usize, u32)],
+    peq: &[[u64; 4]; SCAN_PIECES],
+    g: usize,
+    found: &mut Vec<(u32, usize, u32)>,
+) {
+    use std::arch::x86_64::*;
+    let n = (pieces.len() - g).min(8);
+    let mut eqs = [[0u64; 8]; 4];
+    let (mut tops, mut pvs, mut scores, mut limits) = ([0u64; 8], [0u64; 8], [1u64 << 32; 8], [0u64; 8]);
+    for k in 0..n {
+        let (_, len, allowed) = pieces[g + k];
+        for c in 0..4 {
+            eqs[c][k] = peq[g + k][c];
+        }
+        tops[k] = 1 << (len - 1);
+        pvs[k] = if len == 64 { !0 } else { (1u64 << len) - 1 };
+        scores[k] = len as u64;
+        limits[k] = allowed as u64;
+    }
+    // SAFETY (all loads and stores below): the arrays hold eight 64-bit values.
+    unsafe {
+        let eq = [
+            _mm512_loadu_si512(eqs[0].as_ptr().cast()),
+            _mm512_loadu_si512(eqs[1].as_ptr().cast()),
+            _mm512_loadu_si512(eqs[2].as_ptr().cast()),
+            _mm512_loadu_si512(eqs[3].as_ptr().cast()),
+        ];
+        let top = _mm512_loadu_si512(tops.as_ptr().cast());
+        let limit = _mm512_loadu_si512(limits.as_ptr().cast());
+        let mut pv = _mm512_loadu_si512(pvs.as_ptr().cast());
+        let mut mv = _mm512_setzero_si512();
+        let mut score = _mm512_loadu_si512(scores.as_ptr().cast());
+        let one = _mm512_set1_epi64(1);
+        let mut run = [(u32::MAX, 0u32); 8];
+        let mut open = 0u8;
+        let mut p = lo;
+        while p < hi {
+            let w = word(p);
+            let cnt = (hi - p).min(32);
+            for j in 0..cnt {
+                let e = eq[((w >> (2 * j)) & 3) as usize];
+                let xv = _mm512_or_si512(e, mv);
+                let xh = _mm512_or_si512(
+                    _mm512_xor_si512(_mm512_add_epi64(_mm512_and_si512(e, pv), pv), pv),
+                    e,
+                );
+                let ph = _mm512_or_si512(
+                    mv,
+                    _mm512_andnot_si512(_mm512_or_si512(xh, pv), _mm512_set1_epi64(-1)),
+                );
+                let mh = _mm512_and_si512(pv, xh);
+                score = _mm512_mask_add_epi64(score, _mm512_test_epi64_mask(ph, top), score, one);
+                score = _mm512_mask_sub_epi64(score, _mm512_test_epi64_mask(mh, top), score, one);
+                let ph = _mm512_slli_epi64::<1>(ph);
+                let mh = _mm512_slli_epi64::<1>(mh);
+                pv = _mm512_or_si512(
+                    mh,
+                    _mm512_andnot_si512(_mm512_or_si512(xv, ph), _mm512_set1_epi64(-1)),
+                );
+                mv = _mm512_and_si512(ph, xv);
+                let within = _mm512_cmple_epu64_mask(score, limit);
+                if within | open != 0 {
+                    let mut sv = [0u64; 8];
+                    _mm512_storeu_si512(sv.as_mut_ptr().cast(), score);
+                    for k in 0..n {
+                        if within >> k & 1 == 1 {
+                            if (sv[k] as u32) < run[k].0 {
+                                run[k] = (sv[k] as u32, p + j + 1);
+                            }
+                        } else if run[k].0 != u32::MAX {
+                            found.push((run[k].0 * 64 / pieces[g + k].1 as u32, g + k, run[k].1));
+                            run[k].0 = u32::MAX;
+                        }
+                    }
+                    open = within;
+                }
+            }
+            p += cnt;
+        }
+        for k in 0..n {
+            if run[k].0 != u32::MAX {
+                found.push((run[k].0 * 64 / pieces[g + k].1 as u32, g + k, run[k].1));
+            }
+        }
+    }
+}
+
 /// The most a read's usual junction cost per base (times 64) may raise the bar for a doubtful
 /// junction.
 const USUAL_CAP: u32 = 40;
@@ -536,6 +713,8 @@ const USUAL_CAP: u32 = 40;
 /// one diagonal must cover.
 const WORD_SPAN: u32 = 100_000;
 const WORD_COVER: u32 = 14;
+/// Approximate search of a gap: the edits allowed in a piece of 32 and of 48 read bases.
+const SCAN_EDITS: [u32; 2] = [11, 17];
 
 /// By how much a read-end solution with an unknown junction must beat clipping: for usual
 /// sites and a short intron, usual sites and a long one, other sites and a short intron,
@@ -1482,6 +1661,7 @@ impl<'a> Mapper<'a> {
         // Where a junction leaves read bases unexplained, look for level-2 cores of those bases
         // inside that intron and solve the gap through the exons they point to.
         let mut cand: Vec<Option<Vec<Window>>> = vec![None; pairs.len()];
+        let mut seedless: Vec<Option<Vec<SolverWindow>>> = vec![None; pairs.len()];
         let mut best: Option<(u32, bool, Vec<Placed>)> = None;
         for &minus in &strands {
             let mut total = 0u32;
@@ -1510,6 +1690,11 @@ impl<'a> Mapper<'a> {
                 let wins = cand[k].as_ref().unwrap();
                 let m = q1.saturating_sub(q0) as usize;
                 let mut done = false;
+                // the solution through candidate exons so far, and how its exons were found
+                let mut sol: Option<(Solved, u8)> = None;
+                // what a junction of this length usually costs on this read: an answer above it
+                // still leaves something unexplained
+                let fine = 18 + m as u32 * self.opt.trigger_x64.max(usual) / 64;
                 if (!wins.is_empty() || self.index.junctions.is_some()) && q1 > q0 && t1 > t0 && m <= 600 {
                     let rv = ReadView { q: q0, rev: false };
                     let gv = View {
@@ -1528,9 +1713,6 @@ impl<'a> Mapper<'a> {
                     // Then, if junctions were given, the known exons inside this intron on their
                     // own, believed only when every junction of the solution is a known one.
                     let mut found = false;
-                    // what a junction of this length usually costs on this read: an answer above it
-                    // still leaves something unexplained
-                    let fine = 18 + m as u32 * self.opt.trigger_x64.max(usual) / 64;
                     for (min_hits, from_known) in [(2u32, false), (0, false), (0, true)] {
                         // the lone hits are tried when the junction is clearly bad, and also when
                         // the well-supported candidates gave an answer that is still a poor fit
@@ -1588,27 +1770,34 @@ impl<'a> Mapper<'a> {
                     }
                     if found {
                         sc.stats.rescues_kept += (minus == strands[0]) as u64;
-                        total += s.cost;
-                        juncs.extend(s.hops.iter().map(|h| Placed {
-                            q: h.q,
-                            donor: h.leave,
-                            acceptor: h.enter,
-                            cost: 0,
-                            origin: b'w',
-                        }));
-                        done = true;
+                        sol = Some((s, b'w'));
                     }
                 }
-                // No level-2 hit led to a cheaper explanation: look for an exon between a pair of
-                // splice sites that matches the unexplained bases.
-                if !done && hard && q1 > q0 && t1 > t0 && m <= 600 {
-                    let sites = self.site_windows(read, q0, t0, q1, t1, minus, sc);
-                    let words = self.word_windows(read, q0, t0, q1, t1, sc);
+                // No level-2 hit led to an explanation, or only to one that is still a poor fit
+                // (a lone hit can point next to an exon, and some stretch near it will fit the
+                // read's bases better than nothing): look for an exon between a pair of splice
+                // sites that matches the unexplained bases, and for one that shares short words
+                // with them.
+                let poor_fit = sol.as_ref().is_none_or(|x| x.0.cost >= 2 * fine);
+                if poor_fit && hard && q1 > q0 && t1 > t0 && m <= 600 {
+                    let (sites, mid) = self.site_windows(read, q0, t0, q1, t1, minus, sc);
+                    // (the two searches below do not depend on the strand)
+                    if seedless[k].is_none() {
+                        let mut w = self.word_windows(read, q0, t0, q1, t1, sc);
+                        if let Some(mid) = mid {
+                            w.extend(self.scan_windows(read, q0, t0, q1, t1, mid));
+                        }
+                        seedless[k] = Some(w);
+                    }
+                    let words = seedless[k].clone().unwrap();
                     if !sites.is_empty() || !words.is_empty() {
                         sc.stats.site_tried += (minus == strands[0]) as u64;
                         let mut vw: Vec<SolverWindow> = sites.iter().map(|w| w.forward(q0, t0)).collect();
                         let by_words = !words.is_empty();
                         vw.extend(words);
+                        if sol.is_some() {
+                            vw.extend(wins.iter().map(|w| w.forward(q0, t0)));
+                        }
                         vw.sort_by_key(|w| w.0);
                         let rv = ReadView { q: q0, rev: false };
                         let gv = View {
@@ -1628,19 +1817,31 @@ impl<'a> Mapper<'a> {
                             half,
                             &mut sc.gap,
                         );
-                        if s.hops.len() > 1 && s.cost < (direct.cost as u32).min(1 << 20) {
+                        let limit = sol
+                            .as_ref()
+                            .map_or((direct.cost as u32).min(1 << 20), |x| x.0.cost);
+                        if std::env::var_os("GMAP_DEBUG").is_some() {
+                            eprintln!(
+                                "  seedless windows={vw:?} cost={} hops={:?} limit={limit}",
+                                s.cost, s.hops
+                            );
+                        }
+                        if s.hops.len() > 1 && s.cost < limit {
                             sc.stats.site_kept += (minus == strands[0]) as u64;
-                            total += s.cost;
-                            juncs.extend(s.hops.iter().map(|h| Placed {
-                                q: h.q,
-                                donor: h.leave,
-                                acceptor: h.enter,
-                                cost: 0,
-                                origin: if by_words { b'k' } else { b's' },
-                            }));
-                            done = true;
+                            sol = Some((s, if by_words { b'k' } else { b's' }));
                         }
                     }
+                }
+                if let Some((s, origin)) = sol {
+                    total += s.cost;
+                    juncs.extend(s.hops.iter().map(|h| Placed {
+                        q: h.q,
+                        donor: h.leave,
+                        acceptor: h.enter,
+                        cost: 0,
+                        origin,
+                    }));
+                    done = true;
                 }
                 if std::env::var_os("GMAP_DEBUG").is_some() {
                     eprintln!(
@@ -2166,6 +2367,83 @@ impl<'a> Mapper<'a> {
         out
     }
 
+    /// Candidate exons for the read bases `[q0, q1)` inside the intron `(t0, t1)`, found by
+    /// approximate matching: pieces of those read bases (32 and 48 long, overlapping) are
+    /// looked for along the intron with Myers' bit-vector method, which gives, at every genome
+    /// position, the fewest edits between a piece and any stretch of the genome ending there.
+    /// A piece that matches within about a quarter of its length makes a candidate. This finds
+    /// exons whose read bases are too noisy to share even a short word with the genome. For
+    /// junctions that nothing else explained, and introns up to `WORD_SPAN`.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_windows(
+        &self,
+        read: &[u8],
+        q0: u32,
+        t0: u32,
+        q1: u32,
+        t1: u32,
+        mid: (usize, usize),
+    ) -> Vec<SolverWindow> {
+        let ix = self.index;
+        let m = (q1 - q0) as usize;
+        let (lo, hi) = (t0 + 20, t1.saturating_sub(20));
+        // the stretch neither side explains, with a few bases more on either side
+        let (a, b) = (mid.0.saturating_sub(8), (mid.1 + 8).min(m));
+        if !(32..=600).contains(&m) || b < a + 32 || hi <= lo + 32 || hi - lo > WORD_SPAN {
+            return Vec::new();
+        }
+        // pieces: (offset in the gap, length, edits allowed)
+        let mut pieces: Vec<(usize, usize, u32)> = Vec::new();
+        for (len, allowed) in [(32usize, SCAN_EDITS[0]), (48, SCAN_EDITS[1])] {
+            if b - a < len {
+                continue;
+            }
+            let mut o = a;
+            while o + len < b {
+                pieces.push((o, len, allowed));
+                o += 16;
+            }
+            pieces.push((b - len, len, allowed));
+        }
+        if pieces.len() > SCAN_PIECES {
+            // too many for one pass: every other one
+            let mut k = 0;
+            pieces.retain(|_| {
+                k += 1;
+                k % 2 == 1
+            });
+            pieces.truncate(SCAN_PIECES);
+        }
+        let mut peq = [[0u64; 4]; SCAN_PIECES];
+        for (k, &(o, len, _)) in pieces.iter().enumerate() {
+            for i in 0..len {
+                let b = read[q0 as usize + o + i];
+                if b < 4 {
+                    peq[k][b as usize] |= 1 << i;
+                }
+            }
+        }
+        // (edits per 64 bases, piece, genome position after the match)
+        let mut found: Vec<(u32, usize, u32)> = Vec::new();
+        scan(&|p| ix.word(p), lo, hi, &pieces, &peq, &mut found);
+        // the best matches first; a few, apart from one another
+        found.sort_unstable();
+        let mut out: Vec<SolverWindow> = Vec::new();
+        for (_, k, end) in found {
+            let (o, len, _) = pieces[k];
+            // where read offset 0 of the gap falls on the match's diagonal, and the window: the
+            // stretch neither side explains, on that diagonal, and a few bases more
+            let zero = end as i64 - (o + len) as i64;
+            let gs = (zero + a as i64 - 16).max(lo as i64);
+            let ge = (zero + b as i64 + 16).min(hi as i64);
+            let w: SolverWindow = ((gs - t0 as i64) as u32, (ge - gs).max(0) as u32, gs - zero, 0);
+            if ge > gs + 16 && out.len() < 4 && out.iter().all(|o| w.0 + w.1 <= o.0 || o.0 + o.1 <= w.0) {
+                out.push(w);
+            }
+        }
+        out
+    }
+
     /// Candidate exons for read bases that neither side of a junction explains, found without
     /// any seed: genome intervals inside the intron that start after an acceptor site, end
     /// before a donor site, are about as long as the unexplained bases, and match them.
@@ -2179,7 +2457,7 @@ impl<'a> Mapper<'a> {
         t1: u32,
         minus: bool,
         sc: &mut Scratch,
-    ) -> Vec<Window> {
+    ) -> (Vec<Window>, Option<(usize, usize)>) {
         let ix = self.index;
         let m = (q1 - q0) as usize;
         // How far the read follows the genome from either side.
@@ -2220,7 +2498,7 @@ impl<'a> Mapper<'a> {
         );
         let down = reach(&sc.e2, rows);
         if up + down + 6 > m {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         // The unexplained bases, with a margin on both sides (the read can follow an intron a
         // few bases by chance), and the exon lengths that fit them.
@@ -2229,14 +2507,15 @@ impl<'a> Mapper<'a> {
         let k = m - up - down;
         let mid = &read[q0 as usize + up..q1 as usize - down];
         let (lo, hi) = (t0 + up as u32 + 20, (t1 - down as u32).saturating_sub(20));
+        let mid_at = Some((up, m - down));
         if hi <= lo || k > 200 + 2 * MARGIN {
-            return Vec::new();
+            return (Vec::new(), mid_at);
         }
         let slack = 2 + k / 10;
         let (len_lo, len_hi) = (k.saturating_sub(2 * MARGIN + slack).max(4), k + slack);
         // an exon under ten bases is only looked for close by: further off, chance matches win
         if len_lo < 10 && hi - lo > 20_000 {
-            return Vec::new();
+            return (Vec::new(), mid_at);
         }
         let mut found: Vec<(usize, Window)> = Vec::new();
         let mut scanned = 0u64;
@@ -2247,21 +2526,42 @@ impl<'a> Mapper<'a> {
         ix.pair_scan(lo.saturating_sub(2), hi.saturating_sub(2), a0, a1, |s| {
             starts.push(s + 2)
         });
+        // where an exon can end: before a usual donor site
+        // (GT on the forward strand, CT on the reverse)
+        let mut ends = vec![0u64; ((hi - lo) as usize >> 6) + 1];
+        ix.pair_scan(lo, hi + 1, if minus { 1 } else { 2 }, 3, |e| {
+            ends[(e - lo) as usize >> 6] |= 1 << ((e - lo) & 63)
+        });
+        // the 32 read bases from each offset of the unexplained stretch, two bits each, to
+        // compare 32 bases with the genome at once
+        const LOW: u64 = 0x5555_5555_5555_5555;
+        let mut packed = vec![0u64; k + 1];
+        for o in (0..k).rev() {
+            packed[o] = (packed[o + 1] << 2) | (mid[o] as u64 & 3);
+        }
         for p in starts {
             if p < lo {
                 continue;
             }
+            let gw = ix.word(p);
             for len in len_lo..=len_hi {
                 let e = p + len as u32;
-                if e > hi || donor_motif(ix, e, minus) > FLANK {
+                if e > hi || ends[(e - lo) as usize >> 6] >> ((e - lo) & 63) & 1 == 0 {
                     continue;
                 }
                 // the exon against the unexplained bases at every offset it can have in them
                 let allowed = len / 8;
                 let mut best = usize::MAX;
                 for o in 0..=k.saturating_sub(len) {
+                    let n = len.min(k - o);
+                    // the first 32 bases at once: most offsets fail here
+                    let x = gw ^ packed[o];
+                    let x = (x | (x >> 1)) & LOW & if n >= 32 { !0 } else { (1u64 << (2 * n)) - 1 };
+                    if x.count_ones() as usize > allowed {
+                        continue;
+                    }
                     let mut d = 0;
-                    for i in 0..len.min(k - o) {
+                    for i in 0..n {
                         d += (mid[o + i] != ix.base(p + i as u32)) as usize;
                         if d > allowed {
                             break;
@@ -2300,7 +2600,7 @@ impl<'a> Mapper<'a> {
             }
         }
         out.sort_by_key(|w| w.s);
-        out
+        (out, mid_at)
     }
 
     /// How much cheaper than clipping a read-end solution with junctions must be to be believed:
@@ -3031,6 +3331,39 @@ mod tests {
 
     /// The gap pass of a row, 32 cells at a time, against the cell-by-cell one.
     #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn scans_match() {
+        // a random genome, and pieces that are noisy copies of stretches of it
+        let mut st = 7u64;
+        let g: Vec<u8> = (0..6100).map(|_| (rng(&mut st) % 4) as u8).collect();
+        let word = |p: u32| (0..32).fold(0u64, |w, i| w | (g[p as usize + i] as u64) << (2 * i));
+        for round in 0..20 {
+            let at = 100 + (rng(&mut st) % 5000) as usize;
+            let mut pieces = Vec::new();
+            let mut peq = [[0u64; 4]; SCAN_PIECES];
+            for k in 0..(1 + round % SCAN_PIECES) {
+                let len = [32usize, 48, 64][k % 3];
+                for i in 0..len {
+                    let c = g[at + 7 * k + i];
+                    let c = if rng(&mut st).is_multiple_of(8) {
+                        (c + 1) & 3
+                    } else {
+                        c
+                    };
+                    peq[k][c as usize] |= 1 << i;
+                }
+                pieces.push((0, len, len as u32 / 4));
+            }
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            scan_plain(&word, 20, 5990, &pieces, &peq, &mut a);
+            scan(&word, 20, 5990, &pieces, &peq, &mut b);
+            a.sort_unstable();
+            b.sort_unstable();
+            assert!(!a.is_empty());
+            assert_eq!(a, b);
+        }
+    }
+
     #[test]
     fn row_gaps_match() {
         if !std::is_x86_feature_detected!("avx512bw") {
