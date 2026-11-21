@@ -1,8 +1,10 @@
 //! Development driver for spliced genome mapping.
 //!
-//!   gmap index <genome.fa> <out.gidx> [--hpc]
-//!   gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
-//!            [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]]   (default output: PAF)
+//! ```text
+//! gmap index <genome.fa> <out.gidx> [--hpc]
+//! gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
+//!          [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]]   (default output: PAF)
+//! ```
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
