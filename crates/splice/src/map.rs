@@ -1272,6 +1272,84 @@ impl<'a> Mapper<'a> {
         Some((best, sc.chain.iter().map(|&i| hits[i as usize]).collect()))
     }
 
+    /// Anchors for long stretches of the read that a chain leaves without one (several exons
+    /// in a burst of errors): the level-2 hits between the two chain neighbours are chained,
+    /// and those that another hit of that chain continues on the same diagonal are added to
+    /// the chain. A chance hit is alone on its diagonal; two that agree are not chance. The
+    /// stretch is then several shorter gaps, each within the solver's reach.
+    fn refine(&self, reverse: bool, chain: &[Anchor], qlen: u32, sc: &mut Scratch) -> Vec<Anchor> {
+        const LONG: u32 = 200;
+        const NEAR: i64 = 16;
+        const RUN: usize = 3;
+        let min_intron = self.opt.min_intron as i64;
+        let mut out: Vec<Anchor> = Vec::with_capacity(chain.len());
+        let (mut f, mut back, mut path): (Vec<f32>, Vec<u32>, Vec<usize>) = Default::default();
+        for (k, &a) in chain.iter().enumerate() {
+            out.push(a);
+            let Some(&b) = chain.get(k + 1) else { break };
+            let diag = |x: Anchor, y: Anchor| (y.t as i64 - x.t as i64) - (y.q as i64 - x.q as i64);
+            if b.q < a.q + a.ql as u32 + LONG || diag(a, b) < min_intron {
+                continue;
+            }
+            let mut hits = self.rescue(reverse, Some(a), Some(b), qlen, sc);
+            // only hits that can follow `a` and precede `b`
+            hits.retain(|&h| diag(a, h) >= -NEAR && diag(h, b) >= -NEAR);
+            if hits.len() < 2 {
+                continue;
+            }
+            f.clear();
+            back.clear();
+            let (mut best, mut best_j) = (f32::MIN, 0usize);
+            for j in 0..hits.len() {
+                let h = hits[j];
+                let (mut fj, mut bj) = (h.ql as f32, u32::MAX);
+                for i in (j.saturating_sub(64)..j).rev() {
+                    let p = hits[i];
+                    if p.q + p.ql as u32 > h.q || p.t + p.tl as u32 > h.t {
+                        continue;
+                    }
+                    let d = diag(p, h);
+                    let cost = if d >= min_intron {
+                        8.0
+                    } else if d.abs() <= NEAR + (h.q - p.q) as i64 / 8 {
+                        0.5 * d.abs() as f32
+                    } else {
+                        continue;
+                    };
+                    if f[i] + h.ql as f32 - cost > fj {
+                        fj = f[i] + h.ql as f32 - cost;
+                        bj = i as u32;
+                    }
+                }
+                f.push(fj);
+                back.push(bj);
+                if fj > best {
+                    (best, best_j) = (fj, j);
+                }
+            }
+            path.clear();
+            let mut i = best_j as u32;
+            while i != u32::MAX {
+                path.push(i as usize);
+                i = back[i as usize];
+            }
+            path.reverse();
+            let agree =
+                |x: usize, y: usize| diag(hits[x], hits[y]).abs() <= NEAR && hits[y].q - hits[x].q <= 200;
+            // runs of hits that continue one another; a run of fewer than `RUN` is left out
+            let mut s0 = 0;
+            for n in 1..=path.len() {
+                if n == path.len() || !agree(path[n - 1], path[n]) {
+                    if n - s0 >= RUN {
+                        out.extend(path[s0..n].iter().map(|&x| hits[x]));
+                    }
+                    s0 = n;
+                }
+            }
+        }
+        out
+    }
+
     /// Blocks from a chain: junctions placed, exons without an anchor recovered, read ends solved.
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -1291,6 +1369,13 @@ impl<'a> Mapper<'a> {
         // (a thin chain that passed the screen of thin candidates is trusted the same way: the
         // read was seen to go on matching next to its anchors)
         let solid = screened || (chain.len() >= 3 && anchored >= (qlen / 40).max(50));
+        let refined;
+        let chain = if solid && chain.windows(2).any(|w| w[1].q >= w[0].q + 200) {
+            refined = self.refine(reverse, chain, qlen, sc);
+            &refined[..]
+        } else {
+            chain
+        };
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
         // the prefix tables of the junctions that may go to the solver, to not compute them twice
