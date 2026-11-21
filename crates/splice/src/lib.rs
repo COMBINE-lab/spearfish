@@ -39,6 +39,7 @@ macro_rules! avx2_variant {
 }
 
 pub mod bam;
+pub mod base;
 mod gap;
 pub mod index;
 pub mod junctions;

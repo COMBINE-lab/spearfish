@@ -145,7 +145,10 @@ fn cigar(blocks: &[Block], qlen: u32, out: &mut Vec<u32>) {
 }
 
 /// Append the BAM record of a hit. `read` is the read as sequenced; secondary records carry
-/// no sequence. Tags: `AS`, `cm`, and `XS` (transcript strand) when known.
+/// no sequence. Tags: `AS`, `cm`, and `XS` (transcript strand) when known. With `edits`, `ops`
+/// already holds the hit's base-level CIGAR (from [`crate::base::Aligner::cigar`]) and an `NM`
+/// tag is written; otherwise the block-level CIGAR is made here.
+#[allow(clippy::too_many_arguments)]
 pub fn record(
     ix: &GenomeIndex,
     name: &str,
@@ -153,13 +156,18 @@ pub fn record(
     h: &SplicedHit,
     mapq: u8,
     ops: &mut Vec<u32>,
+    edits: Option<u32>,
     out: &mut Vec<u8>,
 ) {
     let qlen = read.len() as u32;
     let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
     let (rid, pos) = ix.locate(first.ts);
     let ref_end = pos + (last.te - first.ts);
-    cigar(&h.blocks, qlen, ops);
+    // (a record holds 65535 operations at most; a longer alignment falls back to blocks)
+    let edits = edits.filter(|_| ops.len() <= 65535);
+    if edits.is_none() {
+        cigar(&h.blocks, qlen, ops);
+    }
     let seq: &[u8] = if h.primary { read } else { b"" };
     let flag: u16 = if h.reverse { 16 } else { 0 } | if h.primary { 0 } else { 256 };
     let start = out.len();
@@ -213,6 +221,10 @@ pub fn record(
     if h.tx_strand != b'.' {
         out.extend_from_slice(b"XSA");
         out.push(h.tx_strand);
+    }
+    if let Some(e) = edits {
+        out.extend_from_slice(b"NMi");
+        out.extend_from_slice(&(e as i32).to_le_bytes());
     }
     let n = (out.len() - start - 4) as u32;
     out[start..start + 4].copy_from_slice(&n.to_le_bytes());

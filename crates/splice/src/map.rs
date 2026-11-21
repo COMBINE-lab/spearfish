@@ -3275,8 +3275,17 @@ impl<'a> Mapper<'a> {
 }
 
 /// PAF line of a hit (with a block-level `cg` tag: `M` per block, `I`/`D` for a length
-/// difference inside it, `N` for introns).
-pub fn paf_line(ix: &GenomeIndex, name: &str, qlen: u32, h: &SplicedHit, mapq: u8, out: &mut String) {
+/// difference inside it, `N` for introns). With `base`, the base-level CIGAR and edit count
+/// from [`crate::base::Aligner::cigar`], `cg` holds that alignment and an `NM` tag is added.
+pub fn paf_line(
+    ix: &GenomeIndex,
+    name: &str,
+    qlen: u32,
+    h: &SplicedHit,
+    mapq: u8,
+    base: Option<(&[u32], u32)>,
+    out: &mut String,
+) {
     use std::fmt::Write;
     let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
     let (rid, ts) = ix.locate(first.ts);
@@ -3305,9 +3314,20 @@ pub fn paf_line(ix: &GenomeIndex, name: &str, qlen: u32, h: &SplicedHit, mapq: u
             let _ = write!(cg, "{}D", lt - lq);
         }
     }
+    let mut nm = String::new();
+    if let Some((ops, edits)) = base {
+        cg.clear();
+        let mut aligned = 0;
+        for &op in ops.iter().filter(|&&op| op & 15 != 4) {
+            let _ = write!(cg, "{}{}", op >> 4, b"MIDNS"[(op & 15) as usize] as char);
+            aligned += if op & 15 == 0 { op >> 4 } else { 0 };
+        }
+        matches = aligned.saturating_sub(edits);
+        let _ = write!(nm, "\tNM:i:{edits}");
+    }
     let _ = writeln!(
         out,
-        "{name}\t{qlen}\t{qs}\t{qe}\t{}\t{}\t{tlen}\t{ts}\t{}\t{matches}\t{}\t{mapq}\ttp:A:{}\tAS:i:{}\tcm:i:{}\tts:A:{}\tjo:Z:{}\tcg:Z:{cg}",
+        "{name}\t{qlen}\t{qs}\t{qe}\t{}\t{}\t{tlen}\t{ts}\t{}\t{matches}\t{}\t{mapq}\ttp:A:{}\tAS:i:{}\tcm:i:{}\tts:A:{}\tjo:Z:{}{nm}\tcg:Z:{cg}",
         if h.reverse { '-' } else { '+' },
         ix.names()[rid],
         last.te - off,
@@ -3337,33 +3357,47 @@ pub fn sam_header(ix: &GenomeIndex, out: &mut String) {
 /// SAM record of a hit, with a block-level CIGAR (`M` per block, `I`/`D` for a length
 /// difference inside it, `N` for introns, `S` for unaligned read ends). `read` is the read as
 /// sequenced; secondary records carry no sequence.
-pub fn sam_line(ix: &GenomeIndex, name: &str, read: &[u8], h: &SplicedHit, mapq: u8, out: &mut String) {
+pub fn sam_line(
+    ix: &GenomeIndex,
+    name: &str,
+    read: &[u8],
+    h: &SplicedHit,
+    mapq: u8,
+    base: Option<(&[u32], u32)>,
+    out: &mut String,
+) {
     use std::fmt::Write;
     let qlen = read.len() as u32;
     let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
     let (rid, ts) = ix.locate(first.ts);
     let flag = if h.reverse { 16 } else { 0 } | if h.primary { 0 } else { 256 };
     let _ = write!(out, "{name}\t{flag}\t{}\t{}\t{mapq}\t", ix.names()[rid], ts + 1);
-    if first.qs > 0 {
-        let _ = write!(out, "{}S", first.qs);
-    }
-    for (i, b) in h.blocks.iter().enumerate() {
-        if i > 0 {
-            let _ = write!(out, "{}N", b.ts - h.blocks[i - 1].te);
+    if let Some((ops, _)) = base {
+        for &op in ops {
+            let _ = write!(out, "{}{}", op >> 4, b"MIDNS"[(op & 15) as usize] as char);
         }
-        let (lq, lt) = (b.qe - b.qs, b.te - b.ts);
-        let mm = lq.min(lt);
-        if mm > 0 {
-            let _ = write!(out, "{mm}M");
+    } else {
+        if first.qs > 0 {
+            let _ = write!(out, "{}S", first.qs);
         }
-        if lq > lt {
-            let _ = write!(out, "{}I", lq - lt);
-        } else if lt > lq {
-            let _ = write!(out, "{}D", lt - lq);
+        for (i, b) in h.blocks.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(out, "{}N", b.ts - h.blocks[i - 1].te);
+            }
+            let (lq, lt) = (b.qe - b.qs, b.te - b.ts);
+            let mm = lq.min(lt);
+            if mm > 0 {
+                let _ = write!(out, "{mm}M");
+            }
+            if lq > lt {
+                let _ = write!(out, "{}I", lq - lt);
+            } else if lt > lq {
+                let _ = write!(out, "{}D", lt - lq);
+            }
         }
-    }
-    if last.qe < qlen {
-        let _ = write!(out, "{}S", qlen - last.qe);
+        if last.qe < qlen {
+            let _ = write!(out, "{}S", qlen - last.qe);
+        }
     }
     out.push_str("\t*\t0\t0\t");
     if !h.primary {
@@ -3380,6 +3414,9 @@ pub fn sam_line(ix: &GenomeIndex, name: &str, read: &[u8], h: &SplicedHit, mapq:
         out.extend(read.iter().map(|&b| b.to_ascii_uppercase() as char));
     }
     let _ = write!(out, "\t*\tAS:i:{}\tcm:i:{}", h.score, h.anchors);
+    if let Some((_, edits)) = base {
+        let _ = write!(out, "\tNM:i:{edits}");
+    }
     if h.tx_strand != b'.' {
         let _ = write!(out, "\tXS:A:{}", h.tx_strand as char);
     }

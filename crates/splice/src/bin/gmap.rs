@@ -3,7 +3,7 @@
 //! ```text
 //! gmap index <genome.fa> <out.gidx> [--hpc]
 //! gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
-//!          [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]]   (default output: PAF)
+//!          [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]] [--cigar]   (default output: PAF)
 //! ```
 
 use std::fs::File;
@@ -69,6 +69,7 @@ fn main() -> anyhow::Result<()> {
                 opt.cap = c.parse()?;
             }
             let secondary = flag("--secondary").is_some();
+            let base_level = flag("--cigar").is_some();
             let format = if flag("--bam").is_some() {
                 Format::Bam(bam::Level(val("--bam-level").map_or(1, |s| s.parse().unwrap())))
             } else if flag("--sam").is_some() {
@@ -123,42 +124,49 @@ fn main() -> anyhow::Result<()> {
                 // compressed into complete BGZF blocks, by the thread that mapped them.
                 let outs: Vec<(Vec<u8>, u64, Stats)> = batch
                     .par_chunks(256)
-                    .map_init(Scratch::default, |sc, group| {
-                        sc.stats = Stats::default();
-                        let mut text = String::new();
-                        let mut raw: Vec<u8> = Vec::new();
-                        let mut ops: Vec<u32> = Vec::new();
-                        let mut mapped = 0u64;
-                        for (name, seq) in group {
-                            let hits = mapper.map(seq, sc);
-                            let mapq = match (hits.first(), hits.get(1)) {
-                                (Some(a), Some(b)) => {
-                                    (60.0 * (1.0 - b.score.max(0) as f32 / a.score.max(1) as f32))
-                                        .clamp(0.0, 60.0) as u8
-                                }
-                                _ => 60,
-                            };
-                            mapped += !hits.is_empty() as u64;
-                            for h in hits.iter().take(if secondary { 5 } else { 1 }) {
-                                match format {
-                                    Format::Bam(_) => {
-                                        bam::record(&ix, name, seq, h, mapq, &mut ops, &mut raw)
+                    .map_init(
+                        <(Scratch, spearfish_splice::base::Aligner)>::default,
+                        |(sc, al), group| {
+                            sc.stats = Stats::default();
+                            let mut text = String::new();
+                            let mut raw: Vec<u8> = Vec::new();
+                            let mut ops: Vec<u32> = Vec::new();
+                            let mut mapped = 0u64;
+                            for (name, seq) in group {
+                                let hits = mapper.map(seq, sc);
+                                let mapq = match (hits.first(), hits.get(1)) {
+                                    (Some(a), Some(b)) => {
+                                        (60.0 * (1.0 - b.score.max(0) as f32 / a.score.max(1) as f32))
+                                            .clamp(0.0, 60.0) as u8
                                     }
-                                    Format::Sam => sam_line(&ix, name, seq, h, mapq, &mut text),
-                                    Format::Paf => paf_line(&ix, name, seq.len() as u32, h, mapq, &mut text),
+                                    _ => 60,
+                                };
+                                mapped += !hits.is_empty() as u64;
+                                for h in hits.iter().take(if secondary { 5 } else { 1 }) {
+                                    let edits = base_level.then(|| al.cigar(&ix, seq, h, &mut ops));
+                                    let base = edits.map(|e| (&ops[..], e));
+                                    match format {
+                                        Format::Bam(_) => {
+                                            bam::record(&ix, name, seq, h, mapq, &mut ops, edits, &mut raw)
+                                        }
+                                        Format::Sam => sam_line(&ix, name, seq, h, mapq, base, &mut text),
+                                        Format::Paf => {
+                                            paf_line(&ix, name, seq.len() as u32, h, mapq, base, &mut text)
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        let bytes = match format {
-                            Format::Bam(level) => {
-                                let mut z = Vec::with_capacity(raw.len() / 3);
-                                bam::bgzf(&raw, level, &mut z);
-                                z
-                            }
-                            _ => text.into_bytes(),
-                        };
-                        (bytes, mapped, sc.stats)
-                    })
+                            let bytes = match format {
+                                Format::Bam(level) => {
+                                    let mut z = Vec::with_capacity(raw.len() / 3);
+                                    bam::bgzf(&raw, level, &mut z);
+                                    z
+                                }
+                                _ => text.into_bytes(),
+                            };
+                            (bytes, mapped, sc.stats)
+                        },
+                    )
                     .collect();
                 for (bytes, m, st) in &outs {
                     out.write_all(bytes)?;
