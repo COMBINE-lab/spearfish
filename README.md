@@ -32,7 +32,7 @@ x86-64 and arm64):
 conda install -c bioconda -c conda-forge spearfish
 ```
 
-Or with Rust 1.89 or newer ([rustup](https://rustup.rs)), from crates.io or from a checkout:
+Or with Rust 1.91 or newer ([rustup](https://rustup.rs)), from crates.io or from a checkout:
 
 ```sh
 cargo install --locked spearfish-cli              # or: cargo install --locked --path crates/spearfish-cli

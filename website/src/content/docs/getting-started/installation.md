@@ -23,7 +23,7 @@ conda build is as fast as one compiled for your CPU.
 
 ## Install with Cargo
 
-With Rust 1.89 or newer, installed with [rustup](https://rustup.rs):
+With Rust 1.91 or newer, installed with [rustup](https://rustup.rs):
 
 ```sh
 cargo install --locked spearfish-cli

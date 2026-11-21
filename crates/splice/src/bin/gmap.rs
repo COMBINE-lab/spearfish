@@ -3,7 +3,7 @@
 //! ```text
 //! gmap index <genome.fa> <out.gidx> [--hpc]
 //! gmap map <genome.gidx> <reads.fa|fq> [--threads N] [--forward] [--cap N] [--secondary]
-//!          [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]] [--cigar]   (default output: PAF)
+//!          [--junctions <BED12 or GTF>] [--sam | --bam [--bam-level N]] [--cigar [--affine]]   (default output: PAF)
 //! ```
 
 use std::fs::File;
@@ -69,7 +69,14 @@ fn main() -> anyhow::Result<()> {
                 opt.cap = c.parse()?;
             }
             let secondary = flag("--secondary").is_some();
-            let base_level = flag("--cigar").is_some();
+            // --cigar: base-level alignment of the blocks; --affine: with affine gap costs
+            let affine = flag("--affine").is_some();
+            let base_level = flag("--cigar").is_some() || affine;
+            let mode = if affine {
+                spearfish_splice::base::Mode::Affine
+            } else {
+                spearfish_splice::base::Mode::Edits
+            };
             let format = if flag("--bam").is_some() {
                 Format::Bam(bam::Level(val("--bam-level").map_or(1, |s| s.parse().unwrap())))
             } else if flag("--sam").is_some() {
@@ -143,6 +150,7 @@ fn main() -> anyhow::Result<()> {
                                 };
                                 mapped += !hits.is_empty() as u64;
                                 for h in hits.iter().take(if secondary { 5 } else { 1 }) {
+                                    al.mode = mode;
                                     let edits = base_level.then(|| al.cigar(&ix, seq, h, &mut ops));
                                     let base = edits.map(|e| (&ops[..], e));
                                     match format {
@@ -184,6 +192,14 @@ fn main() -> anyhow::Result<()> {
                 t.elapsed().as_secs_f64()
             );
             eprintln!("{stats:?}");
+            if base_level {
+                use std::sync::atomic::Ordering::Relaxed;
+                let (b, g) = (
+                    spearfish_splice::base::BASES.load(Relaxed),
+                    spearfish_splice::base::AGAIN.load(Relaxed),
+                );
+                eprintln!("base level: {b} block bases, {g} aligned again with affine gaps");
+            }
         }
         _ => anyhow::bail!(
             "usage: gmap index <genome.fa> <out.gidx> | gmap map <genome.gidx> <reads> [--threads N]"

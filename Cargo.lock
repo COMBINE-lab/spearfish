@@ -633,6 +633,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksw2rs"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0225d70201dc730e46d0aa48306ed14198cc080ba063a5ed6c7c5834ff1a83f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,6 +1546,7 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "flate2",
+ "ksw2rs",
  "libdeflater",
  "rayon",
  "rustc-hash",

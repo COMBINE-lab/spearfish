@@ -26,13 +26,52 @@ const S: u32 = 4;
 const MAX_EDITS: usize = 1500;
 
 /// Blocks longer than twice this many read bases are aligned in pieces of this many.
-const PIECE: usize = 2048;
+const PIECE: usize = 512;
 
 const NONE: i32 = i32::MIN / 2;
+
+/// Bases of blocks aligned, and of those the bases aligned again with affine gaps (all threads).
+pub static BASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How a block is aligned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Fewest edits.
+    #[default]
+    Edits,
+    /// Affine gaps: the fewest-edits alignment first, then every stretch of it with an indel
+    /// aligned again with affine gap costs (16 bases kept on each side of an indel; the long
+    /// runs without one stay as they are).
+    Affine,
+}
+
+/// Affine scoring (as minimap2's long-read presets: match 2, mismatch 4, gap 4 + 2 per base).
+const MAT: [i8; 25] = {
+    let mut m = [-4i8; 25];
+    let mut i = 0;
+    while i < 4 {
+        m[i * 5 + i] = 2;
+        i += 1;
+    }
+    m[24] = 0;
+    m
+};
+
+/// A run of this many aligned bases without an indel is where the edit alignment is cut into
+/// segments (in the middle of the run).
+const CUT: u32 = 16;
 
 /// Working memory of the block aligner.
 #[derive(Default)]
 pub struct Aligner {
+    pub mode: Mode,
+    /// Bases of blocks, and of those the bases aligned again with affine gaps.
+    pub bases: u64,
+    pub again: u64,
+    tmp: Vec<u32>,
+    seg: Vec<u32>,
+    ksw: ksw2rs::Aligner,
     /// Wavefronts, one after the other: that of `s` edits holds diagonals `-s..=s` from `s * s`.
     waves: Vec<i32>,
     genome: Vec<u8>,
@@ -237,20 +276,88 @@ fn block(mut a: &[u8], mut g: &[u8], waves: &mut Vec<i32>, ops: &mut Vec<u32>) -
     edits
 }
 
+/// Align all of `a` to all of `g` with affine gaps inside a band of `w`: appends the
+/// operations. False, with nothing appended, when no end-to-end alignment came back.
+fn affine(ksw: &mut ksw2rs::Aligner, a: &[u8], g: &[u8], w: i32, ops: &mut Vec<u32>) -> bool {
+    if a.is_empty() || g.is_empty() {
+        push(ops, a.len() as u32, I);
+        push(ops, g.len() as u32, D);
+        return true;
+    }
+    let ez = ksw.align(&ksw2rs::Extz2Input {
+        query: a,
+        target: g,
+        m: 5,
+        mat: &MAT,
+        q: 4,
+        e: 2,
+        w,
+        zdrop: -1,
+        end_bonus: 0,
+        flag: 0,
+    });
+    let (mut i, mut j) = (0usize, 0usize);
+    for &o in &ez.cigar {
+        if o & 15 != D {
+            i += (o >> 4) as usize;
+        }
+        if o & 15 != I {
+            j += (o >> 4) as usize;
+        }
+    }
+    if (i, j) != (a.len(), g.len()) || ez.cigar.iter().any(|&o| o & 15 > D) {
+        return false;
+    }
+    for &o in &ez.cigar {
+        push(ops, o >> 4, o & 15);
+    }
+    true
+}
+
+/// The edits of an alignment of `a` to `g`.
+fn count(a: &[u8], g: &[u8], ops: &[u32]) -> u32 {
+    let (mut i, mut j, mut e) = (0usize, 0usize, 0u32);
+    for &o in ops {
+        let len = (o >> 4) as usize;
+        match o & 15 {
+            M => {
+                e += (0..len).filter(|&t| a[i + t] != g[j + t]).count() as u32;
+                i += len;
+                j += len;
+            }
+            I => {
+                e += len as u32;
+                i += len;
+            }
+            _ => {
+                e += len as u32;
+                j += len;
+            }
+        }
+    }
+    e
+}
+
 impl Aligner {
     /// The full CIGAR of `h` for `read` (ASCII, as sequenced) into `ops` (as `len << 4 | op`),
     /// and the number of edits in its blocks.
     pub fn cigar(&mut self, ix: &GenomeIndex, read: &[u8], h: &SplicedHit, ops: &mut Vec<u32>) -> u32 {
         ops.clear();
         self.codes.clear();
+        // (a base that is none of the four gets a code of its own: it matches nothing)
         let code = |b: u8| match b.to_ascii_uppercase() {
-            b'C' => 1u8,
+            b'A' => 0u8,
+            b'C' => 1,
             b'G' => 2,
             b'T' | b'U' => 3,
-            _ => 0,
+            _ => 4,
         };
         if h.reverse {
-            self.codes.extend(read.iter().rev().map(|&b| 3 - code(b)));
+            self.codes.extend(
+                read.iter()
+                    .rev()
+                    .map(|&b| if code(b) < 4 { 3 - code(b) } else { 4 }),
+            );
         } else {
             self.codes.extend(read.iter().map(|&b| code(b)));
         }
@@ -271,16 +378,85 @@ impl Aligner {
                 self.genome.extend((0..take).map(|k| ((w >> (2 * k)) & 3) as u8));
                 p += take;
             }
-            edits += block(
-                &self.codes[b.qs as usize..b.qe as usize],
-                &self.genome,
-                &mut self.waves,
-                ops,
-            );
+            let a = &self.codes[b.qs as usize..b.qe as usize];
+            self.bases += a.len() as u64;
+            if self.mode != Mode::Edits {
+                let start = ops.len();
+                block(a, &self.genome, &mut self.waves, ops);
+                // Cut the edit alignment in the middle of its long runs without an indel,
+                // and align again the segments whose indels call for it.
+                self.tmp.clear();
+                self.tmp.extend_from_slice(&ops[start..]);
+                ops.truncate(start);
+                self.seg.clear();
+                let (mut i0, mut j0, mut i, mut j) = (0usize, 0usize, 0usize, 0usize);
+                let n_ops = self.tmp.len();
+                for x in 0..=n_ops {
+                    // (the part of a long run before its middle closes the segment)
+                    let (len, op) = if x < n_ops {
+                        (self.tmp[x] >> 4, self.tmp[x] & 15)
+                    } else {
+                        (0, M)
+                    };
+                    let cut = x == n_ops || (op == M && len >= CUT);
+                    // (of a longer run only the `CUT` bases at each end go to a segment; the
+                    // middle stays as it is)
+                    let keep = if cut && len > 2 * CUT { len - 2 * CUT } else { 0 };
+                    let head = if cut { (len - keep) / 2 } else { len };
+                    if head > 0 {
+                        push(&mut self.seg, head, op);
+                        if op != D {
+                            i += head as usize;
+                        }
+                        if op != I {
+                            j += head as usize;
+                        }
+                    }
+                    if cut {
+                        let mut runs = 0u32;
+                        for &o in &self.seg {
+                            if o & 15 != M {
+                                runs += 1;
+                            }
+                        }
+                        let wanted = runs > 0;
+                        let (sa, sg) = (&a[i0..i], &self.genome[j0..j]);
+                        let w = sa.len().abs_diff(sg.len()) as i32 + 16;
+                        if wanted && affine(&mut self.ksw, sa, sg, w, ops) {
+                            self.again += sa.len() as u64;
+                        } else {
+                            for &o in &self.seg {
+                                push(ops, o >> 4, o & 15);
+                            }
+                        }
+                        self.seg.clear();
+                        push(ops, keep, M);
+                        i += keep as usize;
+                        j += keep as usize;
+                        (i0, j0) = (i, j);
+                        if len > head + keep {
+                            push(&mut self.seg, len - head - keep, op);
+                            i += (len - head - keep) as usize;
+                            j += (len - head - keep) as usize;
+                        }
+                    }
+                }
+                edits += count(a, &self.genome, &ops[start..]);
+                continue;
+            }
+            edits += block(a, &self.genome, &mut self.waves, ops);
         }
         if last.qe < qlen {
             ops.push((qlen - last.qe) << 4 | S);
         }
+        BASES.fetch_add(
+            std::mem::take(&mut self.bases),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        AGAIN.fetch_add(
+            std::mem::take(&mut self.again),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         edits
     }
 }

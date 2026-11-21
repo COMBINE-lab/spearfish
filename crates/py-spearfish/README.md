@@ -13,7 +13,7 @@ pip install spearfish
 ```
 
 Wheels are built for Linux (x86-64 and arm64) and macOS (Intel and Apple Silicon). From a checkout
-instead (Rust 1.89 or newer and [maturin](https://www.maturin.rs)):
+instead (Rust 1.91 or newer and [maturin](https://www.maturin.rs)):
 
 ```sh
 cd crates/py-spearfish

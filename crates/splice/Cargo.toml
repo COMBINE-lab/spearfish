@@ -16,11 +16,13 @@ rayon.workspace = true
 rustc-hash.workspace = true
 anyhow.workspace = true
 # DEFLATE for BAM output: zlib-rs (through flate2) by default; the features below swap in a
-# faster engine. zflate needs Rust 1.91, above the workspace's minimum, so it is opt-in.
+# faster engine.
 flate2.workspace = true
 zflate = { version = "1.0.0", optional = true }
 libdeflater = { version = "1.19", optional = true }
 index.workspace = true
+# Affine-gap alignment for the base-level output.
+ksw2rs = "0.3.1"
 
 [features]
 # BAM output's DEFLATE engine (default: zlib-rs).

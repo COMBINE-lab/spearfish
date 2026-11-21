@@ -6,8 +6,8 @@ exclude = ["data"]
 
 [workspace.package]
 edition = "2024"
-# Oldest Rust the workspace builds with (libradicl and paraseq need 1.89); CI checks it.
-rust-version = "1.89"
+# Oldest Rust the workspace builds with (ksw2rs needs 1.91); CI checks it.
+rust-version = "1.91"
 version = "0.3.2"
 license = "BSD-3-Clause"
 repository = "https://github.com/COMBINE-lab/spearfish"
