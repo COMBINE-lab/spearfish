@@ -78,25 +78,6 @@ pub struct Aligner {
     codes: Vec<u8>,
 }
 
-/// Length of the common prefix of `a` and `b`.
-#[inline]
-fn common(a: &[u8], b: &[u8]) -> usize {
-    let n = a.len().min(b.len());
-    let mut i = 0;
-    while i + 8 <= n {
-        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap())
-            ^ u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        if x != 0 {
-            return i + (x.trailing_zeros() / 8) as usize;
-        }
-        i += 8;
-    }
-    while i < n && a[i] == b[i] {
-        i += 1;
-    }
-    i
-}
-
 fn push(ops: &mut Vec<u32>, len: u32, op: u32) {
     if len == 0 {
         return;
@@ -122,8 +103,19 @@ fn put(ops: &mut Vec<u32>, start: usize, len: u32, op: u32) {
 /// of `a` to the start of `b`, ending wherever in `b` takes the fewest edits. Appends the CIGAR
 /// operations to `ops` and returns the edits and the genome bases used, or `None` (nothing
 /// appended) when more than `MAX_EDITS` are needed.
-fn align(a: &[u8], b: &[u8], free: bool, waves: &mut Vec<i32>, ops: &mut Vec<u32>) -> Option<(u32, usize)> {
-    let (m, n) = (a.len() as i32, b.len() as i32);
+///
+/// The sequences are seen through `ext(i, j, max)` alone: how many bases from read position
+/// `i` and genome position `j` on are the same, `max` at most.
+fn align(
+    m: usize,
+    n: usize,
+    ext: &impl Fn(usize, usize, usize) -> usize,
+    free: bool,
+    waves: &mut Vec<i32>,
+    ops: &mut Vec<u32>,
+) -> Option<(u32, usize)> {
+    let (m, n) = (m as i32, n as i32);
+    let common = |i: i32, j: i32| ext(i as usize, j as usize, (m - i).min(n - j) as usize) as i32;
     if m == 0 || n == 0 {
         let d = if free { 0 } else { n };
         push(ops, m as u32, I);
@@ -132,7 +124,7 @@ fn align(a: &[u8], b: &[u8], free: bool, waves: &mut Vec<i32>, ops: &mut Vec<u32
     }
     let mut kf = n - m;
     waves.clear();
-    waves.push(common(a, b) as i32);
+    waves.push(common(0, 0));
     let mut s = 0usize;
     // (diagonal k = genome position - read position; a wavefront entry is a read position)
     loop {
@@ -184,7 +176,7 @@ fn align(a: &[u8], b: &[u8], free: bool, waves: &mut Vec<i32>, ops: &mut Vec<u32
                 }
             }
             let j = v + k;
-            v += common(&a[v as usize..], &b[j as usize..]) as i32;
+            v += common(v, j);
             cur[(k + s as i32) as usize] = v;
         }
     }
@@ -240,40 +232,83 @@ fn align(a: &[u8], b: &[u8], free: bool, waves: &mut Vec<i32>, ops: &mut Vec<u32
     Some((edits, (m + kf) as usize))
 }
 
-/// Align read stretch `a` to genome stretch `g`, end to end: appends the operations, returns
-/// the edits. A long block goes a piece of the read at a time, each piece ending where in the
-/// genome it fits best, so that the work grows with the edits in a piece.
-fn block(mut a: &[u8], mut g: &[u8], waves: &mut Vec<i32>, ops: &mut Vec<u32>) -> u32 {
+/// Align a read stretch of `m` bases to a genome stretch of `n`, end to end (the sequences
+/// seen through `ext`, as in [`align`]): appends the operations, returns the edits. A long block
+/// goes a piece of the read at a time, each piece ending where in the genome it fits best, so
+/// that the work grows with the edits in a piece.
+fn block(
+    m: usize,
+    n: usize,
+    ext: &impl Fn(usize, usize, usize) -> usize,
+    waves: &mut Vec<i32>,
+    ops: &mut Vec<u32>,
+) -> u32 {
     let mut edits = 0;
     let mut whole = true;
-    while whole && a.len() > 2 * PIECE {
-        let reach = g.len().min(PIECE + PIECE / 4);
-        match align(&a[..PIECE], &g[..reach], true, waves, ops) {
+    // (where the part still to align starts)
+    let (mut a0, mut g0) = (0usize, 0usize);
+    while whole && m - a0 > 2 * PIECE {
+        let reach = (n - g0).min(PIECE + PIECE / 4);
+        let sub = |i: usize, j: usize, max: usize| ext(a0 + i, g0 + j, max);
+        match align(PIECE, reach, &sub, true, waves, ops) {
             Some((e, used)) => {
                 edits += e;
-                a = &a[PIECE..];
-                g = &g[used..];
+                a0 += PIECE;
+                g0 += used;
             }
             None => whole = false,
         }
     }
+    let sub = |i: usize, j: usize, max: usize| ext(a0 + i, g0 + j, max);
     match if whole {
-        align(a, g, false, waves, ops)
+        align(m - a0, n - g0, &sub, false, waves, ops)
     } else {
         None
     } {
         Some((e, _)) => edits += e,
         None => {
             // (what is left of the block, as the block-level output writes it)
-            let (lq, lt) = (a.len(), g.len());
+            let (lq, lt) = (m - a0, n - g0);
             let mm = lq.min(lt);
-            edits += (0..mm).filter(|&x| a[x] != g[x]).count() as u32 + lq.abs_diff(lt) as u32;
+            edits += (0..mm).filter(|&x| sub(x, x, 1) == 0).count() as u32 + lq.abs_diff(lt) as u32;
             push(ops, mm as u32, M);
             push(ops, lq.saturating_sub(lt) as u32, I);
             push(ops, lt.saturating_sub(lq) as u32, D);
         }
     }
     edits
+}
+
+/// [`align`]'s view of two sequences held as codes, a byte a base (codes above 3, for symbols
+/// that are not bases, match nothing).
+fn ext_codes<'a>(a: &'a [u8], g: &'a [u8]) -> impl Fn(usize, usize, usize) -> usize + 'a {
+    move |i, j, max| {
+        let mut l = 0;
+        while l < max && a[i + l] == g[j + l] && a[i + l] < 4 {
+            l += 1;
+        }
+        l
+    }
+}
+
+/// The same for two sequences known to hold bases only, eight at a time.
+fn ext_bases<'a>(a: &'a [u8], g: &'a [u8]) -> impl Fn(usize, usize, usize) -> usize + 'a {
+    move |i, j, max| {
+        let (a, g) = (&a[i..i + max], &g[j..j + max]);
+        let mut l = 0;
+        while l + 8 <= max {
+            let x = u64::from_le_bytes(a[l..l + 8].try_into().unwrap())
+                ^ u64::from_le_bytes(g[l..l + 8].try_into().unwrap());
+            if x != 0 {
+                return l + (x.trailing_zeros() / 8) as usize;
+            }
+            l += 8;
+        }
+        while l < max && a[l] == g[l] {
+            l += 1;
+        }
+        l
+    }
 }
 
 /// Align all of `a` to all of `g` with affine gaps inside a band of `w`: appends the
@@ -321,7 +356,7 @@ fn count(a: &[u8], g: &[u8], ops: &[u32]) -> u32 {
         let len = (o >> 4) as usize;
         match o & 15 {
             M => {
-                e += (0..len).filter(|&t| a[i + t] != g[j + t]).count() as u32;
+                e += (0..len).filter(|&t| a[i + t] != g[j + t] || a[i + t] > 3).count() as u32;
                 i += len;
                 j += len;
             }
@@ -361,6 +396,9 @@ impl Aligner {
         } else {
             self.codes.extend(read.iter().map(|&b| code(b)));
         }
+        // (a read with a symbol that is not a base is compared a base at a time)
+        let plain = self.codes.iter().all(|&c| c < 4);
+        let runs = ix.n_runs();
         let qlen = read.len() as u32;
         let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
         push(ops, first.qs, S);
@@ -369,20 +407,41 @@ impl Aligner {
             if i > 0 {
                 ops.push((b.ts - h.blocks[i - 1].te) << 4 | N);
             }
-            // the genome stretch, 32 bases a word
+            // The genome's symbols that are not bases (rare) are listed apart; a block that
+            // holds one is compared a base at a time, with a code for them that matches nothing.
+            let r = runs.partition_point(|&x| x <= b.ts);
+            let clean = r == runs.len() || (r % 2 == 0 && runs[r] >= b.te);
+            let (m, n) = ((b.qe - b.qs) as usize, (b.te - b.ts) as usize);
             self.genome.clear();
-            let mut p = b.ts;
-            while p < b.te {
-                let w = ix.word(p);
-                let take = (b.te - p).min(32);
-                self.genome.extend((0..take).map(|k| ((w >> (2 * k)) & 3) as u8));
-                p += take;
+            {
+                let mut p = b.ts;
+                while p < b.te {
+                    let w = ix.word(p);
+                    let take = (b.te - p).min(32);
+                    self.genome.extend((0..take).map(|k| ((w >> (2 * k)) & 3) as u8));
+                    p += take;
+                }
+                if !clean {
+                    for run in runs[r - r % 2..].chunks(2).take_while(|run| run[0] < b.te) {
+                        for p in run[0].max(b.ts)..run[1].min(b.te) {
+                            self.genome[(p - b.ts) as usize] = 4;
+                        }
+                    }
+                }
             }
             let a = &self.codes[b.qs as usize..b.qe as usize];
-            self.bases += a.len() as u64;
+            self.bases += m as u64;
+            let waves = &mut self.waves;
+            let mut first_pass = |ops: &mut Vec<u32>| {
+                if plain && clean {
+                    block(m, n, &ext_bases(a, &self.genome), waves, ops)
+                } else {
+                    block(m, n, &ext_codes(a, &self.genome), waves, ops)
+                }
+            };
             if self.mode != Mode::Edits {
                 let start = ops.len();
-                block(a, &self.genome, &mut self.waves, ops);
+                first_pass(ops);
                 // Cut the edit alignment in the middle of its long runs without an indel,
                 // and align again the segments whose indels call for it.
                 self.tmp.clear();
@@ -444,7 +503,7 @@ impl Aligner {
                 edits += count(a, &self.genome, &ops[start..]);
                 continue;
             }
-            edits += block(a, &self.genome, &mut self.waves, ops);
+            edits += first_pass(ops);
         }
         if last.qe < qlen {
             ops.push((qlen - last.qe) << 4 | S);
@@ -509,7 +568,11 @@ mod tests {
                 }
             }
             let mut ops = Vec::new();
-            let e = block(&a, &b, &mut waves, &mut ops);
+            // (both views of the sequences must give the same alignment)
+            let mut ops2 = Vec::new();
+            let e2 = block(a.len(), b.len(), &ext_bases(&a, &b), &mut waves, &mut ops2);
+            let e = block(a.len(), b.len(), &ext_codes(&a, &b), &mut waves, &mut ops);
+            assert_eq!((e, &ops), (e2, &ops2));
             if long {
                 // (each piece ends where it fits best on its own, which can cost a few edits)
                 let d = distance(&a, &b);

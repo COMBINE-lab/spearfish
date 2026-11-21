@@ -61,6 +61,7 @@ pub struct GenomeIndex {
 /// Pointers into the container's sections (the `Store` owns the bytes and outlives them).
 struct Raw {
     seq: *const [u64],
+    n_runs: *const [u32],
     offsets: *const [u32],
     labels: *const [u64],
     dir: *const [u32],
@@ -394,6 +395,7 @@ impl GenomeIndex {
             .collect();
         let n = Raw {
             seq: store.get("g_seq")?,
+            n_runs: store.get("g_n_runs")?,
             offsets: store.get("g_offsets")?,
             labels: store.get("g3_labels")?,
             dir: store.get("g3_dir")?,
@@ -460,6 +462,13 @@ impl GenomeIndex {
         let o = self.offsets();
         let i = o.partition_point(|&x| x <= p) - 1;
         (i, p - o[i])
+    }
+
+    /// The runs of symbols other than A, C, G, T, as sorted `start, end` pairs one after the
+    /// other (the sequence holds some base there).
+    pub fn n_runs(&self) -> &[u32] {
+        // SAFETY: see `Raw`.
+        unsafe { &*self.n.n_runs }
     }
 
     /// Base code (0..4) at `p`.

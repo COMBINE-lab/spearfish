@@ -151,7 +151,9 @@ fn main() -> anyhow::Result<()> {
                                 mapped += !hits.is_empty() as u64;
                                 for h in hits.iter().take(if secondary { 5 } else { 1 }) {
                                     al.mode = mode;
-                                    let edits = base_level.then(|| al.cigar(&ix, seq, h, &mut ops));
+                                    // (secondary records keep the block-level alignment)
+                                    let edits =
+                                        (base_level && h.primary).then(|| al.cigar(&ix, seq, h, &mut ops));
                                     let base = edits.map(|e| (&ops[..], e));
                                     match format {
                                         Format::Bam(_) => {

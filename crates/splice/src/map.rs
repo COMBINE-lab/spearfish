@@ -2082,6 +2082,30 @@ impl<'a> Mapper<'a> {
             origins = vec![b'?'; blocks.len().saturating_sub(1)];
         }
         sc.stats.tidied += fixed as u64;
+        // A hit lies on one sequence, that of its longest block: blocks that a chain or a read
+        // end reached on a neighbouring one (the sequences lie end to end) are dropped.
+        if !blocks.is_empty() {
+            let k = (0..blocks.len())
+                .max_by_key(|&x| blocks[x].te - blocks[x].ts)
+                .unwrap_or(0);
+            let o = self.index.offsets();
+            let rid = self.index.locate(blocks[k].ts).0;
+            let (lo, hi) = (o[rid], o[rid + 1]);
+            if blocks[0].ts < lo || blocks[blocks.len() - 1].te > hi {
+                let a = (0..=k)
+                    .rev()
+                    .take_while(|&x| blocks[x].ts >= lo)
+                    .last()
+                    .unwrap_or(k);
+                let z = (k..blocks.len())
+                    .take_while(|&x| blocks[x].te <= hi)
+                    .last()
+                    .unwrap_or(k);
+                blocks.drain(z + 1..);
+                blocks.drain(..a);
+                origins = vec![b'?'; blocks.len() - 1];
+            }
+        }
         let tx_strand = if tx_strand == b'.' && blocks.len() > 1 && !self.opt.forward_only {
             if left.minus.or(right.minus).unwrap_or(minus) {
                 b'-'
