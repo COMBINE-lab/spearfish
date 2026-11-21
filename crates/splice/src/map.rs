@@ -1554,10 +1554,50 @@ impl<'a> Mapper<'a> {
         });
 
         // Read ends, from a point inside the outermost anchors.
-        let (_, _, q1, t1) = self.fixed(last, last);
+        // (A seed can run a few bases past an exon's edge when the intron begins as the next
+        // exon does, so each end is solved from up to `BACK` bases further in, as far as the
+        // read matches the genome base for base and the outermost block reaches.)
+        const BACK: u32 = 8;
+        let (_, _, mut q1, mut t1) = self.fixed(last, last);
         let rescue = solid;
+        if rescue {
+            let bl = blocks[blocks.len() - 1];
+            let (rv, gv) = (
+                ReadView { q: q1, rev: true },
+                View {
+                    origin: t1,
+                    rev: true,
+                },
+            );
+            let room = BACK
+                .min(q1.saturating_sub(bl.qs + 1))
+                .min(t1.saturating_sub(bl.ts + 1));
+            let mut k = 0;
+            while k < room && rv.base(read, k as usize) == gv.base(self.index, k) {
+                k += 1;
+            }
+            (q1, t1) = (q1 - k, t1 - k);
+        }
         let right = self.end(read, reverse, q1, t1, false, minus, undecided, rescue, qlen, sc);
-        let (q0, t0, _, _) = self.fixed(first, first);
+        let (mut q0, mut t0, _, _) = self.fixed(first, first);
+        if rescue {
+            let b0 = blocks[0];
+            let (rv, gv) = (
+                ReadView { q: q0, rev: false },
+                View {
+                    origin: t0,
+                    rev: false,
+                },
+            );
+            let room = BACK
+                .min(b0.qe.saturating_sub(q0 + 1))
+                .min(b0.te.saturating_sub(t0 + 1));
+            let mut k = 0;
+            while k < room && rv.base(read, k as usize) == gv.base(self.index, k) {
+                k += 1;
+            }
+            (q0, t0) = (q0 + k, t0 + k);
+        }
         let left = self.end(read, reverse, q0, t0, true, minus, undecided, rescue, qlen, sc);
         edits += left.cost + right.cost;
         // left end: hops come in travel order (away from the anchor); in genome order the
@@ -2009,7 +2049,7 @@ impl<'a> Mapper<'a> {
                 j.left_site(l, minus) && j.right_site(r, minus)
             })
         });
-        if known { 4 } else { 12 }
+        if known { 4 } else { 8 }
     }
 
     /// Known exons inside the intron `(t0, t1)` that the read bases of a gap of `m` bases could
