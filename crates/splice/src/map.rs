@@ -226,7 +226,7 @@ pub(crate) const INS_EXT: u16 = GAP_EXT + 2;
 /// at a time, so a cheap AT or AC would also make GT..AC and AT..AG cheap, which are not
 /// introns, and AT..AC itself is rare.
 const SEMI: u16 = 8;
-const NONCANON: u16 = 18;
+const NONCANON: u16 = 26;
 const ATAC: u16 = 14;
 /// Sort hits by genome position, then read position. The keys (position and index in one
 /// word) are sorted, not the hits themselves, which are then moved once.
@@ -1415,6 +1415,10 @@ impl<'a> Mapper<'a> {
         } else {
             chain
         };
+        if std::env::var_os("GMAP_DEBUG").is_some() {
+            let v: Vec<_> = chain.iter().map(|a| (a.q, a.ql, a.t, a.w)).collect();
+            eprintln!("chain reverse={reverse} score={score} solid={solid} {v:?}");
+        }
         // Each pair of chain neighbours that the genome separates by an intron, placed directly.
         let mut pairs: Vec<(Anchor, Anchor, [Placed; 2], bool)> = Vec::new();
         // the prefix tables of the junctions that may go to the solver, to not compute them twice
