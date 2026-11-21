@@ -728,8 +728,22 @@ const SCAN_END_MARGIN: u32 = 20;
 const END_MARGIN: [u32; 4] = [2, 16, 16, 32];
 const END_NEAR: u32 = 20_000;
 
-/// Cost of a splice site unknown to the annotation, when one was given (on top of its motif).
+/// Cost of a splice site unknown to the annotation, when one was given (on top of its motif):
+/// on a clean read, and the most on a noisy one. Errors next to a junction make an unknown
+/// site a few bases from a known one fit as well as it, the more often the noisier the read;
+/// on a clean read a new site next to a known one is plain to see and must stay cheap.
 const UNKNOWN_SITE: u16 = 5;
+const UNKNOWN_SITE_NOISY: u16 = 20;
+/// A read counts as clean when its chain's anchors cover this share of the read bases the
+/// chain spans (in percent), and as fully noisy when they cover no more than the second.
+const CLEAN_COVER: u32 = 88;
+const NOISY_COVER: u32 = 63;
+
+thread_local! {
+    /// The cost of an unknown site on the read being mapped, and whether it was set for it yet
+    /// (the first chain built sets it, so that all of a read's hits are priced alike).
+    static UNKNOWN: std::cell::Cell<(u16, bool)> = const { std::cell::Cell::new((UNKNOWN_SITE, false)) };
+}
 
 /// Motif cost of an intron's left end at `p` (its first base) and of its right end at `p` (the
 /// first exon base after it), for a transcript on the forward or reverse strand. On the
@@ -851,7 +865,7 @@ pub(crate) fn site_pens(
 pub(crate) fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     match &ix.junctions {
         Some(j) if j.left_site(p, minus) => 0,
-        Some(_) => donor_motif(ix, p, minus) + UNKNOWN_SITE,
+        Some(_) => donor_motif(ix, p, minus) + UNKNOWN.get().0,
         None => donor_motif(ix, p, minus),
     }
 }
@@ -861,7 +875,7 @@ pub(crate) fn donor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
 pub(crate) fn acceptor_pen(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     match &ix.junctions {
         Some(j) if j.right_site(p, minus) => 0,
-        Some(_) => acceptor_motif(ix, p, minus) + UNKNOWN_SITE,
+        Some(_) => acceptor_motif(ix, p, minus) + UNKNOWN.get().0,
         None => acceptor_motif(ix, p, minus),
     }
 }
@@ -880,6 +894,9 @@ struct Placed {
     /// one found between splice sites, `e` at a read end.
     origin: u8,
 }
+
+/// Known exons shorter than this are tried inside any junction that did not fit exactly.
+const MICRO_EXON: u32 = 20;
 
 /// Reference skips shorter than this are written as deletions, not introns.
 const MIN_INTRON_OUT: u32 = 30;
@@ -1065,6 +1082,7 @@ impl<'a> Mapper<'a> {
 
     /// Hits of `read` (ASCII bases), best first. Empty when the read does not map.
     pub fn map(&self, read: &[u8], sc: &mut Scratch) -> Vec<SplicedHit> {
+        UNKNOWN.set((UNKNOWN_SITE, false));
         let hits = self.map_inner(read, sc);
         sc.stats.solves += std::mem::take(&mut sc.gap.calls);
         sc.stats.prefix_cells += std::mem::take(&mut sc.gap.prefix_cells);
@@ -1603,6 +1621,20 @@ impl<'a> Mapper<'a> {
         } else {
             chain
         };
+        if self.index.junctions.is_some() && !UNKNOWN.get().1 {
+            let (mut cover, mut end) = (0u32, 0u32);
+            for a in chain {
+                let e = a.q + a.ql as u32;
+                cover += e.saturating_sub(a.q.max(end));
+                end = end.max(e);
+            }
+            let span = end.saturating_sub(chain[0].q).max(1);
+            let pct = (100 * cover / span).clamp(NOISY_COVER, CLEAN_COVER);
+            let price = UNKNOWN_SITE
+                + ((CLEAN_COVER - pct) * (UNKNOWN_SITE_NOISY - UNKNOWN_SITE) as u32
+                    / (CLEAN_COVER - NOISY_COVER)) as u16;
+            UNKNOWN.set((price, true));
+        }
         if std::env::var_os("GMAP_DEBUG").is_some() {
             let v: Vec<_> = chain.iter().map(|a| (a.q, a.ql, a.t, a.w)).collect();
             eprintln!("chain reverse={reverse} score={score} solid={solid} {v:?}");
@@ -1677,12 +1709,60 @@ impl<'a> Mapper<'a> {
             let mut juncs: Vec<Placed> = Vec::new();
             for (k, &(a, b, p, poor)) in pairs.iter().enumerate() {
                 let direct = p[minus as usize];
+                let (q0, t0, q1, t1) = self.fixed(a, b);
                 if !poor {
+                    // A junction that fits well enough may still hide a known exon of a few
+                    // bases (written as a short insertion, it costs too little to raise doubt):
+                    // with known junctions, try the short known exons inside the intron.
+                    if direct.cost > 0 && direct.cost < INF && q1 > q0 && t1 > t0 {
+                        let m = (q1 - q0) as usize;
+                        let mut vw = self.known_exons(t0, t1, m);
+                        vw.retain(|w| w.1 < MICRO_EXON);
+                        if !vw.is_empty() {
+                            vw.sort_by_key(|w| w.0);
+                            sc.gap.known_only = true;
+                            let t = gap::solve(
+                                self.index,
+                                read,
+                                ReadView { q: q0, rev: false },
+                                m,
+                                View {
+                                    origin: t0,
+                                    rev: false,
+                                },
+                                Some(t1),
+                                &vw,
+                                minus,
+                                self.opt.min_intron / 2,
+                                &mut sc.gap,
+                            );
+                            sc.gap.known_only = false;
+                            if std::env::var_os("GMAP_DEBUG").is_some() {
+                                eprintln!(
+                                    "  micro q0={q0} t0={t0} m={m} windows={vw:?} cost={} hops={:?} direct={direct:?}",
+                                    t.cost, t.hops
+                                );
+                            }
+                            if t.hops.len() > 1
+                                && t.cost < direct.cost as u32
+                                && self.hop_margin(&t, minus) <= 4
+                            {
+                                total += t.cost;
+                                juncs.extend(t.hops.iter().map(|h| Placed {
+                                    q: h.q,
+                                    donor: h.leave,
+                                    acceptor: h.enter,
+                                    cost: 0,
+                                    origin: b'k',
+                                }));
+                                continue;
+                            }
+                        }
+                    }
                     total += direct.cost as u32;
                     juncs.push(direct);
                     continue;
                 }
-                let (q0, t0, q1, t1) = self.fixed(a, b);
                 if let Some(t) = &tables[k] {
                     sc.gap.restore(t);
                 }
@@ -1743,6 +1823,7 @@ impl<'a> Mapper<'a> {
                                 .collect()
                         };
                         vw.sort_by_key(|w| w.0);
+                        sc.gap.known_only = from_known;
                         let t = gap::solve(
                             self.index,
                             read,
@@ -1755,6 +1836,7 @@ impl<'a> Mapper<'a> {
                             half,
                             &mut sc.gap,
                         );
+                        sc.gap.known_only = false;
                         let limit = if found {
                             s.cost
                         } else {

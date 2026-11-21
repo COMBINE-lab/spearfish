@@ -247,6 +247,10 @@ pub(crate) struct Bufs {
     sites: Sites,
     work: Work,
     /// Work counters: solves, prefix-table cells filled, window cells filled.
+    /// Set while the windows given are known exons (and the answer is kept only if every
+    /// junction in it is a known one): an exon then costs nothing on top of its sites, so
+    /// that a known exon of three bases beats writing them as an insertion.
+    pub known_only: bool,
     pub calls: u64,
     pub prefix_cells: u64,
     pub window_cells: u64,
@@ -754,7 +758,8 @@ pub(crate) fn solve(
         // such a cell or the window can be entered in it; the rows before the first place
         // it can be entered and after the last, once nothing is left, are not filled.
         let ub = if far.is_some() { bound } else { best_end.0 };
-        let enters = |c: u32, ub: u32| c < BIG && (ub >= BIG || c + EXTRA_INTRON <= ub);
+        let extra = if b.known_only { 0 } else { EXTRA_INTRON };
+        let enters = |c: u32, ub: u32| c < BIG && (ub >= BIG || c + extra <= ub);
         let first = (i_lo..=i_hi).find(|&i| enters(cur[i], ub));
         let Some(first) = first else {
             lev_p.extend_from_slice(curp);
@@ -766,7 +771,7 @@ pub(crate) fn solve(
         let rows = i_hi - first + 1;
         b.window_cells += (rows * ww) as u64;
         // (gb[j] is the genome base before window position j)
-        gv.sites(ix, vs, vl, minus, EXTRA_INTRON, &mut b.sites, true);
+        gv.sites(ix, vs, vl, minus, extra, &mut b.sites, true);
         let (enter, leave, gb) = (&b.sites.enter, &b.sites.leave, &b.sites.gb);
         // (a row reads its own entry of `cur` and `curp` before it replaces them, and no
         // other row's, so the level is built in place)
