@@ -1415,6 +1415,9 @@ impl<'a> Mapper<'a> {
                 let read = std::mem::take(&mut sc.codes[h.reverse as usize]);
                 h.score = self.align_score(&read, h, sc);
                 sc.codes[h.reverse as usize] = read;
+                if std::env::var_os("GMAP_DEBUG").is_some() {
+                    eprintln!("scored {} blocks={:?}", h.score, h.blocks);
+                }
                 sc.stats.scored += 1;
             }
             out.retain(|h| h.score >= self.opt.min_score);
@@ -2245,7 +2248,7 @@ impl<'a> Mapper<'a> {
                     continue;
                 }
             }
-            if m.abs_diff(n) > 64.max(m / 8) {
+            if m.abs_diff(n) > 64.max(m / 4) {
                 // lengths too far apart to align in a band: the block scores as unaligned
                 score -= 20;
                 continue;
