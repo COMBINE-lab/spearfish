@@ -421,7 +421,9 @@ unsafe fn row_gap_avx512(hr: &mut [u64]) {
             p = _mm512_min_epu64(p, _mm512_alignr_epi64::<7>(p, none));
             p = _mm512_min_epu64(p, _mm512_alignr_epi64::<6>(p, none));
             p = _mm512_min_epu64(p, _mm512_alignr_epi64::<4>(p, none));
-            let before = _mm512_min_epu64(carry, _mm512_alignr_epi64::<7>(p, none));
+            // (the running minimum includes the cell itself, as a gap of no length that
+            // costs GAP_OPEN: never cheaper than the cell)
+            let before = _mm512_min_epu64(carry, p);
             let back = _mm512_set1_epi64(((len - x) as u64 * del_ext) as i64);
             let left = _mm512_add_epi64(_mm512_sub_epi64(before, back), ramp);
             _mm512_mask_storeu_epi64(at, k, _mm512_min_epu64(c, left));

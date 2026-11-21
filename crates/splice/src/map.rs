@@ -446,8 +446,8 @@ fn prefix_left_plain(here: &mut [u16]) -> u16 {
 /// `prefix_left_plain`, 32 cells at a time, with the same results. The gap that reaches cell
 /// x from cell y < x costs open + (x - 1 - y) * ext, so with a[y] = cell y + open +
 /// (len - 1 - y) * ext the cheapest gap into x is the least a[y] before x, less
-/// (len - x) * ext: a running minimum, taken by five doubling steps inside the 32 and one
-/// carried value between them. (Cells are at most INF, so nothing overflows for any row
+/// (len - x) * ext: a running minimum, taken inside the 32 by doubling steps and one
+/// value carried between them. (Cells are at most INF, so nothing overflows for any row
 /// that fits a band.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
@@ -471,9 +471,9 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
         let iota = _mm512_loadu_si512(IOTA.as_ptr() as *const _);
         let ramp = _mm512_mullo_epi16(iota, _mm512_set1_epi16(GAP_EXT as i16));
         let none = _mm512_set1_epi16(-1);
-        // lane l takes lane l - s (lanes below s keep "none")
-        let from = |s: i16| _mm512_sub_epi16(iota, _mm512_set1_epi16(s));
-        let (f1, f2, f4, f8, f16) = (from(1), from(2), from(4), from(8), from(16));
+        let zero = _mm512_setzero_si512();
+        // (bytes 14 and 15 of each 128 bits: its last cell, to all eight of its cells)
+        let tops = _mm512_set1_epi16(0x0f0e);
         let last = _mm512_set1_epi16(31);
         let mut carry = _mm512_set1_epi16((INF + len as u16 * GAP_EXT) as i16);
         let mut low = none;
@@ -486,19 +486,31 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
             // never reaches a cell before them)
             let c = _mm512_mask_loadu_epi16(none, k, at);
             let a0 = open_del + (len - 1 - x) as u16 * GAP_EXT;
-            let mut p = _mm512_sub_epi16(_mm512_add_epi16(c, _mm512_set1_epi16(a0 as i16)), ramp);
-            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !1, f1, p));
-            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !3, f2, p));
-            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !0xf, f4, p));
-            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !0xff, f8, p));
-            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !0xffff, f16, p));
-            let before = _mm512_min_epu16(carry, _mm512_mask_permutexvar_epi16(none, !1, f1, p));
+            let p = _mm512_sub_epi16(_mm512_add_epi16(c, _mm512_set1_epi16(a0 as i16)), ramp);
+            // The running minimum of p, as the running maximum of its complement (so that
+            // the zeros a shift brings in change nothing): first inside each eight cells,
+            // then each eight takes the last cell of the eights before it.
+            let mut q = _mm512_xor_si512(p, none);
+            q = _mm512_max_epu16(q, _mm512_bslli_epi128::<2>(q));
+            q = _mm512_max_epu16(q, _mm512_bslli_epi128::<4>(q));
+            q = _mm512_max_epu16(q, _mm512_bslli_epi128::<8>(q));
+            let t = _mm512_shuffle_epi8(q, tops);
+            let e = _mm512_max_epu16(
+                _mm512_max_epu16(
+                    _mm512_alignr_epi64::<6>(t, zero),
+                    _mm512_alignr_epi64::<4>(t, zero),
+                ),
+                _mm512_alignr_epi64::<2>(t, zero),
+            );
+            let run = _mm512_xor_si512(_mm512_max_epu16(q, e), none);
+            // (the running minimum includes the cell itself, as a gap of no length that
+            // costs GAP_OPEN: never cheaper than the cell)
             let back = _mm512_set1_epi16(((len - x) as u16 * GAP_EXT) as i16);
-            let left = _mm512_add_epi16(_mm512_sub_epi16(before, back), ramp);
+            let left = _mm512_add_epi16(_mm512_sub_epi16(_mm512_min_epu16(carry, run), back), ramp);
             let v = _mm512_min_epu16(c, left);
             _mm512_mask_storeu_epi16(at, k, v);
             low = _mm512_mask_min_epu16(low, k, low, v);
-            carry = _mm512_min_epu16(carry, _mm512_permutexvar_epi16(last, p));
+            carry = _mm512_min_epu16(carry, _mm512_permutexvar_epi16(last, run));
             x += 32;
         }
         let l = _mm256_min_epu16(_mm512_castsi512_si256(low), _mm512_extracti64x4_epi64::<1>(low));
