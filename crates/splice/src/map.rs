@@ -528,6 +528,10 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
     }
 }
 
+/// The most a read's usual junction cost per base (times 64) may raise the bar for a doubtful
+/// junction.
+const USUAL_CAP: u32 = 40;
+
 /// Short-word search of a gap: the longest intron searched, and the read bases the matches on
 /// one diagonal must cover.
 const WORD_SPAN: u32 = 100_000;
@@ -1441,8 +1445,10 @@ impl<'a> Mapper<'a> {
         };
         let mut rates: Vec<u32> = pairs.iter().filter_map(per_base).collect();
         rates.sort_unstable();
+        // (capped: on a read whose junctions are mostly bad the median says nothing about a
+        // good one, and with no cap nothing on such a read would count as bad)
         let usual = if rates.len() >= 3 {
-            rates[rates.len() / 2]
+            rates[rates.len() / 2].min(USUAL_CAP)
         } else {
             0
         };
@@ -1559,6 +1565,12 @@ impl<'a> Mapper<'a> {
                         } else {
                             (direct.cost as u32).min(1 << 20)
                         };
+                        if std::env::var_os("GMAP_DEBUG").is_some() {
+                            eprintln!(
+                                "  try min_hits={min_hits} known={from_known} windows={vw:?} cost={} hops={:?} limit={limit} fine={fine} hard={hard}",
+                                t.cost, t.hops
+                            );
+                        }
                         if t.hops.len() > 1
                             && t.cost < limit
                             && (!from_known || self.hop_margin(&t, minus) <= 4)
