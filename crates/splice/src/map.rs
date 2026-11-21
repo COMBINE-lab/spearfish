@@ -421,6 +421,16 @@ avx2_variant! {
 /// state follows from the cells as they were.)
 #[inline]
 fn prefix_left(here: &mut [u16]) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    if here.len() >= 16 && std::is_x86_feature_detected!("avx512bw") {
+        // SAFETY: the feature was just detected.
+        return unsafe { prefix_left_avx512(here) };
+    }
+    prefix_left_plain(here)
+}
+
+#[inline]
+fn prefix_left_plain(here: &mut [u16]) -> u16 {
     let open_del = GAP_OPEN + GAP_EXT;
     let (mut left, mut row) = (INF, INF);
     for c in here.iter_mut() {
@@ -433,6 +443,70 @@ fn prefix_left(here: &mut [u16]) -> u16 {
     row
 }
 
+/// `prefix_left_plain`, 32 cells at a time, with the same results. The gap that reaches cell
+/// x from cell y < x costs open + (x - 1 - y) * ext, so with a[y] = cell y + open +
+/// (len - 1 - y) * ext the cheapest gap into x is the least a[y] before x, less
+/// (len - x) * ext: a running minimum, taken by five doubling steps inside the 32 and one
+/// carried value between them. (Cells are at most INF, so nothing overflows for any row
+/// that fits a band.)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
+    use std::arch::x86_64::*;
+    static IOTA: [u16; 32] = {
+        let mut a = [0u16; 32];
+        let mut i = 0;
+        while i < 32 {
+            a[i] = i as u16;
+            i += 1;
+        }
+        a
+    };
+    let open_del = GAP_OPEN + GAP_EXT;
+    let len = here.len();
+    debug_assert!(len < 20_000);
+    // SAFETY (all of it): loads and stores are masked to the cells that remain in `here`;
+    // IOTA is 32 words.
+    unsafe {
+        let iota = _mm512_loadu_si512(IOTA.as_ptr() as *const _);
+        let ramp = _mm512_mullo_epi16(iota, _mm512_set1_epi16(GAP_EXT as i16));
+        let none = _mm512_set1_epi16(-1);
+        // lane l takes lane l - s (lanes below s keep "none")
+        let from = |s: i16| _mm512_sub_epi16(iota, _mm512_set1_epi16(s));
+        let (f1, f2, f4, f8, f16) = (from(1), from(2), from(4), from(8), from(16));
+        let last = _mm512_set1_epi16(31);
+        let mut carry = _mm512_set1_epi16((INF + len as u16 * GAP_EXT) as i16);
+        let mut low = none;
+        let mut x = 0;
+        while x < len {
+            let rem = len - x;
+            let k: __mmask32 = if rem >= 32 { !0 } else { (1u32 << rem) - 1 };
+            let at = here.as_mut_ptr().add(x) as *mut i16;
+            // (cells past the end read as "none"; what they turn into is never stored and
+            // never reaches a cell before them)
+            let c = _mm512_mask_loadu_epi16(none, k, at);
+            let a0 = open_del + (len - 1 - x) as u16 * GAP_EXT;
+            let mut p = _mm512_sub_epi16(_mm512_add_epi16(c, _mm512_set1_epi16(a0 as i16)), ramp);
+            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !1, f1, p));
+            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !3, f2, p));
+            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !0xf, f4, p));
+            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !0xff, f8, p));
+            p = _mm512_min_epu16(p, _mm512_mask_permutexvar_epi16(none, !0xffff, f16, p));
+            let before = _mm512_min_epu16(carry, _mm512_mask_permutexvar_epi16(none, !1, f1, p));
+            let back = _mm512_set1_epi16(((len - x) as u16 * GAP_EXT) as i16);
+            let left = _mm512_add_epi16(_mm512_sub_epi16(before, back), ramp);
+            let v = _mm512_min_epu16(c, left);
+            _mm512_mask_storeu_epi16(at, k, v);
+            low = _mm512_mask_min_epu16(low, k, low, v);
+            carry = _mm512_min_epu16(carry, _mm512_permutexvar_epi16(last, p));
+            x += 32;
+        }
+        let l = _mm256_min_epu16(_mm512_castsi512_si256(low), _mm512_extracti64x4_epi64::<1>(low));
+        let l = _mm_min_epu16(_mm256_castsi256_si128(l), _mm256_extracti128_si256::<1>(l));
+        (_mm_extract_epi16::<0>(_mm_minpos_epu16(l)) as u16).min(INF)
+    }
+}
+
 /// Cost of a splice site unknown to the annotation, when one was given (on top of its motif).
 const UNKNOWN_SITE: u16 = 5;
 
@@ -443,23 +517,12 @@ const UNKNOWN_SITE: u16 = 5;
 /// followed by A or G, and AG mostly preceded by C or T (as minimap2's `--splice-flank`).
 const FLANK: u16 = 5;
 
-#[inline]
-pub(crate) fn donor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
-    if p + 3 > ix.total_len() || p < 1 {
-        return NONCANON;
-    }
-    match (minus, ix.base(p), ix.base(p + 1)) {
-        // GT, then A or G
-        (false, 2, 3) => {
-            if matches!(ix.base(p + 2), 0 | 2) {
-                0
-            } else {
-                FLANK
-            }
-        }
-        // CT (= AG on the other strand), then A or G (= C or T before the AG)
-        (true, 1, 3) => {
-            if matches!(ix.base(p + 2), 0 | 2) {
+/// Motif cost of a left end whose first three intron bases are `b0`, `b1`, `b2`.
+const fn donor_code(minus: bool, b0: u8, b1: u8, b2: u8) -> u16 {
+    match (minus, b0, b1) {
+        // GT, then A or G; CT (= AG on the other strand), then A or G (= C or T before the AG)
+        (false, 2, 3) | (true, 1, 3) => {
+            if matches!(b2, 0 | 2) {
                 0
             } else {
                 FLANK
@@ -470,23 +533,13 @@ pub(crate) fn donor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
     }
 }
 
-#[inline]
-pub(crate) fn acceptor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
-    if p < 3 {
-        return NONCANON;
-    }
-    match (minus, ix.base(p - 2), ix.base(p - 1)) {
-        // C or T, then AG
-        (false, 0, 2) => {
-            if matches!(ix.base(p - 3), 1 | 3) {
-                0
-            } else {
-                FLANK
-            }
-        }
-        // C or T, then AC (= GT on the other strand, followed there by A or G)
-        (true, 0, 1) => {
-            if matches!(ix.base(p - 3), 1 | 3) {
+/// Motif cost of a right end whose last three intron bases are `b3`, `b2`, `b1` (in genome
+/// order).
+const fn acceptor_code(minus: bool, b3: u8, b2: u8, b1: u8) -> u16 {
+    match (minus, b2, b1) {
+        // C or T, then AG; C or T, then AC (= GT on the other strand, followed by A or G)
+        (false, 0, 2) | (true, 0, 1) => {
+            if matches!(b3, 1 | 3) {
                 0
             } else {
                 FLANK
@@ -495,6 +548,78 @@ pub(crate) fn acceptor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
         (false, 0, 1) | (true, 2, 1) | (true, 0, 3) => SEMI, // AC; GC, AT (= GC, AT donors)
         _ => NONCANON,
     }
+}
+
+/// The two functions above for every three bases (the first lowest, two bits each), per
+/// strand.
+const fn motif_table(donor: bool) -> [[u16; 64]; 2] {
+    let mut t = [[0u16; 64]; 2];
+    let mut s = 0;
+    while s < 2 {
+        let mut c = 0;
+        while c < 64 {
+            let (x, y, z) = ((c & 3) as u8, ((c >> 2) & 3) as u8, ((c >> 4) & 3) as u8);
+            t[s][c] = if donor {
+                donor_code(s == 1, x, y, z)
+            } else {
+                acceptor_code(s == 1, x, y, z)
+            };
+            c += 1;
+        }
+        s += 1;
+    }
+    t
+}
+static DONOR: [[u16; 64]; 2] = motif_table(true);
+static ACCEPTOR: [[u16; 64]; 2] = motif_table(false);
+
+#[inline]
+pub(crate) fn donor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+    if p + 3 > ix.total_len() || p < 1 {
+        return NONCANON;
+    }
+    donor_code(minus, ix.base(p), ix.base(p + 1), ix.base(p + 2))
+}
+
+#[inline]
+pub(crate) fn acceptor_motif(ix: &GenomeIndex, p: u32, minus: bool) -> u16 {
+    if p < 3 {
+        return NONCANON;
+    }
+    acceptor_code(minus, ix.base(p - 3), ix.base(p - 2), ix.base(p - 1))
+}
+
+/// [`donor_pen`] and [`acceptor_pen`] at each of `lo..=hi`, from the bases read once:
+/// `bases` receives those of `[lo - 3, hi + 3)`. Returns false, with nothing filled, when
+/// junctions were given or the range is too near an end of the genome for that (the caller
+/// then asks site by site).
+pub(crate) fn site_pens(
+    ix: &GenomeIndex,
+    lo: u32,
+    hi: u32,
+    minus: bool,
+    bases: &mut Vec<u8>,
+    donors: &mut Vec<u32>,
+    acceptors: &mut Vec<u32>,
+) -> bool {
+    if ix.junctions.is_some() || lo < 3 || hi as u64 + 3 > ix.total_len() as u64 {
+        return false;
+    }
+    ix.bases(lo - 3, hi + 3, bases);
+    let n = (hi - lo) as usize + 1;
+    let (dt, at) = (&DONOR[minus as usize], &ACCEPTOR[minus as usize]);
+    donors.clear();
+    acceptors.clear();
+    // (the three bases before position lo + k are bases[k..k + 3], the three from it on
+    // bases[k + 3..k + 6])
+    let mut c = (bases[0] | (bases[1] << 2) | (bases[2] << 4)) as usize;
+    for k in 0..n {
+        acceptors.push(at[c] as u32);
+        let d = (bases[k + 3] | (bases[k + 4] << 2) | (bases[k + 5] << 4)) as usize;
+        donors.push(dt[d] as u32);
+        c = (c >> 2) | ((bases[k + 3] as usize) << 4);
+    }
+    true
 }
 
 /// Cost of an intron's left end at `p`: nothing for a known site; otherwise the motif cost,
@@ -2533,7 +2658,7 @@ mod tests {
         let mut st = 0x9E37_79B9_7F4A_7C15u64;
         for round in 0..400 {
             let m = (rng(&mut st) % 90) as usize;
-            let band = 1 + (rng(&mut st) % 12) as usize;
+            let band = 1 + (rng(&mut st) % 30) as usize;
             // related sequences, so that paths with gaps and mismatches are both taken
             let a: Vec<u8> = (0..m).map(|_| (rng(&mut st) % 4) as u8).collect();
             let mut b: Vec<u8> = Vec::new();
@@ -2559,6 +2684,33 @@ mod tests {
                 e2[..rows * w],
                 "cells, round {round} m {m} n {n} band {band}"
             );
+        }
+    }
+
+    /// The gap pass of a row, 32 cells at a time, against the cell-by-cell one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn row_gaps_match() {
+        if !std::is_x86_feature_detected!("avx512bw") {
+            return;
+        }
+        let mut st = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..2000 {
+            let len = 1 + (rng(&mut st) % 150) as usize;
+            // mostly close costs with a few unreachable cells, or anything up to INF
+            let row: Vec<u16> = (0..len)
+                .map(|_| match (round % 2, rng(&mut st) % 10) {
+                    (0, 0) => INF,
+                    (0, _) => (rng(&mut st) % 40) as u16,
+                    _ => (rng(&mut st) % (INF as u64 + 1)) as u16,
+                })
+                .collect();
+            let (mut x, mut y) = (row.clone(), row.clone());
+            let lx = prefix_left_plain(&mut x);
+            // SAFETY: the feature was just detected.
+            let ly = unsafe { prefix_left_avx512(&mut y) };
+            assert_eq!(x, y, "cells, round {round} {row:?}");
+            assert_eq!(lx, ly, "lowest, round {round} {row:?}");
         }
     }
 }

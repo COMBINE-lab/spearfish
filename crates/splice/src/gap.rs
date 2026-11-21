@@ -15,7 +15,7 @@
 use crate::index::GenomeIndex;
 use crate::map::{
     GAP_EXT, GAP_OPEN, INF, INS_EXT, MISMATCH, acceptor_motif, acceptor_pen, band_prefix, donor_motif,
-    donor_pen,
+    donor_pen, site_pens,
 };
 
 /// Price of each exon added between two fixed points (besides its splice sites).
@@ -94,6 +94,56 @@ impl View {
             acceptor_motif(ix, x, minus)
         }) as u32
     }
+    /// For the `len + 1` boundaries from `vs` on: the cost of an intron ending there plus
+    /// `add`, the cost of one starting there, and (when wanted) the base before each (4
+    /// before the first).
+    #[allow(clippy::too_many_arguments)]
+    fn sites(
+        &self,
+        ix: &GenomeIndex,
+        vs: u32,
+        len: usize,
+        minus: bool,
+        add: u32,
+        s: &mut Sites,
+        want_bases: bool,
+    ) {
+        let l = len as u32;
+        let (lo, hi) = if self.rev {
+            ((self.origin - vs).wrapping_sub(l), self.origin - vs)
+        } else {
+            (self.origin + vs, self.origin + vs + l)
+        };
+        s.enter.clear();
+        s.leave.clear();
+        s.gb.clear();
+        let fits = !self.rev || self.origin - vs >= l;
+        if fits && site_pens(ix, lo, hi, minus, &mut s.bases, &mut s.donors, &mut s.acceptors) {
+            if self.rev {
+                s.enter.extend(s.donors.iter().rev().map(|&c| c + add));
+                s.leave.extend(s.acceptors.iter().rev());
+            } else {
+                s.enter.extend(s.acceptors.iter().map(|&c| c + add));
+                s.leave.extend_from_slice(&s.donors);
+            }
+            if want_bases {
+                s.gb.push(4);
+                if self.rev {
+                    s.gb.extend(s.bases[3..len + 3].iter().rev());
+                } else {
+                    s.gb.extend_from_slice(&s.bases[3..len + 3]);
+                }
+            }
+            return;
+        }
+        s.enter
+            .extend((0..=l).map(|j| add + self.enter(ix, vs + j, minus)));
+        s.leave.extend((0..=l).map(|j| self.leave(ix, vs + j, minus)));
+        if want_bases {
+            s.gb.push(4);
+            s.gb.extend((0..l).map(|j| self.base(ix, vs + j)));
+        }
+    }
     #[inline]
     pub fn enter(&self, ix: &GenomeIndex, p: u32, minus: bool) -> u32 {
         let x = self.real(p);
@@ -103,6 +153,18 @@ impl View {
             acceptor_pen(ix, x, minus)
         }) as u32
     }
+}
+
+/// Splice-site costs and bases of a stretch of a view (see [`View::sites`]), and the buffers
+/// they are worked out in.
+#[derive(Default)]
+pub(crate) struct Sites {
+    enter: Vec<u32>,
+    leave: Vec<u32>,
+    gb: Vec<u8>,
+    bases: Vec<u8>,
+    donors: Vec<u32>,
+    acceptors: Vec<u32>,
 }
 
 /// The read from position `q`, forwards or backwards.
@@ -144,6 +206,21 @@ pub(crate) struct Solved {
     pub end: (u32, u32),
 }
 
+/// The solver's working storage, kept between solves. `cur`, `curp`: per read position, the
+/// cost of having left the genome there and where, for the level being built. `lev_p`: `curp`
+/// as it was after each level, one after another. `via`: per level and read position, where
+/// the level's window was entered (read position, view position) by the path that left the
+/// genome there, or `NO_VIA`. `rows`: the rows of a window's table.
+#[derive(Default)]
+struct Work {
+    cur: Vec<u32>,
+    curp: Vec<u32>,
+    lev_p: Vec<u32>,
+    via: Vec<(u32, u32)>,
+    rows: [Vec<u64>; 4],
+}
+const NO_VIA: (u32, u32) = (u32::MAX, 0);
+
 /// What a pair of prefix tables was computed for: where the read and the genome start, the
 /// direction, the length and the far point (`None` before any).
 type Key = Option<(u32, bool, usize, u32, Option<u32>)>;
@@ -167,6 +244,8 @@ pub(crate) struct Bufs {
     r_cost: Vec<u32>,
     r_j: Vec<u32>,
     r_leave: Vec<u32>,
+    sites: Sites,
+    work: Work,
     /// Work counters: solves, prefix-table cells filled, window cells filled.
     pub calls: u64,
     pub prefix_cells: u64,
@@ -229,10 +308,10 @@ const BIGP: u64 = (BIG as u64) << SH;
 /// its path entered the window. `pd`, `pu` are the row above at the same and the next k, `ur`
 /// its cells that end in read bases left out (next k); `hr`, `nu` receive this row. Returns the
 /// cheapest way to leave the window in this row and the cheapest cell to end the read in, each
-/// as cost above and offset in the row below (`u64::MAX`: none).
+/// as cost above and offset in the row below (`u64::MAX`: none), and the row's lowest cost.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn window_row_body(
+fn window_row_body<const WIDE: bool>(
     pd: &[u64],
     pu: &[u64],
     ur: &[u64],
@@ -245,10 +324,9 @@ fn window_row_body(
     entry: u64,
     j_lo: usize,
     j_min: usize,
-) -> (u64, u64) {
-    let open_del = ((GAP_OPEN + GAP_EXT) as u64) << SH;
+) -> (u64, u64, u64) {
     let open_ins = ((GAP_OPEN + INS_EXT) as u64) << SH;
-    let (ins_ext, del_ext) = ((INS_EXT as u64) << SH, (GAP_EXT as u64) << SH);
+    let ins_ext = (INS_EXT as u64) << SH;
     let mismatch = (MISMATCH as u64) << SH;
     let len = hr.len();
     let (pd, pu, ur, nu) = (&pd[..len], &pu[..len], &ur[..len], &mut nu[..len]);
@@ -267,15 +345,20 @@ fn window_row_body(
         hr[x] = e.min(d).min(f).min(BIGP);
     }
     // along the row (`left` never exceeds BIGP + open_del, since a cell is at most BIGP)
-    let mut left = BIGP;
-    for c in hr.iter_mut() {
-        *c = (*c).min(left);
-        left = (left + del_ext).min(*c + open_del);
+    #[cfg(target_arch = "x86_64")]
+    if WIDE {
+        // SAFETY: WIDE is set only by the copy built (and called) with AVX-512.
+        unsafe { row_gap_avx512(hr) };
+    } else {
+        row_gap(hr);
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    row_gap(hr);
     // something of the window is used: it can be left here, or the read can end
-    let (mut bl, mut be) = (u64::MAX, u64::MAX);
+    let (mut bl, mut be, mut low) = (u64::MAX, u64::MAX, u64::MAX);
     for x in 0..len {
         let c = hr[x];
+        low = low.min(c);
         let unused = (((c < BIGP) & ((j_lo + x) as u64 > (c & 0xffff))) as u64).wrapping_sub(1);
         let cost = c >> SH;
         let l = (((cost + lv[x] as u64) << 16) | x as u64) | unused;
@@ -283,15 +366,143 @@ fn window_row_body(
         bl = bl.min(l);
         be = be.min(t);
     }
-    (bl, be)
+    (bl, be, low >> SH)
 }
 
-avx2_variant! {
-    #[allow(clippy::too_many_arguments)]
-    fn window_row = window_row_body, window_row_avx2(
-        pd: &[u64], pu: &[u64], ur: &[u64], hr: &mut [u64], nu: &mut [u64],
-        en: &[u32], lv: &[u32], g: &[u8], ri: u8, entry: u64, j_lo: usize, j_min: usize,
-    ) -> (u64, u64)
+/// The gap along a row: every cell becomes the cheaper of itself and a gap from a cell before
+/// it (opening costs GAP_OPEN + GAP_EXT, each further base GAP_EXT).
+#[inline(always)]
+fn row_gap(hr: &mut [u64]) {
+    let open_del = ((GAP_OPEN + GAP_EXT) as u64) << SH;
+    let del_ext = (GAP_EXT as u64) << SH;
+    // (`left` never exceeds BIGP + open_del, since a cell is at most BIGP; a gap opened from
+    // a cell that a gap just lowered never beats that gap extended, so the cell as it was is
+    // enough here and the chain from cell to cell is one addition and one comparison)
+    let mut left = BIGP;
+    for c in hr.iter_mut() {
+        let open = *c + open_del;
+        *c = (*c).min(left);
+        left = (left + del_ext).min(open);
+    }
+}
+
+/// `row_gap`, eight cells at a time. The gap that reaches cell x from cell y < x costs
+/// open + (x - 1 - y) * ext, so with a[y] = cell y + open + (len - 1 - y) * ext the cheapest
+/// gap into x is the least a[y] before x, less (len - x) * ext: a running minimum, taken by
+/// three doubling steps inside the eight and one carried word between them. The results are
+/// those of `row_gap` exactly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn row_gap_avx512(hr: &mut [u64]) {
+    use std::arch::x86_64::*;
+    let open_del = ((GAP_OPEN + GAP_EXT) as u64) << SH;
+    let del_ext = (GAP_EXT as u64) << SH;
+    let len = hr.len();
+    // SAFETY (all of it): loads and stores are of whole eights inside `hr`, or masked to
+    // the cells that remain.
+    unsafe {
+        let ramp = _mm512_mullo_epi64(
+            _mm512_set_epi64(7, 6, 5, 4, 3, 2, 1, 0),
+            _mm512_set1_epi64(del_ext as i64),
+        );
+        let none = _mm512_set1_epi64(-1);
+        let last = _mm512_set1_epi64(7);
+        let mut carry = _mm512_set1_epi64((BIGP + len as u64 * del_ext) as i64);
+        let mut x = 0;
+        while x < len {
+            let rem = len - x;
+            let k: __mmask8 = if rem >= 8 { 0xff } else { (1u8 << rem) - 1 };
+            let at = hr.as_mut_ptr().add(x) as *mut i64;
+            // (cells past the end read as "none"; what they turn into is never stored and
+            // never reaches a cell before them)
+            let c = _mm512_mask_loadu_epi64(none, k, at);
+            let a0 = (open_del + (len - 1 - x) as u64 * del_ext) as i64;
+            let mut p = _mm512_sub_epi64(_mm512_add_epi64(c, _mm512_set1_epi64(a0)), ramp);
+            p = _mm512_min_epu64(p, _mm512_alignr_epi64::<7>(p, none));
+            p = _mm512_min_epu64(p, _mm512_alignr_epi64::<6>(p, none));
+            p = _mm512_min_epu64(p, _mm512_alignr_epi64::<4>(p, none));
+            let before = _mm512_min_epu64(carry, _mm512_alignr_epi64::<7>(p, none));
+            let back = _mm512_set1_epi64(((len - x) as u64 * del_ext) as i64);
+            let left = _mm512_add_epi64(_mm512_sub_epi64(before, back), ramp);
+            _mm512_mask_storeu_epi64(at, k, _mm512_min_epu64(c, left));
+            carry = _mm512_min_epu64(carry, _mm512_permutexvar_epi64(last, p));
+            x += 8;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+mod window_row_x86 {
+    use super::*;
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn avx2(
+        pd: &[u64],
+        pu: &[u64],
+        ur: &[u64],
+        hr: &mut [u64],
+        nu: &mut [u64],
+        en: &[u32],
+        lv: &[u32],
+        g: &[u8],
+        ri: u8,
+        entry: u64,
+        j_lo: usize,
+        j_min: usize,
+    ) -> (u64, u64, u64) {
+        window_row_body::<false>(pd, pu, ur, hr, nu, en, lv, g, ri, entry, j_lo, j_min)
+    }
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
+    pub(super) unsafe fn avx512(
+        pd: &[u64],
+        pu: &[u64],
+        ur: &[u64],
+        hr: &mut [u64],
+        nu: &mut [u64],
+        en: &[u32],
+        lv: &[u32],
+        g: &[u8],
+        ri: u8,
+        entry: u64,
+        j_lo: usize,
+        j_min: usize,
+    ) -> (u64, u64, u64) {
+        window_row_body::<true>(pd, pu, ur, hr, nu, en, lv, g, ri, entry, j_lo, j_min)
+    }
+}
+
+/// `window_row_body` built for the instruction set found when the program runs.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn window_row(
+    pd: &[u64],
+    pu: &[u64],
+    ur: &[u64],
+    hr: &mut [u64],
+    nu: &mut [u64],
+    en: &[u32],
+    lv: &[u32],
+    g: &[u8],
+    ri: u8,
+    entry: u64,
+    j_lo: usize,
+    j_min: usize,
+) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vl")
+            && std::is_x86_feature_detected!("avx512dq")
+        {
+            // SAFETY: the features were just detected.
+            return unsafe { window_row_x86::avx512(pd, pu, ur, hr, nu, en, lv, g, ri, entry, j_lo, j_min) };
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was just detected.
+            return unsafe { window_row_x86::avx2(pd, pu, ur, hr, nu, en, lv, g, ri, entry, j_lo, j_min) };
+        }
+    }
+    window_row_body::<false>(pd, pu, ur, hr, nu, en, lv, g, ri, entry, j_lo, j_min)
 }
 
 /// The cheapest cell of a prefix-table row once the cost of leaving the genome there is
@@ -328,6 +539,51 @@ fn row_end_body(row: &[u16], off0: i32) -> u32 {
 }
 avx2_variant! {
     pub(crate) fn row_end = row_end_body, row_end_avx2(row: &[u16], off0: i32) -> u32
+}
+
+/// The cheapest pairing of a level (`cur`, `curp`: per read position, the cost of having left
+/// the genome and where) with the far side: cost, read position, where the genome is entered
+/// (real). The far side's cheapest arrival per number of read bases is cached, so a pairing is
+/// one addition; only when that arrival would overlap the place the genome was left is the
+/// row searched.
+#[allow(clippy::too_many_arguments)]
+fn pair_far(
+    b: &Bufs,
+    cur: &[u32],
+    curp: &[u32],
+    gv: View,
+    t1: u32,
+    m: usize,
+    n: usize,
+    band: usize,
+    min_gap: u32,
+) -> (u32, usize, u32) {
+    let w = 2 * band + 1;
+    let mut best = (BIG, 0usize, 0u32);
+    for (x, &c0) in cur.iter().enumerate() {
+        let rest = m - x;
+        if c0 >= BIG || b.r_cost[rest] >= BIG || c0 + b.r_cost[rest] >= best.0 {
+            continue;
+        }
+        let enter = t1 - b.r_j[rest];
+        if gv.real(curp[x]) + min_gap <= enter {
+            best = (c0 + b.r_cost[rest], x, enter);
+            continue;
+        }
+        let (j_lo, j_hi) = (rest.saturating_sub(band), (rest + band).min(n));
+        for j in j_lo..=j_hi {
+            let e = b.e2[rest * w + j + band - rest] as u32;
+            if e >= INF as u32 {
+                continue;
+            }
+            let c = c0 + e + b.r_leave[j];
+            let enter = t1 - j as u32;
+            if c < best.0 && gv.real(curp[x]) + min_gap <= enter {
+                best = (c, x, enter);
+            }
+        }
+    }
+    best
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -374,7 +630,8 @@ pub(crate) fn solve(
         b.l0_p.clear();
         b.l0_p.resize(m + 1, 0);
         b.l0_end = (BIG, 0, 0);
-        let leave0: Vec<u32> = (0..=n).map(|j| gv.leave(ix, j as u32, minus)).collect();
+        gv.sites(ix, 0, n, minus, 0, &mut b.sites, false);
+        let leave0 = &b.sites.leave;
         // (per row: the cheapest cell with its leaving cost, the first of equals; and, for a
         // read end, the cheapest cell, the nearest to the diagonal of equals)
         let want_end = far.is_none();
@@ -403,120 +660,26 @@ pub(crate) fn solve(
         }
         b.l0_key = Some((key, minus));
     }
-    let mut cur = b.l0_cur.clone();
-    let mut curp = b.l0_p.clone();
+    let mut wk = std::mem::take(&mut b.work);
+    let Work {
+        cur,
+        curp,
+        lev_p,
+        via,
+        rows: [prev, here, up, up2],
+    } = &mut wk;
+    cur.clear();
+    cur.extend_from_slice(&b.l0_cur);
+    curp.clear();
+    curp.extend_from_slice(&b.l0_p);
+    let m1 = m + 1;
     let mut best_end = (BIG, 0usize, 0usize, 0u32, None::<(u32, u32)>); // cost, level, i, end p, entry
     if far.is_none() && b.l0_end.0 < BIG {
         best_end = (b.l0_end.0, 0, b.l0_end.1, b.l0_end.2, None);
     }
-    // Candidate exons, one level each. A level keeps, per read position, the cheapest way to
-    // have left the genome there, through this window or not.
-    let mut lev_p: Vec<Vec<u32>> = vec![curp.clone()];
-    let mut via: Vec<Vec<Option<(u32, u32)>>> = Vec::new();
-    for &(vs, vl, i0, band) in windows {
-        let vl = vl as usize;
-        // Only cells near the diagonal the window's seed hits lie on: window position j goes
-        // with read position i0 + j, give or take `wb`.
-        let wb = if band > 0 { band } else { 14 + vl as i64 / 24 };
-        let ww = (2 * wb + 1) as usize;
-        let i_lo = (i0 - wb).clamp(0, m as i64) as usize;
-        let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
-        let rows = i_hi - i_lo + 1;
-        b.window_cells += (rows * ww) as u64;
-        let enter: Vec<u32> = (0..=vl)
-            .map(|j| EXTRA_INTRON + gv.enter(ix, vs + j as u32, minus))
-            .collect();
-        let leave: Vec<u32> = (0..=vl).map(|j| gv.leave(ix, vs + j as u32, minus)).collect();
-        // (gb[j] is the genome base before window position j)
-        let gb: Vec<u8> = std::iter::once(4)
-            .chain((0..vl).map(|j| gv.base(ix, vs + j as u32)))
-            .collect();
-        let mut next = cur.clone();
-        let mut nextp = curp.clone();
-        let mut v: Vec<Option<(u32, u32)>> = vec![None; m + 1];
-        // Affine gaps, as outside the windows. Only two rows are kept. A cell is one word: its
-        // cost above, and below it where its path entered the window (read position and window
-        // position), so the cheapest of several ways is one comparison and no table is walked
-        // back. `up` holds, per k, the best cell of the row above that ends in read bases left
-        // out. All three rows have one spare cell at the end.
-        let mut prev = vec![BIGP; ww + 1];
-        let mut here = vec![BIGP; ww + 1];
-        let mut up = vec![BIGP; ww + 1];
-        let mut up2 = vec![BIGP; ww + 1];
-        for i in i_lo..=i_hi {
-            let ri = if i > 0 { rv.base(read, i - 1) } else { 0 };
-            // window position j = base_j + k
-            let base_j = i as i64 - i0 - wb;
-            let k_lo = (-base_j).max(0) as usize;
-            let k_hi = (vl as i64 - base_j).min(ww as i64 - 1);
-            here.fill(BIGP);
-            if k_hi < k_lo as i64 {
-                up.fill(BIGP);
-                std::mem::swap(&mut prev, &mut here);
-                continue;
-            }
-            let k_hi = k_hi as usize;
-            let j_lo = (base_j + k_lo as i64) as usize;
-            let len = k_hi - k_lo + 1;
-            // entering here is allowed where the genome was left far enough before
-            let j_min = if cur[i] < BIG {
-                (curp[i] + min_gap).saturating_sub(vs) as usize
-            } else {
-                usize::MAX
-            };
-            let entry = ((cur[i] as u64) << SH) | ((i as u64) << 16);
-            let (bl, be) = window_row(
-                &prev[k_lo..k_lo + len],
-                &prev[k_lo + 1..k_lo + 1 + len],
-                &up[k_lo + 1..k_lo + 1 + len],
-                &mut here[k_lo..k_lo + len],
-                &mut up2[k_lo..k_lo + len],
-                &enter[j_lo..j_lo + len],
-                &leave[j_lo..j_lo + len],
-                &gb[j_lo..j_lo + len],
-                ri,
-                entry,
-                j_lo,
-                j_min,
-            );
-            up2[..k_lo].fill(BIGP);
-            up2[k_hi + 1..].fill(BIGP);
-            std::mem::swap(&mut up, &mut up2);
-            if bl != u64::MAX && ((bl >> 16) as u32) < next[i] {
-                let x = (bl & 0xffff) as usize;
-                let o = here[k_lo + x] as u32;
-                next[i] = (bl >> 16) as u32;
-                nextp[i] = vs + (j_lo + x) as u32;
-                v[i] = Some(((o >> 16) & 0xffff, vs + (o & 0xffff)));
-            }
-            if far.is_none() && be != u64::MAX {
-                let x = (be & 0xffff) as usize;
-                let o = here[k_lo + x] as u32;
-                let e = (be >> 16) as u32 + CLIP * (m - i) as u32;
-                if e < best_end.0 {
-                    best_end = (
-                        e,
-                        via.len() + 1,
-                        i,
-                        vs + (j_lo + x) as u32,
-                        Some(((o >> 16) & 0xffff, vs + (o & 0xffff))),
-                    );
-                }
-            }
-            std::mem::swap(&mut prev, &mut here);
-        }
-        cur = next;
-        curp = nextp;
-        lev_p.push(curp.clone());
-        via.push(v);
-    }
-    // Finish, then walk back through the levels.
-    let mut out = Solved {
-        cost: BIG,
-        ..Default::default()
-    };
-    let (mut level, mut i);
-    let mut hops: Vec<(u32, u32, u32)> = Vec::new(); // read i, leave p, enter (real)
+    // The far side (its tables, cached like level 0), before the windows: the answer without
+    // any window bounds what a window's cells may cost and still matter.
+    let mut bound = BIG;
     if let Some(t1) = far {
         let fv = View {
             origin: t1,
@@ -539,16 +702,17 @@ pub(crate) fn solve(
             );
             b.key2 = key;
         }
-        // The far side per number of read bases it takes: its cheapest arrival, cached like
+        // Per number of read bases it takes: its cheapest arrival, cached like
         // level 0. The pairing with level 0 then costs one addition per read position; only
         // when that arrival would overlap the place the genome was left is the row searched.
         if b.r_key != Some((key, minus)) {
-            let far_leave: Vec<u32> = (0..=n).map(|j| fv.leave(ix, j as u32, minus)).collect();
+            fv.sites(ix, 0, n, minus, 0, &mut b.sites, false);
             b.r_cost.clear();
             b.r_cost.resize(m + 1, BIG);
             b.r_j.clear();
             b.r_j.resize(m + 1, 0);
-            b.r_leave = far_leave;
+            b.r_leave.clear();
+            b.r_leave.extend_from_slice(&b.sites.leave);
             for rest in 0..=m {
                 let (j_lo, j_hi) = (rest.saturating_sub(band), (rest + band).min(n));
                 if j_hi < j_lo {
@@ -565,66 +729,222 @@ pub(crate) fn solve(
             }
             b.r_key = Some((key, minus));
         }
-        let mut best = (BIG, 0usize, 0u32);
-        for (x, &c0) in cur.iter().enumerate() {
-            let rest = m - x;
-            if c0 >= BIG || b.r_cost[rest] >= BIG || c0 + b.r_cost[rest] >= best.0 {
+        if !windows.is_empty() {
+            bound = pair_far(b, cur, curp, gv, t1, m, n, band, min_gap).0;
+        }
+    }
+    // Candidate exons, one level each. A level keeps, per read position, the cheapest way to
+    // have left the genome there, through this window or not.
+    lev_p.clear();
+    lev_p.extend_from_slice(curp);
+    via.clear();
+    let mut levels = 0usize;
+    for &(vs, vl, i0, band) in windows {
+        let vl = vl as usize;
+        // Only cells near the diagonal the window's seed hits lie on: window position j goes
+        // with read position i0 + j, give or take `wb`.
+        let wb = if band > 0 { band } else { 14 + vl as i64 / 24 };
+        let ww = (2 * wb + 1) as usize;
+        let i_lo = (i0 - wb).clamp(0, m as i64) as usize;
+        let i_hi = (i0 + vl as i64 + wb).clamp(0, m as i64) as usize;
+        // A cell that costs more than an answer already in hand cannot be part of a better
+        // one, and costs only grow along a path. So a row matters only if the row above has
+        // such a cell or the window can be entered in it; the rows before the first place
+        // it can be entered and after the last, once nothing is left, are not filled.
+        let ub = if far.is_some() { bound } else { best_end.0 };
+        let enters = |c: u32, ub: u32| c < BIG && (ub >= BIG || c + EXTRA_INTRON <= ub);
+        let first = (i_lo..=i_hi).find(|&i| enters(cur[i], ub));
+        let Some(first) = first else {
+            lev_p.extend_from_slice(curp);
+            via.resize(via.len() + m1, NO_VIA);
+            levels += 1;
+            continue;
+        };
+        let last = (first..=i_hi).rev().find(|&i| enters(cur[i], ub)).unwrap();
+        let rows = i_hi - first + 1;
+        b.window_cells += (rows * ww) as u64;
+        // (gb[j] is the genome base before window position j)
+        gv.sites(ix, vs, vl, minus, EXTRA_INTRON, &mut b.sites, true);
+        let (enter, leave, gb) = (&b.sites.enter, &b.sites.leave, &b.sites.gb);
+        // (a row reads its own entry of `cur` and `curp` before it replaces them, and no
+        // other row's, so the level is built in place)
+        let v0 = via.len();
+        via.resize(v0 + m1, NO_VIA);
+        // Affine gaps, as outside the windows. Only two rows are kept. A cell is one word: its
+        // cost above, and below it where its path entered the window (read position and window
+        // position), so the cheapest of several ways is one comparison and no table is walked
+        // back. `up` holds, per k, the best cell of the row above that ends in read bases left
+        // out. All three rows have one spare cell at the end.
+        for r in [&mut *prev, &mut *here, &mut *up, &mut *up2] {
+            r.clear();
+            r.resize(ww + 1, BIGP);
+        }
+        let mut alive = false;
+        for i in first..=i_hi {
+            let ub = if far.is_some() { bound } else { best_end.0 };
+            let may_enter = enters(cur[i], ub);
+            if !alive && !may_enter {
+                // (the rows above are empty already)
+                if i > last {
+                    break;
+                }
                 continue;
             }
-            let enter = t1 - b.r_j[rest];
-            if gv.real(curp[x]) + min_gap <= enter {
-                best = (c0 + b.r_cost[rest], x, enter);
+            let ri = if i > 0 { rv.base(read, i - 1) } else { 0 };
+            // window position j = base_j + k
+            let base_j = i as i64 - i0 - wb;
+            let k_lo = (-base_j).max(0) as usize;
+            let k_hi = (vl as i64 - base_j).min(ww as i64 - 1);
+            here.fill(BIGP);
+            if k_hi < k_lo as i64 {
+                up.fill(BIGP);
+                std::mem::swap(prev, here);
+                alive = false;
                 continue;
             }
-            let (j_lo, j_hi) = (rest.saturating_sub(band), (rest + band).min(n));
-            for j in j_lo..=j_hi {
-                let e = b.e2[rest * w + j + band - rest] as u32;
-                if e >= INF as u32 {
-                    continue;
-                }
-                let c = c0 + e + b.r_leave[j];
-                let enter = t1 - j as u32;
-                if c < best.0 && gv.real(curp[x]) + min_gap <= enter {
-                    best = (c, x, enter);
+            let k_hi = k_hi as usize;
+            let j_lo = (base_j + k_lo as i64) as usize;
+            let len = k_hi - k_lo + 1;
+            // entering here is allowed where the genome was left far enough before
+            let j_min = if may_enter {
+                (curp[i] + min_gap).saturating_sub(vs) as usize
+            } else {
+                usize::MAX
+            };
+            let entry = ((cur[i] as u64) << SH) | ((i as u64) << 16);
+            let (bl, be, low) = window_row(
+                &prev[k_lo..k_lo + len],
+                &prev[k_lo + 1..k_lo + 1 + len],
+                &up[k_lo + 1..k_lo + 1 + len],
+                &mut here[k_lo..k_lo + len],
+                &mut up2[k_lo..k_lo + len],
+                &enter[j_lo..j_lo + len],
+                &leave[j_lo..j_lo + len],
+                &gb[j_lo..j_lo + len],
+                ri,
+                entry,
+                j_lo,
+                j_min,
+            );
+            up2[..k_lo].fill(BIGP);
+            up2[k_hi + 1..].fill(BIGP);
+            std::mem::swap(up, up2);
+            if bl != u64::MAX && ((bl >> 16) as u32) < cur[i] {
+                let x = (bl & 0xffff) as usize;
+                let o = here[k_lo + x] as u32;
+                cur[i] = (bl >> 16) as u32;
+                curp[i] = vs + (j_lo + x) as u32;
+                via[v0 + i] = ((o >> 16) & 0xffff, vs + (o & 0xffff));
+            }
+            if far.is_none() && be != u64::MAX {
+                let x = (be & 0xffff) as usize;
+                let o = here[k_lo + x] as u32;
+                let e = (be >> 16) as u32 + CLIP * (m - i) as u32;
+                if e < best_end.0 {
+                    best_end = (
+                        e,
+                        levels + 1,
+                        i,
+                        vs + (j_lo + x) as u32,
+                        Some(((o >> 16) & 0xffff, vs + (o & 0xffff))),
+                    );
                 }
             }
+            std::mem::swap(prev, here);
+            alive = ub >= BIG || low <= ub as u64;
+            if !alive {
+                prev.fill(BIGP);
+                up.fill(BIGP);
+            }
         }
-        if best.0 >= BIG {
-            return out;
+        lev_p.extend_from_slice(curp);
+        levels += 1;
+    }
+    // Finish, then walk back through the levels.
+    let mut out = Solved {
+        cost: BIG,
+        ..Default::default()
+    };
+    'done: {
+        let (mut level, mut i);
+        let mut hops: Vec<(u32, u32, u32)> = Vec::new(); // read i, leave p, enter (real)
+        if let Some(t1) = far {
+            let best = pair_far(b, cur, curp, gv, t1, m, n, band, min_gap);
+            if best.0 >= BIG {
+                break 'done;
+            }
+            out.cost = best.0;
+            level = levels;
+            i = best.1;
+            hops.push((i as u32, gv.real(lev_p[level * m1 + i]), best.2));
+        } else {
+            if best_end.0 >= BIG {
+                break 'done;
+            }
+            out.cost = best_end.0;
+            out.end = (rv.real(best_end.2 as u32), gv.real(best_end.3));
+            level = best_end.1;
+            i = best_end.2;
+            if let Some((i1, ep)) = best_end.4 {
+                level -= 1;
+                hops.push((i1, gv.real(lev_p[level * m1 + i1 as usize]), gv.real(ep)));
+                i = i1 as usize;
+            }
         }
-        out.cost = best.0;
-        level = via.len();
-        i = best.1;
-        hops.push((i as u32, gv.real(lev_p[level][i]), best.2));
-    } else {
-        if best_end.0 >= BIG {
-            return out;
-        }
-        out.cost = best_end.0;
-        out.end = (rv.real(best_end.2 as u32), gv.real(best_end.3));
-        level = best_end.1;
-        i = best_end.2;
-        if let Some((i1, ep)) = best_end.4 {
+        while level > 0 {
+            let (i1, ep) = via[(level - 1) * m1 + i];
+            if (i1, ep) != NO_VIA {
+                hops.push((i1, gv.real(lev_p[(level - 1) * m1 + i1 as usize]), gv.real(ep)));
+                i = i1 as usize;
+            }
             level -= 1;
-            hops.push((i1, gv.real(lev_p[level][i1 as usize]), gv.real(ep)));
-            i = i1 as usize;
         }
+        hops.reverse();
+        out.hops = hops
+            .into_iter()
+            .map(|(i, leave, enter)| Hop {
+                q: rv.real(i),
+                leave,
+                enter,
+            })
+            .collect();
     }
-    while level > 0 {
-        if let Some((i1, ep)) = via[level - 1][i] {
-            hops.push((i1, gv.real(lev_p[level - 1][i1 as usize]), gv.real(ep)));
-            i = i1 as usize;
-        }
-        level -= 1;
-    }
-    hops.reverse();
-    out.hops = hops
-        .into_iter()
-        .map(|(i, leave, enter)| Hop {
-            q: rv.real(i),
-            leave,
-            enter,
-        })
-        .collect();
+    b.work = wk;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gap pass of a window's row, eight cells at a time, against the cell-by-cell one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn row_gaps_match() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for round in 0..2000 {
+            let len = 1 + (rng() % 70) as usize;
+            let row: Vec<u64> = (0..len)
+                .map(|_| match rng() % 8 {
+                    0 => BIGP,
+                    1 => ((rng() % (BIG as u64)) << SH) | (rng() & 0xffff_ffff),
+                    _ => ((rng() % 40) << SH) | (rng() & 0xffff_ffff),
+                })
+                .collect();
+            let (mut x, mut y) = (row.clone(), row.clone());
+            row_gap(&mut x);
+            // SAFETY: the feature was just detected.
+            unsafe { row_gap_avx512(&mut y) };
+            assert_eq!(x, y, "round {round} {row:?}");
+        }
+    }
 }
