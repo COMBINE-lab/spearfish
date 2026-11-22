@@ -955,6 +955,9 @@ const END_CLOSE: u32 = 16;
 const END_HIT_GAP: u32 = 64;
 /// The splice-site search past a read end is for fewer unexplained bases than this.
 const SITE_END_MAX: u32 = 25;
+/// How far back, at most, a further round of the read-end search starts from where the round
+/// before it stopped.
+const END_BACK: u32 = 12;
 /// The approximate search past a read end is for at least this many unexplained bases.
 const SCAN_END_MIN: u32 = 40;
 /// Price of a known intron at a read end (besides its sites, which cost nothing).
@@ -2585,9 +2588,44 @@ impl<'a> Mapper<'a> {
             if !more && (whole || (m as u32 - got >= 10 && !hopped) || got < 30) {
                 break;
             }
-            (q, t) = s.end;
+            // The next round starts a few bases back, on the exact matches this one ended with:
+            // an exon's last bases can match the intron beside it by chance, and a junction
+            // there is placed by the round that crosses it.
+            let seg = out.hops.last().map_or(got, |h| s.end.0.abs_diff(h.q).min(got));
+            let back = self
+                .exact_run(read, s.end.0, s.end.1, !left)
+                .min(END_BACK)
+                .min(seg);
+            (q, t) = if left {
+                (s.end.0 + back, s.end.1 + back)
+            } else {
+                (s.end.0 - back, s.end.1 - back)
+            };
         }
         out
+    }
+
+    /// How many read bases next to read position `q` (before it when `left`) match the genome
+    /// next to `t` exactly, one after another on the same diagonal; at most 24.
+    fn exact_run(&self, read: &[u8], q: u32, t: u32, left: bool) -> u32 {
+        const LOW: u64 = 0x5555_5555_5555_5555;
+        let ix = self.index;
+        let avail = if left { q as usize } else { read.len() - q as usize };
+        let gv = View { origin: t, rev: left };
+        if avail < 24 || gv.room(ix) <= 32 {
+            return 0;
+        }
+        let Some(g) = gv.word(ix, 0) else { return 0 };
+        let rw = (0..24).fold(0u64, |w, i| {
+            let b = if left {
+                read[q as usize - 1 - i]
+            } else {
+                read[q as usize + i]
+            };
+            w | (b as u64 & 3) << (2 * i)
+        });
+        let x = (g ^ rw) & ((1u64 << 48) - 1);
+        (((x | (x >> 1)) & LOW).trailing_zeros() / 2).min(24)
     }
 
     /// Alignment score of a hit: per block, two per read base minus the banded affine cost of
