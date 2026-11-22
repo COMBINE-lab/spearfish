@@ -108,6 +108,31 @@ impl View {
         s: &mut Sites,
         want_bases: bool,
     ) {
+        self.sites_of(ix, vs, len, minus, add, s, want_bases);
+        if s.both {
+            let (e, l) = (std::mem::take(&mut s.enter), std::mem::take(&mut s.leave));
+            self.sites_of(ix, vs, len, !minus, add, s, want_bases);
+            for (x, y) in s.enter.iter_mut().zip(&e) {
+                *x = (*x).min(*y);
+            }
+            for (x, y) in s.leave.iter_mut().zip(&l) {
+                *x = (*x).min(*y);
+            }
+            (s.enter2, s.leave2) = (e, l);
+        }
+    }
+    /// [`Self::sites`] for one transcript strand.
+    #[allow(clippy::too_many_arguments)]
+    fn sites_of(
+        &self,
+        ix: &GenomeIndex,
+        vs: u32,
+        len: usize,
+        minus: bool,
+        add: u32,
+        s: &mut Sites,
+        want_bases: bool,
+    ) {
         let l = len as u32;
         let (lo, hi) = if self.rev {
             ((self.origin - vs).wrapping_sub(l), self.origin - vs)
@@ -165,6 +190,11 @@ pub(crate) struct Sites {
     bases: Vec<u8>,
     donors: Vec<u32>,
     acceptors: Vec<u32>,
+    /// Set: every cost is the lower of the two transcript strands' (for a bound that holds
+    /// for both strands).
+    both: bool,
+    enter2: Vec<u32>,
+    leave2: Vec<u32>,
 }
 
 /// The read from position `q`, forwards or backwards.
@@ -267,6 +297,13 @@ pub(crate) struct Tables {
 }
 
 impl Bufs {
+    /// Price every splice site as on its cheaper transcript strand (`on`), or per strand
+    /// again; what is cached per strand is dropped either way.
+    pub fn set_both_strands(&mut self, on: bool) {
+        self.sites.both = on;
+        self.l0_key = None;
+        self.r_key = None;
+    }
     /// The tables of the gap solved last (both must be present: a gap between two anchors).
     pub fn stash(&self) -> Tables {
         debug_assert!(self.key1 == self.key2);

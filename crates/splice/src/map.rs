@@ -1485,9 +1485,24 @@ impl<'a> Mapper<'a> {
                 .collect();
         }
         let top = cands.first().map_or(0.0, |c| c.0);
-        for (score, reverse, chain) in cands.into_iter().take(8) {
-            if score < 0.7 * top {
+        // The best eight chains; and, past those, up to two that cross an intron: a gene with
+        // many processed pseudogenes has more unspliced look-alikes than that, and each scores
+        // above the gene itself, whose chain pays for its introns.
+        let crosses = |chain: &[Anchor]| {
+            chain
+                .windows(2)
+                .any(|w| (w[1].t - w[0].t) as i64 - (w[1].q - w[0].q) as i64 >= self.opt.min_intron as i64)
+        };
+        let mut more = 2;
+        for (k, (score, reverse, chain)) in cands.into_iter().enumerate() {
+            if score < 0.7 * top || (k >= 8 && more == 0) {
                 break;
+            }
+            if k >= 8 {
+                if !crosses(&chain) {
+                    continue;
+                }
+                more -= 1;
             }
             let read = std::mem::take(&mut sc.codes[reverse as usize]);
             sc.gap.reset(); // another chain, possibly the other orientation of the read
@@ -1508,15 +1523,35 @@ impl<'a> Mapper<'a> {
             }
             out.retain(|h| h.score >= self.opt.min_score);
             // A spliced read also aligns, unspliced, to a processed pseudogene of its gene, and
-            // there it can cover a few more bases (no read ends lost at junctions). When a
+            // there it can cover a few more bases: no read ends lost at junctions, and the
+            // read's poly(A) tail matches the one the pseudogene was copied with. When a
             // spliced hit is within 10% of the best unspliced one and aligns at least as well
-            // per base, it is the gene the read came from.
+            // (per base; or, where the unspliced hit covers all the spliced one does, in what
+            // its alignment costs in all), it is the gene the read came from.
             let cover = |h: &SplicedHit| h.blocks.iter().map(|b| b.qe - b.qs).sum::<u32>().max(1) as i64;
-            if let Some(u) = out.iter().filter(|h| h.blocks.len() == 1).max_by_key(|h| h.score) {
-                let (us, uc) = (u.score as i64, cover(u));
-                for h in out.iter_mut().filter(|h| h.blocks.len() > 1) {
-                    let (hs, hc) = (h.score as i64, cover(h));
-                    if hs < us && 10 * hs >= 9 * us && hs * uc >= us * hc {
+            // (the read interval of a hit, on the read as given)
+            let span = |h: &SplicedHit| {
+                let (a, b) = (h.blocks[0].qs, h.blocks[h.blocks.len() - 1].qe);
+                if h.reverse {
+                    (n as u32 - b, n as u32 - a)
+                } else {
+                    (a, b)
+                }
+            };
+            // (blocks a short gap apart are one exon with a deletion)
+            let introns = |h: &SplicedHit| {
+                h.blocks
+                    .windows(2)
+                    .filter(|w| w[1].ts - w[0].te >= MIN_INTRON_REPORTED)
+                    .count()
+            };
+            if let Some(u) = out.iter().filter(|h| introns(h) == 0).max_by_key(|h| h.score) {
+                let (us, uc, (ua, ub)) = (u.score as i64, cover(u), span(u));
+                for h in out.iter_mut().filter(|h| introns(h) > 0) {
+                    let (hs, hc, (ha, hb)) = (h.score as i64, cover(h), span(h));
+                    let within = ua <= ha + 3 && hb <= ub + 3;
+                    let as_well = hs * uc >= us * hc || (within && 2 * hc - hs <= 2 * uc - us);
+                    if hs <= us && 10 * hs >= 9 * us && as_well {
                         h.score = us as i32 + 1;
                         sc.stats.spliced_preferred += 1;
                     }
@@ -2454,14 +2489,11 @@ impl<'a> Mapper<'a> {
                 } else {
                     Vec::new()
                 };
+                // the candidates from seed hits, plus known exons, exons that start at a
+                // splice site and match the unexplained bases, and those of the approximate
+                // search
+                let mut cands: Vec<Vec<SolverWindow>> = Vec::new();
                 for &mi in &strands {
-                    let mut s = Solved {
-                        cost: u32::MAX,
-                        ..Default::default()
-                    };
-                    // the candidates from seed hits, plus known exons, exons that start at a
-                    // splice site and match the unexplained bases, and those of the
-                    // approximate search
                     let mut all = vw.clone();
                     all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
                     // (an exon found by its splice site and a few matching bases alone is
@@ -2480,9 +2512,33 @@ impl<'a> Mapper<'a> {
                         ));
                     }
                     all.extend(scanned.iter().copied());
+                    all.sort_by_key(|w| w.0);
+                    cands.push(all);
+                }
+                // With the strand undecided, first one solve with every site priced as on its
+                // cheaper strand and both strands' candidates: no strand can do better, so
+                // when that does not beat what is in hand, neither strand is solved.
+                let mut hopeless = false;
+                if strands.len() == 2 && cands.iter().any(|c| !c.is_empty()) {
+                    let mut both = cands[0].clone();
+                    both.extend(cands[1].iter().copied());
+                    both.sort_by_key(|w| w.0);
+                    both.dedup();
+                    sc.gap.set_both_strands(true);
+                    let s = gap::solve(ix, read, rv, m, gv, None, &both, strands[0], half, &mut sc.gap);
+                    sc.gap.set_both_strands(false);
+                    hopeless = s.cost >= best.0.cost;
+                }
+                for (&mi, all) in strands.iter().zip(&cands) {
+                    if hopeless {
+                        break;
+                    }
+                    let mut s = Solved {
+                        cost: u32::MAX,
+                        ..Default::default()
+                    };
                     if !all.is_empty() {
-                        all.sort_by_key(|w| w.0);
-                        s = gap::solve(ix, read, rv, m, gv, None, &all, mi, half, &mut sc.gap);
+                        s = gap::solve(ix, read, rv, m, gv, None, all, mi, half, &mut sc.gap);
                     }
                     if s.cost == u32::MAX {
                         continue;
