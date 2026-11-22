@@ -536,6 +536,37 @@ unsafe fn prefix_left_avx512(here: &mut [u16]) -> u16 {
     }
 }
 
+/// Calls `f` with every index of `ids` whose value is one of `want` (at most eight values), in order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn ids_among_avx512(ids: &[u16], want: &[u16], mut f: impl FnMut(usize)) {
+    use std::arch::x86_64::*;
+    let mut w = [_mm512_setzero_si512(); 8];
+    for (k, &x) in want.iter().enumerate() {
+        w[k] = _mm512_set1_epi16(x as i16);
+    }
+    let w = &w[..want.len()];
+    let mut i = 0;
+    while i + 32 <= ids.len() {
+        // SAFETY: 32 values from `i` on lie in `ids`.
+        let v = unsafe { _mm512_loadu_si512(ids.as_ptr().add(i).cast()) };
+        let mut m: u32 = 0;
+        for x in w {
+            m |= _mm512_cmpeq_epi16_mask(v, *x);
+        }
+        while m != 0 {
+            f(i + m.trailing_zeros() as usize);
+            m &= m - 1;
+        }
+        i += 32;
+    }
+    for (j, id) in ids.iter().enumerate().skip(i) {
+        if want.contains(id) {
+            f(j);
+        }
+    }
+}
+
 /// The most pieces of a gap's read bases looked for in one approximate search.
 const SCAN_PIECES: usize = 16;
 
@@ -919,6 +950,13 @@ struct Placed {
 /// Known exons shorter than this are tried inside any junction that did not fit exactly.
 /// Read ends of up to this many unaligned bases are aligned to the genome next to the hit.
 const END_CLOSE: u32 = 16;
+/// Past a read end, seed hits of one candidate exon lie at most this many read bases apart, and
+/// a single hit counts only this close to where the alignment stopped.
+const END_HIT_GAP: u32 = 64;
+/// The splice-site search past a read end is for fewer unexplained bases than this.
+const SITE_END_MAX: u32 = 25;
+/// The approximate search past a read end is for at least this many unexplained bases.
+const SCAN_END_MIN: u32 = 40;
 /// Price of a known intron at a read end (besides its sites, which cost nothing).
 const KNOWN_END: u32 = 8;
 /// The most unexplained read bases at an end for which the known introns are tried on their own
@@ -1029,6 +1067,7 @@ impl Window {
 /// kept (at most `max_windows`), since a chance hit is usually alone. A window reaches past its
 /// hits by the read bases they leave uncovered on that side (the exon's edge can lie anywhere
 /// in them), but not past the midpoint to the next group, and stays inside `(t_lo, t_hi)`.
+/// Consecutive hits of a group lie at most `q_gap` read bases apart.
 fn windows_of(
     hits: &[Anchor],
     q_lo: u32,
@@ -1036,6 +1075,7 @@ fn windows_of(
     t_lo: u32,
     t_hi: u32,
     max_windows: usize,
+    q_gap: u32,
 ) -> Vec<Window> {
     // groups as (first hit, last hit, hits)
     let mut groups: Vec<(Anchor, Anchor, u32)> = Vec::new();
@@ -1043,7 +1083,7 @@ fn windows_of(
         let mut joined = false;
         for g in groups.iter_mut().rev().take(4) {
             let l = g.1;
-            if h.q > l.q && h.t > l.t && h.t - l.t < 2000 {
+            if h.q > l.q && h.t > l.t && h.t - l.t < 2000 && h.q - l.q <= q_gap {
                 let d = (h.t - l.t) as i64 - (h.q - l.q) as i64;
                 if d.abs() < 30 {
                     g.1 = h;
@@ -1564,7 +1604,7 @@ impl<'a> Mapper<'a> {
             if b.q < a.q + a.ql as u32 + LONG || diag(a, b) < min_intron {
                 continue;
             }
-            let mut hits = self.rescue(reverse, Some(a), Some(b), qlen, sc);
+            let mut hits = self.rescue(reverse, Some(a), Some(b), 0, qlen, sc);
             // only hits that can follow `a` and precede `b`
             hits.retain(|&h| diag(a, h) >= -NEAR && diag(h, b) >= -NEAR);
             if hits.len() < 2 {
@@ -1800,9 +1840,9 @@ impl<'a> Mapper<'a> {
                 };
                 if cand[k].is_none() {
                     sc.stats.rescues_tried += 1;
-                    let path = self.rescue(reverse, Some(a), Some(b), qlen, sc);
+                    let path = self.rescue(reverse, Some(a), Some(b), 0, qlen, sc);
                     sc.stats.empty += path.is_empty() as u64;
-                    cand[k] = Some(windows_of(&path, q0, q1, t0, t1, 8));
+                    cand[k] = Some(windows_of(&path, q0, q1, t0, t1, 8, u32::MAX));
                 }
                 let wins = cand[k].as_ref().unwrap();
                 let m = q1.saturating_sub(q0) as usize;
@@ -2332,10 +2372,13 @@ impl<'a> Mapper<'a> {
             }
             if rescue && !tail && !settled && m as u32 - reached >= 10 {
                 sc.stats.end_tried += 1;
-                // level-2 cores of the unexplained bases, within reach of the longest intron
+                // level-2 cores of the unexplained bases of this round (the bases the genome
+                // next to the hit explains have their hits there), within reach of the longest
+                // intron
+                let slack = reached.saturating_sub(12);
                 let here = Anchor {
                     t,
-                    q,
+                    q: if left { q - slack } else { q + slack },
                     ql: 0,
                     tl: 0,
                     q_in: 0,
@@ -2343,12 +2386,11 @@ impl<'a> Mapper<'a> {
                     w: 0.0,
                 };
                 let hits = if left {
-                    self.rescue(reverse, None, Some(here), qlen, sc)
+                    self.rescue(reverse, None, Some(here), q - m as u32, qlen, sc)
                 } else {
-                    self.rescue(reverse, Some(here), None, qlen, sc)
+                    self.rescue(reverse, Some(here), None, 0, q + m as u32, sc)
                 };
                 // windows start at the unexplained bases, not at the start of this round
-                let slack = reached.saturating_sub(12);
                 let windows = |hits: &[Anchor]| {
                     if left {
                         windows_of(
@@ -2358,10 +2400,11 @@ impl<'a> Mapper<'a> {
                             t.saturating_sub(self.opt.max_intron),
                             t,
                             4,
+                            END_HIT_GAP,
                         )
                     } else {
                         let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
-                        windows_of(hits, q + slack, q + m as u32, t, hi, 4)
+                        windows_of(hits, q + slack, q + m as u32, t, hi, 4, END_HIT_GAP)
                     }
                 };
                 // Most introns are short, and within the longest intron's reach a noisy read
@@ -2372,7 +2415,12 @@ impl<'a> Mapper<'a> {
                     .copied()
                     .filter(|h| h.t.abs_diff(t) <= END_NEAR)
                     .collect();
+                // A read end that is no part of the transcript (an adapter, a primer) has
+                // chance hits too, one at a time. A single hit is a candidate only nearby, and
+                // only when it lies in the first unexplained bases: a read that went on in an
+                // exon further off, or for longer, would have more.
                 let mut wins = windows(&hits);
+                wins.retain(|w| w.hits >= 2);
                 if near.len() < hits.len() {
                     for w in windows(&near) {
                         if wins.iter().all(|o| w.e <= o.s || o.e <= w.s) {
@@ -2381,13 +2429,31 @@ impl<'a> Mapper<'a> {
                     }
                     wins.sort_by_key(|w| w.s);
                 }
+                wins.retain(|w| {
+                    w.hits >= 2
+                        || (if left {
+                            t - w.e <= END_NEAR
+                        } else {
+                            w.s - t <= END_NEAR
+                        } && if left {
+                            (q - reached).saturating_sub(w.l.q + w.l.ql as u32) <= END_HIT_GAP
+                        } else {
+                            w.f.q.saturating_sub(q + reached) <= END_HIT_GAP
+                        })
+                });
                 let vw: Vec<SolverWindow> = if left {
                     wins.iter().rev().map(|w| w.backward(q, t)).collect()
                 } else {
                     wins.iter().map(|w| w.forward(q, t)).collect()
                 };
                 let p_end = best.0.end.1.abs_diff(t);
-                let scanned = self.scan_windows_end(read, rv, m, reached as usize, gv, p_end);
+                let unexplained = m as u32 - reached;
+                // (the approximate search needs a long stretch to tell an exon from chance)
+                let scanned = if unexplained >= SCAN_END_MIN {
+                    self.scan_windows_end(read, rv, m, reached as usize, gv, p_end)
+                } else {
+                    Vec::new()
+                };
                 for &mi in &strands {
                     let mut s = Solved {
                         cost: u32::MAX,
@@ -2398,7 +2464,21 @@ impl<'a> Mapper<'a> {
                     // approximate search
                     let mut all = vw.clone();
                     all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
-                    all.extend(self.site_windows_end(read, rv, m, reached as usize, gv, p_end, mi, true, sc));
+                    // (an exon found by its splice site and a few matching bases alone is
+                    // believed for a short read end only: those have no seed to be found by)
+                    if unexplained < SITE_END_MAX {
+                        all.extend(self.site_windows_end(
+                            read,
+                            rv,
+                            m,
+                            reached as usize,
+                            gv,
+                            p_end,
+                            mi,
+                            true,
+                            sc,
+                        ));
+                    }
                     all.extend(scanned.iter().copied());
                     if !all.is_empty() {
                         all.sort_by_key(|w| w.0);
@@ -3134,24 +3214,25 @@ impl<'a> Mapper<'a> {
 
     /// Level-2 anchors for read bases the chain leaves unexplained, searched only where they can
     /// lie: between chain neighbours `a` and `b`, or, when one of them is missing, within the
-    /// longest intron's reach past the chain's first or last anchor. Returns every hit, in genome
-    /// order.
+    /// longest intron's reach past the chain's first or last anchor, for the read bases from
+    /// `q_lo` on or up to `q_hi`. Returns every hit, in genome order.
     fn rescue(
         &self,
         reverse: bool,
         a: Option<Anchor>,
         b: Option<Anchor>,
-        qlen: u32,
+        q_lo: u32,
+        q_hi: u32,
         sc: &mut Scratch,
     ) -> Vec<Anchor> {
         let ix = self.index;
         let (qa, ta) = match a {
             Some(a) => (a.q + a.ql as u32, a.t + a.tl as u32),
-            None => (0, b.map_or(0, |b| b.t.saturating_sub(self.opt.max_intron))),
+            None => (q_lo, b.map_or(0, |b| b.t.saturating_sub(self.opt.max_intron))),
         };
         let (qb, tb) = match b {
             Some(b) => (b.q, b.t),
-            None => (qlen, ta.saturating_add(self.opt.max_intron).min(ix.total_len())),
+            None => (q_hi, ta.saturating_add(self.opt.max_intron).min(ix.total_len())),
         };
         if qb < qa + 8 || tb <= ta {
             return Vec::new();
@@ -3162,22 +3243,12 @@ impl<'a> Mapper<'a> {
         if lo == hi {
             return Vec::new();
         }
-        if sc.want.is_empty() {
-            sc.want.resize(1 << 16, u32::MAX);
-        }
-        // want[id] = index of the first read seed with that id (others are found by scanning on)
-        for (k, s) in seeds[lo..hi].iter().enumerate().rev() {
-            sc.want[s.id as usize] = (lo + k) as u32;
-        }
         let (pos, ids) = ix.l2_window(ta, tb);
         sc.stats.window_bases += (tb - ta) as u64;
         let mut hits: Vec<Anchor> = Vec::new();
-        for (&t, &id) in pos.iter().zip(ids) {
-            let first = sc.want[id as usize];
-            if first == u32::MAX {
-                continue;
-            }
-            for s in seeds[first as usize..hi].iter().filter(|s| s.id == id) {
+        let mut at = |k: usize, first: usize| {
+            let (t, id) = (pos[k], ids[k]);
+            for s in seeds[first..hi].iter().filter(|s| s.id == id) {
                 // the genome length of the core: as many runs as in the read
                 // (without compression the genome core is as long as the read's)
                 let mut e = if s.runs == 0 { t + s.ql as u32 } else { t };
@@ -3200,6 +3271,45 @@ impl<'a> Mapper<'a> {
                     q_out: s.q_out,
                     w: 0.0,
                 });
+            }
+        };
+        // A few labels are looked for by comparing many genome labels at a time; more, through
+        // a table.
+        let mut few = [0u16; 8];
+        let mut n = 0;
+        for s in &seeds[lo..hi] {
+            if !few[..n].contains(&s.id) {
+                if n == 8 {
+                    n = 9;
+                    break;
+                }
+                few[n] = s.id;
+                n += 1;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        let wide = n <= 8 && std::is_x86_feature_detected!("avx512bw");
+        #[cfg(not(target_arch = "x86_64"))]
+        let wide = false;
+        if wide {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: the feature was just detected.
+            unsafe {
+                ids_among_avx512(ids, &few[..n], |k| at(k, lo))
+            };
+            return hits;
+        }
+        if sc.want.is_empty() {
+            sc.want.resize(1 << 16, u32::MAX);
+        }
+        // want[id] = index of the first read seed with that id (others are found by scanning on)
+        for (k, s) in seeds[lo..hi].iter().enumerate().rev() {
+            sc.want[s.id as usize] = (lo + k) as u32;
+        }
+        for (k, &id) in ids.iter().enumerate() {
+            let first = sc.want[id as usize];
+            if first != u32::MAX {
+                at(k, first as usize);
             }
         }
         for s in &seeds[lo..hi] {
@@ -3714,6 +3824,28 @@ mod tests {
 
     /// The gap pass of a row, 32 cells at a time, against the cell-by-cell one.
     #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ids_among_matches_plain() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("avx512bw") {
+                return;
+            }
+            let mut state = 7u64;
+            for len in [0usize, 1, 31, 32, 33, 64, 1000] {
+                let ids: Vec<u16> = (0..len).map(|_| (rng(&mut state) % 40) as u16).collect();
+                for n in 1..=8usize {
+                    let want: Vec<u16> = (0..n).map(|_| (rng(&mut state) % 40) as u16).collect();
+                    let plain: Vec<usize> = (0..len).filter(|&k| want.contains(&ids[k])).collect();
+                    let mut got = Vec::new();
+                    // SAFETY: the feature was just detected.
+                    unsafe { ids_among_avx512(&ids, &want, |k| got.push(k)) };
+                    assert_eq!(got, plain, "len {len}, {n} values");
+                }
+            }
+        }
+    }
+
     #[test]
     fn scans_match() {
         // a random genome, and pieces that are noisy copies of stretches of it

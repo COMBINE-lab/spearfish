@@ -685,7 +685,9 @@ impl GenomeIndex {
         // SAFETY: see `Raw`.
         let (pos, id) = unsafe { (&*self.n.l2_pos, &*self.n.l2_id) };
         let lo = pos.partition_point(|&p| p < start);
-        let hi = lo + pos[lo..].partition_point(|&p| p < end);
+        // (cores start at different bases, so at most `end - start` of them start in the range)
+        let most = (lo + (end.saturating_sub(start)) as usize).min(pos.len());
+        let hi = lo + pos[lo..most].partition_point(|&p| p < end);
         (&pos[lo..hi], &id[lo..hi])
     }
 
