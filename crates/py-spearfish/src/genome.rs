@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use spearfish::Preset;
 use spearfish::genome::{
-    BaseLevel, FileOutputs, GenomeIndex, GenomeIndexOptions, SpliceOptions, SplicedMapper, SplicedRead,
+    FileOutputs, GenomeIndex, GenomeIndexOptions, SpliceOptions, SplicedMapper, SplicedRead,
     TranscriptStrand, output,
 };
 
@@ -386,38 +386,53 @@ impl PySplicedMapper {
     ///     are the transcripts' sense strand) or ``"hifi"`` (PacBio).
     /// :param threads: Threads for :meth:`map_batch` and :meth:`map_file` (0: every
     ///     available CPU).
-    /// :param secondary: Secondary alignments reported per read, at most.
-    /// :param base_level: ``"blocks"`` (exon blocks only, the default), ``"edits"`` (each
-    ///     block aligned with the fewest edits) or ``"affine"`` (with affine gap costs).
-    /// :param max_intron: Longest intron.
-    /// :param min_score: Aligned hits scoring below this are dropped.
-    /// :raises ValueError: For an unknown preset or base level.
+    /// :param settings: Settings changed from the preset, by name (:data:`SPLICE_SETTINGS`
+    ///     lists them; :attr:`options` shows their values). The common ones: ``secondary``
+    ///     (secondary alignments reported per read, at most; the same as ``max_hits`` minus
+    ///     one), ``base_level`` (``"blocks"``, the default: exon blocks only; ``"edits"``:
+    ///     each block aligned with the fewest edits; ``"affine"``: with affine gap costs),
+    ///     ``max_intron`` and ``min_score``.
+    /// :raises TypeError: For an unknown setting.
+    /// :raises ValueError: For an unknown preset or an invalid value.
     #[new]
-    #[pyo3(signature = (index, preset="ont", *, threads=0, secondary=0, base_level="blocks", max_intron=200_000, min_score=100))]
+    #[pyo3(signature = (index, preset="ont", *, threads=0, **settings))]
     fn new(
         index: &Bound<'_, PyGenomeIndex>,
         preset: &str,
         threads: usize,
-        secondary: usize,
-        base_level: &str,
-        max_intron: u32,
-        min_score: i32,
+        settings: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let preset: Preset = preset.parse().map_err(value_err)?;
-        let mut opts = SpliceOptions::preset(preset);
-        opts.max_hits = 1 + secondary;
-        opts.max_intron = max_intron;
-        opts.min_score = min_score;
-        opts.base_level = match base_level {
-            "blocks" => BaseLevel::Blocks,
-            "edits" => BaseLevel::Edits,
-            "affine" => BaseLevel::Affine,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "base_level must be 'blocks', 'edits' or 'affine', not {other:?}"
-                )));
+        // The preset's options as a map, the caller's settings over them, and back: every
+        // field of the options is a setting, under its own name.
+        let mut opts = serde_json::to_value(SpliceOptions::preset(preset)).map_err(value_err)?;
+        let fields = opts.as_object_mut().expect("options are a map");
+        for (k, v) in settings.into_iter().flat_map(|d| d.iter()) {
+            let key: String = k.extract()?;
+            if v.is_none() {
+                continue;
             }
-        };
+            let mut value: serde_json::Value = pythonize::depythonize(&v).map_err(value_err)?;
+            let name = match key.as_str() {
+                "secondary" => {
+                    let n = value
+                        .as_u64()
+                        .ok_or_else(|| PyValueError::new_err("secondary is a count of alignments"))?;
+                    value = (n + 1).into();
+                    "max_hits"
+                }
+                k if fields.contains_key(k) => k,
+                _ => {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "unknown setting {key:?}; the settings are secondary, {}",
+                        fields.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+            };
+            fields.insert(name.to_string(), value);
+        }
+        let opts: SpliceOptions = serde_json::from_value(opts)
+            .map_err(|e| PyValueError::new_err(format!("invalid setting: {e}")))?;
         let n = crate::threads(threads);
         Ok(PySplicedMapper {
             inner: Arc::new(SplicedMapper::new(index.get().inner.clone(), &opts)),
@@ -581,6 +596,10 @@ impl PySplicedMapper {
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let opts = serde_json::to_value(SpliceOptions::default()).map_err(value_err)?;
+    let mut names: Vec<String> = vec!["secondary".into()];
+    names.extend(opts.as_object().expect("options are a map").keys().cloned());
+    m.add("SPLICE_SETTINGS", pyo3::types::PyTuple::new(m.py(), names)?)?;
     m.add_class::<PyGenomeIndex>()?;
     m.add_class::<PySplicedMapper>()?;
     m.add_class::<PySplicedRead>()?;

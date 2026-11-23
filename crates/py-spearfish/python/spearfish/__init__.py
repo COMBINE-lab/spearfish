@@ -22,6 +22,7 @@ See the README for the full interface.
 from ._spearfish import (
     SCORE_DENOM,
     SETTINGS,
+    SPLICE_SETTINGS,
     TSV_HEADER,
     FileBatches,
     GenomeIndex,
@@ -43,6 +44,7 @@ from ._spearfish import (
 __all__ = [
     "SCORE_DENOM",
     "SETTINGS",
+    "SPLICE_SETTINGS",
     "TSV_HEADER",
     "FileBatches",
     "GenomeIndex",

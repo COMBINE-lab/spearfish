@@ -22,7 +22,8 @@
   on several threads as the command does. `spearfish::index_kind` tells a genome index from a transcriptome index, and
   `Index::open` on a genome index says so. New crate `spearfish-splice` holds the
   implementation; depend on `spearfish`, whose interface is the supported one.
-- **Python:** `GenomeIndex` (`load`, `build`, optional `annotation=`), `SplicedMapper` (`map`,
+- **Python:** `GenomeIndex` (`load`, `build`, optional `annotation=`), `SplicedMapper` (settings
+  by keyword, listed in `SPLICE_SETTINGS`; `map`,
   `map_batch`, and `map_file` straight to PAF, SAM or BAM), `SplicedRead` and
   `SplicedAlignment` (exons, introns, strand, mapping quality, CIGAR).
 - The minimum supported Rust version is 1.91 (it was 1.89): the affine alignment of the

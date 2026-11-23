@@ -191,8 +191,10 @@ counts = mapper.map_file("reads.fq.gz", bam="reads.bam")   # read, mapped and wr
 
 The annotation (GTF, GFF3 or BED12) belongs to the loaded index object, not to the file: its
 splice sites, junctions and exons are preferred where a read fits them, and junctions outside
-it are still found. `SplicedMapper` takes `secondary` (secondary alignments per read),
-`base_level` (`"blocks"`, `"edits"` or `"affine"`) and `max_intron`. `map_file` writes any of
+it are still found. `SplicedMapper` takes settings by keyword, as `Mapper` does: the common ones
+are `secondary` (secondary alignments per read), `base_level` (`"blocks"`, `"edits"` or
+`"affine"`) and `max_intron`; `spearfish.SPLICE_SETTINGS` names them all, and `mapper.options`
+shows the values in use. `map_file` writes any of
 `paf=`, `sam=` and `bam=`; SAM and BAM carry base qualities and unmapped reads unless
 `qualities=False` or `unmapped=False`.
 

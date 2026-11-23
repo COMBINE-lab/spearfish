@@ -640,8 +640,19 @@ def test_spliced_mapping(genome, records):
     assert a.edits == 0 and affine.options["sense_reads"] is True and affine.options["max_hits"] == 3
     with pytest.raises(ValueError):
         spearfish.SplicedMapper(genome, "clr")
-    with pytest.raises(ValueError, match="base_level"):
+    with pytest.raises(ValueError, match="invalid setting"):
         spearfish.SplicedMapper(genome, base_level="full")
+    # Every option is a setting under its own name; an unknown one is a TypeError.
+    assert {"secondary", "max_intron", "seed_cap", "pair_seeds"} <= set(spearfish.SPLICE_SETTINGS)
+    assert set(affine.options) == set(spearfish.SPLICE_SETTINGS) - {"secondary"}
+    tuned = spearfish.SplicedMapper(genome, seed_cap=32, pair_seeds=False, max_loci=3, max_hits=2, min_score=None)
+    o = tuned.options
+    assert (o["seed_cap"], o["pair_seeds"], o["max_loci"], o["max_hits"], o["min_score"]) == (32, False, 3, 2, 100)
+    assert tuned.map(records[0][1]).best.exons == truth[records[0][0].split("|")[0]]
+    with pytest.raises(TypeError, match='unknown setting "seed_kap"'):
+        spearfish.SplicedMapper(genome, seed_kap=3)
+    with pytest.raises(ValueError):
+        spearfish.SplicedMapper(genome, max_intron="long")
 
 
 def test_spliced_map_file(genome, records, tmp_path):

@@ -177,6 +177,8 @@ class RadWriter:
     def __enter__(self) -> RadWriter: ...
     def __exit__(self, exc_type: Any = None, exc: Any = None, tb: Any = None) -> bool: ...
 
+SPLICE_SETTINGS: Tuple[str, ...]
+
 class GenomeIndex:
     """A genome index for spliced mapping (immutable, shareable)."""
 
@@ -246,10 +248,7 @@ class SplicedMapper:
         preset: Literal["ont", "drna", "hifi"] = "ont",
         *,
         threads: int = 0,
-        secondary: int = 0,
-        base_level: Literal["blocks", "edits", "affine"] = "blocks",
-        max_intron: int = 200000,
-        min_score: int = 100,
+        **settings: Any,
     ) -> None: ...
 
     index: GenomeIndex
