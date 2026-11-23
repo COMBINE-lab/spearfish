@@ -765,6 +765,9 @@ const SCAN_END_MARGIN: u32 = 20;
 /// sites and a short intron, usual sites and a long one, other sites and a short intron,
 /// other sites and a long one. `END_NEAR` divides short from long.
 const END_MARGIN: [u32; 4] = [2, 16, 16, 32];
+/// The margin that no read-end solution meets: for an unknown junction with a site that is of
+/// none of the kinds of splice site.
+const END_REFUSE: u32 = u32::MAX / 4;
 const END_NEAR: u32 = 20_000;
 
 /// Cost of a splice site unknown to the annotation, when one was given (on top of its motif):
@@ -1512,9 +1515,10 @@ impl<'a> Mapper<'a> {
             out.push(self.build(reverse, &chain, &read, n as u32, score, screened_ok, sc));
             sc.codes[reverse as usize] = read;
         }
-        // Rival hits, and a lone hit resting on few anchors, are scored by aligning their blocks;
-        // a lone well-anchored hit keeps its chain score and is never aligned inside its exons.
-        if out.len() > 1 || out.first().is_some_and(|h| h.anchors <= 3) {
+        // Rival hits, and a lone hit resting on few anchors or with more edits found between its
+        // anchors than they are worth, are scored by aligning their blocks; a lone well-anchored
+        // hit keeps its chain score and is never aligned inside its exons.
+        if out.len() > 1 || out.first().is_some_and(|h| h.anchors <= 3 || h.score <= 0) {
             for h in out.iter_mut() {
                 let read = std::mem::take(&mut sc.codes[h.reverse as usize]);
                 h.score = self.align_score(&read, h, sc);
@@ -3072,7 +3076,13 @@ impl<'a> Mapper<'a> {
             .iter()
             .map(|h| {
                 let (l, r) = (h.leave.min(h.enter), h.leave.max(h.enter));
-                let plain = donor_motif(ix, l, minus) + acceptor_motif(ix, r, minus) == 0;
+                let (d, a) = (donor_motif(ix, l, minus), acceptor_motif(ix, r, minus));
+                let plain = d + a == 0;
+                // (a site of none of the known kinds: among simulated reads' unknown end
+                // junctions, hardly one in ten of those is right)
+                if d.max(a) >= NONCANON {
+                    return END_REFUSE;
+                }
                 match (plain, r - l < END_NEAR) {
                     (true, true) => END_MARGIN[0],
                     (true, false) => END_MARGIN[1],
