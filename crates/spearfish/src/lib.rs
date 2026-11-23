@@ -30,6 +30,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "genome")]
+pub mod genome;
 pub mod output;
 pub mod provenance;
 pub mod settings;
@@ -407,6 +409,27 @@ impl IndexOptions {
     }
 }
 
+/// What an index file holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum IndexKind {
+    /// Transcripts, for unspliced mapping ([`Index`]).
+    Transcriptome,
+    /// A genome, for spliced mapping (`genome::GenomeIndex`, feature `genome`).
+    Genome,
+}
+
+/// Which kind of index the file at `path` is. An error if it is not a spearfish index.
+pub fn index_kind(path: &Path) -> Result<IndexKind> {
+    let store = index::store::Store::open(path)?;
+    Ok(if store.has("g_meta") {
+        IndexKind::Genome
+    } else {
+        IndexKind::Transcriptome
+    })
+}
+
 /// A transcriptome index (memory-mapped when opened from a file).
 pub struct Index {
     inner: Arc<index::Index>,
@@ -415,6 +438,12 @@ pub struct Index {
 impl Index {
     /// Open an index written by `spearfish index` (memory-mapped).
     pub fn open(path: &Path) -> Result<Self> {
+        if index_kind(path)? == IndexKind::Genome {
+            anyhow::bail!(
+                "{} is a genome index: open it with spearfish::genome::GenomeIndex (the command for it is `spearfish map-spliced`)",
+                path.display()
+            );
+        }
         Ok(Index {
             inner: Arc::new(index::Index::open(path)?),
         })

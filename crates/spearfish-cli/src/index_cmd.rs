@@ -1,4 +1,5 @@
-//! `spearfish index`: build the core-graph index from a transcript FASTA, and
+//! `spearfish index`: build the core-graph index from a transcript FASTA (or, with
+//! `--genome`, a genome index: see [`crate::genome_cmd`]), and
 //! `spearfish inspect`: report on a built index.
 
 use std::io::Write;
@@ -21,8 +22,37 @@ pub enum CollapseArg {
 #[derive(clap::Args, Debug)]
 pub struct Args {
     /// Transcript FASTA (optionally compressed). GENCODE headers (`tx|gene|...`) give gene
-    /// IDs; otherwise use --t2g or --infer-genes, or each transcript is its own gene.
+    /// IDs; otherwise use --t2g or --infer-genes, or each transcript is its own gene. With
+    /// --genome, the genome FASTA.
+    #[arg(value_name = "FASTA")]
     transcripts: PathBuf,
+    /// The FASTA is a genome: build an index for spliced mapping (`spearfish map-spliced`
+    /// maps reads to it with introns). No annotation is needed, and none is stored: known
+    /// transcripts are given when mapping (`map-spliced --annotation`).
+    #[arg(
+        short,
+        long,
+        help_heading = "Genome",
+        conflicts_with_all = [
+            "t2g", "infer_genes", "infer_span", "infer_attach_span", "infer_attach_max", "write_t2g",
+            "scheme", "no_hpc", "collapse", "mask_genes", "no_rescue_tables", "allow_collisions",
+        ]
+    )]
+    genome: bool,
+    /// Genome: leave out seeds that occur more often than this (repeats).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1000,
+        requires = "genome",
+        hide_short_help = true,
+        help_heading = "Genome"
+    )]
+    max_occ: u32,
+    /// Genome: seed the homopolymer-compressed sequence (a smaller index that finds fewer
+    /// exons; not the default).
+    #[arg(long, requires = "genome", hide_short_help = true, help_heading = "Genome")]
+    genome_hpc: bool,
     /// Output index file (its manifest is also written as <FILE>.json).
     #[arg(short, long, value_name = "FILE")]
     output: PathBuf,
@@ -116,6 +146,13 @@ pub struct InspectArgs {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    if args.genome {
+        let opts = spearfish::genome::GenomeIndexOptions::builder()
+            .max_occ(args.max_occ)
+            .hpc(args.genome_hpc)
+            .build();
+        return crate::genome_cmd::index(&args.transcripts, &args.output, args.threads, &opts);
+    }
     let t0 = Instant::now();
     // The gene table is small: read it first, so a bad path fails before the FASTA is read.
     let t2g = match &args.t2g {
@@ -294,6 +331,9 @@ pub fn no_gene_groups_warning(genes_from: &str, index: Option<&std::path::Path>)
 }
 
 pub fn inspect(args: InspectArgs) -> Result<()> {
+    if spearfish::index_kind(&args.index)? == spearfish::IndexKind::Genome {
+        return crate::genome_cmd::inspect(&args.index, args.json);
+    }
     let t = Instant::now();
     let idx = Index::open(&args.index)?;
     let load = t.elapsed().as_secs_f64();

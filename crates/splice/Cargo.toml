@@ -1,13 +1,14 @@
 [package]
 name = "spearfish-splice"
-description = "Spliced genome mapping for the spearfish long-read mapper (in development)"
+description = "Spliced genome mapping of long RNA-seq reads for the spearfish mapper (use it through the spearfish crate)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false
+keywords = ["bioinformatics", "rna-seq", "long-reads", "splicing", "mapping"]
+categories = ["science::bioinformatics"]
 
 [dependencies]
 lcp-core.workspace = true
@@ -25,6 +26,16 @@ index.workspace = true
 ksw2rs = "0.3.1"
 
 [features]
+# The development drivers `gmap` and `genome_probe` (the supported command is `spearfish`).
+dev-bins = []
 # BAM output's DEFLATE engine (default: zlib-rs).
 zflate = ["dep:zflate"]
 libdeflate = ["dep:libdeflater"]
+
+[[bin]]
+name = "gmap"
+required-features = ["dev-bins"]
+
+[[bin]]
+name = "genome_probe"
+required-features = ["dev-bins"]

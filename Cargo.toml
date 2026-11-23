@@ -19,6 +19,7 @@ lcp-oracle-sys = { path = "crates/lcp-oracle-sys" }
 seeds = { package = "spearfish-seeds", path = "crates/seeds", version = "0.3.2" }
 index = { package = "spearfish-index", path = "crates/index", version = "0.3.2" }
 map = { package = "spearfish-map", path = "crates/map", version = "0.3.2" }
+splice = { package = "spearfish-splice", path = "crates/splice", version = "0.3.2" }
 spearfish = { path = "crates/spearfish", version = "0.3.2" }
 long-read-rad = { path = "crates/rad", version = "0.3.2" }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }

@@ -1,9 +1,11 @@
-//! `spearfish`: fast long-read RNA-seq mapping with locally consistent parsing.
+//! `spearfish`: fast long-read RNA-seq mapping with locally consistent parsing, to a
+//! transcriptome or, spliced, to a genome.
 
 mod annot;
 mod doctor_cmd;
 mod em;
 mod em_cmd;
+mod genome_cmd;
 mod halo_cmd;
 mod hist;
 mod index_cmd;
@@ -67,10 +69,12 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
-    /// Build the index from a transcript FASTA.
+    /// Build an index: of a transcript FASTA, or of a genome FASTA with --genome.
     Index(index_cmd::Args),
     /// Map long reads to the indexed transcriptome (TSV, PAF and/or RAD output).
     Map(map_cmd::Args),
+    /// Map long reads, spliced, to a genome index (PAF, SAM and/or BAM output).
+    MapSpliced(genome_cmd::Args),
     /// Show what an index holds and what built it.
     #[command(alias = "index-stats")]
     Inspect(index_cmd::InspectArgs),
@@ -152,6 +156,7 @@ fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Index(args) => index_cmd::run(args),
         Command::Map(args) => map_cmd::run(args),
+        Command::MapSpliced(args) => genome_cmd::run(args),
         Command::Inspect(args) => index_cmd::inspect(args),
         Command::Doctor(args) => doctor_cmd::run(args),
         Command::Completions { shell } => {

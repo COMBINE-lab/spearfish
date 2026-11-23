@@ -1314,3 +1314,207 @@ fn warns_on_index_without_gene_groups() {
     assert_eq!(meta["index"]["genes"], info.num_genes);
     assert_eq!(meta["index"]["gene_groups"], true);
 }
+
+fn toy_file(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/toy")
+        .join(name)
+}
+
+fn spearfish(args: &[&std::ffi::OsStr]) -> (bool, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_spearfish"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `index --genome` builds a genome index, and `map-spliced` maps to it: the toy transcripts
+/// come back as their annotated exons, in PAF, SAM and BAM, and the run is recorded.
+#[test]
+fn genome_index_and_spliced_map_on_toy() {
+    use std::ffi::OsStr;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("genome_cli");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (idx, genome, gtf, reads) = (
+        dir.join("toy.sfg"),
+        toy_file("genome.fa"),
+        toy_file("annotation.gtf"),
+        toy(),
+    );
+    let o = |s: &'static str| OsStr::new(s);
+    let (ok, _, err) = spearfish(&[
+        o("index"),
+        o("--genome"),
+        genome.as_os_str(),
+        o("-o"),
+        idx.as_os_str(),
+    ]);
+    assert!(ok, "{err}");
+    assert!(err.contains("genome") && err.contains("sequences 1"), "{err}");
+    assert!(dir.join("toy.sfg.json").exists());
+
+    let (ok, out, err) = spearfish(&[o("inspect"), idx.as_os_str()]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("kind\tgenome") && out.contains("bases\t18090"),
+        "{out}"
+    );
+    let (ok, out, err) = spearfish(&[o("inspect"), o("--json"), idx.as_os_str()]);
+    assert!(ok, "{err}");
+    let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(j["kind"], "genome");
+    assert_eq!(j["manifest"]["kind"], "spearfish-genome-index");
+    let (ok, out, err) = spearfish(&[o("doctor"), o("--index"), idx.as_os_str()]);
+    assert!(ok, "{err}");
+    assert!(out.contains("ok: genome, 1 sequences"), "{out}");
+
+    // PAF on stdout by default; with the annotation, exact reads give the annotated exons.
+    let map = |extra: &[&OsStr]| {
+        let mut a = vec![o("map-spliced"), idx.as_os_str(), reads.as_os_str()];
+        a.extend_from_slice(extra);
+        spearfish(&a)
+    };
+    let (ok, paf, err) = map(&[o("-a"), gtf.as_os_str(), o("-t"), o("2")]);
+    assert!(ok, "{err}");
+    assert!(err.contains("annotation: 6 transcripts, 11 introns"), "{err}");
+    let cg: std::collections::HashMap<&str, &str> = paf
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            assert_eq!((f[4], f[5], f[11]), ("+", "toy", "60"), "{l}");
+            (f[0].split('|').next().unwrap(), l.rsplit("cg:Z:").next().unwrap())
+        })
+        .collect();
+    assert_eq!(cg.len(), 6);
+    assert_eq!(cg["TOYT0000001"], "400M1176N250M1114N120M1321N500M");
+    assert_eq!(cg["TOYT0000002"], "400M1176N250M2555N500M");
+    assert_eq!(cg["TOYT0000004"], "350M793N264M1194N450M");
+
+    // SAM and BAM files, with a base-level alignment, and a run record beside the first.
+    let (sam, bam) = (dir.join("out.sam"), dir.join("out.bam"));
+    let (ok, out, err) = map(&[
+        o("--annotation"),
+        gtf.as_os_str(),
+        o("--preset"),
+        o("drna"),
+        o("--sam"),
+        sam.as_os_str(),
+        o("--bam"),
+        bam.as_os_str(),
+        o("--base-level"),
+        o("affine"),
+        o("--secondary"),
+        o("2"),
+    ]);
+    assert!(ok && out.is_empty(), "{err}");
+    let sam_text = std::fs::read_to_string(&sam).unwrap();
+    assert!(
+        sam_text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n@SQ\tSN:toy\tLN:18090\n@PG\tID:spearfish")
+    );
+    let line = sam_text.lines().find(|l| l.starts_with("TOYT0000001")).unwrap();
+    let rec: Vec<&str> = line.split('\t').collect();
+    assert_eq!(
+        (rec[1], rec[2], rec[3], rec[5]),
+        ("0", "toy", "858", "400M1176N250M1114N120M1321N500M")
+    );
+    assert!(rec.contains(&"NM:i:0") && rec.contains(&"XS:A:+"), "{rec:?}");
+    let bam_bytes = std::fs::read(&bam).unwrap();
+    assert_eq!(&bam_bytes[..4], &[0x1f, 0x8b, 8, 4]);
+    // (the empty BGZF block that ends a BAM file)
+    assert_eq!(&bam_bytes[bam_bytes.len() - 28..][..4], &[0x1f, 0x8b, 8, 4]);
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("out.sam.meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["kind"], "spearfish-genome-map-run");
+    assert_eq!(meta["index"]["kind"], "genome");
+    assert_eq!(meta["annotation"]["transcripts"], 6);
+    assert_eq!(meta["preset"], "drna");
+    assert_eq!(meta["parameters"]["sense_reads"], true);
+    assert_eq!(meta["parameters"]["max_hits"], 3);
+    assert_eq!(
+        (meta["stats"]["reads"].as_u64(), meta["stats"]["spliced"].as_u64()),
+        (Some(6), Some(6))
+    );
+
+    // GFF3 and BED12 give the same alignments as the GTF.
+    let (gff, bed) = (dir.join("toy.gff3"), dir.join("toy.bed"));
+    let (mut g, mut b) = (String::from("##gff-version 3\n"), String::new());
+    let mut tx: std::collections::BTreeMap<String, Vec<(u32, u32)>> = Default::default();
+    for l in std::fs::read_to_string(&gtf).unwrap().lines() {
+        let p: Vec<&str> = l.split('\t').collect();
+        if p.len() == 9 && p[2] == "exon" {
+            let id = p[8]
+                .split("transcript_id \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            g += &format!("toy\tx\texon\t{}\t{}\t.\t+\t.\tID=e;Parent={id}\n", p[3], p[4]);
+            tx.entry(id.into())
+                .or_default()
+                .push((p[3].parse::<u32>().unwrap() - 1, p[4].parse().unwrap()));
+        }
+    }
+    for (id, ex) in &tx {
+        let (s, e) = (ex[0].0, ex[ex.len() - 1].1);
+        let sizes: Vec<String> = ex.iter().map(|x| (x.1 - x.0).to_string()).collect();
+        let starts: Vec<String> = ex.iter().map(|x| (x.0 - s).to_string()).collect();
+        b += &format!(
+            "toy\t{s}\t{e}\t{id}\t0\t+\t{s}\t{e}\t0\t{}\t{},\t{},\n",
+            ex.len(),
+            sizes.join(","),
+            starts.join(",")
+        );
+    }
+    std::fs::write(&gff, g).unwrap();
+    std::fs::write(&bed, b).unwrap();
+    let sorted = |s: &str| {
+        let mut v: Vec<String> = s.lines().map(String::from).collect();
+        v.sort();
+        v
+    };
+    for (file, format) in [(&gff, "gff3"), (&bed, "bed12")] {
+        let (ok, out, err) = map(&[o("-a"), file.as_os_str()]);
+        assert!(ok, "{err}");
+        assert!(err.contains(&format!("({format})")), "{err}");
+        assert_eq!(sorted(&out), sorted(&paf), "{format}");
+    }
+
+    // Each mapping command refuses the other kind of index and names the right command.
+    let (ok, _, err) = spearfish(&[o("map"), idx.as_os_str(), reads.as_os_str()]);
+    assert!(
+        !ok && err.contains("is a genome index") && err.contains("map-spliced"),
+        "{err}"
+    );
+    let tidx = dir.join("toy.sfi");
+    let (ok, _, err) = spearfish(&[o("index"), reads.as_os_str(), o("-o"), tidx.as_os_str()]);
+    assert!(ok, "{err}");
+    let (ok, _, err) = spearfish(&[o("map-spliced"), tidx.as_os_str(), reads.as_os_str()]);
+    assert!(
+        !ok && err.contains("is a transcriptome index") && err.contains("spearfish map"),
+        "{err}"
+    );
+    let (ok, _, err) = spearfish(&[
+        o("index"),
+        o("--genome"),
+        genome.as_os_str(),
+        o("-o"),
+        o("x"),
+        o("--infer-genes"),
+    ]);
+    assert!(!ok && err.contains("cannot be used with"), "{err}");
+    // An annotation of another assembly stops the run.
+    let other = dir.join("other.gtf");
+    std::fs::write(&other, "chr1\tx\texon\t10\t50\t.\t+\t.\ttranscript_id \"t1\";\n").unwrap();
+    let (ok, _, err) = map(&[o("-a"), other.as_os_str()]);
+    assert!(
+        !ok && err.contains("no transcript is on a sequence of the index"),
+        "{err}"
+    );
+}

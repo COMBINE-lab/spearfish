@@ -212,8 +212,9 @@ impl Stats {
     }
 }
 
-pub struct Mapper<'a> {
-    pub index: &'a GenomeIndex,
+/// A spliced mapper over one index; `Send + Sync` (working memory is per thread, in [`Scratch`]).
+pub struct Mapper {
+    pub index: std::sync::Arc<GenomeIndex>,
     pub opt: MapOptions,
     seeder: BaseSeeder,
     seeder2: BaseSeeder,
@@ -1144,13 +1145,14 @@ fn windows_of(
     out
 }
 
-impl<'a> Mapper<'a> {
-    pub fn new(index: &'a GenomeIndex, opt: MapOptions) -> Self {
+impl Mapper {
+    pub fn new(index: std::sync::Arc<GenomeIndex>, opt: MapOptions) -> Self {
+        let hpc = index.hpc();
         Mapper {
             index,
             opt,
-            seeder: BaseSeeder::new(L3_SPEC, index.hpc()).expect("valid seed spec"),
-            seeder2: BaseSeeder::new(L2_SPEC, index.hpc()).expect("valid seed spec"),
+            seeder: BaseSeeder::new(L3_SPEC, hpc).expect("valid seed spec"),
+            seeder2: BaseSeeder::new(L2_SPEC, hpc).expect("valid seed spec"),
         }
     }
 
@@ -1205,7 +1207,7 @@ impl<'a> Mapper<'a> {
 
     /// Seed the read once, in both orientations: level-3 and level-2 cores with raw coordinates.
     fn seed(&self, read: &[u8], sc: &mut Scratch) {
-        let ix = self.index;
+        let ix = &*self.index;
         // Both orientations as codes; other symbols read as A.
         sc.codes[0].clear();
         sc.codes[0].extend(read.iter().map(|&b| code(b) & 3));
@@ -1303,7 +1305,7 @@ impl<'a> Mapper<'a> {
         if std::mem::replace(&mut sc.pairs_done[o], true) {
             return;
         }
-        let ix = self.index;
+        let ix = &*self.index;
         for w in sc.l2[o].windows(2) {
             let l = crate::index::pair_label(w[0].label, w[1].label);
             if w[1].q - w[0].q >= 64 || !crate::index::keep_pair(l) {
@@ -1331,7 +1333,7 @@ impl<'a> Mapper<'a> {
     }
 
     fn map_with(&self, read: &[u8], cap: usize, pairs: bool, sc: &mut Scratch) -> Vec<SplicedHit> {
-        let ix = self.index;
+        let ix = &*self.index;
         sc.gap.reset();
         let n = read.len();
         let mut out: Vec<SplicedHit> = Vec::new();
@@ -1832,7 +1834,7 @@ impl<'a> Mapper<'a> {
                             vw.sort_by_key(|w| w.0);
                             sc.gap.known_only = true;
                             let t = gap::solve(
-                                self.index,
+                                &self.index,
                                 read,
                                 ReadView { q: q0, rev: false },
                                 m,
@@ -1947,7 +1949,7 @@ impl<'a> Mapper<'a> {
                         vw.sort_by_key(|w| w.0);
                         sc.gap.known_only = from_known;
                         let t = gap::solve(
-                            self.index,
+                            &self.index,
                             read,
                             rv,
                             m,
@@ -2019,7 +2021,7 @@ impl<'a> Mapper<'a> {
                         };
                         let half = self.opt.min_intron / 2;
                         let s = gap::solve(
-                            self.index,
+                            &self.index,
                             read,
                             rv,
                             m,
@@ -2127,7 +2129,7 @@ impl<'a> Mapper<'a> {
                 .min(q1.saturating_sub(bl.qs + 1))
                 .min(t1.saturating_sub(bl.ts + 1));
             let mut k = 0;
-            while k < room && rv.base(read, k as usize) == gv.base(self.index, k) {
+            while k < room && rv.base(read, k as usize) == gv.base(&self.index, k) {
                 k += 1;
             }
             (q1, t1) = (q1 - k, t1 - k);
@@ -2147,7 +2149,7 @@ impl<'a> Mapper<'a> {
                 .min(b0.qe.saturating_sub(q0 + 1))
                 .min(b0.te.saturating_sub(t0 + 1));
             let mut k = 0;
-            while k < room && rv.base(read, k as usize) == gv.base(self.index, k) {
+            while k < room && rv.base(read, k as usize) == gv.base(&self.index, k) {
                 k += 1;
             }
             (q0, t0) = (q0 + k, t0 + k);
@@ -2332,7 +2334,7 @@ impl<'a> Mapper<'a> {
         qlen: u32,
         sc: &mut Scratch,
     ) -> EndSolved {
-        let ix = self.index;
+        let ix = &*self.index;
         let (mut q, mut t) = (q, t);
         let mut out = EndSolved {
             cost: 0,
@@ -2613,7 +2615,7 @@ impl<'a> Mapper<'a> {
     /// next to `t` exactly, one after another on the same diagonal; at most 24.
     fn exact_run(&self, read: &[u8], q: u32, t: u32, left: bool) -> u32 {
         const LOW: u64 = 0x5555_5555_5555_5555;
-        let ix = self.index;
+        let ix = &*self.index;
         let avail = if left { q as usize } else { read.len() - q as usize };
         let gv = View { origin: t, rev: left };
         if avail < 24 || gv.room(ix) <= 32 {
@@ -2636,7 +2638,7 @@ impl<'a> Mapper<'a> {
     /// the block against its genome interval; splice sites off the canonical pair cost as in
     /// junction placement.
     fn align_score(&self, read: &[u8], h: &SplicedHit, sc: &mut Scratch) -> i32 {
-        let ix = self.index;
+        let ix = &*self.index;
         let minus = h.tx_strand == b'-';
         let mut score = 0i32;
         for (k, b) in h.blocks.iter().enumerate() {
@@ -2712,7 +2714,7 @@ impl<'a> Mapper<'a> {
     ) -> Vec<SolverWindow> {
         const K: usize = 8;
         const TOP: u32 = 2 * (K as u32 - 1);
-        let ix = self.index;
+        let ix = &*self.index;
         let m = (q1 - q0) as usize;
         let (lo, hi) = (t0 + 20, t1.saturating_sub(20));
         if !(24..=600).contains(&m) || hi <= lo + 2 * K as u32 || hi - lo > WORD_SPAN {
@@ -2836,7 +2838,7 @@ impl<'a> Mapper<'a> {
         t1: u32,
         mid: (usize, usize),
     ) -> Vec<SolverWindow> {
-        let ix = self.index;
+        let ix = &*self.index;
         let m = (q1 - q0) as usize;
         let (lo, hi) = (t0 + 20, t1.saturating_sub(20));
         // the stretch neither side explains, with a few bases more on either side
@@ -2910,7 +2912,7 @@ impl<'a> Mapper<'a> {
         minus: bool,
         sc: &mut Scratch,
     ) -> (Vec<Window>, Option<(usize, usize)>) {
-        let ix = self.index;
+        let ix = &*self.index;
         let m = (q1 - q0) as usize;
         // How far the read follows the genome from either side.
         let band = 4 + m / 10;
@@ -3071,7 +3073,7 @@ impl<'a> Mapper<'a> {
         // An unknown junction at a read end is believed on little when both its sites are the
         // usual ones and the intron is short, and only on much more otherwise: among real
         // reads' end junctions, those are the ones that turn out to be annotated.
-        let ix = self.index;
+        let ix = &*self.index;
         s.hops
             .iter()
             .map(|h| {
@@ -3163,7 +3165,7 @@ impl<'a> Mapper<'a> {
         sc: &mut Scratch,
     ) -> Vec<SolverWindow> {
         const MARGIN: usize = 4;
-        let ix = self.index;
+        let ix = &*self.index;
         let start = reached.saturating_sub(MARGIN);
         let k = m - start;
         if k < 10 + MARGIN {
@@ -3245,7 +3247,7 @@ impl<'a> Mapper<'a> {
         gv: View,
         p_end: u32,
     ) -> Vec<SolverWindow> {
-        let ix = self.index;
+        let ix = &*self.index;
         let start = reached.saturating_sub(8);
         let from = p_end + 20;
         let hi = (p_end + SCAN_END_SPAN.min(self.opt.max_intron)).min(gv.room(ix).saturating_sub(64));
@@ -3329,7 +3331,7 @@ impl<'a> Mapper<'a> {
         q_hi: u32,
         sc: &mut Scratch,
     ) -> Vec<Anchor> {
-        let ix = self.index;
+        let ix = &*self.index;
         let (qa, ta) = match a {
             Some(a) => (a.q + a.ql as u32, a.t + a.tl as u32),
             None => (q_lo, b.map_or(0, |b| b.t.saturating_sub(self.opt.max_intron))),
@@ -3428,7 +3430,7 @@ impl<'a> Mapper<'a> {
     /// compression an anchor can run a few bases past the true exon edge (the intron's first
     /// bases often look like the next exon's), so the edge is searched for inside them too.
     fn fixed(&self, a: Anchor, b: Anchor) -> (u32, u32, u32, u32) {
-        let ix = self.index;
+        let ix = &*self.index;
         let mut t0 = a.t + 1;
         let c = ix.base(a.t);
         while t0 < a.t + a.tl as u32 && ix.base(t0) == c {
@@ -3466,7 +3468,7 @@ impl<'a> Mapper<'a> {
         // two stretches overlap there is a split at canonical sites. That split costs nothing,
         // so no alignment can beat it.
         {
-            let ix = self.index;
+            let ix = &*self.index;
             let (r, span) = (&read[q0 as usize..q1 as usize], (t1 - t0) as usize);
             let mut l = 0;
             while l < m && l < span && r[l] == ix.base(t0 + l as u32) {
@@ -3512,7 +3514,7 @@ impl<'a> Mapper<'a> {
         let mut out = [none; 2];
         for (s, o) in out.iter_mut().enumerate() {
             let solved = gap::solve(
-                self.index,
+                &self.index,
                 read,
                 rv,
                 m,
@@ -3540,7 +3542,7 @@ impl<'a> Mapper<'a> {
     /// the genome next to `t` on the best of the five nearest diagonals. Chance gives about 6-10.
     fn diagonal_matches(&self, read: &[u8], q: u32, t: u32, left: bool) -> u32 {
         const LOW: u64 = 0x5555_5555_5555_5555;
-        let ix = self.index;
+        let ix = &*self.index;
         let avail = if left { q as usize } else { read.len() - q as usize };
         if avail < 24 {
             return 0;
@@ -3574,7 +3576,7 @@ impl<'a> Mapper<'a> {
     /// Extend from read position `q` / genome position `t` towards the read's start (`left`) or
     /// end. Returns the read and genome bases added and the edits among them.
     fn extend(&self, read: &[u8], q: u32, t: u32, left: bool, sc: &mut Scratch) -> (u32, u32, u32) {
-        let ix = self.index;
+        let ix = &*self.index;
         let m = if left { q as usize } else { read.len() - q as usize };
         if m == 0 {
             return (0, 0, 0);
@@ -3648,6 +3650,17 @@ impl<'a> Mapper<'a> {
     }
 }
 
+/// Mapping quality of a read's best hit, from the scores of the best two: 60 for a lone hit,
+/// falling to 0 as the second approaches the first.
+pub fn mapq(hits: &[SplicedHit]) -> u8 {
+    match (hits.first(), hits.get(1)) {
+        (Some(a), Some(b)) => {
+            (60.0 * (1.0 - b.score.max(0) as f32 / a.score.max(1) as f32)).clamp(0.0, 60.0) as u8
+        }
+        _ => 60,
+    }
+}
+
 /// PAF line of a hit (with a block-level `cg` tag: `M` per block, `I`/`D` for a length
 /// difference inside it, `N` for introns). With `base`, the base-level CIGAR and edit count
 /// from [`crate::base::Aligner::cigar`], `cg` holds that alignment and an `NM` tag is added.
@@ -3658,9 +3671,10 @@ pub fn paf_line(
     h: &SplicedHit,
     mapq: u8,
     base: Option<(&[u32], u32)>,
-    out: &mut String,
+    out: &mut Vec<u8>,
 ) {
-    use std::fmt::Write;
+    use std::fmt::Write as _;
+    use std::io::Write as _;
     let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
     let (rid, ts) = ix.locate(first.ts);
     let off = ix.offsets()[rid];
@@ -3718,14 +3732,24 @@ pub fn paf_line(
     );
 }
 
-/// SAM header for the index's sequences.
-pub fn sam_header(ix: &GenomeIndex, out: &mut String) {
-    use std::fmt::Write;
-    out.push_str("@HD\tVN:1.6\tSO:unsorted\tGO:query\n");
+/// SAM header for the index's sequences. `program` is the version and command line of the
+/// program writing the file, for the `@PG` line.
+pub fn sam_header(ix: &GenomeIndex, program: Option<(&str, &str)>, out: &mut Vec<u8>) {
+    use std::io::Write as _;
+    out.extend_from_slice(b"@HD\tVN:1.6\tSO:unsorted\tGO:query\n");
     for (i, n) in ix.names().iter().enumerate() {
-        let _ = writeln!(out, "@SQ\tSN:{n}\tLN:{}", ix.offsets()[i + 1] - ix.offsets()[i]);
+        let _ = writeln!(out, "@SQ\tSN:{n}\tLN:{}", ix.seq_len(i));
     }
-    out.push_str("@PG\tID:spearfish\tPN:spearfish\n");
+    out.extend_from_slice(b"@PG\tID:spearfish\tPN:spearfish");
+    if let Some((version, command_line)) = program {
+        // (a tab or a line break would end the field)
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        let _ = write!(out, "\tVN:{}", clean(version));
+        if !command_line.is_empty() {
+            let _ = write!(out, "\tCL:{}", clean(command_line));
+        }
+    }
+    out.push(b'\n');
 }
 
 /// SAM record of a hit, with a block-level CIGAR (`M` per block, `I`/`D` for a length
@@ -3738,9 +3762,9 @@ pub fn sam_line(
     h: &SplicedHit,
     mapq: u8,
     base: Option<(&[u32], u32)>,
-    out: &mut String,
+    out: &mut Vec<u8>,
 ) {
-    use std::fmt::Write;
+    use std::io::Write as _;
     let qlen = read.len() as u32;
     let (first, last) = (h.blocks[0], h.blocks[h.blocks.len() - 1]);
     let (rid, ts) = ix.locate(first.ts);
@@ -3773,19 +3797,19 @@ pub fn sam_line(
             let _ = write!(out, "{}S", qlen - last.qe);
         }
     }
-    out.push_str("\t*\t0\t0\t");
+    out.extend_from_slice(b"\t*\t0\t0\t");
     if !h.primary {
-        out.push('*');
+        out.push(b'*');
     } else if h.reverse {
         out.extend(read.iter().rev().map(|&b| match b.to_ascii_uppercase() {
-            b'A' => 'T',
-            b'C' => 'G',
-            b'G' => 'C',
-            b'T' | b'U' => 'A',
-            _ => 'N',
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' | b'U' => b'A',
+            _ => b'N',
         }));
     } else {
-        out.extend(read.iter().map(|&b| b.to_ascii_uppercase() as char));
+        out.extend(read.iter().map(|&b| b.to_ascii_uppercase()));
     }
     let _ = write!(out, "\t*\tAS:i:{}\tcm:i:{}", h.score, h.anchors);
     if let Some((_, edits)) = base {
@@ -3794,7 +3818,7 @@ pub fn sam_line(
     if h.tx_strand != b'.' {
         let _ = write!(out, "\tXS:A:{}", h.tx_strand as char);
     }
-    out.push('\n');
+    out.push(b'\n');
 }
 
 #[cfg(test)]

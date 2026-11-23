@@ -1466,6 +1466,7 @@ dependencies = [
  "spearfish-index",
  "spearfish-lcp",
  "spearfish-map",
+ "spearfish-splice",
  "xxhash-rust",
 ]
 

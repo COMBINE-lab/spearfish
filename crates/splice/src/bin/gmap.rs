@@ -85,17 +85,18 @@ fn main() -> anyhow::Result<()> {
                 Format::Paf
             };
             opt.keep_seeds = base_level;
-            let mapper = Mapper::new(&ix, opt);
+            let ix = std::sync::Arc::new(ix);
+            let mapper = Mapper::new(ix.clone(), opt);
             let mut out = BufWriter::with_capacity(1 << 22, std::io::stdout().lock());
             match format {
                 Format::Sam => {
-                    let mut h = String::new();
-                    sam_header(&ix, &mut h);
-                    out.write_all(h.as_bytes())?;
+                    let mut h = Vec::new();
+                    sam_header(&ix, None, &mut h);
+                    out.write_all(&h)?;
                 }
                 Format::Bam(level) => {
                     let (mut h, mut z) = (Vec::new(), Vec::new());
-                    bam::header(&ix, &mut h);
+                    bam::header(&ix, None, &mut h);
                     bam::bgzf(&h, level, &mut z);
                     out.write_all(&z)?;
                 }
@@ -136,19 +137,13 @@ fn main() -> anyhow::Result<()> {
                         <(Scratch, spearfish_splice::base::Aligner)>::default,
                         |(sc, al), group| {
                             sc.stats = Stats::default();
-                            let mut text = String::new();
+                            let mut text: Vec<u8> = Vec::new();
                             let mut raw: Vec<u8> = Vec::new();
                             let mut ops: Vec<u32> = Vec::new();
                             let mut mapped = 0u64;
                             for (name, seq) in group {
                                 let hits = mapper.map(seq, sc);
-                                let mapq = match (hits.first(), hits.get(1)) {
-                                    (Some(a), Some(b)) => {
-                                        (60.0 * (1.0 - b.score.max(0) as f32 / a.score.max(1) as f32))
-                                            .clamp(0.0, 60.0) as u8
-                                    }
-                                    _ => 60,
-                                };
+                                let mapq = spearfish_splice::map::mapq(&hits);
                                 mapped += !hits.is_empty() as u64;
                                 for h in hits.iter().take(if secondary { 5 } else { 1 }) {
                                     al.mode = mode;
@@ -173,7 +168,7 @@ fn main() -> anyhow::Result<()> {
                                     bam::bgzf(&raw, level, &mut z);
                                     z
                                 }
-                                _ => text.into_bytes(),
+                                _ => text,
                             };
                             (bytes, mapped, sc.stats)
                         },

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Spliced mapping to a genome.** `spearfish index --genome genome.fa -o genome.sfg` builds a
+  genome index, and the new command `spearfish map-spliced` maps reads to it with introns.
+  Output is PAF (`--paf`, the default on stdout), SAM (`--sam`) and/or BAM (`--bam`,
+  `--bam-level`), with introns as `N`. By default an alignment is its exon blocks;
+  `--base-level edits|affine` aligns each block base by base. Known transcripts are optional
+  and are given when mapping (`-a`/`--annotation`: GTF, GFF3 or BED12, plain or compressed);
+  the index stores none. `--secondary N`, `--max-intron` and `--preset ont|drna|hifi` apply.
+  `map` and `map-spliced` each refuse the other's kind of index and name the command to use.
+  `inspect` and `doctor --index` report on genome indexes, and every run writes a run record
+  (`kind: spearfish-genome-map-run`).
+- **Library:** the new `genome` module (feature `genome`, on by default): `GenomeIndex`
+  (`open`, `build_from_fasta`, `build_to_file`, `load_annotation`, `set_annotation`),
+  `SpliceOptions`, `SplicedMapper` (`Send + Sync`), `SplicedRead`, `SplicedAlignment` (exon
+  blocks, introns, CIGAR, mapping quality) and `genome::output` (PAF, SAM, BAM records and
+  BGZF blocks). `spearfish::index_kind` tells a genome index from a transcriptome index, and
+  `Index::open` on a genome index says so. New crate `spearfish-splice` holds the
+  implementation; depend on `spearfish`, whose interface is the supported one.
+- The minimum supported Rust version is 1.91 (it was 1.89): the affine alignment of the
+  base-level output needs it.
+
 ## 0.3.2 (2026-11-14)
 
 - **`spearfish em` reads 15-column TSVs correctly.** Since 0.3.0, `spearfish map` writes a 15th

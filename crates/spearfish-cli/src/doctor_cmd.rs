@@ -131,6 +131,18 @@ pub fn run(args: Args) -> Result<()> {
     report["self_test"] = tests.into();
     if let Some(path) = &args.index {
         let r = (|| -> Result<serde_json::Value> {
+            if spearfish::index_kind(path)? == spearfish::IndexKind::Genome {
+                let idx = spearfish::genome::GenomeIndex::open(path)?;
+                return Ok(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "kind": "genome",
+                    "index_id": idx.id(),
+                    "sequences": idx.n_sequences(),
+                    "bases": idx.total_len(),
+                    "built_by": idx.manifest().map(|m| m.built_by.short()),
+                    "compatible": true,
+                }));
+            }
             let idx = Index::open(path)?;
             idx.raw().check_compatible()?;
             Ok(serde_json::json!({
@@ -178,6 +190,13 @@ pub fn run(args: Args) -> Result<()> {
         }
         if let Some(i) = report.get("index") {
             match i["compatible"].as_bool() {
+                Some(true) if i["kind"] == "genome" => println!(
+                    "index       ok: genome, {} sequences, {} bases, id {}, built by {}",
+                    i["sequences"],
+                    i["bases"],
+                    i["index_id"].as_str().unwrap_or(""),
+                    i["built_by"].as_str().unwrap_or("unknown (no manifest)")
+                ),
                 Some(true) => println!(
                     "index       ok: {} transcripts, id {}, built by {}",
                     i["transcripts"],

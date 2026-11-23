@@ -1,6 +1,6 @@
 [package]
 name = "spearfish"
-description = "Fast long-read RNA-seq mapping to a transcriptome with locally consistent parsing (library)"
+description = "Fast long-read RNA-seq mapping to a transcriptome, and spliced to a genome, with locally consistent parsing (library)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
-keywords = ["bioinformatics", "rna-seq", "long-reads", "transcriptome", "mapping"]
+keywords = ["bioinformatics", "rna-seq", "long-reads", "splicing", "mapping"]
 categories = ["science::bioinformatics"]
 
 [dependencies]
@@ -16,6 +16,7 @@ anyhow.workspace = true
 index.workspace = true
 lcp-core.workspace = true
 map.workspace = true
+splice = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 bon.workspace = true
@@ -31,9 +32,14 @@ niffler = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
 
 [features]
-default = ["fasta", "rad"]
+default = ["fasta", "rad", "genome"]
 # FASTA/FASTQ input helpers (read_transcripts, Index::build_from_fasta) via paraseq.
 fasta = ["dep:paraseq", "dep:flate2", "dep:niffler", "dep:bzip2"]
+# Spliced mapping to a genome (the `genome` module).
+genome = ["dep:splice"]
+# BAM output's DEFLATE engine for the genome mode (default: zlib-rs).
+bam-zflate = ["splice?/zflate"]
+bam-libdeflate = ["splice?/libdeflate"]
 # RAD output for oarfish (output::rad_writer, output::rad_record).
 rad = ["dep:long-read-rad"]
 
@@ -41,3 +47,7 @@ rad = ["dep:long-read-rad"]
 [[test]]
 name = "api"
 required-features = ["fasta"]
+
+[[test]]
+name = "genome"
+required-features = ["fasta", "genome"]

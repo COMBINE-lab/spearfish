@@ -1,4 +1,5 @@
-//! `spearfish map`: map long reads to the indexed transcriptome.
+//! `spearfish map`: map long reads to the indexed transcriptome (`spearfish map-spliced`,
+//! in [`crate::genome_cmd`], maps to a genome index).
 //!
 //! Outputs, any combination (default: TSV on stdout):
 //!
@@ -43,9 +44,9 @@ pub const DEFAULT_BATCH_SIZE: usize = 32;
 
 /// What `--bump-alloc` asks for: the arenas with this configuration, or no arenas.
 #[derive(Clone, Copy, Debug)]
-struct BumpAlloc(Option<nudgy::Config>);
+pub(crate) struct BumpAlloc(Option<nudgy::Config>);
 
-fn parse_bump_alloc(s: &str) -> Result<BumpAlloc, nudgy::ParseConfigError> {
+pub(crate) fn parse_bump_alloc(s: &str) -> Result<BumpAlloc, nudgy::ParseConfigError> {
     if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") {
         return Ok(BumpAlloc(None));
     }
@@ -57,7 +58,8 @@ fn parse_bump_alloc(s: &str) -> Result<BumpAlloc, nudgy::ParseConfigError> {
 #[derive(clap::Args, Debug)]
 #[command(after_long_help = preset_table())]
 pub struct Args {
-    /// Index built by `spearfish index`.
+    /// Index built by `spearfish index` from transcripts (for a genome index, see
+    /// `spearfish map-spliced`).
     #[arg(required_unless_present = "print_params")]
     index: Option<PathBuf>,
     /// Reads (FASTA/FASTQ, optionally gzip/bzip2/zstd-compressed); `-` reads stdin.
@@ -251,7 +253,7 @@ fn oriented(c: &Counts, both_strands: bool) -> Option<&'static str> {
     }
 }
 
-type Out = Arc<Mutex<Box<dyn Write + Send>>>;
+pub(crate) type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 
 #[derive(Clone)]
 struct Processor {
@@ -316,7 +318,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
 }
 
 /// Open an output: a file, or stdout for `-`.
-fn sink(p: &Path) -> Result<Out> {
+pub(crate) fn sink(p: &Path) -> Result<Out> {
     let w: Box<dyn Write + Send> = if p.as_os_str() == "-" {
         Box::new(std::io::BufWriter::new(std::io::stdout()))
     } else {
@@ -327,13 +329,13 @@ fn sink(p: &Path) -> Result<Out> {
 }
 
 /// Draws `mapped N reads (R reads/s)` on stderr every second until dropped.
-struct Progress {
+pub(crate) struct Progress {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Progress {
-    fn start(count: Arc<AtomicU64>) -> Self {
+    pub(crate) fn start(count: Arc<AtomicU64>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let handle = crate::logging::progress_enabled().then(|| {
             let stop = stop.clone();
@@ -429,7 +431,7 @@ impl ArenaStats {
 /// Whether `p` names a regular file to write (or one to be created), so a run record can sit
 /// next to it: not `-` (stdout), and not a device, pipe or other special file such as
 /// `/dev/null`.
-fn is_file_output(p: &Path) -> bool {
+pub(crate) fn is_file_output(p: &Path) -> bool {
     p.as_os_str() != "-" && std::fs::metadata(p).map_or(true, |m| m.is_file())
 }
 
@@ -494,20 +496,19 @@ pub fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&settings.resolve()?)?);
         return Ok(());
     }
-    match (args.no_bump_alloc, args.bump_alloc) {
-        (true, _) | (_, Some(BumpAlloc(None))) => {}
-        // The default: the arenas where the system has them, and none, silently, elsewhere.
-        (false, None) => {
-            nudgy::enable();
-        }
-        (false, Some(BumpAlloc(Some(config)))) => {
-            if !nudgy::enable_with(config) {
-                log::warn!("--bump-alloc is not available on this system; mapping without it");
-            }
-        }
+    check_outputs(&args.output, &args.paf, &args.rad)?;
+    let index = args.index.clone().unwrap();
+    if spearfish::index_kind(&index).with_context(|| format!("index {}", index.display()))?
+        == spearfish::IndexKind::Genome
+    {
+        bail!(
+            "{} is a genome index: map reads to it, spliced, with `spearfish map-spliced`",
+            index.display()
+        );
     }
+    enable_arenas(args.no_bump_alloc, args.bump_alloc);
     execute(Job {
-        index: args.index.unwrap(),
+        index,
         reads: args.reads.unwrap(),
         threads: args.threads,
         output: args.output,
@@ -521,24 +522,46 @@ pub fn run(args: Args) -> Result<()> {
     .map(|_| ())
 }
 
-/// Run a mapping job; returns the read counts.
-pub fn execute(args: Job) -> Result<Counts> {
-    let settings = args.settings.clone();
-    let opts = settings.resolve()?;
-    let both_strands = opts.params.strands == spearfish::Strands::Both;
-    let (index_path, reads) = (args.index.clone(), args.reads.clone());
-    let stdout_outputs = [&args.output, &args.paf]
+/// Turn the per-thread arenas on as `--bump-alloc` / `--no-bump-alloc` ask (on by default).
+pub(crate) fn enable_arenas(no_bump_alloc: bool, bump_alloc: Option<BumpAlloc>) {
+    match (no_bump_alloc, bump_alloc) {
+        (true, _) | (_, Some(BumpAlloc(None))) => {}
+        // The default: the arenas where the system has them, and none, silently, elsewhere.
+        (false, None) => {
+            nudgy::enable();
+        }
+        (false, Some(BumpAlloc(Some(config)))) => {
+            if !nudgy::enable_with(config) {
+                log::warn!("--bump-alloc is not available on this system; mapping without it");
+            }
+        }
+    }
+}
+
+/// What can be said about the outputs before anything is opened.
+fn check_outputs(tsv: &Option<PathBuf>, paf: &Option<PathBuf>, rad: &Option<PathBuf>) -> Result<()> {
+    let stdout_outputs = [tsv, paf]
         .iter()
         .filter(|o| o.as_ref().is_some_and(|p| p.as_os_str() == "-"))
         .count();
     if stdout_outputs > 1 {
         bail!("only one output can go to stdout");
     }
-    if args.rad.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+    if rad.as_deref().is_some_and(|p| p.as_os_str() == "-") {
         bail!(
             "RAD output needs a file (its read counts are written when it is finished); `-` (stdout) is not supported"
         );
     }
+    Ok(())
+}
+
+/// Run a mapping job; returns the read counts.
+pub fn execute(args: Job) -> Result<Counts> {
+    let settings = args.settings.clone();
+    let opts = settings.resolve()?;
+    let both_strands = opts.params.strands == spearfish::Strands::Both;
+    let (index_path, reads) = (args.index.clone(), args.reads.clone());
+    check_outputs(&args.output, &args.paf, &args.rad)?;
     let tsv_path = match (&args.output, &args.paf, &args.rad) {
         (None, None, None) => Some(PathBuf::from("-")),
         (o, _, _) => o.clone(),

@@ -47,6 +47,7 @@ export default defineConfig({
           items: [
             { label: 'Building an index', slug: 'guide/indexing' },
             { label: 'Mapping reads', slug: 'guide/mapping' },
+            { label: 'Spliced mapping to a genome', slug: 'guide/genome' },
             { label: 'Output format', slug: 'guide/output' },
             { label: 'Quantification', slug: 'guide/quantification' },
             { label: 'Using the library', slug: 'guide/library' },

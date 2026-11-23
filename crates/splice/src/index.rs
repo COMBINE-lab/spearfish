@@ -98,25 +98,32 @@ pub fn code(b: u8) -> u8 {
     }
 }
 
-fn read_fasta(path: &Path) -> Result<(Vec<u8>, Vec<String>, Vec<u32>)> {
-    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+fn read_fasta(input: impl BufRead) -> Result<(Vec<u8>, Vec<String>, Vec<u32>)> {
     let mut seq = Vec::new();
-    let mut names = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut offsets = Vec::new();
-    for line in BufReader::with_capacity(1 << 24, f).lines() {
+    let mut seen = std::collections::HashSet::new();
+    for line in input.lines() {
         let line = line?;
         if let Some(h) = line.strip_prefix('>') {
-            names.push(h.split_whitespace().next().unwrap_or("").to_string());
+            let name = h.split_whitespace().next().unwrap_or("").to_string();
+            ensure!(!name.is_empty(), "sequence {} has no name", names.len() + 1);
+            ensure!(seen.insert(name.clone()), "two sequences are named {name}");
+            names.push(name);
             offsets.push(seq.len() as u32);
         } else {
-            seq.extend(line.bytes().map(|b| b.to_ascii_uppercase()));
+            ensure!(
+                !names.is_empty() || line.trim().is_empty(),
+                "not a FASTA file: sequence before the first `>` line"
+            );
+            seq.extend(line.trim_end().bytes().map(|b| b.to_ascii_uppercase()));
         }
         ensure!(
             seq.len() < u32::MAX as usize,
             "reference longer than 4.29 Gbp is not supported yet"
         );
     }
-    ensure!(!names.is_empty(), "no sequences in {}", path.display());
+    ensure!(!names.is_empty(), "no sequences in the FASTA input");
     offsets.push(seq.len() as u32);
     Ok((seq, names, offsets))
 }
@@ -187,8 +194,16 @@ fn fold16(l: u64) -> u16 {
 }
 
 impl GenomeIndex {
-    /// Build from a FASTA file (plain text).
+    /// Build from a FASTA file (plain text; see [`GenomeIndex::build_from_reader`] for any
+    /// other source).
     pub fn build(fasta: &Path, opt: &BuildOptions) -> Result<GenomeIndex> {
+        let f = File::open(fasta).with_context(|| format!("opening {}", fasta.display()))?;
+        Self::build_from_reader(BufReader::with_capacity(1 << 24, f), opt)
+            .with_context(|| format!("reading {}", fasta.display()))
+    }
+
+    /// Build from FASTA text. Sequence names are the header up to the first white space.
+    pub fn build_from_reader(fasta: impl BufRead, opt: &BuildOptions) -> Result<GenomeIndex> {
         let (seq, names, offsets) = read_fasta(fasta)?;
         let segs = segments(&seq, &offsets);
 
@@ -360,8 +375,26 @@ impl GenomeIndex {
         Self::from_store(Store::open(path)?)
     }
 
+    /// Whether the file at `path` is a genome index (and not, say, a transcriptome index,
+    /// which shares the container format). An error if it is no spearfish index at all.
+    pub fn is_genome_index(path: &Path) -> Result<bool> {
+        Ok(Store::open(path)?.has("g_meta"))
+    }
+
+    /// Write the index to `path`; returns the bytes written.
     pub fn write(&self, path: &Path) -> Result<u64> {
+        self.write_with_manifest(path, None)
+    }
+
+    /// Write the index with a record of how it was built (any text; the `spearfish` library
+    /// stores JSON), replacing the one it holds, if any.
+    pub fn write_with_manifest(&self, path: &Path, manifest: Option<&[u8]>) -> Result<u64> {
         let mut w = Writer::default();
+        match manifest {
+            Some(m) => w.add::<u8>("g_manifest", m),
+            None if self.store.has("g_manifest") => w.add::<u8>("g_manifest", self.store.get("g_manifest")?),
+            None => {}
+        }
         let optional = ["gp_labels", "gp_dir", "gp_occ_off", "gp_pos", "gp_len"];
         for name in optional.iter().copied().filter(|n| self.store.has(n)) {
             w.add::<u8>(name, self.store.get(name)?);
@@ -443,8 +476,26 @@ impl GenomeIndex {
         })
     }
 
+    /// The record of how the index was built, when it was written with one.
+    pub fn manifest(&self) -> Option<&[u8]> {
+        self.store.get::<u8>("g_manifest").ok()
+    }
+
+    /// Level-3 labels with more occurrences than this were left out of the index, and how
+    /// many labels that was.
+    pub fn max_occ(&self) -> (u32, u64) {
+        let meta: &[u64] = self.store.get("g_meta").expect("checked when opened");
+        (meta[1] as u32, meta[2])
+    }
+
+    /// Sequence names, in file order.
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// Length of sequence `i`.
+    pub fn seq_len(&self, i: usize) -> u32 {
+        self.offsets()[i + 1] - self.offsets()[i]
     }
 
     /// Start of each sequence on the concatenated axis, plus the total length.

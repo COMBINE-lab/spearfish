@@ -7,7 +7,8 @@
 
 # spearfish
 
-Fast long-read RNA-seq mapping to a transcriptome with locally consistent parsing (LCP).
+Fast long-read RNA-seq mapping with locally consistent parsing (LCP): to a transcriptome, or
+spliced to a genome.
 
 For each read (ONT cDNA, ONT direct RNA, PacBio Kinnex/Iso-Seq), spearfish performs *delta
 mapping*: it reports every compatible transcript, the read's position on it, and its score
@@ -57,8 +58,9 @@ spearfish map transcripts.sfi reads.fq.gz --preset ont -o reads.tsv   # and/or -
 
 | Command | Does |
 | --- | --- |
-| `index` | Build the index from a transcript FASTA (gene IDs from headers, `--t2g`, or `--infer-genes`). |
-| `map` | Map reads: TSV (`-o`), PAF (`--paf`) and/or RAD (`--rad`) output, plus a run record. |
+| `index` | Build the index from a transcript FASTA (gene IDs from headers, `--t2g`, or `--infer-genes`), or from a genome FASTA with `--genome`. |
+| `map` | Map reads to transcripts: TSV (`-o`), PAF (`--paf`) and/or RAD (`--rad`) output, plus a run record. |
+| `map-spliced` | Map reads, spliced, to a genome index: PAF (`--paf`), SAM (`--sam`) and/or BAM (`--bam`) output, plus a run record. |
 | `inspect` | Show what an index holds, what built it, and whether this build can use it. |
 | `doctor` | Report the build and machine and run a self-test; `--index` also checks an index. |
 | `completions`, `man` | Shell completions and man pages. |
@@ -71,6 +73,23 @@ flags, `--help` all of them.
 Every index records how it was built (`<index>.json`, and `spearfish inspect`), and every
 mapping run writes `<output>.meta.json`: the build, command line, index, settings, every
 parameter used, and run statistics.
+
+## Spliced mapping to a genome
+
+Reads can also be mapped to a genome, with introns. `index --genome` builds the genome index and
+`map-spliced` maps to it.
+
+```sh
+spearfish index --genome genome.fa.gz -o genome.sfg
+spearfish map-spliced genome.sfg reads.fq.gz --preset ont --bam reads.bam   # or --sam, --paf (default: PAF on stdout)
+spearfish map-spliced genome.sfg reads.fq.gz -a annotation.gtf.gz --bam reads.bam   # known transcripts are optional
+```
+
+The index needs no annotation and stores none. Known transcripts (`-a`: GTF, GFF3 or BED12)
+are given when mapping; junctions outside them are still found. By default an alignment is
+its exon blocks, with introns as `N` in the CIGAR, which is what quantification and transcript
+discovery read; `--base-level edits|affine` adds a base-level alignment of each block. See the
+[guide](https://combine-lab.github.io/spearfish/guide/genome/).
 
 ## Quantification
 
@@ -108,6 +127,21 @@ for hit in mapper.map(b"ACGT...").hits {
 }
 ```
 
+Spliced mapping to a genome is the `genome` module:
+
+```rust
+use spearfish::{Preset, genome::{GenomeIndex, SpliceOptions, SplicedMapper}};
+
+let mut index = GenomeIndex::open("genome.sfg".as_ref())?;
+index.load_annotation("annotation.gtf".as_ref())?;      // optional
+let mapper = SplicedMapper::new(index, &SpliceOptions::preset(Preset::Ont));
+if let Some(best) = mapper.map(b"ACGT...").alignments.first() {
+    for exon in best.blocks() {
+        println!("{} {}-{}", mapper.index().seq_name(best.seq), exon.target_start, exon.target_end);
+    }
+}
+```
+
 ## Layout
 
 | Path (crate) | Contents |
@@ -117,12 +151,13 @@ for hit in mapper.map(b"ACGT...").hits {
 | `crates/seeds` (`spearfish-seeds`) | seed-scheme trait: LCP, and minimizers, syncmers and strobemers for ablations |
 | `crates/index` (`spearfish-index`) | core-graph index and its on-disk container |
 | `crates/map` (`spearfish-map`) | read mapping: anchoring, chaining, tie-break, rescue, span extension |
+| `crates/splice` (`spearfish-splice`) | spliced mapping to a genome: genome index, junction placement, PAF/SAM/BAM records |
 | `crates/rad` (`long-read-rad`) | `bulk_long_read` RAD records, shared with oarfish |
 | `crates/spearfish` (`spearfish`) | the library: index, settings, mapper, output formats, provenance |
 | `crates/spearfish-cli` (`spearfish-cli`) | the `spearfish` binary |
 | `crates/nudgy` (`nudgy`) | the allocator behind `spearfish map`'s arenas (`--bump-alloc`): per-thread bump arenas in front of any global allocator (independent of spearfish, with its own version) |
 | `crates/py-spearfish` | the Python package (`spearfish` on PyPI; built with maturin) |
-| `fixtures/toy` | toy transcriptome with an exon skip, an alternative 3′ site and a paralog pair |
+| `fixtures/toy` | toy transcriptome with an exon skip, an alternative 3′ site and a paralog pair, and its genome and annotation |
 
 ## Development
 

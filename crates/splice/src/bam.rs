@@ -89,12 +89,13 @@ pub const EOF: [u8; 28] = [
 ];
 
 /// The uncompressed BAM header (magic, SAM text, reference list) for the index's sequences.
-pub fn header(ix: &GenomeIndex, out: &mut Vec<u8>) {
-    let mut text = String::new();
-    crate::map::sam_header(ix, &mut text);
+/// `program` is as for [`crate::map::sam_header`].
+pub fn header(ix: &GenomeIndex, program: Option<(&str, &str)>, out: &mut Vec<u8>) {
+    let mut text = Vec::new();
+    crate::map::sam_header(ix, program, &mut text);
     out.extend_from_slice(b"BAM\x01");
     out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(&text);
     out.extend_from_slice(&(ix.names().len() as u32).to_le_bytes());
     for (i, n) in ix.names().iter().enumerate() {
         out.extend_from_slice(&(n.len() as u32 + 1).to_le_bytes());
