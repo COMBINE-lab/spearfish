@@ -145,15 +145,96 @@ fn cigar(blocks: &[Block], qlen: u32, out: &mut Vec<u32>) {
     }
 }
 
-/// Append the BAM record of a hit. `read` is the read as sequenced; secondary records carry
-/// no sequence. Tags: `AS`, `cm`, and `XS` (transcript strand) when known. With `edits`, `ops`
-/// already holds the hit's base-level CIGAR (from [`crate::base::Aligner::cigar`]) and an `NM`
-/// tag is written; otherwise the block-level CIGAR is made here.
+/// 4-bit code of a base.
+fn code4(b: u8) -> u8 {
+    match b.to_ascii_uppercase() {
+        b'A' => 1,
+        b'C' => 2,
+        b'G' => 4,
+        b'T' | b'U' => 8,
+        _ => 15,
+    }
+}
+
+/// The fixed fields, name, CIGAR, bases and qualities of a record; returns where the record
+/// starts, for [`finish`]. `seq` and `qual` are as sequenced, and reversed here for a
+/// reverse-strand record.
+#[allow(clippy::too_many_arguments)]
+fn start(
+    name: &str,
+    rid: i32,
+    pos: i32,
+    mapq: u8,
+    bin: u16,
+    flag: u16,
+    ops: &[u32],
+    seq: &[u8],
+    qual: Option<&[u8]>,
+    reverse: bool,
+    out: &mut Vec<u8>,
+) -> usize {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&rid.to_le_bytes());
+    out.extend_from_slice(&pos.to_le_bytes());
+    out.push(name.len().min(254) as u8 + 1);
+    out.push(mapq);
+    out.extend_from_slice(&bin.to_le_bytes());
+    out.extend_from_slice(&(ops.len().min(65535) as u16).to_le_bytes());
+    out.extend_from_slice(&flag.to_le_bytes());
+    out.extend_from_slice(&(seq.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(-1i32).to_le_bytes());
+    out.extend_from_slice(&(-1i32).to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&name.as_bytes()[..name.len().min(254)]);
+    out.push(0);
+    for &c in ops.iter().take(65535) {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    // 4-bit bases, in the orientation the read maps in
+    let comp = |c: u8| match c {
+        1 => 8,
+        2 => 4,
+        4 => 2,
+        8 => 1,
+        x => x,
+    };
+    let at = |i: usize| {
+        if reverse {
+            comp(code4(seq[seq.len() - 1 - i]))
+        } else {
+            code4(seq[i])
+        }
+    };
+    for i in (0..seq.len()).step_by(2) {
+        out.push(at(i) << 4 | if i + 1 < seq.len() { at(i + 1) } else { 0 });
+    }
+    // Phred qualities (0xff: none)
+    match qual.filter(|q| q.len() == seq.len()) {
+        Some(q) if reverse => out.extend(q.iter().rev().map(|&c| c.saturating_sub(33))),
+        Some(q) => out.extend(q.iter().map(|&c| c.saturating_sub(33))),
+        None => out.extend(std::iter::repeat_n(0xff, seq.len())),
+    }
+    start
+}
+
+/// Write the length of the record that began at `start`.
+fn finish(start: usize, out: &mut [u8]) {
+    let n = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&n.to_le_bytes());
+}
+
+/// Append the BAM record of a hit. `read` is the read as sequenced and `qual` its base
+/// qualities (Phred+33), if it has them; secondary records carry neither. Tags: `AS`, `cm`,
+/// and `XS` (transcript strand) when known. With `edits`, `ops` already holds the hit's
+/// base-level CIGAR (from [`crate::base::Aligner::cigar`]) and an `NM` tag is written;
+/// otherwise the block-level CIGAR is made here.
 #[allow(clippy::too_many_arguments)]
 pub fn record(
     ix: &GenomeIndex,
     name: &str,
     read: &[u8],
+    qual: Option<&[u8]>,
     h: &SplicedHit,
     mapq: u8,
     ops: &mut Vec<u32>,
@@ -169,52 +250,21 @@ pub fn record(
     if edits.is_none() {
         cigar(&h.blocks, qlen, ops);
     }
-    let seq: &[u8] = if h.primary { read } else { b"" };
+    let (seq, qual): (&[u8], Option<&[u8]>) = if h.primary { (read, qual) } else { (b"", None) };
     let flag: u16 = if h.reverse { 16 } else { 0 } | if h.primary { 0 } else { 256 };
-    let start = out.len();
-    out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&(rid as i32).to_le_bytes());
-    out.extend_from_slice(&(pos as i32).to_le_bytes());
-    out.push(name.len().min(254) as u8 + 1);
-    out.push(mapq);
-    out.extend_from_slice(&reg2bin(pos, ref_end).to_le_bytes());
-    out.extend_from_slice(&(ops.len().min(65535) as u16).to_le_bytes());
-    out.extend_from_slice(&flag.to_le_bytes());
-    out.extend_from_slice(&(seq.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(-1i32).to_le_bytes());
-    out.extend_from_slice(&(-1i32).to_le_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes());
-    out.extend_from_slice(&name.as_bytes()[..name.len().min(254)]);
-    out.push(0);
-    for &c in ops.iter().take(65535) {
-        out.extend_from_slice(&c.to_le_bytes());
-    }
-    // 4-bit bases, in the orientation the read maps in
-    let code = |b: u8| match b.to_ascii_uppercase() {
-        b'A' => 1u8,
-        b'C' => 2,
-        b'G' => 4,
-        b'T' | b'U' => 8,
-        _ => 15,
-    };
-    let comp = |c: u8| match c {
-        1 => 8,
-        2 => 4,
-        4 => 2,
-        8 => 1,
-        x => x,
-    };
-    let at = |i: usize| {
-        if h.reverse {
-            comp(code(seq[seq.len() - 1 - i]))
-        } else {
-            code(seq[i])
-        }
-    };
-    for i in (0..seq.len()).step_by(2) {
-        out.push(at(i) << 4 | if i + 1 < seq.len() { at(i + 1) } else { 0 });
-    }
-    out.extend(std::iter::repeat_n(0xff, seq.len()));
+    let start = start(
+        name,
+        rid as i32,
+        pos as i32,
+        mapq,
+        reg2bin(pos, ref_end),
+        flag,
+        ops,
+        seq,
+        qual,
+        h.reverse,
+        out,
+    );
     out.extend_from_slice(b"ASi");
     out.extend_from_slice(&h.score.to_le_bytes());
     out.extend_from_slice(b"cmi");
@@ -227,6 +277,13 @@ pub fn record(
         out.extend_from_slice(b"NMi");
         out.extend_from_slice(&(e as i32).to_le_bytes());
     }
-    let n = (out.len() - start - 4) as u32;
-    out[start..start + 4].copy_from_slice(&n.to_le_bytes());
+    finish(start, out);
+}
+
+/// Append the BAM record of a read that did not map (flag 4), with its sequence and
+/// qualities.
+pub fn unmapped(name: &str, read: &[u8], qual: Option<&[u8]>, out: &mut Vec<u8>) {
+    // (bin 4680 is that of a record without a position)
+    let start = start(name, -1, -1, 0, 4680, 4, &[], read, qual, false, out);
+    finish(start, out);
 }

@@ -84,8 +84,14 @@ written as they finish, not in input order, and the records of a read are adjace
 | `--sam FILE` | SAM |
 | `--bam FILE` | BAM, unsorted (`--bam-level 0` to `9`, default 1) |
 
-Unmapped reads are not written. Records carry the read sequence for the primary alignment and
-no base qualities. `--secondary N` adds up to N secondary alignments per read.
+The primary record of a read carries its sequence and, for FASTQ input, its base qualities;
+secondary records carry neither. SAM and BAM also get a record (flag 4) for each read that
+does not map, so the file holds every read; PAF has mapped reads only. `--secondary N` adds up
+to N secondary alignments per read.
+
+Qualities nearly double the size of a BAM file. A tool that does not read them, such as a
+quantifier, loses nothing with `--no-qualities`, and `--no-unmapped` leaves out the reads
+that did not map.
 
 | Tag | Meaning |
 | --- | --- |
@@ -109,7 +115,8 @@ reads, mapped reads and spliced reads.
 transcripts and estimates their abundances:
 
 ```sh
-spearfish map-spliced genome.sfg reads.fastq.gz -a annotation.gtf --secondary 4 --bam reads.bam
+spearfish map-spliced genome.sfg reads.fastq.gz -a annotation.gtf --secondary 4 \
+    --no-qualities --no-unmapped --bam reads.bam
 oarfish --genome-alignments reads.bam --annotation annotation.gtf --genome-fasta genome.fa -o sample
 ```
 

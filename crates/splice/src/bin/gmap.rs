@@ -152,10 +152,12 @@ fn main() -> anyhow::Result<()> {
                                         (base_level && h.primary).then(|| al.cigar(&ix, seq, h, &mut ops));
                                     let base = edits.map(|e| (&ops[..], e));
                                     match format {
-                                        Format::Bam(_) => {
-                                            bam::record(&ix, name, seq, h, mapq, &mut ops, edits, &mut raw)
+                                        Format::Bam(_) => bam::record(
+                                            &ix, name, seq, None, h, mapq, &mut ops, edits, &mut raw,
+                                        ),
+                                        Format::Sam => {
+                                            sam_line(&ix, name, seq, None, h, mapq, base, &mut text)
                                         }
-                                        Format::Sam => sam_line(&ix, name, seq, h, mapq, base, &mut text),
                                         Format::Paf => {
                                             paf_line(&ix, name, seq.len() as u32, h, mapq, base, &mut text)
                                         }

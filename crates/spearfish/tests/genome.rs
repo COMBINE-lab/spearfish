@@ -132,15 +132,26 @@ fn direct_rna_reads_map_in_sense_only_and_base_level_alignments_are_exact() {
     );
     let (mut sam, mut bam, mut z) = (Vec::new(), Vec::new(), Vec::new());
     output::sam_header(&mut sam, mapper.index(), "test");
-    output::sam_records(&mut sam, name, seq, &r, mapper.index());
+    let qual = vec![b'I'; seq.len()];
+    output::sam_records(&mut sam, name, seq, Some(&qual), &r, mapper.index());
+    output::sam_unmapped(&mut sam, "lost", b"ACGT", Some(b"!!II"));
     let sam = String::from_utf8(sam).unwrap();
     assert!(
         sam.contains("@SQ\tSN:toy\tLN:18090") && sam.contains("\tCL:test\n"),
         "{sam}"
     );
     assert!(sam.contains("\tNM:i:0") && sam.contains("\tXS:A:+"), "{sam}");
+    assert!(
+        sam.contains(&format!("\t{}\tAS:i:", "I".repeat(seq.len()))),
+        "qualities"
+    );
+    assert!(
+        sam.ends_with("lost\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t!!II\n"),
+        "{sam}"
+    );
     output::bam_header(&mut bam, mapper.index(), "test");
-    output::bam_records(&mut bam, name, seq, &r, mapper.index());
+    output::bam_records(&mut bam, name, seq, Some(&qual), &r, mapper.index());
+    output::bam_unmapped(&mut bam, "lost", b"ACGT", None);
     output::bgzf(&bam, 1, &mut z);
     assert_eq!(&z[..4], &[0x1f, 0x8b, 8, 4]);
     // A sense read that maps as its reverse complement is of a reverse-strand transcript:

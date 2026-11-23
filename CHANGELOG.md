@@ -9,6 +9,8 @@
   `--base-level edits|affine` aligns each block base by base. Known transcripts are optional
   and are given when mapping (`-a`/`--annotation`: GTF, GFF3 or BED12, plain or compressed);
   the index stores none. `--secondary N`, `--max-intron` and `--preset ont|drna|hifi` apply.
+  SAM and BAM carry base qualities for FASTQ reads and a record for each unmapped read
+  (`--no-qualities` and `--no-unmapped` leave them out).
   `map` and `map-spliced` each refuse the other's kind of index and name the command to use.
   `inspect` and `doctor --index` report on genome indexes, and every run writes a run record
   (`kind: spearfish-genome-map-run`).

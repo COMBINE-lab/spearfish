@@ -142,6 +142,13 @@ pub struct GenomeArgs {
     /// BAM output (`-`: stdout), unsorted, a read's records together.
     #[arg(long, value_name = "FILE", help_heading = IO)]
     pub bam: Option<PathBuf>,
+    /// Leave reads that do not map out of SAM and BAM (PAF never has them).
+    #[arg(long, hide_short_help = true, help_heading = IO)]
+    pub no_unmapped: bool,
+    /// Leave base qualities out of SAM and BAM (smaller files, written faster; FASTA reads
+    /// have none).
+    #[arg(long, hide_short_help = true, help_heading = IO)]
+    pub no_qualities: bool,
     /// BAM compression level, 0 (none) to 9.
     #[arg(
         long,
@@ -344,6 +351,9 @@ struct Processor {
     /// BAM: the sink, the batch's records, and their BGZF blocks.
     bam: Option<(Out, Vec<u8>, Vec<u8>)>,
     bam_level: u8,
+    /// Write unmapped reads, and base qualities, to SAM and BAM.
+    unmapped: bool,
+    qualities: bool,
     total: Arc<Mutex<(Counts, spearfish::genome::InternalStats)>>,
     progress: Arc<AtomicU64>,
     local: Counts,
@@ -359,6 +369,8 @@ impl Clone for Processor {
             sam: self.sam.clone(),
             bam: self.bam.clone(),
             bam_level: self.bam_level,
+            unmapped: self.unmapped,
+            qualities: self.qualities,
             total: self.total.clone(),
             progress: self.progress.clone(),
             local: Counts::default(),
@@ -373,21 +385,32 @@ impl<Rf: Record> ParallelProcessor<Rf> for Processor {
         let r = self.mapper.map_with(&seq, &mut self.work);
         self.local.add_read(&r);
         self.batch_reads += 1;
-        if r.alignments.is_empty() {
+        // A read without an alignment is written only to SAM and BAM, and only when asked.
+        if r.alignments.is_empty() && (!self.unmapped || (self.sam.is_none() && self.bam.is_none())) {
             return Ok(());
         }
         // Lossy: a header that is not UTF-8 gets U+FFFD instead of failing the run.
         let id = String::from_utf8_lossy(record.id());
         let name = id.split_whitespace().next().unwrap_or("");
         let idx = self.mapper.index();
+        let qual = record.qual().filter(|_| self.qualities);
+        if r.alignments.is_empty() {
+            if let Some((_, buf)) = &mut self.sam {
+                output::sam_unmapped(buf, name, &seq, qual);
+            }
+            if let Some((_, raw, _)) = &mut self.bam {
+                output::bam_unmapped(raw, name, &seq, qual);
+            }
+            return Ok(());
+        }
         if let Some((_, buf)) = &mut self.paf {
             output::paf_lines(buf, name, &r, idx);
         }
         if let Some((_, buf)) = &mut self.sam {
-            output::sam_records(buf, name, &seq, &r, idx);
+            output::sam_records(buf, name, &seq, qual, &r, idx);
         }
         if let Some((_, raw, _)) = &mut self.bam {
-            output::bam_records(raw, name, &seq, &r, idx);
+            output::bam_records(raw, name, &seq, qual, &r, idx);
         }
         Ok(())
     }
@@ -592,6 +615,8 @@ pub fn execute(job: Job) -> Result<Counts> {
         sam: sam.clone(),
         bam: bam.clone(),
         bam_level: a.bam_level,
+        unmapped: !a.no_unmapped,
+        qualities: !a.no_qualities,
         total: total.clone(),
         progress: progress.clone(),
         local: Counts::default(),

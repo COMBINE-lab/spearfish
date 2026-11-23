@@ -3754,11 +3754,14 @@ pub fn sam_header(ix: &GenomeIndex, program: Option<(&str, &str)>, out: &mut Vec
 
 /// SAM record of a hit, with a block-level CIGAR (`M` per block, `I`/`D` for a length
 /// difference inside it, `N` for introns, `S` for unaligned read ends). `read` is the read as
-/// sequenced; secondary records carry no sequence.
+/// sequenced and `qual` its base qualities (Phred+33), if it has them; secondary records
+/// carry neither.
+#[allow(clippy::too_many_arguments)]
 pub fn sam_line(
     ix: &GenomeIndex,
     name: &str,
     read: &[u8],
+    qual: Option<&[u8]>,
     h: &SplicedHit,
     mapq: u8,
     base: Option<(&[u32], u32)>,
@@ -3811,12 +3814,34 @@ pub fn sam_line(
     } else {
         out.extend(read.iter().map(|&b| b.to_ascii_uppercase()));
     }
-    let _ = write!(out, "\t*\tAS:i:{}\tcm:i:{}", h.score, h.anchors);
+    out.push(b'\t');
+    match qual.filter(|q| h.primary && q.len() == read.len()) {
+        Some(q) if h.reverse => out.extend(q.iter().rev()),
+        Some(q) => out.extend_from_slice(q),
+        None => out.push(b'*'),
+    }
+    let _ = write!(out, "\tAS:i:{}\tcm:i:{}", h.score, h.anchors);
     if let Some((_, edits)) = base {
         let _ = write!(out, "\tNM:i:{edits}");
     }
     if h.tx_strand != b'.' {
         let _ = write!(out, "\tXS:A:{}", h.tx_strand as char);
+    }
+    out.push(b'\n');
+}
+
+/// SAM record of a read that did not map (flag 4), with its sequence and qualities.
+pub fn sam_unmapped(name: &str, read: &[u8], qual: Option<&[u8]>, out: &mut Vec<u8>) {
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b"\t4\t*\t0\t0\t*\t*\t0\t0\t");
+    if read.is_empty() {
+        out.push(b'*');
+    }
+    out.extend(read.iter().map(|&b| b.to_ascii_uppercase()));
+    out.push(b'\t');
+    match qual.filter(|q| q.len() == read.len() && !q.is_empty()) {
+        Some(q) => out.extend_from_slice(q),
+        None => out.push(b'*'),
     }
     out.push(b'\n');
 }

@@ -788,14 +788,27 @@ pub mod output {
         splice::map::sam_header(&idx.inner, Some((crate::provenance::VERSION, command_line)), buf);
     }
 
-    /// SAM records of one read's alignments (none if unmapped). `seq` is the read as
-    /// sequenced; secondary records carry no sequence, and no record carries qualities. Tags:
-    /// `AS:i`, `cm:i`, `XS:A` (the transcript strand, when known) and `NM:i` with a base-level
+    /// SAM records of one read's alignments (none if unmapped; see [`sam_unmapped`]). `seq`
+    /// is the read as sequenced and `qual` its base qualities (Phred+33, as in FASTQ), if it
+    /// has them; the primary record carries both, secondary records neither. Tags: `AS:i`,
+    /// `cm:i`, `XS:A` (the transcript strand, when known) and `NM:i` with a base-level
     /// alignment.
-    pub fn sam_records(buf: &mut Vec<u8>, name: &str, seq: &[u8], r: &SplicedRead, idx: &GenomeIndex) {
+    pub fn sam_records(
+        buf: &mut Vec<u8>,
+        name: &str,
+        seq: &[u8],
+        qual: Option<&[u8]>,
+        r: &SplicedRead,
+        idx: &GenomeIndex,
+    ) {
         for a in &r.alignments {
-            splice::map::sam_line(&idx.inner, name, seq, &a.hit, a.mapq, base(a), buf);
+            splice::map::sam_line(&idx.inner, name, seq, qual, &a.hit, a.mapq, base(a), buf);
         }
+    }
+
+    /// The SAM record of a read that did not map (flag 4), with its sequence and qualities.
+    pub fn sam_unmapped(buf: &mut Vec<u8>, name: &str, seq: &[u8], qual: Option<&[u8]>) {
+        splice::map::sam_unmapped(name, seq, qual, buf);
     }
 
     /// The uncompressed BAM header (pass it through [`bgzf`]).
@@ -805,14 +818,28 @@ pub mod output {
 
     /// Uncompressed BAM records of one read's alignments, as [`sam_records`]. Collect the
     /// records of some reads and pass them through [`bgzf`].
-    pub fn bam_records(buf: &mut Vec<u8>, name: &str, seq: &[u8], r: &SplicedRead, idx: &GenomeIndex) {
+    pub fn bam_records(
+        buf: &mut Vec<u8>,
+        name: &str,
+        seq: &[u8],
+        qual: Option<&[u8]>,
+        r: &SplicedRead,
+        idx: &GenomeIndex,
+    ) {
         let mut ops = Vec::new();
         for a in &r.alignments {
             if a.edits.is_some() {
                 ops.clone_from(&a.cigar);
             }
-            splice::bam::record(&idx.inner, name, seq, &a.hit, a.mapq, &mut ops, a.edits, buf);
+            splice::bam::record(
+                &idx.inner, name, seq, qual, &a.hit, a.mapq, &mut ops, a.edits, buf,
+            );
         }
+    }
+
+    /// The uncompressed BAM record of a read that did not map, as [`sam_unmapped`].
+    pub fn bam_unmapped(buf: &mut Vec<u8>, name: &str, seq: &[u8], qual: Option<&[u8]>) {
+        splice::bam::unmapped(name, seq, qual, buf);
     }
 
     /// Compress `data` into complete BGZF blocks appended to `out`, at DEFLATE level `level`
