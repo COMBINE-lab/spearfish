@@ -5,6 +5,8 @@
 //! helpers (data frames, chunked mapping of any iterable). Everything that runs per read
 //! happens here with the GIL released; batches map in parallel on the mapper's own thread pool.
 
+mod genome;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1785,6 +1787,7 @@ fn _spearfish(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFileBatches>()?;
     m.add_class::<PyRecordBatches>()?;
     m.add_class::<PyRadWriter>()?;
+    genome::register(m)?;
     m.add_function(wrap_pyfunction!(resolve_settings, m)?)?;
     m.add_function(wrap_pyfunction!(presets, m)?)?;
     Ok(())

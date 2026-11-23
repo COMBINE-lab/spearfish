@@ -18,9 +18,13 @@
   (`open`, `build_from_fasta`, `build_to_file`, `load_annotation`, `set_annotation`),
   `SpliceOptions`, `SplicedMapper` (`Send + Sync`), `SplicedRead`, `SplicedAlignment` (exon
   blocks, introns, CIGAR, mapping quality) and `genome::output` (PAF, SAM, BAM records and
-  BGZF blocks). `spearfish::index_kind` tells a genome index from a transcriptome index, and
+  BGZF blocks), and `genome::map_file`, which maps a FASTA/FASTQ file to PAF, SAM and/or BAM
+  on several threads as the command does. `spearfish::index_kind` tells a genome index from a transcriptome index, and
   `Index::open` on a genome index says so. New crate `spearfish-splice` holds the
   implementation; depend on `spearfish`, whose interface is the supported one.
+- **Python:** `GenomeIndex` (`load`, `build`, optional `annotation=`), `SplicedMapper` (`map`,
+  `map_batch`, and `map_file` straight to PAF, SAM or BAM), `SplicedRead` and
+  `SplicedAlignment` (exons, introns, strand, mapping quality, CIGAR).
 - The minimum supported Rust version is 1.91 (it was 1.89): the affine alignment of the
   base-level output needs it.
 

@@ -9,19 +9,16 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use paraseq::Record;
-use paraseq::prelude::*;
 use serde::Serialize;
 use spearfish::Preset;
 use spearfish::genome::{
-    BaseLevel, GenomeIndex, GenomeIndexOptions, GenomeManifest, SpliceOptions, SplicedMapper, SplicedRead,
-    Workspace, output,
+    BaseLevel, GenomeIndex, GenomeIndexOptions, GenomeManifest, SpliceOptions, SplicedMapper, output,
 };
 
 use crate::runinfo::{self, Invocation, Usage};
@@ -293,158 +290,8 @@ pub struct Job {
     pub args: GenomeArgs,
 }
 
-/// Per-thread and total counts.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct Counts {
-    pub reads: u64,
-    pub mapped: u64,
-    pub unmapped: u64,
-    /// Mapped reads whose primary alignment has an intron.
-    pub spliced: u64,
-    /// Introns in primary alignments.
-    pub junctions: u64,
-    /// Mapped reads with more than one reported alignment.
-    pub multi_mapped: u64,
-    /// Mapped reads whose primary alignment is on the read's forward strand.
-    pub forward: u64,
-    pub alignments: u64,
-    pub bases: u64,
-}
-
-impl Counts {
-    fn add_read(&mut self, r: &SplicedRead) {
-        self.reads += 1;
-        self.bases += r.len as u64;
-        match r.alignments.first() {
-            None => self.unmapped += 1,
-            Some(a) => {
-                self.mapped += 1;
-                self.spliced += a.spliced() as u64;
-                self.junctions += a.introns().count() as u64;
-                self.multi_mapped += (r.alignments.len() > 1) as u64;
-                self.forward += !a.reverse as u64;
-            }
-        }
-        self.alignments += r.alignments.len() as u64;
-    }
-
-    fn add(&mut self, o: &Counts) {
-        self.reads += o.reads;
-        self.mapped += o.mapped;
-        self.unmapped += o.unmapped;
-        self.spliced += o.spliced;
-        self.junctions += o.junctions;
-        self.multi_mapped += o.multi_mapped;
-        self.forward += o.forward;
-        self.alignments += o.alignments;
-        self.bases += o.bases;
-    }
-}
-
-type Out = crate::map_cmd::Out;
-
-struct Processor {
-    mapper: Arc<SplicedMapper>,
-    work: Workspace,
-    paf: Option<(Out, Vec<u8>)>,
-    sam: Option<(Out, Vec<u8>)>,
-    /// BAM: the sink, the batch's records, and their BGZF blocks.
-    bam: Option<(Out, Vec<u8>, Vec<u8>)>,
-    bam_level: u8,
-    /// Write unmapped reads, and base qualities, to SAM and BAM.
-    unmapped: bool,
-    qualities: bool,
-    total: Arc<Mutex<(Counts, spearfish::genome::InternalStats)>>,
-    progress: Arc<AtomicU64>,
-    local: Counts,
-    batch_reads: u64,
-}
-
-impl Clone for Processor {
-    fn clone(&self) -> Self {
-        Processor {
-            mapper: self.mapper.clone(),
-            work: Workspace::default(),
-            paf: self.paf.clone(),
-            sam: self.sam.clone(),
-            bam: self.bam.clone(),
-            bam_level: self.bam_level,
-            unmapped: self.unmapped,
-            qualities: self.qualities,
-            total: self.total.clone(),
-            progress: self.progress.clone(),
-            local: Counts::default(),
-            batch_reads: 0,
-        }
-    }
-}
-
-impl<Rf: Record> ParallelProcessor<Rf> for Processor {
-    fn process_record(&mut self, record: Rf) -> paraseq::Result<()> {
-        let seq = record.seq();
-        let r = self.mapper.map_with(&seq, &mut self.work);
-        self.local.add_read(&r);
-        self.batch_reads += 1;
-        // A read without an alignment is written only to SAM and BAM, and only when asked.
-        if r.alignments.is_empty() && (!self.unmapped || (self.sam.is_none() && self.bam.is_none())) {
-            return Ok(());
-        }
-        // Lossy: a header that is not UTF-8 gets U+FFFD instead of failing the run.
-        let id = String::from_utf8_lossy(record.id());
-        let name = id.split_whitespace().next().unwrap_or("");
-        let idx = self.mapper.index();
-        let qual = record.qual().filter(|_| self.qualities);
-        if r.alignments.is_empty() {
-            if let Some((_, buf)) = &mut self.sam {
-                output::sam_unmapped(buf, name, &seq, qual);
-            }
-            if let Some((_, raw, _)) = &mut self.bam {
-                output::bam_unmapped(raw, name, &seq, qual);
-            }
-            return Ok(());
-        }
-        if let Some((_, buf)) = &mut self.paf {
-            output::paf_lines(buf, name, &r, idx);
-        }
-        if let Some((_, buf)) = &mut self.sam {
-            output::sam_records(buf, name, &seq, qual, &r, idx);
-        }
-        if let Some((_, raw, _)) = &mut self.bam {
-            output::bam_records(raw, name, &seq, qual, &r, idx);
-        }
-        Ok(())
-    }
-
-    /// Write the batch's records. For BAM they are compressed here, by the thread that mapped
-    /// them, into complete BGZF blocks, so the shared writer only appends bytes.
-    fn on_batch_complete(&mut self) -> paraseq::Result<()> {
-        for (out, buf) in [&mut self.paf, &mut self.sam].into_iter().flatten() {
-            if !buf.is_empty() {
-                out.lock().unwrap().write_all(buf)?;
-                buf.clear();
-            }
-        }
-        if let Some((out, raw, z)) = &mut self.bam
-            && !raw.is_empty()
-        {
-            z.clear();
-            output::bgzf(raw, self.bam_level, z);
-            raw.clear();
-            out.lock().unwrap().write_all(z)?;
-        }
-        self.progress.fetch_add(self.batch_reads, Ordering::Relaxed);
-        self.batch_reads = 0;
-        Ok(())
-    }
-
-    fn on_thread_complete(&mut self) -> paraseq::Result<()> {
-        let mut t = self.total.lock().unwrap();
-        t.0.add(&self.local);
-        t.1.add(self.work.stats());
-        self.local = Counts::default();
-        Ok(())
-    }
-}
+/// Read counts of a run.
+pub type Counts = spearfish::genome::FileCounts;
 
 #[derive(Serialize)]
 struct Outputs {
@@ -591,59 +438,39 @@ pub fn execute(job: Job) -> Result<Counts> {
     let mapper = Arc::new(SplicedMapper::new(idx, &opts));
     let load = t0.elapsed().as_secs_f64();
 
-    let open = |p: &Option<PathBuf>| p.as_deref().map(crate::map_cmd::sink).transpose();
-    let paf = open(&paf_path)?.map(|o| (o, Vec::new()));
-    let sam = open(&a.sam)?.map(|o| (o, Vec::new()));
-    let bam = open(&a.bam)?.map(|o| (o, Vec::new(), Vec::new()));
-    if let Some((out, _)) = &sam {
-        let mut h = Vec::new();
-        output::sam_header(&mut h, mapper.index(), &command_line);
-        out.lock().unwrap().write_all(&h)?;
-    }
-    if let Some((out, _, _)) = &bam {
-        let (mut h, mut z) = (Vec::new(), Vec::new());
-        output::bam_header(&mut h, mapper.index(), &command_line);
-        output::bgzf(&h, a.bam_level, &mut z);
-        out.lock().unwrap().write_all(&z)?;
-    }
-    let total = Arc::new(Mutex::new((Counts::default(), Default::default())));
-    let progress = Arc::new(AtomicU64::new(0));
-    let mut proc = Processor {
-        mapper,
-        work: Workspace::default(),
-        paf: paf.clone(),
-        sam: sam.clone(),
-        bam: bam.clone(),
+    let open = |p: &Option<PathBuf>| -> Result<Option<Box<dyn Write + Send>>> {
+        Ok(match p {
+            Some(p) if p.as_os_str() == "-" => Some(Box::new(std::io::stdout())),
+            Some(p) => Some(Box::new(
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+            )),
+            None => None,
+        })
+    };
+    let outputs = spearfish::genome::FileOutputs {
+        paf: open(&paf_path)?,
+        sam: open(&a.sam)?,
+        bam: open(&a.bam)?,
         bam_level: a.bam_level,
         unmapped: !a.no_unmapped,
         qualities: !a.no_qualities,
-        total: total.clone(),
-        progress: progress.clone(),
-        local: Counts::default(),
-        batch_reads: 0,
+        command_line,
     };
-    let reader = spearfish::open_fastx(input.as_deref(), Some(job.batch_size))
-        .with_context(|| format!("reading {}", job.reads.display()))?;
+    let progress = Arc::new(AtomicU64::new(0));
     let t1 = Instant::now();
-    {
-        let _p = crate::map_cmd::Progress::start(progress);
-        reader.process_parallel(&mut proc, threads)?;
-    }
-    if let Some((out, _, _)) = &bam {
-        out.lock().unwrap().write_all(&output::BGZF_EOF)?;
-    }
-    for out in [
-        paf.as_ref().map(|x| &x.0),
-        sam.as_ref().map(|x| &x.0),
-        bam.as_ref().map(|x| &x.0),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        out.lock().unwrap().flush()?;
-    }
+    let (c, internal) = {
+        let _p = crate::map_cmd::Progress::start(progress.clone());
+        spearfish::genome::map_file(
+            &mapper,
+            input.as_deref(),
+            outputs,
+            threads,
+            job.batch_size,
+            Some(progress),
+        )
+        .with_context(|| format!("mapping {}", job.reads.display()))?
+    };
     let secs = t1.elapsed().as_secs_f64();
-    let (c, internal) = *total.lock().unwrap();
     log::info!(
         "map: {} reads ({:.1}% mapped, {:.1}% of them spliced), {:.1} Mbp in {secs:.2} s ({:.0} reads/s, {:.1} Mbp/s); index load {load:.2} s",
         c.reads,

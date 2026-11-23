@@ -560,3 +560,111 @@ def test_rad_writer(mapper, reads, tmp_path, index):
             rad.write(other.map_batch(seqs[:2]))
     with pytest.raises(ValueError, match="codec"):
         spearfish.RadWriter(tmp_path / "y.rad", mapper, codec="gzip")
+
+
+# ─── Spliced mapping to a genome ────────────────────────────────────────────────────────────
+
+TOY_GENOME = TOY.parent / "genome.fa"
+TOY_GTF = TOY.parent / "annotation.gtf"
+
+
+def annotated_exons():
+    exons = {}
+    for line in open(TOY_GTF):
+        p = line.rstrip("\n").split("\t")
+        if len(p) == 9 and p[2] == "exon":
+            tid = p[8].split('transcript_id "')[1].split('"')[0]
+            exons.setdefault(tid, []).append((int(p[3]) - 1, int(p[4])))
+    return {t: sorted(e) for t, e in exons.items()}
+
+
+@pytest.fixture(scope="module")
+def genome():
+    return spearfish.GenomeIndex.build(TOY_GENOME, annotation=TOY_GTF)
+
+
+def test_genome_index(genome, tmp_path):
+    assert genome.num_sequences == len(genome) == 1
+    assert genome.sequence_names == ["toy"]
+    assert genome.sequence_lengths == [18090] and genome.total_length == 18090
+    assert genome.annotation["format"] == "gtf" and genome.annotation["transcripts"] == 6
+    assert "GenomeIndex(sequences=1" in repr(genome)
+    path = tmp_path / "toy.sfg"
+    built = spearfish.GenomeIndex.build(TOY_GENOME, output=path)
+    assert built.annotation is None and built.path == str(path)
+    loaded = spearfish.GenomeIndex.load(path)
+    assert loaded.manifest["kind"] == "spearfish-genome-index"
+    assert loaded.id == loaded.manifest["index_id"] != "unknown"
+    assert loaded.sequence_names == ["toy"]
+    # A transcriptome index is not a genome index, and the other way round.
+    tx = tmp_path / "toy.sfi"
+    spearfish.Index.build(TOY, output=tx)
+    with pytest.raises(OSError, match="transcriptome index"):
+        spearfish.GenomeIndex.load(tx)
+    with pytest.raises(OSError, match="genome index"):
+        spearfish.Index.load(path)
+    other = tmp_path / "other.gtf"
+    other.write_text('chr1\tx\texon\t10\t50\t.\t+\t.\ttranscript_id "t1";\n')
+    with pytest.raises(ValueError, match="no transcript is on a sequence"):
+        spearfish.GenomeIndex.load(path, annotation=other)
+
+
+def test_spliced_mapping(genome, records):
+    truth = annotated_exons()
+    mapper = spearfish.SplicedMapper(genome, "ont", threads=2)
+    assert mapper.preset == "ont" and mapper.threads == 2 and mapper.index is genome
+    assert mapper.options["max_hits"] == 1 and mapper.options["sense_reads"] is False
+    for header, seq in records:
+        tid = header.split("|")[0]
+        for strand, s in (("+", seq), ("-", revcomp(seq))):
+            read = mapper.map(s, name=tid)
+            assert read.is_mapped and read.name == tid and read.length == len(seq) and len(read) == 1
+            a = read.best
+            assert (a.sequence, a.sequence_id, a.strand) == ("toy", 0, strand)
+            assert a.exons == truth[tid] and a.is_primary and a.is_spliced
+            assert (a.start, a.end) == (truth[tid][0][0], truth[tid][-1][1])
+            assert (a.query_start, a.query_end) == (0, len(seq))
+            assert a.transcript_strand == "+" and a.mapq == 60 and a.edits is None
+            assert len(a.introns) == len(a.exons) - 1 == a.cigar.count("N")
+            assert [b[2:] for b in a.blocks] == a.exons
+            assert read.to_paf().decode().startswith(f"{tid}\t{len(seq)}\t0\t{len(seq)}\t{strand}\ttoy\t")
+    names = [h.split("|")[0] for h, _ in records]
+    batch = mapper.map_batch([s for _, s in records], names)
+    assert [r.name for r in batch] == names
+    assert [r.best.exons for r in batch] == [truth[n] for n in names]
+    with pytest.raises(ValueError, match="names"):
+        mapper.map_batch(["ACGT"], ["a", "b"])
+    assert not mapper.map("ACGT" * 100).is_mapped and mapper.map("ACGT" * 100).best is None
+    affine = spearfish.SplicedMapper(genome, "drna", base_level="affine", secondary=2)
+    a = affine.map(records[0][1]).best
+    assert a.edits == 0 and affine.options["sense_reads"] is True and affine.options["max_hits"] == 3
+    with pytest.raises(ValueError):
+        spearfish.SplicedMapper(genome, "clr")
+    with pytest.raises(ValueError, match="base_level"):
+        spearfish.SplicedMapper(genome, base_level="full")
+
+
+def test_spliced_map_file(genome, records, tmp_path):
+    fq = tmp_path / "reads.fq"
+    with open(fq, "w") as f:
+        for header, seq in records:
+            f.write(f"@{header.split('|')[0]}\n{seq}\n+\n{'I' * len(seq)}\n")
+        f.write(f"@junk\n{'ACGT' * 100}\n+\n{'#' * 400}\n")
+    mapper = spearfish.SplicedMapper(genome, threads=2)
+    paf, sam, bam = tmp_path / "o.paf", tmp_path / "o.sam", tmp_path / "o.bam"
+    counts = mapper.map_file(fq, paf=paf, sam=sam, bam=bam)
+    assert (counts["reads"], counts["mapped"], counts["unmapped"], counts["spliced"]) == (7, 6, 1, 6)
+    assert len(paf.read_text().splitlines()) == 6
+    lines = [l.split("\t") for l in sam.read_text().splitlines() if not l.startswith("@")]
+    assert len(lines) == 7
+    junk = next(l for l in lines if l[0] == "junk")
+    assert junk[1] == "4" and junk[9] == "ACGT" * 100 and junk[10] == "#" * 400
+    hit = next(l for l in lines if l[0] == "TOYT0000001")
+    assert hit[5] == "400M1176N250M1114N120M1321N500M" and hit[10] == "I" * 1270
+    data = bam.read_bytes()
+    assert data[:4] == b"\x1f\x8b\x08\x04" and gzip.decompress(data)[:4] == b"BAM\x01"
+    counts = mapper.map_file(fq, sam=sam, unmapped=False, qualities=False)
+    lines = [l.split("\t") for l in sam.read_text().splitlines() if not l.startswith("@")]
+    assert len(lines) == 6 and all(l[10] == "*" for l in lines) and counts["reads"] == 7
+    with pytest.raises(ValueError, match="at least one"):
+        mapper.map_file(fq)

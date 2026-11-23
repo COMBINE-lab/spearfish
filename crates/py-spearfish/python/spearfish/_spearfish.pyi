@@ -176,3 +176,99 @@ class RadWriter:
     def close(self) -> None: ...
     def __enter__(self) -> RadWriter: ...
     def __exit__(self, exc_type: Any = None, exc: Any = None, tb: Any = None) -> bool: ...
+
+class GenomeIndex:
+    """A genome index for spliced mapping (immutable, shareable)."""
+
+    @staticmethod
+    def load(path: PathLike, *, annotation: PathLike | None = None) -> GenomeIndex: ...
+    @staticmethod
+    def build(
+        fasta: PathLike,
+        *,
+        output: PathLike | None = None,
+        annotation: PathLike | None = None,
+        max_occ: int = 1000,
+        threads: int = 0,
+    ) -> GenomeIndex: ...
+
+    path: str | None
+    num_sequences: int
+    sequence_names: list[str]
+    sequence_lengths: list[int]
+    total_length: int
+    id: str
+    manifest: dict[str, Any] | None
+    annotation: dict[str, Any] | None
+
+    def __len__(self) -> int: ...
+
+class SplicedAlignment:
+    """One alignment of a read to the genome: a locus, a strand and exon blocks."""
+
+    sequence: str
+    sequence_id: int
+    start: int
+    end: int
+    query_start: int
+    query_end: int
+    strand: Literal["+", "-"]
+    transcript_strand: Literal["+", "-", "."]
+    mapq: int
+    score: int
+    is_primary: bool
+    is_spliced: bool
+    anchors: int
+    edits: int | None
+    exons: list[Tuple[int, int]]
+    introns: list[Tuple[int, int]]
+    blocks: list[Tuple[int, int, int, int]]
+    cigar: str
+
+class SplicedRead:
+    """The alignments of one read, best first; none when the read does not map."""
+
+    name: str | None
+    length: int
+    alignments: list[SplicedAlignment]
+    is_mapped: bool
+    best: SplicedAlignment | None
+
+    def to_paf(self) -> bytes: ...
+    def __len__(self) -> int: ...
+
+class SplicedMapper:
+    """Maps long RNA-seq reads, spliced, to a genome index (immutable, thread-safe)."""
+
+    def __init__(
+        self,
+        index: GenomeIndex,
+        preset: Literal["ont", "drna", "hifi"] = "ont",
+        *,
+        threads: int = 0,
+        secondary: int = 0,
+        base_level: Literal["blocks", "edits", "affine"] = "blocks",
+        max_intron: int = 200000,
+        min_score: int = 100,
+    ) -> None: ...
+
+    index: GenomeIndex
+    preset: str
+    threads: int
+    options: dict[str, Any]
+
+    def map(self, seq: Seq, name: str | None = None) -> SplicedRead: ...
+    def map_batch(
+        self, seqs: Iterable[Seq], names: Iterable[str] | None = None
+    ) -> list[SplicedRead]: ...
+    def map_file(
+        self,
+        reads: PathLike,
+        *,
+        paf: PathLike | None = None,
+        sam: PathLike | None = None,
+        bam: PathLike | None = None,
+        bam_level: int = 1,
+        unmapped: bool = True,
+        qualities: bool = True,
+    ) -> dict[str, int]: ...

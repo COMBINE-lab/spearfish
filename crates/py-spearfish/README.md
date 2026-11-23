@@ -168,6 +168,34 @@ time: the one you are using, the one mapping, and for `map_file` one being read.
 stays flat as long as you drop each batch when you are done with it; `chunk_size` sets the
 scale. Columnar results (`hit_columns`, `to_pandas`) are the cheapest to consume.
 
+## Spliced mapping to a genome
+
+`GenomeIndex` and `SplicedMapper` map reads to a genome with introns, as `spearfish
+map-spliced` does.
+
+```python
+genome = spearfish.GenomeIndex.build("genome.fa.gz", output="genome.sfg")   # or GenomeIndex.load("genome.sfg")
+genome = spearfish.GenomeIndex.load("genome.sfg", annotation="genes.gtf")   # known transcripts are optional
+mapper = spearfish.SplicedMapper(genome, "ont", threads=16)                 # "ont", "drna" or "hifi"
+
+read = mapper.map(seq, name="read1")
+if read.is_mapped:
+    a = read.best
+    a.sequence, a.start, a.end, a.strand, a.mapq    # locus, 0-based and half-open
+    a.exons                                         # [(start, end), ...] in genome order
+    a.introns, a.transcript_strand, a.cigar
+
+reads = mapper.map_batch(seqs, names)               # in parallel, in input order
+counts = mapper.map_file("reads.fq.gz", bam="reads.bam")   # read, mapped and written in Rust
+```
+
+The annotation (GTF, GFF3 or BED12) belongs to the loaded index object, not to the file: its
+splice sites, junctions and exons are preferred where a read fits them, and junctions outside
+it are still found. `SplicedMapper` takes `secondary` (secondary alignments per read),
+`base_level` (`"blocks"`, `"edits"` or `"affine"`) and `max_intron`. `map_file` writes any of
+`paf=`, `sam=` and `bam=`; SAM and BAM carry base qualities and unmapped reads unless
+`qualities=False` or `unmapped=False`.
+
 ## Thread safety
 
 `Index` and `Mapper` are immutable and thread-safe; share one of each across threads. The

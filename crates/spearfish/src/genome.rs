@@ -763,6 +763,263 @@ impl SplicedMapper {
     }
 }
 
+// ─── Mapping a file ─────────────────────────────────────────────────────────────────────────
+
+/// Where [`map_file`] writes, and what. Any combination of the three formats; each sink
+/// gets the whole file of its format, header included.
+#[cfg(feature = "fasta")]
+#[derive(Default)]
+pub struct FileOutputs {
+    /// PAF (mapped reads only).
+    pub paf: Option<Box<dyn std::io::Write + Send>>,
+    /// SAM.
+    pub sam: Option<Box<dyn std::io::Write + Send>>,
+    /// BAM, unsorted.
+    pub bam: Option<Box<dyn std::io::Write + Send>>,
+    /// BAM compression level, 0 to 9.
+    pub bam_level: u8,
+    /// Write a record for each read that does not map (SAM and BAM).
+    pub unmapped: bool,
+    /// Write base qualities when the reads have them (SAM and BAM).
+    pub qualities: bool,
+    /// The command line for the `@PG` header line (may be empty).
+    pub command_line: String,
+}
+
+#[cfg(feature = "fasta")]
+use std::io::Write as _;
+#[cfg(feature = "fasta")]
+use std::sync::Mutex;
+#[cfg(feature = "fasta")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Read counts of a file mapped by [`map_file`].
+#[cfg(feature = "fasta")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct FileCounts {
+    /// Reads in the file.
+    pub reads: u64,
+    /// Reads with at least one alignment.
+    pub mapped: u64,
+    /// Reads with none.
+    pub unmapped: u64,
+    /// Mapped reads whose primary alignment has an intron.
+    pub spliced: u64,
+    /// Introns in primary alignments.
+    pub junctions: u64,
+    /// Mapped reads with more than one reported alignment.
+    pub multi_mapped: u64,
+    /// Mapped reads whose primary alignment is on the read's forward strand.
+    pub forward: u64,
+    /// Alignments reported.
+    pub alignments: u64,
+    /// Read bases.
+    pub bases: u64,
+}
+
+#[cfg(feature = "fasta")]
+impl FileCounts {
+    fn add_read(&mut self, r: &SplicedRead) {
+        self.reads += 1;
+        self.bases += r.len as u64;
+        match r.alignments.first() {
+            None => self.unmapped += 1,
+            Some(a) => {
+                self.mapped += 1;
+                self.spliced += a.spliced() as u64;
+                self.junctions += a.introns().count() as u64;
+                self.multi_mapped += (r.alignments.len() > 1) as u64;
+                self.forward += !a.reverse as u64;
+            }
+        }
+        self.alignments += r.alignments.len() as u64;
+    }
+
+    fn add(&mut self, o: &FileCounts) {
+        self.reads += o.reads;
+        self.mapped += o.mapped;
+        self.unmapped += o.unmapped;
+        self.spliced += o.spliced;
+        self.junctions += o.junctions;
+        self.multi_mapped += o.multi_mapped;
+        self.forward += o.forward;
+        self.alignments += o.alignments;
+        self.bases += o.bases;
+    }
+}
+
+#[cfg(feature = "fasta")]
+type Out = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+
+#[cfg(feature = "fasta")]
+struct Processor {
+    mapper: Arc<SplicedMapper>,
+    work: Workspace,
+    paf: Option<(Out, Vec<u8>)>,
+    sam: Option<(Out, Vec<u8>)>,
+    /// BAM: the sink, the batch's records, and their BGZF blocks.
+    bam: Option<(Out, Vec<u8>, Vec<u8>)>,
+    bam_level: u8,
+    /// Write unmapped reads, and base qualities, to SAM and BAM.
+    unmapped: bool,
+    qualities: bool,
+    total: Arc<Mutex<(FileCounts, InternalStats)>>,
+    progress: Option<Arc<AtomicU64>>,
+    local: FileCounts,
+    batch_reads: u64,
+}
+
+#[cfg(feature = "fasta")]
+impl Clone for Processor {
+    fn clone(&self) -> Self {
+        Processor {
+            mapper: self.mapper.clone(),
+            work: Workspace::default(),
+            paf: self.paf.clone(),
+            sam: self.sam.clone(),
+            bam: self.bam.clone(),
+            bam_level: self.bam_level,
+            unmapped: self.unmapped,
+            qualities: self.qualities,
+            total: self.total.clone(),
+            progress: self.progress.clone(),
+            local: FileCounts::default(),
+            batch_reads: 0,
+        }
+    }
+}
+
+#[cfg(feature = "fasta")]
+impl<Rf: paraseq::Record> paraseq::prelude::ParallelProcessor<Rf> for Processor {
+    fn process_record(&mut self, record: Rf) -> paraseq::Result<()> {
+        let seq = record.seq();
+        let r = self.mapper.map_with(&seq, &mut self.work);
+        self.local.add_read(&r);
+        self.batch_reads += 1;
+        // A read without an alignment is written only to SAM and BAM, and only when asked.
+        if r.alignments.is_empty() && (!self.unmapped || (self.sam.is_none() && self.bam.is_none())) {
+            return Ok(());
+        }
+        // Lossy: a header that is not UTF-8 gets U+FFFD instead of failing the run.
+        let id = String::from_utf8_lossy(record.id());
+        let name = id.split_whitespace().next().unwrap_or("");
+        let idx = self.mapper.index();
+        let qual = record.qual().filter(|_| self.qualities);
+        if r.alignments.is_empty() {
+            if let Some((_, buf)) = &mut self.sam {
+                output::sam_unmapped(buf, name, &seq, qual);
+            }
+            if let Some((_, raw, _)) = &mut self.bam {
+                output::bam_unmapped(raw, name, &seq, qual);
+            }
+            return Ok(());
+        }
+        if let Some((_, buf)) = &mut self.paf {
+            output::paf_lines(buf, name, &r, idx);
+        }
+        if let Some((_, buf)) = &mut self.sam {
+            output::sam_records(buf, name, &seq, qual, &r, idx);
+        }
+        if let Some((_, raw, _)) = &mut self.bam {
+            output::bam_records(raw, name, &seq, qual, &r, idx);
+        }
+        Ok(())
+    }
+
+    /// Write the batch's records. For BAM they are compressed here, by the thread that mapped
+    /// them, into complete BGZF blocks, so the shared writer only appends bytes.
+    fn on_batch_complete(&mut self) -> paraseq::Result<()> {
+        for (out, buf) in [&mut self.paf, &mut self.sam].into_iter().flatten() {
+            if !buf.is_empty() {
+                out.lock().unwrap().write_all(buf)?;
+                buf.clear();
+            }
+        }
+        if let Some((out, raw, z)) = &mut self.bam
+            && !raw.is_empty()
+        {
+            z.clear();
+            output::bgzf(raw, self.bam_level, z);
+            raw.clear();
+            out.lock().unwrap().write_all(z)?;
+        }
+        if let Some(p) = &self.progress {
+            p.fetch_add(self.batch_reads, Ordering::Relaxed);
+        }
+        self.batch_reads = 0;
+        Ok(())
+    }
+
+    fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let mut t = self.total.lock().unwrap();
+        t.0.add(&self.local);
+        t.1.add(self.work.stats());
+        self.local = FileCounts::default();
+        Ok(())
+    }
+}
+
+/// Map a FASTA/FASTQ file (optionally gzip, bzip2 or zstd compressed; `None` reads stdin) on
+/// `threads` threads and write the alignments to `out`. Reads are written as they finish,
+/// not in input order; the records of a read are adjacent. BAM records are compressed by the
+/// thread that mapped them. `progress`, when given, counts the reads done as they finish.
+/// Returns the read counts and the mapper's internal counters.
+#[cfg(feature = "fasta")]
+pub fn map_file(
+    mapper: &Arc<SplicedMapper>,
+    reads: Option<&Path>,
+    out: FileOutputs,
+    threads: usize,
+    batch_size: usize,
+    progress: Option<Arc<AtomicU64>>,
+) -> Result<(FileCounts, InternalStats)> {
+    use paraseq::prelude::*;
+    let share = |w: Option<Box<dyn std::io::Write + Send>>| -> Option<Out> {
+        w.map(|w| {
+            let w: Box<dyn std::io::Write + Send> = Box::new(std::io::BufWriter::with_capacity(1 << 20, w));
+            Arc::new(Mutex::new(w))
+        })
+    };
+    let (paf, sam, bam) = (share(out.paf), share(out.sam), share(out.bam));
+    if let Some(o) = &sam {
+        let mut h = Vec::new();
+        output::sam_header(&mut h, mapper.index(), &out.command_line);
+        o.lock().unwrap().write_all(&h)?;
+    }
+    if let Some(o) = &bam {
+        let (mut h, mut z) = (Vec::new(), Vec::new());
+        output::bam_header(&mut h, mapper.index(), &out.command_line);
+        output::bgzf(&h, out.bam_level, &mut z);
+        o.lock().unwrap().write_all(&z)?;
+    }
+    let total = Arc::new(Mutex::new((FileCounts::default(), InternalStats::default())));
+    let mut proc = Processor {
+        mapper: mapper.clone(),
+        work: Workspace::default(),
+        paf: paf.clone().map(|o| (o, Vec::new())),
+        sam: sam.clone().map(|o| (o, Vec::new())),
+        bam: bam.clone().map(|o| (o, Vec::new(), Vec::new())),
+        bam_level: out.bam_level,
+        unmapped: out.unmapped,
+        qualities: out.qualities,
+        total: total.clone(),
+        progress,
+        local: FileCounts::default(),
+        batch_reads: 0,
+    };
+    let reader = crate::open_fastx(reads, Some(batch_size.max(1)))?;
+    reader.process_parallel(&mut proc, threads.max(1))?;
+    if let Some(o) = &bam {
+        o.lock().unwrap().write_all(&output::BGZF_EOF)?;
+    }
+    for o in [&paf, &sam, &bam].into_iter().flatten() {
+        o.lock().unwrap().flush()?;
+    }
+    let t = *total.lock().unwrap();
+    Ok(t)
+}
+
 /// Alignments as `spearfish map-spliced` writes them: PAF, SAM and BAM.
 pub mod output {
     use super::{GenomeIndex, SplicedAlignment, SplicedRead};
