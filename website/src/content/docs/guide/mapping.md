@@ -160,6 +160,14 @@ Where Linux has transparent huge pages always on, the allocator's memory uses th
 2 MB stretch that mapping touches is resident whole. If memory is tight, `MIMALLOC_ALLOW_THP=0`
 in the environment turns that off, which lowers the peak by several hundred megabytes.
 
+The general allocator is mimalloc, which spearfish starts with three of its settings changed
+so that memory no thread is using does not stay resident: arena memory is committed when it is
+first used, freed pages go back to the system at once, and a page's memory is committed as the
+page fills. With 32 threads this lowers the peak by a few hundred megabytes and costs no
+mapping time. mimalloc's environment variables take precedence, and
+`MIMALLOC_ARENA_EAGER_COMMIT=2 MIMALLOC_PURGE_DELAY=10 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0` gives
+its own defaults back. This applies on Linux and macOS, to `map` and `map-spliced` alike.
+
 `spearfish map` takes the mapper's small allocations (up to 8 KB) from memory that belongs to
 each thread, instead of from the general allocator. Mapping a read makes a few hundred of
 them and frees nearly all before the next read, so a thread stays in the same few pages.

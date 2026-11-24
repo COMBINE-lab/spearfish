@@ -26,6 +26,8 @@ nudgy = { path = "../nudgy", version = "0.2.0" }
 long-read-rad.workspace = true
 anyhow.workspace = true
 mimalloc.workspace = true
+# Pinned: `lean_allocator` in main.rs names three mimalloc options by number.
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["extended"] }
 clap.workspace = true
 lcp-core.workspace = true
 paraseq.workspace = true

@@ -30,6 +30,44 @@ use clap::{CommandFactory, Parser, Subcommand};
 #[global_allocator]
 static GLOBAL: nudgy::Bump<mimalloc::MiMalloc> = nudgy::Bump::new(mimalloc::MiMalloc);
 
+// mimalloc as shipped commits its arenas ahead of use and holds freed pages for a while before it
+// returns them. With many mapping threads that is several hundred megabytes of resident memory
+// that nothing uses. The three settings below give that memory back and cost no measurable time.
+// mimalloc commits its first arena on the first allocation, which happens before `main`, so the
+// settings are made from a load-time hook.
+//
+// Each one is a default only: a `MIMALLOC_*` environment variable still wins (for example
+// `MIMALLOC_PURGE_DELAY=10 MIMALLOC_ARENA_EAGER_COMMIT=2 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0` gives
+// mimalloc as shipped).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[used]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+static LEAN_ALLOCATOR: extern "C" fn() = lean_allocator;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+extern "C" fn lean_allocator() {
+    // (option number in mimalloc v3's `mi_option_t`, value as shipped, value wanted). The binding
+    // has no names for these three, hence the pinned `libmimalloc-sys` and the check below.
+    const SETTINGS: [(libmimalloc_sys::mi_option_t, std::ffi::c_long, std::ffi::c_long); 3] = [
+        (4, 2, 0),   // arena_eager_commit: commit arena memory when it is first used
+        (15, 10, 0), // purge_delay (ms): return freed pages at once
+        (40, 0, 1),  // page_commit_on_demand: commit a page's memory as it fills
+    ];
+    for (option, shipped, wanted) in SETTINGS {
+        // SAFETY: both calls read or write one option slot of mimalloc's static table, and
+        // mimalloc supports them before its own initialisation. No other thread exists yet.
+        unsafe {
+            // Reading the option also takes in its environment variable, after which
+            // `mi_option_set_default` leaves a value the user chose alone. An unexpected value
+            // means the user set it or the numbering has moved; either way it is left as is.
+            if libmimalloc_sys::mi_option_get(option) == shipped {
+                libmimalloc_sys::mi_option_set_default(option, wanted);
+            }
+        }
+    }
+}
+
 /// `--version`: the version and git revision; `--version` (long) also the target and SIMD.
 fn long_version() -> &'static str {
     let b = spearfish::provenance::BuildInfo::current();

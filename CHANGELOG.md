@@ -26,6 +26,14 @@
   by keyword, listed in `SPLICE_SETTINGS`; `map`,
   `map_batch`, and `map_file` straight to PAF, SAM or BAM), `SplicedRead` and
   `SplicedAlignment` (exons, introns, strand, mapping quality, CIGAR).
+- **Lower peak memory with many threads.** The command now starts mimalloc with three settings
+  changed: arena memory is committed when it is first used and not ahead of it, freed pages go
+  back to the system at once, and a page's memory is committed as the page fills. Peak memory
+  at 32 threads falls by a few hundred megabytes in `map` and `map-spliced`; mapping time and
+  output are unchanged. With one thread the peak is about the same as before. The settings are
+  defaults: mimalloc's environment variables still win, and `MIMALLOC_ARENA_EAGER_COMMIT=2
+  MIMALLOC_PURGE_DELAY=10 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0` gives the allocator as it was.
+  Linux and macOS only.
 - The minimum supported Rust version is 1.91 (it was 1.89): the affine alignment of the
   base-level output needs it.
 
