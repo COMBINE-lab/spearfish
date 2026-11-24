@@ -43,6 +43,18 @@ pub trait SeedScheme: Send + Sync {
         v.dedup();
         out.extend(v.iter().map(|&(l, s, _)| (l, s)));
     }
+    /// [`Self::top_into`], and with it the seeds that this scheme gives at the level `lower`
+    /// below its highest, appended to `lower_out`. Returns false, having done nothing, if the
+    /// scheme cannot give both from one pass.
+    fn top_and_lower_into(
+        &self,
+        _seq: &[u8],
+        _lower: u8,
+        _out: &mut Vec<(u64, u32, u32)>,
+        _lower_out: &mut Vec<(u64, u32, u32)>,
+    ) -> bool {
+        false
+    }
     /// Canonical spec string; `from_spec(&s.name())` rebuilds the scheme.
     fn name(&self) -> String;
 }
@@ -67,6 +79,23 @@ impl SeedScheme for LcpSeeds {
             self.parser
                 .top_cores(seq, self.max_level, &mut sc.borrow_mut(), out)
         });
+    }
+
+    fn top_and_lower_into(
+        &self,
+        seq: &[u8],
+        lower: u8,
+        out: &mut Vec<(u64, u32, u32)>,
+        lower_out: &mut Vec<(u64, u32, u32)>,
+    ) -> bool {
+        if lower == 0 || lower >= self.max_level {
+            return false;
+        }
+        PARSE.with(|sc| {
+            self.parser
+                .top_and_lower_cores(seq, self.max_level, lower, &mut sc.borrow_mut(), out, lower_out)
+        });
+        true
     }
 
     fn top_codes_into(&self, codes: &[u8], out: &mut Vec<(u64, u32, u32)>) {

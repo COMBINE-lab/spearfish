@@ -71,6 +71,10 @@ pub struct ParseScratch {
     bits: [BitArena; 2],
     /// Two levels (ping-pong): labels, starts, ends.
     lv: [(Vec<u64>, Vec<u32>, Vec<u32>); 2],
+    /// A level below the top whose cores are wanted as well (0: none), and where they go
+    /// ([`LcpParser::top_and_lower_cores`]).
+    lower: u8,
+    lower_out: Vec<(u64, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +240,26 @@ impl LcpParser {
         self.top::<true, _>(codes, k, sc, out)
     }
 
+    /// [`Self::top_cores`], and the cores of the level `lower < k` as well, appended to
+    /// `lower_out`: the same cores as `top_cores(seq, lower, ..)` gives, from the one parse.
+    /// (A parse to level `k` computes every level below it on the way.)
+    pub fn top_and_lower_cores(
+        &self,
+        seq: &[u8],
+        k: u8,
+        lower: u8,
+        sc: &mut ParseScratch,
+        out: &mut Vec<(u64, u32, u32)>,
+        lower_out: &mut Vec<(u64, u32, u32)>,
+    ) {
+        assert!(lower >= 1 && lower < k);
+        std::mem::swap(&mut sc.lower_out, lower_out);
+        sc.lower = lower;
+        self.top::<false, _>(seq, k, sc, out);
+        sc.lower = 0;
+        std::mem::swap(&mut sc.lower_out, lower_out);
+    }
+
     /// `top_cores` (`seq` is ACGT text) or `top_cores_codes` (`CODES`: `seq` is codes), into
     /// either kind of output.
     #[inline(always)]
@@ -361,6 +385,9 @@ impl LcpParser {
         if O::ENDS {
             cur.2.extend(sc.spans.iter().map(|s| s.1 as u32));
         }
+        if O::ENDS && sc.lower == 1 {
+            sc.lower_out.extend_top(&sc.lv[0].0, &sc.lv[0].1, &sc.lv[0].2, o);
+        }
         let mut ci = 0; // index of the current level's buffers
         for level in 2..=k {
             let n = sc.lv[ci].0.len();
@@ -405,6 +432,10 @@ impl LcpParser {
                 }
             }
             ci = ni;
+            if O::ENDS && sc.lower == level {
+                sc.lower_out
+                    .extend_top(&sc.lv[ci].0, &sc.lv[ci].1, &sc.lv[ci].2, o);
+            }
         }
         let top = &sc.lv[ci];
         out.extend_top(&top.0, &top.1, &top.2, o);

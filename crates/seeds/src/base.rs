@@ -54,6 +54,28 @@ impl BaseSeeder {
         v
     }
 
+    /// The seeds of a parsed sequence in `out`, and in `lower_out` the seeds of the same scheme
+    /// one or more levels down (`lower`), both as [`Self::seed_parsed`] of the two schemes
+    /// would give them, from one pass over the sequence. Returns false, with both empty, if the
+    /// scheme has no such level.
+    pub fn seed_parsed_with_lower(
+        &self,
+        seq: &[u8],
+        lower: u8,
+        out: &mut Vec<Seed>,
+        lower_out: &mut Vec<Seed>,
+    ) -> bool {
+        let (mut top, mut low) = (Vec::new(), Vec::new());
+        out.clear();
+        lower_out.clear();
+        if !self.scheme.top_and_lower_into(seq, lower, &mut top, &mut low) {
+            return false;
+        }
+        Self::finish(&top, out);
+        Self::finish(&low, lower_out);
+        true
+    }
+
     /// `seed_parsed` into `out` (cleared first), with `tmp` as reusable scratch.
     pub fn seed_parsed_into(&self, seq: &[u8], out: &mut Vec<Seed>, tmp: &mut Vec<(u64, u32, u32)>) {
         tmp.clear();
@@ -92,6 +114,41 @@ impl BaseSeeder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_levels_from_one_pass() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut seq: Vec<u8> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x >> 33) as usize % 4]
+            })
+            .collect();
+        seq[5000..5010].fill(b'N');
+        let (l3, l2) = (
+            BaseSeeder::new("lcp:K=3", false).unwrap(),
+            BaseSeeder::new("lcp:K=2", false).unwrap(),
+        );
+        for s in [&seq[..], &seq[..40], &seq[..7], b""] {
+            for (top, lower, low) in [
+                (&l3, 2, l2.seed_parsed(s)),
+                (&l3, 1, BaseSeeder::new("lcp:K=1", false).unwrap().seed_parsed(s)),
+            ] {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                assert!(top.seed_parsed_with_lower(s, lower, &mut a, &mut b));
+                assert_eq!(a, top.seed_parsed(s));
+                assert_eq!(b, low);
+            }
+        }
+        assert!(!l2.seed_parsed_with_lower(&seq, 2, &mut Vec::new(), &mut Vec::new()));
+        assert!(
+            !BaseSeeder::new("minimizer:k=15,w=10", false)
+                .unwrap()
+                .seed_parsed_with_lower(&seq, 1, &mut Vec::new(), &mut Vec::new())
+        );
+    }
 
     #[test]
     fn top_level_and_hpc() {

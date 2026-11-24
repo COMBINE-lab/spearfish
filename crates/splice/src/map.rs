@@ -1246,8 +1246,14 @@ impl Mapper {
                     }
                 }
             };
+            // Level 3 is built from level 2, so one parse gives both.
+            let (mut top, mut low) = (Vec::new(), Vec::new());
+            if !self.seeder.seed_parsed_with_lower(parsed, 2, &mut top, &mut low) {
+                top = self.seeder.seed_parsed(parsed);
+                low = self.seeder2.seed_parsed(parsed);
+            }
             sc.l3[o].clear();
-            for s in self.seeder.seed_parsed(parsed) {
+            for s in top {
                 let (qs, qe, q_in, q_out, runs) = coords(s.start, s.end);
                 sc.l3[o].push(L2Seed {
                     q: qs,
@@ -1261,7 +1267,7 @@ impl Mapper {
                 });
             }
             sc.l2[o].clear();
-            for s in self.seeder2.seed_parsed(parsed) {
+            for s in low {
                 if let Some(id) = ix.l2_id(s.label) {
                     let (qs, qe, q_in, q_out, runs) = coords(s.start, s.end);
                     sc.l2[o].push(L2Seed {
@@ -1603,7 +1609,9 @@ impl Mapper {
             let mut bj = u32::MAX;
             for i in (j.saturating_sub(H)..j).rev() {
                 let p = hits[i];
-                if p.q >= a.q || p.t >= a.t {
+                // (a step adds at most the anchor's own length, so a predecessor whose score
+                // plus that length is no better than what is in hand cannot win)
+                if p.q >= a.q || p.t >= a.t || sc.f[i] + a.ql as f32 <= fj {
                     continue;
                 }
                 let v = sc.f[i] + self.step(p, a);
