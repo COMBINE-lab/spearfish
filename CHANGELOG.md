@@ -40,6 +40,10 @@
   longer outweighs the single copy the read came from. Regions are followed up when they weigh
   at least 0.4 of the best one (it was a quarter), which saves time on reads with many weak
   regions.
+- **Known micro-exons.** With an annotation, a known exon of a few bases next to an exon
+  that was found by its seeds could be written as an insertion, because the known exons were
+  tried on their own only when the seeds explained nothing. They are now tried as well when
+  the answer from the seeds is still a poor fit.
 - **Genome index builds in less memory.** `index --genome` held the genome unpacked and its
   seed tables several times over, and then the whole index again to write it. It now packs the
   genome as it reads it and builds in stages, one table at a time, each written to the output

@@ -2045,13 +2045,16 @@ impl Mapper {
                     };
                     // Then, if junctions were given, the known exons inside this intron on their
                     // own, believed only when every junction of the solution is a known one.
+                    // (also after the seed hits gave an answer that is still a poor fit: an exon
+                    // of a few bases costs more there than writing it as an insertion, so that
+                    // answer leaves a known micro-exon out)
                     let mut found = false;
                     for (min_hits, from_known) in [(2u32, false), (0, false), (0, true)] {
                         // the lone hits are tried when the junction is clearly bad, and also when
                         // the well-supported candidates gave an answer that is still a poor fit
                         // (a second exon may be missing in the same gap)
                         let lone_too = hard || (found && s.cost >= fine);
-                        if (from_known && (known.is_empty() || found))
+                        if (from_known && known.is_empty())
                             || (!from_known && wins.is_empty())
                             || (!from_known && min_hits == 2 && strong == 0)
                             || (!from_known && min_hits == 0 && (!lone_too || strong == wins.len()))
