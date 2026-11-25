@@ -254,6 +254,11 @@ impl Junctions {
         self.by_left.len()
     }
 
+    /// How many of the introns are shorter than `bases`.
+    pub fn shorter_than(&self, bases: u32) -> usize {
+        self.by_left.iter().filter(|&&(l, r)| r - l < bases).count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_left.is_empty()
     }

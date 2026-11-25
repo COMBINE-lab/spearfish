@@ -172,6 +172,8 @@ pub struct Stats {
     pub retried: u64,
     /// Spliced hits ranked above an unspliced rival of slightly higher score.
     pub spliced_preferred: u64,
+    /// Reads mapped with the higher seed cap for repeats.
+    pub repeat_reads: u64,
     /// Hits whose blocks had to be made consistent (a defect upstream when not zero).
     pub tidied: u64,
     /// Splice-site searches: tried, kept, genome bases scanned.
@@ -201,6 +203,7 @@ impl Stats {
         self.scored += o.scored;
         self.retried += o.retried;
         self.spliced_preferred += o.spliced_preferred;
+        self.repeat_reads += o.repeat_reads;
         self.tidied += o.tidied;
         self.site_tried += o.site_tried;
         self.site_kept += o.site_kept;
@@ -221,6 +224,9 @@ pub struct Mapper {
     /// Parts of the method that are switched off, for measuring what each contributes
     /// ([`ablation`]).
     ablate: u32,
+    /// Whether a skip under `MIN_INTRON_REPORTED` with intron ends is taken for an intron
+    /// when it is not a known one.
+    short_introns: bool,
 }
 
 /// Parts of the method that the environment variable `SPEARFISH_ABLATE` (names separated by
@@ -239,6 +245,8 @@ pub mod ablation {
     pub const COPY: u32 = 16;
     /// The seed table of pairs of level-2 cores.
     pub const PAIRS: u32 = 32;
+    /// What reads from repeats get: the higher seed cap, and loci weighed by distinct seeds.
+    pub const REPEATS: u32 = 64;
 
     pub(super) fn from_env() -> u32 {
         let Ok(v) = std::env::var("SPEARFISH_ABLATE") else {
@@ -252,7 +260,10 @@ pub mod ablation {
                 "ends" => ENDS,
                 "copy" => COPY,
                 "pairs" => PAIRS,
-                _ => panic!("SPEARFISH_ABLATE: unknown part `{name}` (l2, sites, scan, ends, copy, pairs)"),
+                "repeats" => REPEATS,
+                _ => panic!(
+                    "SPEARFISH_ABLATE: unknown part `{name}` (l2, sites, scan, ends, copy, pairs, repeats)"
+                ),
             }
         })
     }
@@ -786,6 +797,10 @@ unsafe fn scan_avx512(
 /// The most a read's usual junction cost per base (times 64) may raise the bar for a doubtful
 /// junction.
 const USUAL_CAP: u32 = 40;
+/// Seed cap for a read most of whose seeds are over the usual one, and the share of its seeds
+/// (numerator, denominator) that makes it such a read.
+const REPEAT_CAP: usize = 256;
+const REPEAT_SHARE: (usize, usize) = (1, 3);
 
 /// Short-word search of a gap: the longest intron searched, and the read bases the matches on
 /// one diagonal must cover.
@@ -1016,6 +1031,9 @@ const MIN_INTRON_OUT: u32 = 30;
 /// known intron (they are bases the read lacks). Until a hit is chosen they stay junctions,
 /// priced as such.
 const MIN_INTRON_REPORTED: u32 = 60;
+/// The share of an annotation's introns (numerator, denominator) under `MIN_INTRON_REPORTED`
+/// from which a skip that short, not among them, can be a new intron.
+const SHORT_INTRON_SHARE: (usize, usize) = (1, 100);
 
 /// Make blocks consistent for output: in genome order without overlap, each starting on the
 /// read where the previous one ends. Returns whether anything had to change.
@@ -1187,7 +1205,15 @@ fn windows_of(
 impl Mapper {
     pub fn new(index: std::sync::Arc<GenomeIndex>, opt: MapOptions) -> Self {
         let hpc = index.hpc();
+        // Whether introns under `MIN_INTRON_REPORTED` are common is a property of the genome:
+        // a sixth of the fly's are, and four in ten thousand of the human's. An annotation
+        // shows which kind of genome this is; without one, the ends of the skip decide alone.
+        let short_introns = index.junctions.as_ref().is_none_or(|j| {
+            SHORT_INTRON_SHARE.1 * j.shorter_than(MIN_INTRON_REPORTED)
+                >= SHORT_INTRON_SHARE.0 * j.len().max(1)
+        });
         Mapper {
+            short_introns,
             index,
             opt,
             seeder: BaseSeeder::new(L3_SPEC, hpc).expect("valid seed spec"),
@@ -1393,26 +1419,44 @@ impl Mapper {
         // Level-3 hits of both orientations first: which one the read maps in shows in them.
         let mut l3_hits: [Vec<Anchor>; 2] = [Vec::new(), Vec::new()];
         let mut found = [0usize; 2];
-        for o in 0..2 {
-            for s in &sc.l3[o] {
-                let (pos, len) = ix.occ(s.occ, false);
-                found[o] += !pos.is_empty() as usize;
-                if pos.is_empty() || pos.len() > cap {
-                    continue;
+        // A read from a repeat family with more copies than the cap on one strand and fewer on
+        // the other would keep its seeds only for the strand with fewer, and map there. When
+        // the cap takes a good share of the seeds an orientation has in the genome, the cap
+        // is raised for the read.
+        let mut cap = cap;
+        loop {
+            let mut repeat = false;
+            for o in 0..2 {
+                let mut over = 0usize;
+                found[o] = 0;
+                l3_hits[o].clear();
+                for s in &sc.l3[o] {
+                    let (pos, len) = ix.occ(s.occ, false);
+                    found[o] += !pos.is_empty() as usize;
+                    if pos.is_empty() || pos.len() > cap {
+                        over += !pos.is_empty() as usize;
+                        continue;
+                    }
+                    let w = (s.ql as u32).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
+                    for (&t, &tl) in pos.iter().zip(len) {
+                        l3_hits[o].push(Anchor {
+                            t,
+                            q: s.q,
+                            ql: s.ql,
+                            tl: tl as u16,
+                            q_in: s.q_in,
+                            q_out: s.q_out,
+                            w,
+                        });
+                    }
                 }
-                let w = (s.ql as u32).min(40) as f32 / (1.0 + (pos.len() as f32).ln());
-                for (&t, &tl) in pos.iter().zip(len) {
-                    l3_hits[o].push(Anchor {
-                        t,
-                        q: s.q,
-                        ql: s.ql,
-                        tl: tl as u16,
-                        q_in: s.q_in,
-                        q_out: s.q_out,
-                        w,
-                    });
-                }
+                repeat |= found[o] >= 3 && REPEAT_SHARE.1 * over >= REPEAT_SHARE.0 * found[o];
             }
+            if !repeat || cap >= REPEAT_CAP || self.off(ablation::REPEATS) {
+                break;
+            }
+            cap = REPEAT_CAP;
+            sc.stats.repeat_reads += 1;
         }
         for o in 0..2 {
             sc.hits.clear();
@@ -1455,12 +1499,25 @@ impl Mapper {
             }
             sc.had_hits = true;
             sort_hits(&mut sc.hits, &mut sc.hit_keys, &mut sc.hits_sorted);
-            // Loci: runs of hits no further apart than the longest intron.
+            // Loci: runs of hits no further apart than the longest intron. A locus weighs what
+            // its hits weigh, each seed of the read counted once: no chain uses a seed twice,
+            // and a stretch with several copies of a repeat would otherwise outweigh the one
+            // copy the read came from.
             let mut loci: Vec<(f32, usize, usize)> = Vec::new();
             let mut s = 0;
+            let mut seen = vec![0u32; n + 1];
+            let single = self.off(ablation::REPEATS);
             for i in 1..=sc.hits.len() {
                 if i == sc.hits.len() || sc.hits[i].t - sc.hits[i - 1].t > self.opt.max_intron {
-                    let w: f32 = sc.hits[s..i].iter().map(|a| a.w).sum();
+                    let id = loci.len() as u32 + 1;
+                    let mut w = 0.0;
+                    for a in &sc.hits[s..i] {
+                        let mark = &mut seen[a.q as usize];
+                        if *mark != id || single {
+                            *mark = id;
+                            w += a.w;
+                        }
+                    }
                     loci.push((w, s, i));
                     s = i;
                 }
@@ -1478,10 +1535,10 @@ impl Mapper {
             } else {
                 48
             };
-            // The heaviest `limit` loci among those within a quarter of the best, heaviest
+            // The heaviest `limit` loci among those of at least 0.4 of the best, heaviest
             // first (a read of chance hits has thousands of loci of one hit each: they are
             // not all sorted).
-            loci.retain(|l| l.0 >= 0.25 * best);
+            loci.retain(|l| l.0 >= 0.4 * best);
             if loci.len() > limit {
                 loci.select_nth_unstable_by(limit, |a, b| b.0.total_cmp(&a.0));
                 loci.truncate(limit);
@@ -1627,19 +1684,20 @@ impl Mapper {
         if let Some(h) = out.first_mut() {
             h.primary = true;
         }
-        // A skip under `MIN_INTRON_REPORTED` is a deletion unless its ends say otherwise: a
-        // known intron, or one of at least the chain's shortest intron with GT at one end and
-        // AG at the other on the hit's strand (either strand when the hit has none). Genomes
-        // with short introns need this: a sixth of the junctions in fly reads are under 60
-        // bases.
+        // A skip under `MIN_INTRON_REPORTED` is an intron or a deletion, and nothing in the
+        // read's bases tells them apart. What does: a known intron is one; otherwise how
+        // common such introns are in this genome (from the annotation, when there is one),
+        // and the skip's ends, GT or GC at one and AG at the other on the hit's strand
+        // (either strand when the hit has none). Genomes with short introns need this: a
+        // sixth of the junctions in fly reads are under 60 bases.
         let ix = &*self.index;
         let sited = |l: u32, r: u32, strand: u8| {
             ix.junctions.as_ref().is_some_and(|j| j.intron(l, r))
-                || r - l >= self.opt.min_intron
+                || self.short_introns
+                    && r - l >= self.opt.min_intron
                     && [false, true].into_iter().any(|minus| {
-                        (strand == b'.' || (strand == b'-') == minus)
-                            && donor_motif(ix, l, minus) <= FLANK
-                            && acceptor_motif(ix, r, minus) <= FLANK
+                        let (d, a) = (donor_motif(ix, l, minus), acceptor_motif(ix, r, minus));
+                        (strand == b'.' || (strand == b'-') == minus) && d.max(a) <= SEMI && d.min(a) <= FLANK
                     })
         };
         for h in out.iter_mut() {

@@ -28,8 +28,18 @@
   `SplicedAlignment` (exons, introns, strand, mapping quality, CIGAR).
 - **Short introns.** `map-spliced` reported every skip under 60 bases as a deletion, which is
   right for human and mouse reads and wrong for genomes with short introns such as
-  *Drosophila*. A skip of 40 to 59 bases is now reported as an intron when it is a known intron
-  or has GT and AG at its ends.
+  *Drosophila*. A skip of 40 to 59 bases is now reported as an intron when it is a known intron,
+  or when it has GT or GC at one end and AG at the other. With an annotation, the second case
+  applies only if at least 1% of the annotated introns are under 60 bases, so a genome whose
+  annotation has next to none keeps such skips as deletions.
+- **Reads from repeats.** `map-spliced` leaves out seeds with more than `--seed-cap` copies in
+  the genome. A read from a repeat family with more copies than that on one strand lost its
+  seeds there and was placed at a copy on the other strand. A read with a third or more of its
+  seeds over the cap is now mapped with a cap of 256. A candidate region is weighed by the
+  read's seeds that hit it, each counted once, so a region with several copies of a repeat no
+  longer outweighs the single copy the read came from. Regions are followed up when they weigh
+  at least 0.4 of the best one (it was a quarter), which saves time on reads with many weak
+  regions.
 - **Genome index builds in less memory.** `index --genome` held the genome unpacked and its
   seed tables several times over, and then the whole index again to write it. It now packs the
   genome as it reads it and builds in stages, one table at a time, each written to the output
