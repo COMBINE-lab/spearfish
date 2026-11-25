@@ -26,6 +26,10 @@
   by keyword, listed in `SPLICE_SETTINGS`; `map`,
   `map_batch`, and `map_file` straight to PAF, SAM or BAM), `SplicedRead` and
   `SplicedAlignment` (exons, introns, strand, mapping quality, CIGAR).
+- **Short introns.** `map-spliced` reported every skip under 60 bases as a deletion, which is
+  right for human and mouse reads and wrong for genomes with short introns such as
+  *Drosophila*. A skip of 40 to 59 bases is now reported as an intron when it is a known intron
+  or has GT and AG at its ends.
 - **Genome index builds in less memory.** `index --genome` held the genome unpacked and its
   seed tables several times over, and then the whole index again to write it. It now packs the
   genome as it reads it and builds in stages, one table at a time, each written to the output

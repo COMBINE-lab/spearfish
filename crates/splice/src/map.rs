@@ -1011,9 +1011,10 @@ const MICRO_EXON: u32 = 20;
 
 /// Reference skips shorter than this are written as deletions, not introns.
 const MIN_INTRON_OUT: u32 = 30;
-/// Skips shorter than this are reported as deletions in the end: among real reads' skips of
-/// 30 to 59 bases next to none is a known intron (they are bases the read lacks). Until a hit
-/// is chosen they stay junctions, priced as such.
+/// Skips shorter than this are reported as deletions in the end, unless their ends are those
+/// of an intron: among real human and mouse reads' skips of 30 to 59 bases next to none is a
+/// known intron (they are bases the read lacks). Until a hit is chosen they stay junctions,
+/// priced as such.
 const MIN_INTRON_REPORTED: u32 = 60;
 
 /// Make blocks consistent for output: in genome order without overlap, each starting on the
@@ -1626,10 +1627,26 @@ impl Mapper {
         if let Some(h) = out.first_mut() {
             h.primary = true;
         }
+        // A skip under `MIN_INTRON_REPORTED` is a deletion unless its ends say otherwise: a
+        // known intron, or one of at least the chain's shortest intron with GT at one end and
+        // AG at the other on the hit's strand (either strand when the hit has none). Genomes
+        // with short introns need this: a sixth of the junctions in fly reads are under 60
+        // bases.
+        let ix = &*self.index;
+        let sited = |l: u32, r: u32, strand: u8| {
+            ix.junctions.as_ref().is_some_and(|j| j.intron(l, r))
+                || r - l >= self.opt.min_intron
+                    && [false, true].into_iter().any(|minus| {
+                        (strand == b'.' || (strand == b'-') == minus)
+                            && donor_motif(ix, l, minus) <= FLANK
+                            && acceptor_motif(ix, r, minus) <= FLANK
+                    })
+        };
         for h in out.iter_mut() {
             let mut k = 1;
             while k < h.blocks.len() {
-                if h.blocks[k].ts < h.blocks[k - 1].te + MIN_INTRON_REPORTED {
+                let (l, r) = (h.blocks[k - 1].te, h.blocks[k].ts);
+                if r < l + MIN_INTRON_REPORTED && !sited(l, r, h.tx_strand) {
                     let b = h.blocks.remove(k);
                     h.blocks[k - 1].te = b.te;
                     h.blocks[k - 1].qe = b.qe;
