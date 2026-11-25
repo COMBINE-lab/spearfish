@@ -200,10 +200,26 @@ impl GenomeIndex {
             xxh3: provenance::file_xxh3(fasta).with_context(|| format!("reading {}", fasta.display()))?,
             command_line,
         };
-        let index = Self::build_from_fasta(fasta, opts)?;
-        let manifest = index.new_manifest(opts, input, t.elapsed().as_secs_f64());
-        let bytes = index.write(out, Some(&manifest))?;
-        Ok((index, bytes, manifest))
+        let o = BuildOptions {
+            max_occ: opts.max_occ,
+            hpc: opts.hpc,
+        };
+        // The index is written table by table as it is built, which takes much less memory
+        // than building it whole and writing it then.
+        let mut manifest = None;
+        let (inner, bytes) =
+            splice::index::GenomeIndex::build_to_file(open_text(fasta)?, &o, out, |names, offsets| {
+                let m = Self::manifest_of(names, offsets, opts, input, t.elapsed().as_secs_f64());
+                let json = serde_json::to_vec_pretty(&m)?;
+                manifest = Some(m);
+                Ok(Some(json))
+            })
+            .with_context(|| format!("building {} from {}", out.display(), fasta.display()))?;
+        let manifest = manifest.expect("made with the index");
+        let side = provenance::sidecar(out);
+        std::fs::write(&side, serde_json::to_vec_pretty(&manifest)?)
+            .with_context(|| format!("writing {}", side.display()))?;
+        Ok((Self::wrap(inner), bytes, manifest))
     }
 
     /// The manifest of this index as just built with `opts` from `input`.
@@ -213,10 +229,28 @@ impl GenomeIndex {
         input: GenomeInput,
         build_seconds: f64,
     ) -> GenomeManifest {
+        Self::manifest_of(
+            self.inner.names(),
+            self.inner.offsets(),
+            opts,
+            input,
+            build_seconds,
+        )
+    }
+
+    /// The manifest of an index of sequences `names` that start at `offsets` (the total
+    /// length last).
+    fn manifest_of(
+        names: &[String],
+        offsets: &[u32],
+        opts: &GenomeIndexOptions,
+        input: GenomeInput,
+        build_seconds: f64,
+    ) -> GenomeManifest {
         let mut h = xxhash_rust::xxh3::Xxh3::new();
-        for i in 0..self.n_sequences() {
-            h.update(self.seq_name(i as u32).as_bytes());
-            h.update(&self.seq_len(i as u32).to_le_bytes());
+        for (name, w) in names.iter().zip(offsets.windows(2)) {
+            h.update(name.as_bytes());
+            h.update(&(w[1] - w[0]).to_le_bytes());
         }
         h.update(input.xxh3.as_bytes());
         h.update(&opts.max_occ.to_le_bytes());
@@ -238,8 +272,8 @@ impl GenomeIndex {
             lcp_seed: format!("{:#x}", lcp_core::LcpConfig::default().seed),
             input: input.path,
             input_xxh3: input.xxh3,
-            sequences: self.n_sequences(),
-            bases: self.inner.total_len() as u64,
+            sequences: names.len(),
+            bases: offsets.last().copied().unwrap_or(0) as u64,
             build_seconds,
         }
     }

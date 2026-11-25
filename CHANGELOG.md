@@ -26,6 +26,13 @@
   by keyword, listed in `SPLICE_SETTINGS`; `map`,
   `map_batch`, and `map_file` straight to PAF, SAM or BAM), `SplicedRead` and
   `SplicedAlignment` (exons, introns, strand, mapping quality, CIGAR).
+- **Genome index builds in less memory.** `index --genome` held the genome unpacked and its
+  seed tables several times over, and then the whole index again to write it. It now packs the
+  genome as it reads it and builds in stages, one table at a time, each written to the output
+  file as soon as it is made. For a human genome the peak is about a quarter of what it was and
+  close to the size of the index, for a few seconds more build time. The index is the same,
+  section for section; the sections are in a different order in the file. In the library,
+  `GenomeIndex::build_to_file` builds this way, and building in memory needs more.
 - **Lower peak memory with many threads.** The command now starts mimalloc with three settings
   changed: arena memory is committed when it is first used and not ahead of it, freed pages go
   back to the system at once, and a page's memory is committed as the page fills. Peak memory

@@ -18,13 +18,18 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use index::store::{Store, Writer};
+use index::store::{FileWriter, SectionSink, Store, Writer};
 use rayon::prelude::*;
 use seeds::BaseSeeder;
 
 /// Sequence is seeded in chunks of this many bases, so that long chromosomes parse in
 /// parallel and in bounded memory. Cores that would straddle a chunk edge are lost.
 const CHUNK: usize = 8 << 20;
+
+/// Segments parsed at one time, at most. Parsing a segment of `CHUNK` bases holds about a third
+/// of a gigabyte, and parsing is a small part of the build, so more threads than this buy
+/// little time for much memory.
+const PARSE_THREADS: usize = 8;
 
 pub const L3_SPEC: &str = "lcp:K=3";
 pub const L2_SPEC: &str = "lcp:K=2";
@@ -98,81 +103,439 @@ pub fn code(b: u8) -> u8 {
     }
 }
 
-fn read_fasta(input: impl BufRead) -> Result<(Vec<u8>, Vec<String>, Vec<u32>)> {
-    let mut seq = Vec::new();
-    let mut names: Vec<String> = Vec::new();
-    let mut offsets = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for line in input.lines() {
-        let line = line?;
-        if let Some(h) = line.strip_prefix('>') {
-            let name = h.split_whitespace().next().unwrap_or("").to_string();
-            ensure!(!name.is_empty(), "sequence {} has no name", names.len() + 1);
-            ensure!(seen.insert(name.clone()), "two sequences are named {name}");
-            names.push(name);
-            offsets.push(seq.len() as u32);
-        } else {
+/// The genome as it is read: packed sequence, sequence names and starts, runs of other
+/// symbols. The sequence is never held unpacked; a FASTA file is packed block by block.
+struct Packed {
+    words: Vec<u64>,
+    names: Vec<String>,
+    /// Start of each sequence, plus the total length.
+    offsets: Vec<u32>,
+    /// `[start, end)` of each maximal run of symbols other than A, C, G, T, flattened.
+    n_runs: Vec<u32>,
+}
+
+/// Bases packed in one step while reading (a multiple of 32).
+const BLOCK: usize = 1 << 26;
+
+impl Packed {
+    /// Pack `block`, whose first base is at `at` (a multiple of 32), and note its runs of
+    /// other symbols.
+    fn push_block(&mut self, at: usize, block: &[u8]) {
+        const PIECE: usize = 1 << 16;
+        let parts: Vec<(Vec<u64>, Vec<u32>)> = block
+            .par_chunks(PIECE)
+            .enumerate()
+            .map(|(k, piece)| {
+                let lo = at + k * PIECE;
+                let mut runs = Vec::new();
+                let words = piece
+                    .chunks(32)
+                    .enumerate()
+                    .map(|(w, bases)| {
+                        let mut x = 0u64;
+                        for (i, &b) in bases.iter().enumerate() {
+                            let p = lo + w * 32 + i;
+                            // A symbol other than A, C, G, T must not look like any base: it
+                            // is stored as a base that depends on its position, so that a
+                            // run of N matches nothing (a read's poly(A) tail would otherwise
+                            // match an N spacer stored as A).
+                            let c = match code(b) {
+                                c @ 0..=3 => c as u64,
+                                _ => {
+                                    match runs.last_mut() {
+                                        Some(end) if *end == p as u32 => *end += 1,
+                                        _ => runs.extend([p as u32, p as u32 + 1]),
+                                    }
+                                    (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 62
+                                }
+                            };
+                            x |= c << (2 * i);
+                        }
+                        x
+                    })
+                    .collect();
+                (words, runs)
+            })
+            .collect();
+        for (words, runs) in parts {
+            self.words.extend(words);
+            let mut runs = &runs[..];
+            // A run that continues the last one of the piece before.
+            if let (Some(end), Some(&start)) = (self.n_runs.last_mut(), runs.first())
+                && *end == start
+            {
+                *end = runs[1];
+                runs = &runs[2..];
+            }
+            self.n_runs.extend(runs);
+        }
+    }
+
+    fn read(mut input: impl BufRead) -> Result<Packed> {
+        let mut g = Packed {
+            words: Vec::new(),
+            names: Vec::new(),
+            offsets: Vec::new(),
+            n_runs: Vec::new(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        // Bases read and not yet packed, and the number packed.
+        let (mut block, mut done) = (Vec::with_capacity(BLOCK + (1 << 16)), 0usize);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if input.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let text = line.trim_ascii_end();
+            if let Some(h) = text.strip_prefix(b">") {
+                let h = std::str::from_utf8(h).context("a sequence name is not valid UTF-8")?;
+                let name = h.split_whitespace().next().unwrap_or("").to_string();
+                ensure!(!name.is_empty(), "sequence {} has no name", g.names.len() + 1);
+                ensure!(seen.insert(name.clone()), "two sequences are named {name}");
+                g.names.push(name);
+                g.offsets.push((done + block.len()) as u32);
+            } else {
+                ensure!(
+                    !g.names.is_empty() || text.is_empty(),
+                    "not a FASTA file: sequence before the first `>` line"
+                );
+                block.extend_from_slice(text);
+            }
             ensure!(
-                !names.is_empty() || line.trim().is_empty(),
-                "not a FASTA file: sequence before the first `>` line"
+                done + block.len() < u32::MAX as usize,
+                "reference longer than 4.29 Gbp is not supported yet"
             );
-            seq.extend(line.trim_end().bytes().map(|b| b.to_ascii_uppercase()));
-        }
-        ensure!(
-            seq.len() < u32::MAX as usize,
-            "reference longer than 4.29 Gbp is not supported yet"
-        );
-    }
-    ensure!(!names.is_empty(), "no sequences in the FASTA input");
-    offsets.push(seq.len() as u32);
-    Ok((seq, names, offsets))
-}
-
-/// Maximal ACGT stretches, cut into chunks of at most `CHUNK` bases.
-fn segments(seq: &[u8], offsets: &[u32]) -> Vec<(usize, usize)> {
-    let mut v = Vec::new();
-    for w in offsets.windows(2) {
-        let (mut i, end) = (w[0] as usize, w[1] as usize);
-        while i < end {
-            if code(seq[i]) > 3 {
-                i += 1;
-                continue;
-            }
-            let s = i;
-            while i < end && code(seq[i]) <= 3 {
-                i += 1;
-            }
-            let mut a = s;
-            while a < i {
-                let b = (a + CHUNK).min(i);
-                v.push((a, b));
-                a = b;
+            if block.len() >= BLOCK {
+                let full = block.len() & !31;
+                g.push_block(done, &block[..full]);
+                block.drain(..full);
+                done += full;
             }
         }
+        ensure!(!g.names.is_empty(), "no sequences in the FASTA input");
+        g.push_block(done, &block);
+        let total = done + block.len();
+        g.offsets.push(total as u32);
+        g.words.resize(total.div_ceil(32) + 1, 0);
+        Ok(g)
     }
-    v
+
+    /// Maximal ACGT stretches of each sequence, cut into chunks of at most `CHUNK` bases.
+    fn segments(&self) -> Vec<(usize, usize)> {
+        let mut v = Vec::new();
+        let mut runs = self.n_runs.chunks(2).peekable();
+        for w in self.offsets.windows(2) {
+            let (mut i, end) = (w[0] as usize, w[1] as usize);
+            while i < end {
+                // The run of other symbols at or after `i`, if it starts in this sequence.
+                while runs.peek().is_some_and(|r| r[1] as usize <= i) {
+                    runs.next();
+                }
+                let (rs, re) = runs.peek().map_or((end, end), |r| (r[0] as usize, r[1] as usize));
+                let stop = rs.clamp(i, end);
+                let mut a = i;
+                while a < stop {
+                    let b = (a + CHUNK).min(stop);
+                    v.push((a, b));
+                    a = b;
+                }
+                i = if rs < end { re.min(end).max(stop) } else { end };
+            }
+        }
+        v
+    }
+
+    /// Bases `[a, b)` as letters.
+    fn bases(&self, a: usize, b: usize) -> Vec<u8> {
+        (a..b)
+            .map(|p| b"ACGT"[((self.words[p / 32] >> (2 * (p % 32))) & 3) as usize])
+            .collect()
+    }
 }
 
-/// (label, raw start, raw length) of the top-level cores of every segment.
-fn seed_all(seq: &[u8], segs: &[(usize, usize)], spec: &str, hpc: bool) -> Vec<(u64, u32, u32)> {
-    let seeder = BaseSeeder::new(spec, hpc).expect("valid seed spec");
-    segs.par_iter()
-        .flat_map_iter(|&(a, b)| match seeder.parsed(&seq[a..b]) {
-            Some(h) => seeder
-                .seed_parsed(&h.seq)
-                .into_iter()
-                .map(|s| {
-                    let (rs, re) = h.to_raw(s.start, s.end);
-                    (s.label, a as u32 + rs, re - rs)
+/// A seed occurrence in a table: (label, raw start, raw length up to 255).
+type Entry = (u64, u32, u8);
+
+/// The cores of `spec` in bases `[a, b)` of the genome as (label, raw start, raw length), in
+/// genome order.
+fn cores(seeder: &BaseSeeder, g: &Packed, a: usize, b: usize, mut each: impl FnMut(u64, u32, u32)) {
+    let bases = g.bases(a, b);
+    let h = seeder.parsed(&bases);
+    let parsed: &[u8] = h.as_ref().map_or(&bases, |h| &h.seq);
+    for s in seeder.seed_parsed(parsed) {
+        let (rs, re) = h.as_ref().map_or((s.start, s.end), |h| h.to_raw(s.start, s.end));
+        each(s.label, a as u32 + rs, re - rs);
+    }
+}
+
+/// Run `work` on every segment and hand the results to `sink` in genome order.
+///
+/// Segments are parsed a batch at a time into buffers that are reused, on at most
+/// [`PARSE_THREADS`] threads of their own, so the memory held besides what `sink` keeps is that
+/// of one batch and of those threads' parse buffers, which end with the threads.
+fn each_segment<B: Default + Send>(
+    segs: &[(usize, usize)],
+    work: impl Fn(usize, usize, &mut B) + Sync,
+    mut sink: impl FnMut(&B),
+) {
+    let threads = PARSE_THREADS.min(rayon::current_num_threads().max(1));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("thread pool");
+    let mut bufs: Vec<B> = Vec::new();
+    for batch in segs.chunks(threads) {
+        bufs.resize_with(bufs.len().max(batch.len()), B::default);
+        pool.install(|| {
+            bufs.par_iter_mut()
+                .zip(batch)
+                .for_each(|(buf, &(a, b))| work(a, b, buf))
+        });
+        bufs[..batch.len()].iter().for_each(&mut sink);
+    }
+}
+
+/// What the level-2 pass makes of one segment.
+#[derive(Default)]
+struct Level2 {
+    pos: Vec<u32>,
+    /// Labels folded to 16 bits.
+    folded: Vec<u16>,
+    /// The labels, and the distinct ones in order if they are few, while ranks may be wanted.
+    labels: Vec<u64>,
+    distinct: Option<Vec<u64>>,
+    /// Pairs of consecutive cores within the segment.
+    pairs: Vec<Entry>,
+    /// The first core (label, start, length) and the last (label, start).
+    first: Option<(u64, u32, u32)>,
+    last: Option<(u64, u32)>,
+}
+
+/// The fallback seed of two consecutive level-2 cores, if it is one that is kept.
+#[inline]
+fn pair_entry(l0: u64, p0: u32, l1: u64, p1: u32, len1: u32) -> Option<Entry> {
+    let l = pair_label(l0, l1);
+    (p1 - p0 < 64 && keep_pair(l)).then(|| (l, p0, (p1 + len1 - p0).min(255) as u8))
+}
+
+/// `x` and `y` (sorted, distinct) merged, unless that is more than `limit` values.
+fn merge_up_to(x: &[u64], y: &[u64], limit: usize) -> Option<Vec<u64>> {
+    let mut v = Vec::with_capacity(x.len() + y.len());
+    let (mut i, mut j) = (0, 0);
+    while i < x.len() || j < y.len() {
+        let l = if j == y.len() || (i < x.len() && x[i] <= y[j]) {
+            x[i]
+        } else {
+            y[j]
+        };
+        i += (i < x.len() && x[i] == l) as usize;
+        j += (j < y.len() && y[j] == l) as usize;
+        v.push(l);
+    }
+    (v.len() <= limit).then_some(v)
+}
+
+/// Write the label table of `entries` (sorted) as sections `<prefix>_labels`, `_dir`,
+/// `_occ_off`, `_pos` and `_len`, leaving out labels with more than `max_occ` occurrences.
+/// Returns the directory's bits and the number of occurrences left out.
+fn put_table(
+    sink: &mut impl SectionSink,
+    prefix: &str,
+    mut entries: Vec<Entry>,
+    max_occ: u32,
+) -> Result<(u32, u64)> {
+    let mut labels: Vec<u64> = Vec::new();
+    let mut occ_off: Vec<u32> = vec![0];
+    // Kept occurrences are moved to the front, so the table needs no second copy of them.
+    let (mut kept, mut i) = (0, 0);
+    while i < entries.len() {
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].0 == entries[i].0 {
+            j += 1;
+        }
+        if j - i <= max_occ as usize {
+            labels.push(entries[i].0);
+            entries.copy_within(i..j, kept);
+            kept += j - i;
+            occ_off.push(kept as u32);
+        }
+        i = j;
+    }
+    let dropped = (entries.len() - kept) as u64;
+    entries.truncate(kept);
+    let bits = (labels.len().max(2).ilog2()).clamp(1, 28);
+    let mut dir = vec![0u32; (1usize << bits) + 1];
+    for &l in &labels {
+        dir[(l >> (64 - bits)) as usize + 1] += 1;
+    }
+    for b in 1..dir.len() {
+        dir[b] += dir[b - 1];
+    }
+    sink.put(&format!("{prefix}_labels"), labels)?;
+    sink.put(&format!("{prefix}_dir"), dir)?;
+    sink.put(&format!("{prefix}_occ_off"), occ_off)?;
+    sink.put(
+        &format!("{prefix}_pos"),
+        entries.par_iter().map(|x| x.1).collect::<Vec<u32>>(),
+    )?;
+    sink.put(
+        &format!("{prefix}_len"),
+        entries.par_iter().map(|x| x.2).collect::<Vec<u8>>(),
+    )?;
+    Ok((bits, dropped))
+}
+
+/// Sections of a genome index, besides a manifest.
+const SECTIONS: usize = 18;
+
+/// Build the index of `fasta` into `sink`; returns the sequence names and their starts (with
+/// the total length last).
+///
+/// The build is in stages, each of which hands its finished tables to `sink` before the next
+/// begins: the packed genome is read, then parsed once for the level-3 table and once more for
+/// the level-2 table and the table of pairs. With a sink that writes sections out, the most
+/// held at one time is the packed genome, one stage's table as it is sorted, and the parse
+/// buffers.
+fn build_into(
+    fasta: impl BufRead,
+    opt: &BuildOptions,
+    sink: &mut impl SectionSink,
+) -> Result<(Vec<String>, Vec<u32>)> {
+    let g = Packed::read(fasta)?;
+    let segs = g.segments();
+    let total = *g.offsets.last().unwrap() as usize;
+    let l3_seeder = BaseSeeder::new(L3_SPEC, opt.hpc).expect("valid seed spec");
+    let l2_seeder = BaseSeeder::new(L2_SPEC, opt.hpc).expect("valid seed spec");
+
+    // Level 3: sorted by (label, position); frequent labels dropped. The space reserved here
+    // and below is an estimate from the human genome (0.08 level-3 cores, 0.18 level-2 cores
+    // and 0.09 pairs per base without compression); it is not touched until it is used.
+    let mut l3: Vec<Entry> = Vec::with_capacity(total / 8);
+    each_segment(
+        &segs,
+        |a, b, buf: &mut Vec<Entry>| {
+            buf.clear();
+            cores(&l3_seeder, &g, a, b, |l, p, n| buf.push((l, p, n.min(255) as u8)));
+        },
+        |buf| l3.extend_from_slice(buf),
+    );
+    l3.par_sort_unstable();
+    let (dir_bits, dropped) = put_table(sink, "g3", l3, opt.max_occ)?;
+
+    // Level 2 in genome order: positions and 16-bit ids. Ids are ranks when the labels fit
+    // 16 bits (they do for small genomes); otherwise a 16-bit fold of the label, whose
+    // collisions only add chance hits that the gap solver discards. The labels themselves are
+    // kept only while ranks are still possible.
+    //
+    // The same pass makes the fallback seeds for reads that level 3 anchors weakly: pairs of
+    // consecutive level-2 cores (every other pair, chosen by label), as a label table like
+    // level 3's.
+    let limit = u16::MAX as usize;
+    let few = std::sync::atomic::AtomicBool::new(true);
+    let (mut l2_pos, mut l2_id) = (
+        Vec::<u32>::with_capacity(total / 4),
+        Vec::<u16>::with_capacity(total / 4),
+    );
+    let mut pairs: Vec<Entry> = Vec::with_capacity(total / 8);
+    let mut ranks: Option<(Vec<u64>, Vec<u64>)> = Some((Vec::new(), Vec::new()));
+    let mut prev: Option<(u64, u32)> = None;
+    each_segment(
+        &segs,
+        |a, b, s: &mut Level2| {
+            let few = few.load(std::sync::atomic::Ordering::Relaxed);
+            let (mut labels, mut lens) = (std::mem::take(&mut s.labels), Vec::new());
+            labels.clear();
+            s.pos.clear();
+            cores(&l2_seeder, &g, a, b, |l, p, n| {
+                labels.push(l);
+                s.pos.push(p);
+                lens.push(n);
+            });
+            assert!(s.pos.is_sorted(), "level-2 cores are not in genome order");
+            s.folded.clear();
+            s.folded.extend(labels.iter().map(|&l| fold16(l)));
+            s.pairs.clear();
+            s.pairs.extend(
+                (1..labels.len())
+                    .filter_map(|i| pair_entry(labels[i - 1], s.pos[i - 1], labels[i], s.pos[i], lens[i])),
+            );
+            s.first = labels.first().map(|&l| (l, s.pos[0], lens[0]));
+            s.last = labels.last().map(|&l| (l, *s.pos.last().unwrap()));
+            s.distinct = few
+                .then(|| {
+                    let mut d = labels.clone();
+                    d.sort_unstable();
+                    d.dedup();
+                    (d.len() <= limit).then_some(d)
                 })
-                .collect::<Vec<_>>(),
-            None => seeder
-                .seed_parsed(&seq[a..b])
-                .into_iter()
-                .map(|s| (s.label, a as u32 + s.start, s.end - s.start))
-                .collect::<Vec<_>>(),
-        })
-        .collect()
+                .flatten();
+            s.labels = labels;
+        },
+        |s| {
+            if let Some((l, p, n)) = s.first {
+                if let Some((l0, p0)) = prev {
+                    assert!(p0 <= p, "level-2 cores are not in genome order");
+                    pairs.extend(pair_entry(l0, p0, l, p, n));
+                }
+                prev = s.last;
+            }
+            l2_pos.extend_from_slice(&s.pos);
+            l2_id.extend_from_slice(&s.folded);
+            pairs.extend_from_slice(&s.pairs);
+            ranks = ranks.take().and_then(|(mut all, distinct)| {
+                let distinct = merge_up_to(&distinct, s.distinct.as_ref()?, limit)?;
+                all.extend_from_slice(&s.labels);
+                Some((all, distinct))
+            });
+            if ranks.is_none() {
+                few.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+    );
+    let ranked = ranks.is_some();
+    let l2_labels = match ranks {
+        Some((all, distinct)) => {
+            l2_id = all
+                .par_iter()
+                .map(|l| distinct.binary_search(l).unwrap() as u16)
+                .collect();
+            distinct
+        }
+        None => Vec::new(),
+    };
+    let Packed {
+        words,
+        names,
+        offsets,
+        n_runs,
+    } = g;
+    sink.put("g_seq", words)?;
+    sink.put("g2_labels", l2_labels)?;
+    sink.put("g2_pos", l2_pos)?;
+    sink.put("g2_id", l2_id)?;
+    pairs.par_sort_unstable();
+    // No label of a pair is left out for being frequent without a count: `dropped` is level 3's.
+    let (p_bits, _) = put_table(sink, "gp", pairs, opt.max_occ)?;
+
+    let mut name_bytes = Vec::new();
+    for n in &names {
+        name_bytes.extend_from_slice(n.as_bytes());
+        name_bytes.push(b'\n');
+    }
+    let meta = vec![
+        dir_bits as u64,
+        opt.max_occ as u64,
+        dropped,
+        opt.hpc as u64,
+        ranked as u64,
+        p_bits as u64,
+    ];
+    sink.put("g_meta", meta)?;
+    sink.put("g_names", name_bytes)?;
+    sink.put("g_offsets", offsets.clone())?;
+    sink.put("g_n_runs", n_runs)?;
+    Ok((names, offsets))
 }
 
 /// The label of two consecutive level-2 cores taken as one seed.
@@ -194,181 +557,40 @@ fn fold16(l: u64) -> u16 {
 }
 
 impl GenomeIndex {
-    /// Build from a FASTA file (plain text; see [`GenomeIndex::build_from_reader`] for any
-    /// other source).
+    /// Build in memory from a FASTA file (plain text; see [`GenomeIndex::build_from_reader`]
+    /// for any other source). [`GenomeIndex::build_to_file`] needs much less memory.
     pub fn build(fasta: &Path, opt: &BuildOptions) -> Result<GenomeIndex> {
         let f = File::open(fasta).with_context(|| format!("opening {}", fasta.display()))?;
         Self::build_from_reader(BufReader::with_capacity(1 << 24, f), opt)
             .with_context(|| format!("reading {}", fasta.display()))
     }
 
-    /// Build from FASTA text. Sequence names are the header up to the first white space.
+    /// Build in memory from FASTA text. Sequence names are the header up to the first white
+    /// space.
     pub fn build_from_reader(fasta: impl BufRead, opt: &BuildOptions) -> Result<GenomeIndex> {
-        let (seq, names, offsets) = read_fasta(fasta)?;
-        let segs = segments(&seq, &offsets);
-
-        // Packed sequence and the runs of other symbols.
-        let mut words = vec![0u64; seq.len().div_ceil(32) + 1];
-        words.par_iter_mut().enumerate().for_each(|(w, out)| {
-            let lo = w * 32;
-            let hi = (lo + 32).min(seq.len());
-            let mut x = 0u64;
-            for (k, &b) in seq[lo.min(hi)..hi].iter().enumerate() {
-                // A symbol other than A, C, G, T must not look like any base: it is stored as
-                // a base that depends on its position, so that a run of N matches nothing
-                // (a read's poly(A) tail would otherwise match an N spacer stored as A).
-                let c = match code(b) {
-                    c @ 0..=3 => c as u64,
-                    _ => ((lo + k) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 62,
-                };
-                x |= c << (2 * k);
-            }
-            *out = x;
-        });
-        let mut n_runs: Vec<u32> = Vec::new();
-        let mut i = 0;
-        while i < seq.len() {
-            if code(seq[i]) > 3 {
-                let s = i;
-                while i < seq.len() && code(seq[i]) > 3 {
-                    i += 1;
-                }
-                n_runs.extend([s as u32, i as u32]);
-            } else {
-                i += 1;
-            }
-        }
-
-        // Level 3: sorted by (label, position); frequent labels dropped.
-        let mut l3 = seed_all(&seq, &segs, L3_SPEC, opt.hpc);
-        l3.par_sort_unstable();
-        let mut labels: Vec<u64> = Vec::new();
-        let mut occ_off: Vec<u32> = vec![0];
-        let mut pos: Vec<u32> = Vec::with_capacity(l3.len());
-        let mut len: Vec<u8> = Vec::with_capacity(l3.len());
-        let mut dropped = 0u64;
-        let mut i = 0;
-        while i < l3.len() {
-            let mut j = i + 1;
-            while j < l3.len() && l3[j].0 == l3[i].0 {
-                j += 1;
-            }
-            if j - i <= opt.max_occ as usize {
-                labels.push(l3[i].0);
-                pos.extend(l3[i..j].iter().map(|x| x.1));
-                len.extend(l3[i..j].iter().map(|x| x.2.min(255) as u8));
-                occ_off.push(pos.len() as u32);
-            } else {
-                dropped += (j - i) as u64;
-            }
-            i = j;
-        }
-        drop(l3);
-        let dir_bits = (labels.len().max(2).ilog2()).clamp(1, 28);
-        let mut dir = vec![0u32; (1usize << dir_bits) + 1];
-        for &l in &labels {
-            dir[(l >> (64 - dir_bits)) as usize + 1] += 1;
-        }
-        for b in 1..dir.len() {
-            dir[b] += dir[b - 1];
-        }
-
-        // Level 2 in genome order.
-        let mut l2 = seed_all(&seq, &segs, L2_SPEC, opt.hpc);
-        let mut l2_labels: Vec<u64> = l2.par_iter().map(|x| x.0).collect();
-        l2_labels.par_sort_unstable();
-        l2_labels.dedup();
-        // Ids are ranks when the labels fit 16 bits (they do with compression: about 21,000
-        // on the human genome); otherwise a 16-bit fold of the label, whose collisions only
-        // add chance hits that the gap solver discards.
-        let ranked = l2_labels.len() <= u16::MAX as usize;
-        l2.par_sort_unstable_by_key(|x| x.1);
-        let l2_pos: Vec<u32> = l2.par_iter().map(|x| x.1).collect();
-        let l2_id: Vec<u16> = l2
-            .par_iter()
-            .map(|x| {
-                if ranked {
-                    l2_labels.binary_search(&x.0).unwrap() as u16
-                } else {
-                    fold16(x.0)
-                }
-            })
-            .collect();
-        if !ranked {
-            l2_labels.clear();
-        }
-        // Fallback seeds for reads that level 3 anchors weakly: pairs of consecutive level-2
-        // cores (every other pair, chosen by label), as a label table like level 3's.
-        let mut pairs: Vec<(u64, u32, u8)> = l2
-            .par_windows(2)
-            .filter_map(|w| {
-                let l = pair_label(w[0].0, w[1].0);
-                (w[1].1 - w[0].1 < 64 && keep_pair(l))
-                    .then(|| (l, w[0].1, (w[1].1 + w[1].2 - w[0].1).min(255) as u8))
-            })
-            .collect();
-        pairs.par_sort_unstable();
-        let (mut p_labels, mut p_occ_off, mut p_pos, mut p_len) =
-            (Vec::new(), vec![0u32], Vec::new(), Vec::new());
-        let mut i = 0;
-        while i < pairs.len() {
-            let mut j = i + 1;
-            while j < pairs.len() && pairs[j].0 == pairs[i].0 {
-                j += 1;
-            }
-            if j - i <= opt.max_occ as usize {
-                p_labels.push(pairs[i].0);
-                p_pos.extend(pairs[i..j].iter().map(|x| x.1));
-                p_len.extend(pairs[i..j].iter().map(|x| x.2));
-                p_occ_off.push(p_pos.len() as u32);
-            }
-            i = j;
-        }
-        drop(pairs);
-        let p_bits = (p_labels.len().max(2).ilog2()).clamp(1, 28);
-        let mut p_dir = vec![0u32; (1usize << p_bits) + 1];
-        for &l in &p_labels {
-            p_dir[(l >> (64 - p_bits)) as usize + 1] += 1;
-        }
-        for b in 1..p_dir.len() {
-            p_dir[b] += p_dir[b - 1];
-        }
-        drop(l2);
-        drop(seq);
-
-        let mut name_bytes = Vec::new();
-        for n in &names {
-            name_bytes.extend_from_slice(n.as_bytes());
-            name_bytes.push(b'\n');
-        }
-        let meta = vec![
-            dir_bits as u64,
-            opt.max_occ as u64,
-            dropped,
-            opt.hpc as u64,
-            ranked as u64,
-            p_bits as u64,
-        ];
         let mut w = Writer::default();
-        w.add_owned("g_meta", meta);
-        w.add_owned("g_names", name_bytes);
-        w.add_owned("g_offsets", offsets);
-        w.add_owned("g_seq", words);
-        w.add_owned("g_n_runs", n_runs);
-        w.add_owned("g3_labels", labels);
-        w.add_owned("g3_dir", dir);
-        w.add_owned("g3_occ_off", occ_off);
-        w.add_owned("g3_pos", pos);
-        w.add_owned("g3_len", len);
-        w.add_owned("g2_labels", l2_labels);
-        w.add_owned("g2_pos", l2_pos);
-        w.add_owned("g2_id", l2_id);
-        w.add_owned("gp_labels", p_labels);
-        w.add_owned("gp_dir", p_dir);
-        w.add_owned("gp_occ_off", p_occ_off);
-        w.add_owned("gp_pos", p_pos);
-        w.add_owned("gp_len", p_len);
-        Self::from_store(Store::from_bytes(&w.to_bytes())?)
+        build_into(fasta, opt, &mut w)?;
+        Self::from_store(w.into_store()?)
+    }
+
+    /// Build from FASTA text straight into the file `path`, and open it. Each table is written
+    /// as soon as it is made, so the build holds little more than the largest of them.
+    ///
+    /// `manifest` is given the sequence names and their starts (with the total length last)
+    /// once the index is made, and returns the record to store in it, if any.
+    pub fn build_to_file(
+        fasta: impl BufRead,
+        opt: &BuildOptions,
+        path: &Path,
+        manifest: impl FnOnce(&[String], &[u32]) -> Result<Option<Vec<u8>>>,
+    ) -> Result<(GenomeIndex, u64)> {
+        let mut w = FileWriter::create(path, SECTIONS + 1)?;
+        let (names, offsets) = build_into(fasta, opt, &mut w)?;
+        if let Some(m) = manifest(&names, &offsets)? {
+            w.put("g_manifest", m)?;
+        }
+        let bytes = w.finish()?;
+        Ok((Self::open(path)?, bytes))
     }
 
     pub fn open(path: &Path) -> Result<GenomeIndex> {
@@ -758,4 +980,107 @@ fn prefetch<T>(p: *const T) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = p;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A FASTA text of three sequences with runs of N at the places that matter: across the
+    /// end of a sequence, across the pieces packed in parallel, and at both ends.
+    fn fasta() -> (String, Vec<u8>, Vec<u32>) {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut base = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b"ACGTacgt"[(x % 8) as usize]
+        };
+        let mut seqs: Vec<Vec<u8>> = [150_000usize, 70_000, 33]
+            .iter()
+            .map(|&n| (0..n).map(|_| base()).collect())
+            .collect();
+        for (s, range) in [
+            (0, 0..40),
+            (0, 65_530..65_545),
+            (0, 149_990..150_000),
+            (1, 0..7),
+            (1, 500..501),
+            (2, 30..33),
+        ] {
+            seqs[s][range].fill(b'N');
+        }
+        let (mut text, mut all, mut offsets) = (String::new(), Vec::new(), vec![0u32]);
+        for (i, s) in seqs.iter().enumerate() {
+            text += &format!(">s{i} description\n");
+            for line in s.chunks(61) {
+                text += std::str::from_utf8(line).unwrap();
+                text += "\r\n";
+            }
+            all.extend_from_slice(s);
+            offsets.push(all.len() as u32);
+        }
+        (text, all, offsets)
+    }
+
+    #[test]
+    fn packed_genome() {
+        let (text, all, offsets) = fasta();
+        let g = Packed::read(text.as_bytes()).unwrap();
+        assert_eq!(g.names, ["s0", "s1", "s2"]);
+        assert_eq!(g.offsets, offsets);
+        assert_eq!(g.words.len(), all.len().div_ceil(32) + 1);
+        // Runs of N, found one symbol at a time; a run goes on across the end of a sequence.
+        let (mut runs, mut segs) = (Vec::new(), Vec::new());
+        for (p, &b) in all.iter().enumerate() {
+            let p = p as u32;
+            if code(b) > 3 {
+                match runs.last_mut() {
+                    Some(end) if *end == p => *end += 1,
+                    _ => runs.extend([p, p + 1]),
+                }
+            } else {
+                assert_eq!(g.bases(p as usize, p as usize + 1), [b.to_ascii_uppercase()]);
+                match segs.last_mut() {
+                    Some((_, end)) if *end == p as usize && !offsets.contains(&p) => *end += 1,
+                    _ => segs.push((p as usize, p as usize + 1)),
+                }
+            }
+        }
+        assert_eq!(g.n_runs, runs);
+        assert_eq!(g.segments(), segs);
+    }
+
+    #[test]
+    fn file_build_is_the_memory_build() {
+        let (text, ..) = fasta();
+        let dir = std::env::temp_dir().join(format!("spearfish-gidx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for hpc in [false, true] {
+            let opt = BuildOptions { max_occ: 1000, hpc };
+            let mem = GenomeIndex::build_from_reader(text.as_bytes(), &opt).unwrap();
+            let path = dir.join("g.gidx");
+            let (file, bytes) = GenomeIndex::build_to_file(text.as_bytes(), &opt, &path, |names, _| {
+                Ok(Some(names.join(",").into_bytes()))
+            })
+            .unwrap();
+            assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+            assert_eq!(file.manifest(), Some(&b"s0,s1,s2"[..]));
+            assert_eq!(mem.manifest(), None);
+            let mut sizes = file.store.sizes();
+            sizes.retain(|(name, _)| name != "g_manifest");
+            sizes.sort();
+            let mut other = mem.store.sizes();
+            other.sort();
+            assert_eq!(sizes, other);
+            for (name, _) in &sizes {
+                assert_eq!(
+                    file.store.get::<u8>(name).unwrap(),
+                    mem.store.get::<u8>(name).unwrap(),
+                    "{name}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
