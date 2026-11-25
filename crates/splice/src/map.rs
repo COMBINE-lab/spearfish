@@ -218,6 +218,44 @@ pub struct Mapper {
     pub opt: MapOptions,
     seeder: BaseSeeder,
     seeder2: BaseSeeder,
+    /// Parts of the method that are switched off, for measuring what each contributes
+    /// ([`ablation`]).
+    ablate: u32,
+}
+
+/// Parts of the method that the environment variable `SPEARFISH_ABLATE` (names separated by
+/// commas) switches off, for experiments that measure what each part contributes. Nothing
+/// else reads it, and results with it set are not those of the mapper.
+pub mod ablation {
+    /// The positional level-2 table: seed hits between two anchors and past a read end.
+    pub const L2: u32 = 1;
+    /// Exons sought between a pair of splice sites, without a seed.
+    pub const SITES: u32 = 2;
+    /// Short words and the approximate scan.
+    pub const SCAN: u32 = 4;
+    /// Junctions past the outermost anchor of a read.
+    pub const ENDS: u32 = 8;
+    /// The preference for a spliced hit over an unspliced rival of slightly higher score.
+    pub const COPY: u32 = 16;
+    /// The seed table of pairs of level-2 cores.
+    pub const PAIRS: u32 = 32;
+
+    pub(super) fn from_env() -> u32 {
+        let Ok(v) = std::env::var("SPEARFISH_ABLATE") else {
+            return 0;
+        };
+        v.split(',').filter(|x| !x.is_empty()).fold(0, |m, name| {
+            m | match name {
+                "l2" => L2,
+                "sites" => SITES,
+                "scan" => SCAN,
+                "ends" => ENDS,
+                "copy" => COPY,
+                "pairs" => PAIRS,
+                _ => panic!("SPEARFISH_ABLATE: unknown part `{name}` (l2, sites, scan, ends, copy, pairs)"),
+            }
+        })
+    }
 }
 
 pub(crate) const INF: u16 = u16::MAX / 4;
@@ -1153,7 +1191,13 @@ impl Mapper {
             opt,
             seeder: BaseSeeder::new(L3_SPEC, hpc).expect("valid seed spec"),
             seeder2: BaseSeeder::new(L2_SPEC, hpc).expect("valid seed spec"),
+            ablate: ablation::from_env(),
         }
+    }
+
+    #[inline]
+    fn off(&self, part: u32) -> bool {
+        self.ablate & part != 0
     }
 
     /// Hits of `read` (ASCII bases), best first. Empty when the read does not map.
@@ -1383,7 +1427,8 @@ impl Mapper {
                 && found[best] >= 3
                 && 25 * found[best] >= sc.l3[best].len();
             let beaten = found[1 - o] >= 5 && 4 * found[o] <= found[1 - o];
-            if (pairs || (self.opt.pairs && noisy && !beaten)) && ix.has_pairs() {
+            if (pairs || (self.opt.pairs && noisy && !beaten)) && ix.has_pairs() && !self.off(ablation::PAIRS)
+            {
                 self.pair_seeds(o, sc);
                 for s in &sc.pair_seeds[o] {
                     let (pos, len) = ix.occ(s.occ, true);
@@ -1560,7 +1605,11 @@ impl Mapper {
                     .filter(|w| w[1].ts - w[0].te >= MIN_INTRON_REPORTED)
                     .count()
             };
-            if let Some(u) = out.iter().filter(|h| introns(h) == 0).max_by_key(|h| h.score) {
+            if let Some(u) = out
+                .iter()
+                .filter(|h| introns(h) == 0 && !self.off(ablation::COPY))
+                .max_by_key(|h| h.score)
+            {
                 let (us, uc, (ua, ub)) = (u.score as i64, cover(u), span(u));
                 for h in out.iter_mut().filter(|h| introns(h) > 0) {
                     let (hs, hc, (ha, hb)) = (h.score as i64, cover(h), span(h));
@@ -2003,7 +2052,10 @@ impl Mapper {
                 // with them.
                 let poor_fit = sol.as_ref().is_none_or(|x| x.0.cost >= 2 * fine);
                 if poor_fit && hard && q1 > q0 && t1 > t0 && m <= 600 {
-                    let (sites, mid) = self.site_windows(read, q0, t0, q1, t1, minus, sc);
+                    let (mut sites, mid) = self.site_windows(read, q0, t0, q1, t1, minus, sc);
+                    if self.off(ablation::SITES) {
+                        sites.clear();
+                    }
                     // (the two searches below do not depend on the strand)
                     if seedless[k].is_none() {
                         let mut w = self.word_windows(read, q0, t0, q1, t1, sc);
@@ -2399,7 +2451,8 @@ impl Mapper {
             // stops: a read end that goes on in the exon after one of them is believed on a
             // few bases, and then nothing else is searched.
             let mut settled = false;
-            if rescue && !tail && known && m as u32 - reached >= 4 && m as u32 - reached <= KNOWN_END_SPAN {
+            let search = rescue && !self.off(ablation::ENDS);
+            if search && !tail && known && m as u32 - reached >= 4 && m as u32 - reached <= KNOWN_END_SPAN {
                 let p_end = best.0.end.1.abs_diff(t);
                 let mut kh = self.known_hops(gv, p_end, reached as usize, m - reached as usize);
                 kh.sort_by_key(|w| w.0);
@@ -2422,7 +2475,7 @@ impl Mapper {
                     }
                 }
             }
-            if rescue && !tail && !settled && m as u32 - reached >= 10 {
+            if search && !tail && !settled && m as u32 - reached >= 10 {
                 sc.stats.end_tried += 1;
                 // level-2 cores of the unexplained bases of this round (the bases the genome
                 // next to the hit explains have their hits there), within reach of the longest
@@ -2720,6 +2773,9 @@ impl Mapper {
         t1: u32,
         sc: &mut Scratch,
     ) -> Vec<SolverWindow> {
+        if self.off(ablation::SCAN) {
+            return Vec::new();
+        }
         const K: usize = 8;
         const TOP: u32 = 2 * (K as u32 - 1);
         let ix = &*self.index;
@@ -2846,6 +2902,9 @@ impl Mapper {
         t1: u32,
         mid: (usize, usize),
     ) -> Vec<SolverWindow> {
+        if self.off(ablation::SCAN) {
+            return Vec::new();
+        }
         let ix = &*self.index;
         let m = (q1 - q0) as usize;
         let (lo, hi) = (t0 + 20, t1.saturating_sub(20));
@@ -3172,6 +3231,9 @@ impl Mapper {
         near: bool,
         sc: &mut Scratch,
     ) -> Vec<SolverWindow> {
+        if self.off(ablation::SITES) {
+            return Vec::new();
+        }
         const MARGIN: usize = 4;
         let ix = &*self.index;
         let start = reached.saturating_sub(MARGIN);
@@ -3255,6 +3317,9 @@ impl Mapper {
         gv: View,
         p_end: u32,
     ) -> Vec<SolverWindow> {
+        if self.off(ablation::SCAN) {
+            return Vec::new();
+        }
         let ix = &*self.index;
         let start = reached.saturating_sub(8);
         let from = p_end + 20;
@@ -3339,6 +3404,9 @@ impl Mapper {
         q_hi: u32,
         sc: &mut Scratch,
     ) -> Vec<Anchor> {
+        if self.off(ablation::L2) {
+            return Vec::new();
+        }
         let ix = &*self.index;
         let (qa, ta) = match a {
             Some(a) => (a.q + a.ql as u32, a.t + a.tl as u32),
