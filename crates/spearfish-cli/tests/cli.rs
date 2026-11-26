@@ -1486,6 +1486,30 @@ fn genome_index_and_spliced_map_on_toy() {
         assert_eq!(sorted(&out), sorted(&paf), "{format}");
     }
 
+    // A list of introns (BED with the strand in column 6, as minimap2 reads and writes) gives
+    // the same junctions without the exons; without a strand column they are read as well.
+    for cols in [6, 3] {
+        let introns = dir.join(format!("introns{cols}.bed"));
+        let mut t = String::new();
+        for (id, ex) in &tx {
+            for w in ex.windows(2) {
+                t += &format!("toy\t{}\t{}", w[0].1, w[1].0);
+                if cols == 6 {
+                    t += &format!("\t{id}\t6\t+");
+                }
+                t.push('\n');
+            }
+        }
+        std::fs::write(&introns, t).unwrap();
+        let (ok, out, err) = map(&[o("-a"), introns.as_os_str()]);
+        assert!(ok, "{err}");
+        assert!(
+            err.contains("annotation: 0 transcripts, 11 introns, 0 exons (bed)"),
+            "{err}"
+        );
+        assert_eq!(out.lines().count(), paf.lines().count());
+    }
+
     // Each mapping command refuses the other kind of index and names the right command.
     let (ok, _, err) = spearfish(&[o("map"), idx.as_os_str(), reads.as_os_str()]);
     assert!(
@@ -1514,7 +1538,7 @@ fn genome_index_and_spliced_map_on_toy() {
     std::fs::write(&other, "chr1\tx\texon\t10\t50\t.\t+\t.\ttranscript_id \"t1\";\n").unwrap();
     let (ok, _, err) = map(&[o("-a"), other.as_os_str()]);
     assert!(
-        !ok && err.contains("no transcript is on a sequence of the index"),
+        !ok && err.contains("no transcript or intron is on a sequence of the index"),
         "{err}"
     );
 }

@@ -128,7 +128,8 @@ pub fn run(args: Args) -> Result<()> {
 /// The mapping and output options of `spearfish map-spliced`.
 #[derive(clap::Args, Debug, Default)]
 pub struct GenomeArgs {
-    /// Known transcripts (GTF, GFF3 or BED12, optionally compressed). Optional: their splice
+    /// Known transcripts (GTF, GFF3 or BED12) or known introns (BED, one intron per line with the
+    /// strand in column 6, as `minimap2 --write-junc` writes), optionally compressed. Optional: their splice
     /// sites, junctions and exons are preferred where a read fits them, and junctions not
     /// among them are still found. Sequence names must match the genome's.
     #[arg(short = 'a', long, alias = "junctions", value_name = "FILE", help_heading = HEADING)]
@@ -319,6 +320,7 @@ struct AnnotationInfo {
     path: String,
     format: &'static str,
     transcripts: usize,
+    intron_records: usize,
     introns: usize,
     exons: usize,
     /// Records on sequences the index does not hold.
@@ -404,6 +406,9 @@ pub fn execute(job: Job) -> Result<Counts> {
                 s.exons,
                 s.format
             );
+            if s.intron_records > 0 {
+                log::info!("annotation: {} lines of introns alone", s.intron_records);
+            }
             if s.skipped_records > 0 {
                 log::warn!(
                     "annotation: {} records are on sequences the index does not hold ({}{})",
@@ -420,6 +425,7 @@ pub fn execute(job: Job) -> Result<Counts> {
                 path: spearfish::provenance::absolute(path),
                 format: s.format,
                 transcripts: s.transcripts,
+                intron_records: s.intron_records,
                 introns: s.introns,
                 exons: s.exons,
                 skipped_records: s.skipped_records,

@@ -189,7 +189,7 @@ reads = mapper.map_batch(seqs, names)               # in parallel, in input orde
 counts = mapper.map_file("reads.fq.gz", bam="reads.bam")   # read, mapped and written in Rust
 ```
 
-The annotation (GTF, GFF3 or BED12) belongs to the loaded index object, not to the file: its
+The annotation (GTF, GFF3, BED12, or a BED list of introns) belongs to the loaded index object, not to the file: its
 splice sites, junctions and exons are preferred where a read fits them, and junctions outside
 it are still found. `SplicedMapper` takes settings by keyword, as `Mapper` does: the common ones
 are `secondary` (secondary alignments per read), `base_level` (`"blocks"`, `"edits"` or

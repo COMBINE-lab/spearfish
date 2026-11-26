@@ -1,7 +1,10 @@
 //! Known splice junctions and exons (optional input).
 //!
-//! Read from transcript models in GTF, GFF3 or BED12 (as `paftools.js gff2bed` writes); the
-//! format is told from the content. Positions are on the index's concatenated axis. A known
+//! Read from transcript models in GTF, GFF3 or BED12 (as `paftools.js gff2bed` writes), or from
+//! a list of introns in BED with fewer than twelve columns (sequence, start, end, name, score,
+//! strand: what `minimap2 --write-junc` writes and what it reads with `--junc-bed` and
+//! `--pass1`); the format is told from the content. A list of introns gives splice sites and
+//! junctions but no exons. Positions are on the index's concatenated axis. A known
 //! splice site costs nothing where an unknown one pays for its motif and a little more for
 //! being unknown; known exons and the donor-to-acceptor links are extra candidates where read
 //! bases are left unexplained.
@@ -27,11 +30,13 @@ pub struct Model {
 /// What a file of transcript models held.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
-    /// `gtf`, `gff3` or `bed12`.
+    /// `gtf`, `gff3`, `bed12`, or `bed` for a list of introns.
     pub format: &'static str,
     /// Transcript models on sequences of the index.
     pub transcripts: usize,
-    /// Distinct introns and exons among them.
+    /// Lines of a list of introns (several may name one intron).
+    pub intron_records: usize,
+    /// Distinct introns and exons in all.
     pub introns: usize,
     pub exons: usize,
     /// Records on sequences the index does not hold, and those sequences' names (the first few).
@@ -88,6 +93,8 @@ impl Junctions {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
         let mut models: Vec<Model> = Vec::new();
+        // introns listed on their own: sequence, strand of the transcript if given, interval
+        let mut introns: Vec<(usize, Option<bool>, u32, u32)> = Vec::new();
         let mut by_id: HashMap<String, usize> = HashMap::new();
         let mut sum = Summary::default();
         let mut skipped: Vec<String> = Vec::new();
@@ -159,13 +166,39 @@ impl Junctions {
                     });
                     models[k].exons.push((s - 1, e));
                 }
-            } else {
-                if p.len() < 12 {
+            } else if p.len() < 12 {
+                // One intron per line, as minimap2 writes and reads them: the interval is the
+                // intron, and the sixth column the strand of the transcript. Without a strand
+                // the intron is known for both.
+                if p.len() < 3 {
                     bail!(
-                        "line {n}: {} columns; transcript models are read from GTF, GFF3 or BED12 (12 columns)",
+                        "line {n}: {} columns; known junctions are read from GTF, GFF3, BED12, or BED with one intron per line",
                         p.len()
                     );
                 }
+                if sum.format.is_empty() {
+                    sum.format = "bed";
+                }
+                let Some(&seq) = seq_of.get(p[0]) else {
+                    skip(p[0], &mut sum);
+                    continue;
+                };
+                let (s, e) = (num(p[1], "start")?, num(p[2], "end")?);
+                if e <= s || e > ix.seq_len(seq) {
+                    bail!(
+                        "line {n}: intron {s}-{e} is not an interval of {} ({} bases)",
+                        p[0],
+                        ix.seq_len(seq)
+                    );
+                }
+                let strand = match p.get(5).copied() {
+                    Some("+") => Some(false),
+                    Some("-") => Some(true),
+                    _ => None,
+                };
+                sum.intron_records += 1;
+                introns.push((seq, strand, s, e));
+            } else {
                 sum.format = "bed12";
                 let Some(&seq) = seq_of.get(p[0]) else {
                     skip(p[0], &mut sum);
@@ -207,7 +240,7 @@ impl Junctions {
         }
         sum.skipped_sequences = skipped;
         sum.transcripts = models.len();
-        let j = Self::from_models(models, ix);
+        let j = Self::build(models, introns, ix);
         sum.introns = j.len();
         sum.exons = j.exons.len();
         Ok((j, sum))
@@ -215,7 +248,25 @@ impl Junctions {
 
     /// Junctions and exons of transcript models that a caller already holds.
     pub fn from_models(models: impl IntoIterator<Item = Model>, ix: &GenomeIndex) -> Junctions {
+        Self::build(models, Vec::new(), ix)
+    }
+
+    fn build(
+        models: impl IntoIterator<Item = Model>,
+        introns: Vec<(usize, Option<bool>, u32, u32)>,
+        ix: &GenomeIndex,
+    ) -> Junctions {
         let mut j = Junctions::default();
+        for (seq, strand, s, e) in introns {
+            let off = ix.offsets()[seq];
+            j.by_left.push((off + s, off + e));
+            for minus in [false, true] {
+                if strand.is_none_or(|m| m == minus) {
+                    j.donors[minus as usize].push(off + s);
+                    j.acceptors[minus as usize].push(off + e);
+                }
+            }
+        }
         for Model {
             seq,
             reverse: minus,

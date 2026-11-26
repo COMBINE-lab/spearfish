@@ -152,6 +152,7 @@ impl PyGenomeIndex {
         let d = PyDict::new(py);
         d.set_item("format", a.format)?;
         d.set_item("transcripts", a.transcripts)?;
+        d.set_item("intron_records", a.intron_records)?;
         d.set_item("introns", a.introns)?;
         d.set_item("exons", a.exons)?;
         d.set_item("skipped_records", a.skipped_records)?;

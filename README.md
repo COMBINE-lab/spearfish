@@ -85,7 +85,7 @@ spearfish map-spliced genome.sfg reads.fq.gz --preset ont --bam reads.bam   # or
 spearfish map-spliced genome.sfg reads.fq.gz -a annotation.gtf.gz --bam reads.bam   # known transcripts are optional
 ```
 
-The index needs no annotation and stores none. Known transcripts (`-a`: GTF, GFF3 or BED12)
+The index needs no annotation and stores none. Known transcripts (`-a`: GTF, GFF3 or BED12; or a BED list of introns, as minimap2 reads and writes)
 are given when mapping; junctions outside them are still found. By default an alignment is
 its exon blocks, with introns as `N` in the CIGAR, which is what quantification and transcript
 discovery read; `--base-level edits|affine` adds a base-level alignment of each block. See the

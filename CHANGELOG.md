@@ -55,6 +55,12 @@
   for a tie, 60 for a lone hit, and in between rises by 3 each time that share doubles (9 at a
   twentieth of a percent, 22 at one percent), a scale fitted to how often such hits are the
   true one on simulated reads. Placements do not change.
+- **Known introns as a list.** `map-spliced -a` also reads a BED file with one intron per
+  line (sequence, start, end, name, score, strand), the form that `minimap2 --write-junc`
+  writes and that minimap2 reads with `--junc-bed` and `--pass1`. Such a list gives splice
+  sites and junctions but no exons, so a file of transcripts (GTF, GFF3 or BED12) remains
+  the better input where there is one. Without a strand column an intron is known for both
+  strands.
 - **Genome index builds in less memory.** `index --genome` held the genome unpacked and its
   seed tables several times over, and then the whole index again to write it. It now packs the
   genome as it reads it and builds in stages, one table at a time, each written to the output

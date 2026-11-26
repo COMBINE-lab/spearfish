@@ -346,18 +346,18 @@ impl GenomeIndex {
     /// read bases are left unexplained. Nothing is written to the index. Replaces an
     /// annotation loaded before; must be called before the index is given to a mapper.
     ///
-    /// An error when no transcript in the file is on a sequence of the index (sequence names
+    /// An error when no transcript or intron in the file is on a sequence of the index (sequence names
     /// must match: `chr1` is not `1`).
     pub fn load_annotation(&mut self, path: &Path) -> Result<&AnnotationSummary> {
         let (j, sum) = Junctions::from_reader(open_text(path)?, &self.inner)
             .with_context(|| format!("reading {}", path.display()))?;
-        if sum.transcripts == 0 {
+        if sum.transcripts == 0 && sum.intron_records == 0 {
             let names = sum.skipped_sequences.join(", ");
             bail!(
-                "{}: no transcript is on a sequence of the index{}",
+                "{}: no transcript or intron is on a sequence of the index{}",
                 path.display(),
                 if names.is_empty() {
-                    " (the file has no exon records)".to_string()
+                    " (the file has no exon or intron records)".to_string()
                 } else {
                     format!(
                         " (it names {names}, ...; the index has {}, ...)",
