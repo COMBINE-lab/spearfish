@@ -1022,6 +1022,9 @@ const KNOWN_END: u32 = 8;
 /// The most unexplained read bases at an end for which the known introns are tried on their own
 /// (more than that is another exon or more, and the seeds find those).
 const KNOWN_END_SPAN: u32 = 60;
+/// A run of A at the end of a read (of T at its start), scored +1 per base of the run and -3 per
+/// other base, is a poly(A) tail from this score on.
+const TAIL_RUN: i32 = 12;
 const MICRO_EXON: u32 = 20;
 
 /// Reference skips shorter than this are written as deletions, not introns.
@@ -2517,8 +2520,26 @@ impl Mapper {
             let known = self.index.junctions.is_some();
             // What is left of the read may be a poly(A) tail (poly(T) on the other strand) or
             // other low-complexity sequence: that is clipped, never searched for.
+            // A tail can also follow a few bases of a last exon. Those bases are searched for as
+            // if the read ended where the tail begins (`me`): with the tail counted in, the end
+            // would look too long, or too uniform, for the searches made for short ends.
+            let me = {
+                let ch = if left { 3 } else { 0 };
+                let (mut cur, mut start, mut found) = (0i32, reached as usize, m);
+                for i in reached as usize..m {
+                    if cur <= 0 {
+                        (cur, start) = (0, i);
+                    }
+                    cur += if rv.base(read, i) & 3 == ch { 1 } else { -3 };
+                    if cur >= TAIL_RUN {
+                        found = start;
+                        break;
+                    }
+                }
+                found
+            };
             let tail = {
-                let n = (m - reached as usize).min(24);
+                let n = (me - reached as usize).min(24);
                 let mut c = [0usize; 4];
                 for i in 0..n {
                     c[rv.base(read, reached as usize + i) as usize & 3] += 1;
@@ -2530,9 +2551,9 @@ impl Mapper {
             // few bases, and then nothing else is searched.
             let mut settled = false;
             let search = rescue && !self.off(ablation::ENDS);
-            if search && !tail && known && m as u32 - reached >= 4 && m as u32 - reached <= KNOWN_END_SPAN {
+            if search && !tail && known && me as u32 - reached >= 4 && me as u32 - reached <= KNOWN_END_SPAN {
                 let p_end = best.0.end.1.abs_diff(t);
-                let mut kh = self.known_hops(gv, p_end, reached as usize, m - reached as usize);
+                let mut kh = self.known_hops(gv, p_end, reached as usize, me - reached as usize);
                 kh.sort_by_key(|w| w.0);
                 if !kh.is_empty() {
                     let j = self.index.junctions.as_ref().unwrap();
@@ -2547,13 +2568,13 @@ impl Mapper {
                                 .iter()
                                 .all(|h| j.intron(h.leave.min(h.enter), h.leave.max(h.enter)));
                         if all_known && s.cost < best.0.cost && s.cost <= plain_cost {
-                            settled = m as u32 - s.end.0.abs_diff(q) < 4;
+                            settled = (me as u32).saturating_sub(s.end.0.abs_diff(q)) < 4;
                             best = (s, Some(mi));
                         }
                     }
                 }
             }
-            if search && !tail && !settled && m as u32 - reached >= 10 {
+            if search && !tail && !settled && me as u32 - reached >= 10 {
                 sc.stats.end_tried += 1;
                 // level-2 cores of the unexplained bases of this round (the bases the genome
                 // next to the hit explains have their hits there), within reach of the longest
@@ -2569,16 +2590,16 @@ impl Mapper {
                     w: 0.0,
                 };
                 let hits = if left {
-                    self.rescue(reverse, None, Some(here), q - m as u32, qlen, sc)
+                    self.rescue(reverse, None, Some(here), q - me as u32, qlen, sc)
                 } else {
-                    self.rescue(reverse, Some(here), None, 0, q + m as u32, sc)
+                    self.rescue(reverse, Some(here), None, 0, q + me as u32, sc)
                 };
                 // windows start at the unexplained bases, not at the start of this round
                 let windows = |hits: &[Anchor]| {
                     if left {
                         windows_of(
                             hits,
-                            q.saturating_sub(m as u32),
+                            q.saturating_sub(me as u32),
                             q - slack,
                             t.saturating_sub(self.opt.max_intron),
                             t,
@@ -2587,7 +2608,7 @@ impl Mapper {
                         )
                     } else {
                         let hi = t.saturating_add(self.opt.max_intron).min(ix.total_len());
-                        windows_of(hits, q + slack, q + m as u32, t, hi, 4, END_HIT_GAP)
+                        windows_of(hits, q + slack, q + me as u32, t, hi, 4, END_HIT_GAP)
                     }
                 };
                 // Most introns are short, and within the longest intron's reach a noisy read
@@ -2630,10 +2651,10 @@ impl Mapper {
                     wins.iter().map(|w| w.forward(q, t)).collect()
                 };
                 let p_end = best.0.end.1.abs_diff(t);
-                let unexplained = m as u32 - reached;
+                let unexplained = me as u32 - reached;
                 // (the approximate search needs a long stretch to tell an exon from chance)
                 let scanned = if unexplained >= SCAN_END_MIN {
-                    self.scan_windows_end(read, rv, m, reached as usize, gv, p_end)
+                    self.scan_windows_end(read, rv, me, reached as usize, gv, p_end)
                 } else {
                     Vec::new()
                 };
@@ -2643,14 +2664,14 @@ impl Mapper {
                 let mut cands: Vec<Vec<SolverWindow>> = Vec::new();
                 for &mi in &strands {
                     let mut all = vw.clone();
-                    all.extend(self.known_hops(gv, p_end, reached as usize, m - reached as usize));
+                    all.extend(self.known_hops(gv, p_end, reached as usize, me - reached as usize));
                     // (an exon found by its splice site and a few matching bases alone is
                     // believed for a short read end only: those have no seed to be found by)
                     if unexplained < SITE_END_MAX {
                         all.extend(self.site_windows_end(
                             read,
                             rv,
-                            m,
+                            me,
                             reached as usize,
                             gv,
                             p_end,
@@ -3805,11 +3826,19 @@ impl Mapper {
 }
 
 /// Mapping quality of a read's best hit, from the scores of the best two: 60 for a lone hit,
-/// falling to 0 as the second approaches the first.
+/// 0 for a tie, and in between a value that rises by 3 each time the share of the best score by
+/// which the second falls short doubles (9 at a twentieth of a percent, 22 at one percent).
+/// The scale follows simulated reads, on which a best hit ahead by a twentieth of a percent is
+/// the true one about nine times in ten, and one ahead by one percent about 99 times in 100.
 pub fn mapq(hits: &[SplicedHit]) -> u8 {
     match (hits.first(), hits.get(1)) {
         (Some(a), Some(b)) => {
-            (60.0 * (1.0 - b.score.max(0) as f32 / a.score.max(1) as f32)).clamp(0.0, 60.0) as u8
+            let gap = 1.0 - b.score.max(0) as f32 / a.score.max(1) as f32;
+            if gap <= 0.0 {
+                0
+            } else {
+                (9.0 + 3.0 * (gap / 0.0005).log2()).round().clamp(1.0, 60.0) as u8
+            }
         }
         _ => 60,
     }

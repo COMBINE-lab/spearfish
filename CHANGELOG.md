@@ -44,6 +44,17 @@
   that was found by its seeds could be written as an insertion, because the known exons were
   tried on their own only when the seeds explained nothing. They are now tried as well when
   the answer from the seeds is still a poor fit.
+- **Read ends with a poly(A) tail.** A short last exon followed by a poly(A) tail could be
+  left out. The search past a read's outermost seed is chosen by how many bases are
+  unexplained, and the tail was counted among them, so a few exon bases before a tail looked
+  too long, or too uniform, to be searched. The search now measures the end up to where the
+  tail begins. The tail itself stays unaligned.
+- **Mapping quality.** The quality of a hit with a rival was 60 times the share of the best
+  score by which the second fell short, which gave single digits to hits that are nearly
+  always right, and downstream tools that filter on quality dropped those reads. It is now 0
+  for a tie, 60 for a lone hit, and in between rises by 3 each time that share doubles (9 at a
+  twentieth of a percent, 22 at one percent), a scale fitted to how often such hits are the
+  true one on simulated reads. Placements do not change.
 - **Genome index builds in less memory.** `index --genome` held the genome unpacked and its
   seed tables several times over, and then the whole index again to write it. It now packs the
   genome as it reads it and builds in stages, one table at a time, each written to the output
