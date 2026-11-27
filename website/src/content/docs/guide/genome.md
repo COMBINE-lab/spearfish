@@ -61,9 +61,14 @@ that fits a known junction is placed on it. And where read bases are left unexpl
 exons and junctions are tried first. Junctions that are not in the file are still found, at
 the cost their motif gives them.
 
+The file may also be a list of known introns: a BED file of fewer than twelve columns, one
+intron per line (sequence, intron start, intron end, and the strand in column 6). This is the
+form minimap2 takes with `--junc-bed` and writes with `--write-junc`. An intron with no strand
+is taken as known on both strands. Such a list holds no exons, so known exons are not tried.
+
 Sequence names in the annotation must be those of the genome (`chr1` is not `1`). Records on
-other sequences are counted and reported; if no transcript is on a sequence of the index, the
-run stops with an error.
+other sequences are counted and reported; if no transcript or intron is on a sequence of the
+index, the run stops with an error.
 
 ## Presets
 

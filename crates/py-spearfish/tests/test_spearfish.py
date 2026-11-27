@@ -605,7 +605,7 @@ def test_genome_index(genome, tmp_path):
         spearfish.Index.load(path)
     other = tmp_path / "other.gtf"
     other.write_text('chr1\tx\texon\t10\t50\t.\t+\t.\ttranscript_id "t1";\n')
-    with pytest.raises(ValueError, match="no transcript is on a sequence"):
+    with pytest.raises(ValueError, match="no transcript or intron is on a sequence"):
         spearfish.GenomeIndex.load(path, annotation=other)
 
 
