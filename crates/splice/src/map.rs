@@ -169,6 +169,9 @@ pub struct Stats {
     pub end_kept: u64,
     /// Hits scored by aligning their blocks.
     pub scored: u64,
+    /// Reads with a hit scored that way, and the read bases in the blocks so aligned.
+    pub scored_reads: u64,
+    pub scored_bases: u64,
     pub retried: u64,
     /// Spliced hits ranked above an unspliced rival of slightly higher score.
     pub spliced_preferred: u64,
@@ -201,6 +204,8 @@ impl Stats {
         self.end_tried += o.end_tried;
         self.end_kept += o.end_kept;
         self.scored += o.scored;
+        self.scored_reads += o.scored_reads;
+        self.scored_bases += o.scored_bases;
         self.retried += o.retried;
         self.spliced_preferred += o.spliced_preferred;
         self.repeat_reads += o.repeat_reads;
@@ -247,6 +252,9 @@ pub mod ablation {
     pub const PAIRS: u32 = 32;
     /// What reads from repeats get: the higher seed cap, and loci weighed by distinct seeds.
     pub const REPEATS: u32 = 64;
+    /// A junction of two known sites that no known intron joins, moved onto a known intron
+    /// a few bases away.
+    pub const KNOWN_PAIRS: u32 = 128;
 
     pub(super) fn from_env() -> u32 {
         let Ok(v) = std::env::var("SPEARFISH_ABLATE") else {
@@ -261,6 +269,7 @@ pub mod ablation {
                 "copy" => COPY,
                 "pairs" => PAIRS,
                 "repeats" => REPEATS,
+                "knownpairs" => KNOWN_PAIRS,
                 _ => panic!(
                     "SPEARFISH_ABLATE: unknown part `{name}` (l2, sites, scan, ends, copy, pairs, repeats)"
                 ),
@@ -1034,6 +1043,12 @@ const MIN_INTRON_OUT: u32 = 30;
 /// known intron (they are bases the read lacks). Until a hit is chosen they stay junctions,
 /// priced as such.
 const MIN_INTRON_REPORTED: u32 = 60;
+/// How far, at each end, a known intron may lie from a junction of two known sites that no
+/// known intron joins, to be tried in its place ([`Mapper::known_pairs`]).
+const PAIR_REACH: u32 = 10;
+/// Edits by which the read may fit such a junction better than the known intron and still be
+/// moved onto the intron.
+const PAIR_EDITS: u32 = 2;
 /// The share of an annotation's introns (numerator, denominator) under `MIN_INTRON_REPORTED`
 /// from which a skip that short, not among them, can be a new intron.
 const SHORT_INTRON_SHARE: (usize, usize) = (1, 100);
@@ -1626,14 +1641,18 @@ impl Mapper {
             }
             let read = std::mem::take(&mut sc.codes[reverse as usize]);
             sc.gap.reset(); // another chain, possibly the other orientation of the read
-            out.push(self.build(reverse, &chain, &read, n as u32, score, screened_ok, sc));
+            let mut hit = self.build(reverse, &chain, &read, n as u32, score, screened_ok, sc);
+            self.known_pairs(&read, &mut hit);
+            out.push(hit);
             sc.codes[reverse as usize] = read;
         }
         // Rival hits, and a lone hit resting on few anchors or with more edits found between its
         // anchors than they are worth, are scored by aligning their blocks; a lone well-anchored
         // hit keeps its chain score and is never aligned inside its exons.
         if out.len() > 1 || out.first().is_some_and(|h| h.anchors <= 3 || h.score <= 0) {
+            sc.stats.scored_reads += 1;
             for h in out.iter_mut() {
+                sc.stats.scored_bases += h.blocks.iter().map(|b| (b.qe - b.qs) as u64).sum::<u64>();
                 let read = std::mem::take(&mut sc.codes[h.reverse as usize]);
                 h.score = self.align_score(&read, h, sc);
                 sc.codes[h.reverse as usize] = read;
@@ -3597,6 +3616,113 @@ impl Mapper {
             sc.want[s.id as usize] = u32::MAX;
         }
         hits
+    }
+
+    /// Two known splice sites cost nothing each, whether or not any known intron joins them.
+    /// So where two known introns end a few bases apart, one read error next to the junction
+    /// is enough to pair the left end of one with the right end of the other, an intron no
+    /// transcript has. Such a junction (both ends known, the pair not) is moved onto a known
+    /// intron within `PAIR_REACH` bases at both ends unless the read's bases around it fit
+    /// the reported one better by more than `PAIR_EDITS` edits.
+    fn known_pairs(&self, read: &[u8], h: &mut SplicedHit) {
+        let ix = &*self.index;
+        let Some(j) = &ix.junctions else { return };
+        if self.off(ablation::KNOWN_PAIRS) {
+            return;
+        }
+        // Read bases looked at on each side of the junction.
+        const W: u32 = 40;
+        // Genome bases allowed beyond the read's on each side (for deletions in the read).
+        const SLACK: usize = 15;
+        let known = |p: u32, right: bool| {
+            [false, true].into_iter().any(|m| {
+                if right {
+                    j.right_site(p, m)
+                } else {
+                    j.left_site(p, m)
+                }
+            })
+        };
+        // out[i]: fewest edits of the first `i` bases of `r` against genome bases that end
+        // (in the order given by `g`, last to first) at the junction. `g(k)` is the k-th base
+        // away from the junction; `r` is given nearest the far end first.
+        let ends =
+            |r: &[u8], far_first: bool, g: &dyn Fn(u32) -> u8, col: &mut Vec<u32>, out: &mut Vec<u32>| {
+                let (m, n) = (r.len(), r.len() + SLACK);
+                col.clear();
+                col.resize(m + 1, 0); // col[i] after genome base x: read bases i used
+                for (i, c) in col.iter_mut().enumerate() {
+                    *c = i as u32;
+                }
+                // (free start in the genome: column 0 of every genome row costs nothing)
+                for x in (0..n as u32).rev() {
+                    let gb = g(x);
+                    let mut diag = col[0];
+                    col[0] = 0;
+                    for i in 1..=m {
+                        let rb = if far_first { r[i - 1] } else { r[m - i] };
+                        let v = (diag + (rb != gb) as u32).min(col[i] + 1).min(col[i - 1] + 1);
+                        diag = col[i];
+                        col[i] = v;
+                    }
+                }
+                out.clear();
+                out.extend_from_slice(col);
+            };
+        let (mut col, mut left, mut right) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 0..h.blocks.len().saturating_sub(1) {
+            let (b0, b1) = (h.blocks[k], h.blocks[k + 1]);
+            let (d, a) = (b0.te, b1.ts);
+            if a < d + MIN_INTRON_REPORTED || j.intron(d, a) || !known(d, false) || !known(a, true) {
+                continue;
+            }
+            let near = j
+                .from_left(d.saturating_sub(PAIR_REACH), d + PAIR_REACH + 1)
+                .iter()
+                .filter(|&&(x, y)| y.abs_diff(a) <= PAIR_REACH && x > b0.ts + 3 && y + 3 < b1.te);
+            let qj = (b0.qe + b1.qs) / 2;
+            let (lo, hi) = (qj.saturating_sub(W).max(b0.qs), (qj + W).min(b1.qe));
+            let reach = (2 * W) as u64 + SLACK as u64;
+            if hi <= lo + 2
+                || (d as u64) < reach + PAIR_REACH as u64
+                || a as u64 + reach + PAIR_REACH as u64 > ix.total_len() as u64
+            {
+                continue;
+            }
+            let (s_lo, s_hi) = (qj.saturating_sub(14).max(lo + 1), (qj + 14).min(hi - 1));
+            if s_lo > s_hi {
+                continue;
+            }
+            let r = &read[lo as usize..hi as usize];
+            // The cheapest split of the read bases between an intron's two sides, and where.
+            let mut cost = |x: u32, y: u32| -> (u32, u32) {
+                // left[i]: read[lo..lo + i] against the genome ending at x
+                ends(r, true, &|k| ix.base(x - 1 - k), &mut col, &mut left);
+                // right[i]: the last i bases of read[lo..hi] against the genome starting at y
+                ends(r, false, &|k| ix.base(y + k), &mut col, &mut right);
+                (s_lo..=s_hi)
+                    .map(|s| (left[(s - lo) as usize] + right[(hi - s) as usize], s))
+                    .min()
+                    .unwrap_or((u32::MAX, qj))
+            };
+            let mut best: Option<(u32, u32, u32, u32)> = None;
+            for &(x, y) in near {
+                let (c, s) = cost(x, y);
+                if best.is_none_or(|b| (c, x, y) < (b.0, b.2, b.3)) {
+                    best = Some((c, s, x, y));
+                }
+            }
+            let Some((c1, s1, x, y)) = best else { continue };
+            if c1 <= cost(d, a).0 + PAIR_EDITS {
+                h.blocks[k].te = x;
+                h.blocks[k].qe = s1;
+                h.blocks[k + 1].ts = y;
+                h.blocks[k + 1].qs = s1;
+                if let Some(o) = h.origins.get_mut(k) {
+                    *o = b'p';
+                }
+            }
+        }
     }
 
     /// The corresponding read/genome points a junction after anchor `a` and before anchor `b`

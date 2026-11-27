@@ -55,6 +55,12 @@
   for a tie, 60 for a lone hit, and in between rises by 3 each time that share doubles (9 at a
   twentieth of a percent, 22 at one percent), a scale fitted to how often such hits are the
   true one on simulated reads. Placements do not change.
+- **Two known sites that no known intron joins.** A known splice site costs nothing, so
+  where two known introns end a few bases apart, one read error next to the junction could
+  join the start of one to the end of the other, an intron that no transcript has. Such a
+  junction is now moved onto a known intron within 10 bases at both ends, unless the read's
+  bases around it fit the reported junction better by more than 2 edits. Only runs with an
+  annotation change.
 - **Known introns as a list.** `map-spliced -a` also reads a BED file with one intron per
   line (sequence, start, end, name, score, strand), the form that `minimap2 --write-junc`
   writes and that minimap2 reads with `--junc-bed` and `--pass1`. Such a list gives splice
